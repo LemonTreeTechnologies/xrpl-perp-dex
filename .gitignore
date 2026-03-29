@@ -1,0 +1,27 @@
+# Build
+build/
+*.o
+*.so
+*.signed.so
+
+# SGX
+enclave.token
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Secrets
+*.pem
+*.key
+.env
