@@ -1,0 +1,613 @@
+//! Central Limit Order Book (CLOB) with price-time priority matching.
+//!
+//! Orders live in the orchestrator (not in the enclave).
+//! When a match occurs, the orchestrator calls enclave `open_position`
+//! for both maker and taker to validate margin.
+
+use std::collections::BTreeMap;
+use std::time::SystemTime;
+
+use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
+use tracing::info;
+
+use crate::types::{FP8, Side};
+
+// ── Order types ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderType {
+    Limit,
+    Market,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeInForce {
+    /// Good-Till-Cancelled
+    Gtc,
+    /// Immediate-Or-Cancel
+    Ioc,
+    /// Fill-Or-Kill
+    Fok,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderStatus {
+    Open,
+    PartiallyFilled,
+    Filled,
+    Cancelled,
+}
+
+// ── Order ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Order {
+    pub id: u64,
+    pub user_id: String,
+    pub market: String,
+    pub side: Side,
+    pub order_type: OrderType,
+    pub price: FP8,
+    pub size: FP8,
+    pub filled: FP8,
+    pub leverage: u32,
+    pub status: OrderStatus,
+    pub time_in_force: TimeInForce,
+    pub reduce_only: bool,
+    pub timestamp_ms: u64,
+    pub client_order_id: Option<String>,
+}
+
+impl Order {
+    pub fn remaining(&self) -> FP8 {
+        self.size - self.filled
+    }
+}
+
+// ── Trade (fill record) ─────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Trade {
+    pub trade_id: u64,
+    pub market: String,
+    pub maker_order_id: u64,
+    pub taker_order_id: u64,
+    pub maker_user_id: String,
+    pub taker_user_id: String,
+    pub price: FP8,
+    pub size: FP8,
+    pub taker_side: Side,
+    pub timestamp_ms: u64,
+}
+
+// ── Price level: orders at the same price ───────────────────────
+
+#[derive(Debug, Clone)]
+struct PriceLevel {
+    orders: Vec<Order>,
+}
+
+impl PriceLevel {
+    fn new() -> Self {
+        PriceLevel { orders: Vec::new() }
+    }
+
+    fn add(&mut self, order: Order) {
+        self.orders.push(order);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.orders.is_empty()
+    }
+
+    fn total_size(&self) -> FP8 {
+        self.orders.iter().map(|o| o.remaining()).fold(FP8::ZERO, |a, b| a + b)
+    }
+}
+
+// ── Order Book ──────────────────────────────────────────────────
+
+/// CLOB for a single market (e.g., XRP-RLUSD-PERP).
+pub struct OrderBook {
+    pub market: String,
+
+    /// Bids: price → orders (BTreeMap = sorted ascending, we iterate from highest)
+    bids: BTreeMap<i64, PriceLevel>,
+
+    /// Asks: price → orders (BTreeMap = sorted ascending, we iterate from lowest)
+    asks: BTreeMap<i64, PriceLevel>,
+
+    next_order_id: u64,
+    next_trade_id: u64,
+
+    /// Recent trades (last N)
+    pub recent_trades: Vec<Trade>,
+    max_recent_trades: usize,
+}
+
+impl OrderBook {
+    pub fn new(market: &str) -> Self {
+        OrderBook {
+            market: market.to_string(),
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+            next_order_id: 1,
+            next_trade_id: 1,
+            recent_trades: Vec::new(),
+            max_recent_trades: 1000,
+        }
+    }
+
+    /// Best bid price (highest buy order).
+    pub fn best_bid(&self) -> Option<FP8> {
+        self.bids.keys().next_back().map(|&p| FP8(p))
+    }
+
+    /// Best ask price (lowest sell order).
+    pub fn best_ask(&self) -> Option<FP8> {
+        self.asks.keys().next().map(|&p| FP8(p))
+    }
+
+    /// Mid price.
+    pub fn mid_price(&self) -> Option<FP8> {
+        match (self.best_bid(), self.best_ask()) {
+            (Some(bid), Some(ask)) => Some(FP8((bid.0 + ask.0) / 2)),
+            _ => None,
+        }
+    }
+
+    /// Spread.
+    pub fn spread(&self) -> Option<FP8> {
+        match (self.best_bid(), self.best_ask()) {
+            (Some(bid), Some(ask)) if ask.0 > bid.0 => Some(ask - bid),
+            _ => None,
+        }
+    }
+
+    /// Submit a new order. Returns (order, fills).
+    /// Fills are produced immediately if the order crosses the book.
+    pub fn submit_order(
+        &mut self,
+        user_id: String,
+        side: Side,
+        order_type: OrderType,
+        price: FP8,
+        size: FP8,
+        leverage: u32,
+        time_in_force: TimeInForce,
+        reduce_only: bool,
+        client_order_id: Option<String>,
+    ) -> Result<(Order, Vec<Trade>)> {
+        if size.0 <= 0 {
+            bail!("order size must be positive");
+        }
+        if order_type == OrderType::Limit && price.0 <= 0 {
+            bail!("limit order price must be positive");
+        }
+
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let order_id = self.next_order_id;
+        self.next_order_id += 1;
+
+        let mut order = Order {
+            id: order_id,
+            user_id,
+            market: self.market.clone(),
+            side,
+            order_type,
+            price,
+            size,
+            filled: FP8::ZERO,
+            leverage,
+            status: OrderStatus::Open,
+            time_in_force,
+            reduce_only,
+            timestamp_ms: now_ms,
+            client_order_id,
+        };
+
+        // Match against resting orders
+        let trades = self.match_order(&mut order);
+
+        // Handle remaining quantity
+        match order_type {
+            OrderType::Market => {
+                // Market order: cancel unfilled remainder
+                if order.remaining().0 > 0 {
+                    order.status = if order.filled.0 > 0 {
+                        OrderStatus::PartiallyFilled
+                    } else {
+                        OrderStatus::Cancelled
+                    };
+                }
+            }
+            OrderType::Limit => match time_in_force {
+                TimeInForce::Ioc => {
+                    // IOC: cancel unfilled remainder
+                    if order.remaining().0 > 0 && order.filled.0 > 0 {
+                        order.status = OrderStatus::PartiallyFilled;
+                    } else if order.filled.0 == 0 {
+                        order.status = OrderStatus::Cancelled;
+                    }
+                }
+                TimeInForce::Fok => {
+                    // FOK: should have been fully filled or not at all
+                    // (handled in match_order)
+                }
+                TimeInForce::Gtc => {
+                    // GTC: rest unfilled on the book
+                    if order.remaining().0 > 0 && order.status == OrderStatus::Open {
+                        self.add_to_book(order.clone());
+                    }
+                }
+            },
+        }
+
+        if order.filled == order.size {
+            order.status = OrderStatus::Filled;
+        }
+
+        if !trades.is_empty() {
+            info!(
+                order_id,
+                fills = trades.len(),
+                filled = %order.filled,
+                remaining = %order.remaining(),
+                "order matched"
+            );
+        }
+
+        Ok((order, trades))
+    }
+
+    /// Cancel an order by ID. Returns the cancelled order or error.
+    pub fn cancel_order(&mut self, order_id: u64) -> Result<Order> {
+        // Search bids
+        for level in self.bids.values_mut() {
+            if let Some(pos) = level.orders.iter().position(|o| o.id == order_id) {
+                let mut order = level.orders.remove(pos);
+                order.status = OrderStatus::Cancelled;
+                self.bids.retain(|_, l| !l.is_empty());
+                return Ok(order);
+            }
+        }
+        // Search asks
+        for level in self.asks.values_mut() {
+            if let Some(pos) = level.orders.iter().position(|o| o.id == order_id) {
+                let mut order = level.orders.remove(pos);
+                order.status = OrderStatus::Cancelled;
+                self.asks.retain(|_, l| !l.is_empty());
+                return Ok(order);
+            }
+        }
+        bail!("order {} not found", order_id)
+    }
+
+    /// Cancel all orders for a user.
+    pub fn cancel_all(&mut self, user_id: &str) -> Vec<Order> {
+        let mut cancelled = Vec::new();
+        for level in self.bids.values_mut() {
+            level.orders.retain(|o| {
+                if o.user_id == user_id {
+                    let mut c = o.clone();
+                    c.status = OrderStatus::Cancelled;
+                    cancelled.push(c);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        for level in self.asks.values_mut() {
+            level.orders.retain(|o| {
+                if o.user_id == user_id {
+                    let mut c = o.clone();
+                    c.status = OrderStatus::Cancelled;
+                    cancelled.push(c);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        self.bids.retain(|_, l| !l.is_empty());
+        self.asks.retain(|_, l| !l.is_empty());
+        cancelled
+    }
+
+    /// Get all open orders for a user.
+    pub fn user_orders(&self, user_id: &str) -> Vec<&Order> {
+        let mut orders = Vec::new();
+        for level in self.bids.values() {
+            for o in &level.orders {
+                if o.user_id == user_id {
+                    orders.push(o);
+                }
+            }
+        }
+        for level in self.asks.values() {
+            for o in &level.orders {
+                if o.user_id == user_id {
+                    orders.push(o);
+                }
+            }
+        }
+        orders
+    }
+
+    /// Get top N levels of the order book.
+    pub fn depth(&self, levels: usize) -> (Vec<(FP8, FP8)>, Vec<(FP8, FP8)>) {
+        let bids: Vec<(FP8, FP8)> = self
+            .bids
+            .iter()
+            .rev()
+            .take(levels)
+            .map(|(&price, level)| (FP8(price), level.total_size()))
+            .collect();
+
+        let asks: Vec<(FP8, FP8)> = self
+            .asks
+            .iter()
+            .take(levels)
+            .map(|(&price, level)| (FP8(price), level.total_size()))
+            .collect();
+
+        (bids, asks)
+    }
+
+    // ── Internal ────────────────────────────────────────────────
+
+    fn add_to_book(&mut self, order: Order) {
+        let book = match order.side {
+            Side::Long => &mut self.bids,
+            Side::Short => &mut self.asks,
+        };
+        book.entry(order.price.0)
+            .or_insert_with(PriceLevel::new)
+            .add(order);
+    }
+
+    fn match_order(&mut self, taker: &mut Order) -> Vec<Trade> {
+        let mut trades = Vec::new();
+
+        let opposite_book = match taker.side {
+            Side::Long => &mut self.asks,   // buyer matches against asks
+            Side::Short => &mut self.bids,  // seller matches against bids
+        };
+
+        // Collect matching price levels
+        let matching_prices: Vec<i64> = match taker.side {
+            Side::Long => {
+                // Buy: match asks from lowest up to taker.price
+                opposite_book
+                    .keys()
+                    .copied()
+                    .take_while(|&ask_price| {
+                        taker.order_type == OrderType::Market || ask_price <= taker.price.0
+                    })
+                    .collect()
+            }
+            Side::Short => {
+                // Sell: match bids from highest down to taker.price
+                opposite_book
+                    .keys()
+                    .rev()
+                    .copied()
+                    .take_while(|&bid_price| {
+                        taker.order_type == OrderType::Market || bid_price >= taker.price.0
+                    })
+                    .collect()
+            }
+        };
+
+        for price_key in matching_prices {
+            if taker.remaining().0 <= 0 {
+                break;
+            }
+
+            if let Some(level) = opposite_book.get_mut(&price_key) {
+                let mut i = 0;
+                while i < level.orders.len() && taker.remaining().0 > 0 {
+                    let maker = &mut level.orders[i];
+
+                    // Don't self-trade
+                    if maker.user_id == taker.user_id {
+                        i += 1;
+                        continue;
+                    }
+
+                    let fill_size = std::cmp::min(taker.remaining().0, maker.remaining().0);
+                    let fill = FP8(fill_size);
+                    let fill_price = FP8(price_key); // maker's price
+
+                    // Update quantities
+                    taker.filled = taker.filled + fill;
+                    maker.filled = maker.filled + fill;
+
+                    if maker.filled == maker.size {
+                        maker.status = OrderStatus::Filled;
+                    } else {
+                        maker.status = OrderStatus::PartiallyFilled;
+                    }
+
+                    // Record trade
+                    let trade_id = self.next_trade_id;
+                    self.next_trade_id += 1;
+
+                    let now_ms = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+
+                    let trade = Trade {
+                        trade_id,
+                        market: self.market.clone(),
+                        maker_order_id: maker.id,
+                        taker_order_id: taker.id,
+                        maker_user_id: maker.user_id.clone(),
+                        taker_user_id: taker.user_id.clone(),
+                        price: fill_price,
+                        size: fill,
+                        taker_side: taker.side,
+                        timestamp_ms: now_ms,
+                    };
+                    trades.push(trade.clone());
+
+                    // Add to recent trades
+                    self.recent_trades.push(trade);
+                    if self.recent_trades.len() > self.max_recent_trades {
+                        self.recent_trades.remove(0);
+                    }
+
+                    // Remove fully filled maker
+                    if maker.status == OrderStatus::Filled {
+                        level.orders.remove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+
+        // Clean empty levels
+        opposite_book.retain(|_, l| !l.is_empty());
+
+        trades
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn book() -> OrderBook {
+        OrderBook::new("XRP-RLUSD-PERP")
+    }
+
+    #[test]
+    fn limit_order_rests_on_book() {
+        let mut ob = book();
+        let (order, trades) = ob
+            .submit_order(
+                "alice".into(), Side::Long, OrderType::Limit,
+                FP8::from_f64(0.55), FP8::from_f64(100.0), 5,
+                TimeInForce::Gtc, false, None,
+            )
+            .unwrap();
+
+        assert!(trades.is_empty());
+        assert_eq!(order.status, OrderStatus::Open);
+        assert_eq!(ob.best_bid(), Some(FP8::from_f64(0.55)));
+        assert_eq!(ob.best_ask(), None);
+    }
+
+    #[test]
+    fn matching_produces_trade() {
+        let mut ob = book();
+
+        // Alice places buy at 0.55
+        ob.submit_order(
+            "alice".into(), Side::Long, OrderType::Limit,
+            FP8::from_f64(0.55), FP8::from_f64(100.0), 5,
+            TimeInForce::Gtc, false, None,
+        ).unwrap();
+
+        // Bob places sell at 0.55 → should match
+        let (order, trades) = ob
+            .submit_order(
+                "bob".into(), Side::Short, OrderType::Limit,
+                FP8::from_f64(0.55), FP8::from_f64(50.0), 5,
+                TimeInForce::Gtc, false, None,
+            )
+            .unwrap();
+
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].size, FP8::from_f64(50.0));
+        assert_eq!(trades[0].price, FP8::from_f64(0.55));
+        assert_eq!(order.status, OrderStatus::Filled);
+
+        // Alice's order partially filled, 50 remaining
+        assert_eq!(ob.best_bid(), Some(FP8::from_f64(0.55)));
+    }
+
+    #[test]
+    fn market_order_sweeps() {
+        let mut ob = book();
+
+        // Place 3 sell orders at different prices
+        ob.submit_order("s1".into(), Side::Short, OrderType::Limit, FP8::from_f64(0.55), FP8::from_f64(100.0), 5, TimeInForce::Gtc, false, None).unwrap();
+        ob.submit_order("s2".into(), Side::Short, OrderType::Limit, FP8::from_f64(0.56), FP8::from_f64(100.0), 5, TimeInForce::Gtc, false, None).unwrap();
+        ob.submit_order("s3".into(), Side::Short, OrderType::Limit, FP8::from_f64(0.57), FP8::from_f64(100.0), 5, TimeInForce::Gtc, false, None).unwrap();
+
+        // Market buy 250 → should fill 100@0.55 + 100@0.56 + 50@0.57
+        let (order, trades) = ob
+            .submit_order(
+                "buyer".into(), Side::Long, OrderType::Market,
+                FP8::ZERO, FP8::from_f64(250.0), 5,
+                TimeInForce::Ioc, false, None,
+            )
+            .unwrap();
+
+        assert_eq!(trades.len(), 3);
+        assert_eq!(trades[0].price, FP8::from_f64(0.55));
+        assert_eq!(trades[0].size, FP8::from_f64(100.0));
+        assert_eq!(trades[1].price, FP8::from_f64(0.56));
+        assert_eq!(trades[2].price, FP8::from_f64(0.57));
+        assert_eq!(trades[2].size, FP8::from_f64(50.0));
+        assert_eq!(order.filled, FP8::from_f64(250.0));
+    }
+
+    #[test]
+    fn cancel_order() {
+        let mut ob = book();
+        let (order, _) = ob.submit_order(
+            "alice".into(), Side::Long, OrderType::Limit,
+            FP8::from_f64(0.55), FP8::from_f64(100.0), 5,
+            TimeInForce::Gtc, false, None,
+        ).unwrap();
+
+        let cancelled = ob.cancel_order(order.id).unwrap();
+        assert_eq!(cancelled.status, OrderStatus::Cancelled);
+        assert_eq!(ob.best_bid(), None);
+    }
+
+    #[test]
+    fn no_self_trade() {
+        let mut ob = book();
+
+        ob.submit_order("alice".into(), Side::Long, OrderType::Limit, FP8::from_f64(0.55), FP8::from_f64(100.0), 5, TimeInForce::Gtc, false, None).unwrap();
+
+        // Alice sells — should NOT match her own buy
+        let (_, trades) = ob.submit_order(
+            "alice".into(), Side::Short, OrderType::Limit,
+            FP8::from_f64(0.55), FP8::from_f64(50.0), 5,
+            TimeInForce::Gtc, false, None,
+        ).unwrap();
+
+        assert!(trades.is_empty());
+    }
+
+    #[test]
+    fn depth_snapshot() {
+        let mut ob = book();
+        ob.submit_order("a".into(), Side::Long, OrderType::Limit, FP8::from_f64(0.54), FP8::from_f64(100.0), 5, TimeInForce::Gtc, false, None).unwrap();
+        ob.submit_order("b".into(), Side::Long, OrderType::Limit, FP8::from_f64(0.55), FP8::from_f64(200.0), 5, TimeInForce::Gtc, false, None).unwrap();
+        ob.submit_order("c".into(), Side::Short, OrderType::Limit, FP8::from_f64(0.56), FP8::from_f64(150.0), 5, TimeInForce::Gtc, false, None).unwrap();
+
+        let (bids, asks) = ob.depth(10);
+        assert_eq!(bids.len(), 2);
+        assert_eq!(bids[0].0, FP8::from_f64(0.55)); // highest bid first
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].0, FP8::from_f64(0.56));
+    }
+}

@@ -8,6 +8,7 @@
 //!   - Periodic state persistence
 
 mod enclave_client;
+mod orderbook;
 mod perp_client;
 mod price_feed;
 mod types;
