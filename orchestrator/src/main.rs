@@ -1,28 +1,30 @@
 //! Perp DEX Orchestrator — main entry point.
 //!
-//! Rewrite of `perp_orchestrator.py`. Handles:
-//!   - Price feed polling (Binance XRP/USDT)
-//!   - XRPL deposit monitoring
-//!   - Periodic liquidation scanning
-//!   - Funding rate computation and application (every 8 hours)
-//!   - Periodic state persistence
+//! Two concurrent tasks:
+//!   1. API server (axum) — accepts orders from users
+//!   2. Background loop — price feeds, deposit monitoring, liquidations, funding
 
+mod api;
 mod enclave_client;
 mod orderbook;
 mod perp_client;
 mod price_feed;
+mod trading;
 mod types;
 mod xrpl_monitor;
 mod xrpl_signer;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::{error, info, warn};
 
+use crate::api::AppState;
 use crate::perp_client::PerpClient;
+use crate::trading::TradingEngine;
 use crate::types::float_to_fp8_string;
 use crate::xrpl_monitor::XrplMonitor;
 
@@ -54,22 +56,27 @@ struct Cli {
     /// Liquidation scan interval in seconds
     #[arg(long, default_value_t = 10)]
     liquidation_interval: u64,
+
+    /// API server listen address
+    #[arg(long, default_value = "0.0.0.0:3000")]
+    api_listen: String,
+
+    /// Market name
+    #[arg(long, default_value = "XRP-RLUSD-PERP")]
+    market: String,
 }
 
 // ── Funding rate ────────────────────────────────────────────────
 
-const FUNDING_INTERVAL: Duration = Duration::from_secs(8 * 3600); // 8 hours
-const STATE_SAVE_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
+const FUNDING_INTERVAL: Duration = Duration::from_secs(8 * 3600);
+const STATE_SAVE_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Simple funding rate: premium + interest, clamped to +/- 0.05%.
 fn compute_funding_rate(mark_price: f64, index_price: f64) -> f64 {
     if index_price <= 0.0 {
         return 0.0;
     }
     let premium = (mark_price - index_price) / index_price;
-    let interest = 0.0001 / 8.0; // 0.01% per day / 3 periods
-    let rate = premium + interest;
-    rate.clamp(-0.0005, 0.0005)
+    premium.clamp(-0.0005, 0.0005)
 }
 
 // ── Liquidation scanning ────────────────────────────────────────
@@ -109,11 +116,10 @@ async fn run_liquidation_scan(perp: &PerpClient, current_price: f64) {
     }
 }
 
-// ── Main loop ───────────────────────────────────────────────────
+// ── Main ────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -129,10 +135,7 @@ async fn main() -> Result<()> {
         None => {
             let config_data = std::fs::read_to_string(&cli.escrow_config)
                 .with_context(|| {
-                    format!(
-                        "no --escrow-address and cannot read config at {}",
-                        cli.escrow_config.display()
-                    )
+                    format!("no --escrow-address and cannot read {}", cli.escrow_config.display())
                 })?;
             let config: serde_json::Value =
                 serde_json::from_str(&config_data).context("invalid escrow config JSON")?;
@@ -145,15 +148,34 @@ async fn main() -> Result<()> {
 
     // Initialize clients
     let perp = PerpClient::new(&cli.enclave_url)?;
+    let perp_for_api = PerpClient::new(&cli.enclave_url)?;
     let monitor = XrplMonitor::new(&cli.xrpl_url, &escrow_address);
     let http_client = reqwest::Client::new();
 
     // Try to load persisted state
     match perp.load_state().await {
         Ok(_) => info!("loaded persisted state"),
-        Err(_) => info!("no persisted state found, starting fresh"),
+        Err(_) => info!("no persisted state, starting fresh"),
     }
 
+    // Create trading engine
+    let engine = TradingEngine::new(&cli.market, perp_for_api);
+    let app_state = Arc::new(AppState {
+        engine,
+        perp: PerpClient::new(&cli.enclave_url)?,
+    });
+
+    // Start API server
+    let api_listen = cli.api_listen.clone();
+    let api_state = app_state.clone();
+    let api_handle = tokio::spawn(async move {
+        let router = api::router(api_state);
+        let listener = tokio::net::TcpListener::bind(&api_listen).await.unwrap();
+        info!(listen = %api_listen, "API server started");
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    // Background orchestration loop
     let mut last_ledger: u32 = 0;
     let mut current_price: f64 = 0.0;
 
@@ -177,7 +199,7 @@ async fn main() -> Result<()> {
             .unwrap()
             .as_secs();
 
-        // ── Price update ────────────────────────────────────────
+        // Price update
         if last_price_update.elapsed() >= price_interval {
             match price_feed::fetch_xrp_price(&http_client).await {
                 Ok(price) => {
@@ -187,14 +209,12 @@ async fn main() -> Result<()> {
                         error!("price update failed: {}", e);
                     }
                 }
-                Err(e) => {
-                    warn!("price fetch failed: {}", e);
-                }
+                Err(e) => warn!("price fetch failed: {}", e),
             }
             last_price_update = Instant::now();
         }
 
-        // ── Deposit scanning ────────────────────────────────────
+        // Deposit scanning
         match monitor.scan_deposits(last_ledger).await {
             Ok((deposits, new_ledger)) => {
                 for deposit in &deposits {
@@ -202,26 +222,21 @@ async fn main() -> Result<()> {
                         .deposit(&deposit.sender, &deposit.amount, &deposit.tx_hash)
                         .await
                     {
-                        error!(
-                            sender = %deposit.sender,
-                            "deposit credit failed: {}", e
-                        );
+                        error!(sender = %deposit.sender, "deposit credit failed: {}", e);
                     }
                 }
                 last_ledger = new_ledger;
             }
-            Err(e) => {
-                warn!("deposit scan failed: {}", e);
-            }
+            Err(e) => warn!("deposit scan failed: {}", e),
         }
 
-        // ── Liquidation scanning ────────────────────────────────
+        // Liquidation scanning
         if last_liquidation_scan.elapsed() >= liquidation_interval && current_price > 0.0 {
             run_liquidation_scan(&perp, current_price).await;
             last_liquidation_scan = Instant::now();
         }
 
-        // ── Funding rate (every 8 hours) ────────────────────────
+        // Funding rate (every 8 hours)
         if last_funding_time.elapsed() >= FUNDING_INTERVAL && current_price > 0.0 {
             let rate = compute_funding_rate(current_price, current_price);
             let fp8_rate = float_to_fp8_string(rate);
@@ -232,7 +247,7 @@ async fn main() -> Result<()> {
             last_funding_time = Instant::now();
         }
 
-        // ── Periodic state save (every 5 minutes) ──────────────
+        // State save (every 5 minutes)
         if last_state_save.elapsed() >= STATE_SAVE_INTERVAL {
             if let Err(e) = perp.save_state().await {
                 warn!("state save failed: {}", e);
