@@ -8,32 +8,33 @@
 ## Overview
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        Internet                              │
-│                                                              │
-│   User/Trader ──── HTTPS ────► HAProxy :443                 │
-│                                   │                          │
-│                          ┌────────┼────────┐                │
-│                          ▼        ▼        ▼                │
-│                       :9088    :9089    :9090                │
-│                     ┌────────────────────────┐              │
-│                     │  SGX Enclave Instances  │              │
-│                     │  (perp-dex-server)      │              │
-│                     │  FROST 2-of-3 signing   │              │
-│                     └────────────────────────┘              │
-│                          ▲                                   │
-│                          │ localhost only                    │
-│                     ┌────┴─────┐                            │
-│                     │Orchestrator│                           │
-│                     │  (Rust)    │                           │
-│                     └────┬──┬───┘                           │
-│                          │  │                                │
-│                    ┌─────┘  └──────┐                        │
-│                    ▼               ▼                         │
-│              XRPL Mainnet    Binance/CEX                    │
-│            (deposit monitor)  (price feed)                  │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                        Internet                               │
+│                                                               │
+│   User/Trader ─── HTTPS ───► HAProxy :443 (public frontend) │
+│                                   │                           │
+│                          ┌────────┼────────┐                 │
+│                          ▼        ▼        ▼                 │
+│                       :9088    :9089    :9090                 │
+│                     ┌────────────────────────┐               │
+│                     │  SGX Enclave Instances  │               │
+│                     │  (perp-dex-server)      │               │
+│                     │  TCSNum=1, single-threaded │            │
+│                     │  FROST 2-of-3 signing   │               │
+│                     └────────────────────────┘               │
+│                          ▲                                    │
+│                          │                                    │
+│   Orchestrator ──────► HAProxy :9443 (internal frontend)     │
+│     (Rust)                 127.0.0.1 only                    │
+│       │                                                       │
+│       ├──► XRPL Mainnet (deposit monitor)                    │
+│       └──► Binance/CEX (price feed)                          │
+└──────────────────────────────────────────────────────────────┘
 ```
+
+**Critical:** Each enclave instance is single-threaded (TCSNum=1). One ecall at a time.
+HAProxy is **mandatory** even for localhost -- it serializes requests into a queue
+and distributes them across instances, preventing conflicts.
 
 ---
 
@@ -71,11 +72,12 @@
 ## HAProxy Configuration
 
 ```haproxy
-frontend perp-dex
+# === Public frontend (users) ===
+frontend perp-public
     bind *:443 ssl crt /etc/ssl/perp.pem
     mode http
 
-    # Block internal endpoints
+    # Block ALL internal endpoints — users see only public API
     acl is_internal path_beg /v1/perp/deposit
     acl is_internal path_beg /v1/perp/price
     acl is_internal path_beg /v1/perp/liquidate
@@ -96,14 +98,30 @@ frontend perp-dex
 
     default_backend enclave_instances
 
+# === Internal frontend (orchestrator only) ===
+frontend perp-internal
+    bind 127.0.0.1:9443 ssl crt /etc/ssl/perp.pem
+    mode http
+    # No endpoint blocking — orchestrator has full access
+    default_backend enclave_instances
+
+# === Backend: enclave instances ===
+# maxconn 1 per server — enclave is single-threaded (TCSNum=1)
+# queue handles waiting requests
 backend enclave_instances
     mode http
     balance roundrobin
+    timeout queue 5s
+    timeout server 30s
     option httpchk GET /v1/pool/status
-    server enclave1 127.0.0.1:9088 check ssl verify none
-    server enclave2 127.0.0.1:9089 check ssl verify none
-    server enclave3 127.0.0.1:9090 check ssl verify none
+    server enclave1 127.0.0.1:9088 maxconn 1 check ssl verify none
+    server enclave2 127.0.0.1:9089 maxconn 1 check ssl verify none
+    server enclave3 127.0.0.1:9090 maxconn 1 check ssl verify none
 ```
+
+**maxconn 1** -- the key parameter. HAProxy sends only one request
+at a time to each instance. Others wait in the queue. This guarantees
+that a single-threaded enclave does not receive parallel ecalls.
 
 ---
 
@@ -129,7 +147,8 @@ backend enclave_instances
 ### 3. Orchestrator (Rust binary)
 
 - Single process, runs on localhost
-- Connects to enclave instance directly (127.0.0.1:9088)
+- Connects **through HAProxy internal frontend** (127.0.0.1:9443), NOT directly to instance
+- HAProxy distributes and serializes requests across instances
 - Functions:
   - **Price feed**: Binance API -> enclave price update (every 5 sec)
   - **Deposit monitor**: XRPL ledger -> enclave deposit credit
