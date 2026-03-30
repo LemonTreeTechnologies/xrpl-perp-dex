@@ -58,6 +58,8 @@ Users ──[encrypted orders]──> SGX Enclave (TEE)
 | [Production Architecture (EN)](research/03-production-architecture.en.md) | English version |
 | [Multi-Operator (RU)](research/04-multi-operator-architecture.md) | FROST 2-of-3, sequencer/validator, failover |
 | [Multi-Operator (EN)](research/04-multi-operator-architecture.en.md) | English version |
+| [TEE Rationale & API (RU)](research/05-tee-rationale-and-api-design.md) | Why TEE, trust model comparison, production API design |
+| [TEE Rationale & API (EN)](research/05-tee-rationale-and-api-design.en.md) | English version |
 
 ## Timeline
 
