@@ -126,11 +126,13 @@ Funding rates keep the perpetual contract price anchored to the spot price. When
 
 The TEE requires external spot price data. Options in order of preference:
 
-1. **Multiple CEX API feeds via TLS-attested connections.** The TEE opens TLS connections to Binance, Coinbase, Kraken, and Bitstamp REST APIs. Using TLS termination inside the enclave (the TLS session key never leaves the TEE), the enclave can prove it received authentic data from these endpoints. The index price is the **median** of the four feeds (resistant to one compromised source).
+1. **External price feed via orchestrator.** The untrusted orchestrator layer fetches prices from multiple CEX APIs (Binance, Coinbase, Kraken) and submits the median price to the enclave. The enclave accepts price updates from the trusted operator process.
 
-2. **XRPL on-ledger oracle (future).** If XRPL adds native oracle support (currently absent), the TEE could read price data directly from validated ledgers. Not available today.
+   > **Note:** TLS-attested connections directly from inside the enclave to CEX APIs are technically possible but introduce complexity and fragility (certificate pinning, API changes, rate limits inside SGX). For production, a signed oracle feed (e.g., Pyth, Chainlink) or a multi-source aggregator with outlier detection is preferred.
 
-3. **Fallback: XRPL native DEX mid-price.** The XRPL has a built-in CLOB for spot XRP. The TEE can read the order book from validated ledgers and compute a mid-price. This is a secondary check, not a primary source, because XRPL spot liquidity is thin compared to CEXs.
+2. **XRPL native DEX mid-price (secondary).** The XRPL has a built-in CLOB for spot XRP. The orchestrator can read the order book from validated ledgers and compute a mid-price as a sanity check against CEX feeds.
+
+3. **XRPL on-ledger oracle (future).** If XRPL adds native oracle support, the TEE could read price data directly from validated ledgers.
 
 **Mark Price (fair perp price):**
 
@@ -144,20 +146,17 @@ The mark price uses the index price as a foundation and adjusts by a smoothed (E
 
 ### 2.3 Funding Rate Calculation
 
-Following the industry-standard approach (adapted from Binance/dYdX):
+Pure premium-based funding rate (no interest rate component):
 
 ```
 premium_index = (mark_price - index_price) / index_price
 
 funding_rate = clamp(premium_index, -0.05%, +0.05%)
-             + clamp(interest_rate_component, ...)
-
-where:
-  interest_rate_component = 0.01% / 8 = 0.00125% per period
-  (represents the RLUSD/XRP interest rate differential, fixed for PoC)
 
   clamp bounds: +/- 0.05% per period (safety rails)
 ```
+
+The funding rate is purely driven by the premium/discount of the perp price vs spot. No default interest rate component is added -- this keeps the mechanism clean and predictable.
 
 ### 2.4 Funding Application Schedule
 
@@ -249,6 +248,60 @@ The insurance fund covers negative-equity liquidations (socialized loss preventi
 **Insurance fund on XRPL:**
 - The insurance fund balance is included in periodic state reports published by the TEE.
 - In a full shutdown scenario, the insurance fund's RLUSD is distributed according to the final sealed state.
+
+---
+
+## 3.5 Vault Architecture
+
+The system uses several vault types to manage liquidity, liquidations, and yield:
+
+### Liquidation Vault
+
+Instead of a simple insurance fund, an **internal liquidation vault** handles forced closures. The vault:
+- Absorbs liquidated positions at mark price
+- Gradually unwinds them on the order book
+- Earns liquidation penalties as yield for vault depositors
+- Provides deeper liquidation liquidity than a passive insurance fund
+
+### HLP Trading Vault (Hyperliquid-style)
+
+A **passive market-making vault** where XRP/RLUSD depositors earn yield by providing liquidity:
+- Depositors provide collateral to the vault
+- The vault acts as counterparty to traders (similar to GLP/HLP)
+- Vault PnL = trading fees earned - trader profits + trader losses
+- Allows naive depositors to participate in market making without active trading
+- Rebalances automatically based on open interest
+
+### Basis Trading Vaults
+
+Two vault strategies that capture the funding rate:
+
+**Delta-0 Vault (market-neutral):**
+- Goes long spot XRP + short perp XRP simultaneously
+- Net exposure to XRP price = 0 (delta neutral)
+- Captures funding rate payments when rate is positive (longs pay shorts)
+- Pure yield strategy, no directional risk
+
+**Delta-1 Vault (XRP-exposed):**
+- Holds spot XRP as collateral
+- Captures funding rate while maintaining full XRP exposure
+- Allows XRP holders to earn yield without selling their XRP
+- Effectively: hold XRP + earn funding rate on top
+
+### XRP as Collateral
+
+In addition to RLUSD, the system accepts **XRP as collateral**:
+- XRP collateral is valued at mark price with a haircut (e.g., 90% LTV)
+- Enables delta-1 strategies where users deposit XRP directly
+- Haircut is recalculated on every price update
+- If XRP price drops and margin becomes insufficient, standard liquidation applies
+
+### XRP Staking
+
+Users who stake XRP in the protocol receive:
+- **Reduced trading fees** (tiered based on stake amount)
+- **Points accumulation** for governance/rewards
+- Staked XRP can also serve as collateral (with appropriate haircut)
 
 ---
 
@@ -347,6 +400,8 @@ All position state lives in TEE memory during operation. This is the single most
 | Processed XRPL tx hashes | ~500 KB | Sealed storage |
 
 Total sealed state: under 5 MB. Easily fits in enclave memory and seals quickly.
+
+> **Implementation note:** SGX `sgx_seal_data` has a practical limit of ~64KB per seal call. For production, state must be sealed in parts (users, positions, tx hashes separately). The PoC uses reduced limits (100 users, 200 positions) to fit in a single seal operation. Periodic auto-save (every 5 minutes) ensures state survives restarts.
 
 ### 5.2 Sealed Storage and Snapshots
 
