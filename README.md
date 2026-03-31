@@ -60,6 +60,8 @@ Users ──[encrypted orders]──> SGX Enclave (TEE)
 | [Multi-Operator (EN)](research/04-multi-operator-architecture.en.md) | English version |
 | [TEE Rationale & API (RU)](research/05-tee-rationale-and-api-design.md) | Why TEE, trust model comparison, production API design |
 | [TEE Rationale & API (EN)](research/05-tee-rationale-and-api-design.en.md) | English version |
+| [Latency Analysis (RU)](research/06-latency-analysis.md) | Per-operation latency, comparison with CEX/DEX |
+| [Latency Analysis (EN)](research/06-latency-analysis.en.md) | English version |
 
 ## Timeline
 
