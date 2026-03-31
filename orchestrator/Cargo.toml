@@ -33,5 +33,8 @@ clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8", features = ["json"] }
 tower-http = { version = "0.6", features = ["cors"] }
 
+# P2P (order flow replication between operators)
+libp2p = { version = "0.54", features = ["gossipsub", "tcp", "noise", "yamux", "tokio", "macros", "identify"] }
+
 # Error handling
 anyhow = "1"

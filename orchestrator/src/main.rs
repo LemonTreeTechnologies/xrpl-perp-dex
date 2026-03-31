@@ -7,6 +7,7 @@
 mod api;
 mod enclave_client;
 mod orderbook;
+mod p2p;
 mod perp_client;
 mod price_feed;
 mod trading;
@@ -64,6 +65,18 @@ struct Cli {
     /// Market name
     #[arg(long, default_value = "XRP-RLUSD-PERP")]
     market: String,
+
+    /// P2P listen address (libp2p multiaddr)
+    #[arg(long, default_value = "/ip4/0.0.0.0/tcp/4001")]
+    p2p_listen: String,
+
+    /// P2P peers to connect to (multiaddr, comma-separated)
+    #[arg(long)]
+    p2p_peers: Option<String>,
+
+    /// Run as sequencer (publishes order batches) vs validator (subscribes only)
+    #[arg(long, default_value_t = false)]
+    sequencer: bool,
 }
 
 // ── Funding rate ────────────────────────────────────────────────
@@ -168,12 +181,59 @@ async fn main() -> Result<()> {
     // Start API server
     let api_listen = cli.api_listen.clone();
     let api_state = app_state.clone();
-    let api_handle = tokio::spawn(async move {
+    let _api_handle = tokio::spawn(async move {
         let router = api::router(api_state);
         let listener = tokio::net::TcpListener::bind(&api_listen).await.unwrap();
         info!(listen = %api_listen, "API server started");
         axum::serve(listener, router).await.unwrap();
     });
+
+    // Start P2P node (gossipsub for order flow replication)
+    let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<p2p::OrderBatch>(100);
+    let mut p2p_node = p2p::P2PNode::new(&cli.p2p_listen, batch_tx)
+        .await
+        .context("failed to start P2P node")?;
+
+    // Connect to peers
+    if let Some(peers_str) = &cli.p2p_peers {
+        for peer in peers_str.split(',') {
+            let peer = peer.trim();
+            if !peer.is_empty() {
+                match p2p_node.dial(peer) {
+                    Ok(_) => info!(peer = %peer, "dialing P2P peer"),
+                    Err(e) => warn!(peer = %peer, "failed to dial: {}", e),
+                }
+            }
+        }
+    }
+
+    let is_sequencer = cli.sequencer;
+    info!(
+        role = if is_sequencer { "sequencer" } else { "validator" },
+        peer_id = %p2p_node.peer_id,
+        "P2P started"
+    );
+
+    // P2P event loop
+    let _p2p_handle = tokio::spawn(async move {
+        p2p_node.run().await;
+    });
+
+    // Validator: process received batches
+    if !is_sequencer {
+        let _validator_handle = tokio::spawn(async move {
+            while let Some(batch) = batch_rx.recv().await {
+                info!(
+                    seq = batch.seq_num,
+                    orders = batch.orders.len(),
+                    hash = %batch.state_hash,
+                    "replaying batch from sequencer"
+                );
+                // TODO: replay orders against local order book
+                // TODO: verify state_hash matches
+            }
+        });
+    }
 
     // Background orchestration loop
     let mut last_ledger: u32 = 0;
