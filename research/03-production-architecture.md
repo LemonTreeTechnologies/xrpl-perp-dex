@@ -20,7 +20,7 @@
 │                     │  SGX Enclave Instances  │               │
 │                     │  (perp-dex-server)      │               │
 │                     │  TCSNum=1, однопоточные │               │
-│                     │  FROST 2-of-3 signing   │               │
+│                     │  XRPL multisig 2-of-3   │               │
 │                     └────────────────────────┘               │
 │                          ▲                                    │
 │                          │                                    │
@@ -64,8 +64,8 @@ HAProxy **обязателен** даже для localhost — он сериал
 | POST | `/v1/perp/state/load` | Загрузка состояния | Orchestrator |
 | POST | `/v1/pool/generate` | Генерация ключей | Admin |
 | POST | `/v1/pool/sign` | Прямая подпись | Admin |
-| POST | `/v1/pool/frost/*` | FROST operations | Admin |
-| POST | `/v1/pool/dkg/*` | DKG operations | Admin |
+| POST | `/v1/pool/frost/*` | FROST operations (Bitcoin Taproot, не XRPL) | Admin |
+| POST | `/v1/pool/dkg/*` | DKG operations (Bitcoin Taproot, не XRPL) | Admin |
 
 ---
 
@@ -140,7 +140,7 @@ backend enclave_instances
 - 3 инстанса на портах 9088-9090
 - Каждый со своим `enclave.signed.so` (одинаковый MRENCLAVE)
 - TCSNum=1 (single-threaded per instance)
-- FROST 2-of-3: каждый инстанс держит свой share
+- XRPL native multisig (SignerListSet): каждый инстанс держит свой независимый ECDSA ключ
 - State sealed на диск (per-instance)
 - Слушают на 127.0.0.1 (не доступны извне напрямую)
 
@@ -158,10 +158,10 @@ backend enclave_instances
 
 ### 4. XRPL Mainnet
 
-- Escrow аккаунт контролируется SGX (приватный ключ внутри enclave)
+- Escrow аккаунт контролируется SGX (3 независимых ECDSA ключа, SignerListSet quorum=2, master key disabled)
 - RLUSD collateral на escrow
 - Deposits: пользователь → Payment → escrow → Orchestrator детектит → enclave кредитует
-- Withdrawals: пользователь запрашивает → enclave проверяет margin → SGX подписывает Payment → XRPL
+- Withdrawals: пользователь запрашивает → enclave проверяет margin → orchestrator собирает 2 ECDSA подписи от 2 инстансов → собирает Signers array → отправляет на XRPL
 
 ---
 

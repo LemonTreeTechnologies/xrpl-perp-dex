@@ -1,6 +1,6 @@
 # Анализ задержек: Perp DEX на XRPL с SGX
 
-**Конфигурация**: 3 SGX сервера (1 Hetzner + 2 Azure DCsv3), FROST 2-of-3
+**Конфигурация**: 3 SGX сервера (1 Hetzner + 2 Azure DCsv3), XRPL native multisig 2-of-3 (SignerListSet)
 **Транспорт**: HTTPS между операторами, SGX enclave на каждом узле
 
 ---
@@ -70,23 +70,20 @@ XRPL finality                              3-5 sec
 Итого:                                     ~4-6 sec
 ```
 
-### Withdrawal (FROST 2-of-3, multi-operator)
+### Withdrawal (XRPL multisig 2-of-3, multi-operator)
 
 ```
-Orchestrator → Enclave A: nonce_gen        ~100 ms  ┐
-Orchestrator → Enclave B: nonce_gen        ~100 ms  ┤ PARALLEL
+Orchestrator → Enclave A: ECDSA sign       ~100 ms  ┐
+Orchestrator → Enclave B: ECDSA sign       ~100 ms  ┤ PARALLEL
                                                     ┘
-Orchestrator → Enclave A: partial_sign     ~100 ms  ┐
-Orchestrator → Enclave B: partial_sign     ~100 ms  ┤ PARALLEL
-                                                    ┘
-Coordinator: sig_agg                       ~100 ms
-Orchestrator → XRPL: submit tx            ~200-500 ms
+Orchestrator: assemble Signers array       <1 ms
+Orchestrator → XRPL: submit multisig tx   ~200-500 ms
 XRPL finality                              3-5 sec
                                            ─────────
 Итого:                                     ~4-6 sec
 ```
 
-FROST добавляет ~300 ms к withdrawal — незаметно на фоне XRPL finality.
+Multisig signing добавляет ~100 ms к withdrawal — незаметно на фоне XRPL finality.
 
 ### Liquidation (event-driven)
 
@@ -95,7 +92,7 @@ Orchestrator: price update                 каждые 5 sec
 Orchestrator → Enclave: check_liquidations ~5 ms
 Enclave: scan all positions                <1 ms (до 200 позиций)
 Orchestrator → Enclave: liquidate          ~5 ms
-Если FROST withdrawal нужен:               +300 ms
+Если multisig withdrawal нужен:            +100 ms
                                            ─────────
 Итого:                                     ~5-10 sec (от изменения цены)
 ```
@@ -113,18 +110,18 @@ Orchestrator → Enclave: apply_funding      ~10-50 ms (обход всех по
 
 Незначительно — выполняется 3 раза в сутки.
 
-### DKG — Distributed Key Generation (однократно при setup)
+### ECDSA Key Generation + SignerListSet (однократно при setup)
 
 ```
-Round 1: 3 polynomial generations          PARALLEL  ~100 ms
-Round 1: 6 share exports (sealed)          SEQUENTIAL ~600 ms
-Round 2: 6 share imports + VSS verify      SEQUENTIAL ~600 ms
-Finalize: 3 aggregations                   PARALLEL  ~100 ms
+3 инстанса генерируют ECDSA keypair       PARALLEL  ~10 ms
+Orchestrator: SignerListSet tx на escrow   ~200-500 ms
+Orchestrator: DisableMasterKey tx          ~200-500 ms
+XRPL finality (2 tx)                       ~6-10 sec
                                                      ─────────
-Итого:                                               ~1.4 sec
+Итого:                                               ~7-11 sec
 ```
 
-Выполняется один раз при создании escrow account.
+Каждый инстанс генерирует независимый ECDSA ключ (secp256k1). Orchestrator настраивает SignerListSet с quorum=2 на escrow account.
 
 ### State Save (каждые 5 минут)
 
@@ -173,7 +170,7 @@ Enclave → disk: ocall_save_to_file         ~5 ms
 | Withdrawal | Средняя | ~4-6 sec | Быстрее чем CEX |
 | Liquidation | Редко | ~5-10 sec | Риск: глубокий убыток. Митигация: insurance fund |
 | Funding | 3 раза/сутки | ~50 ms | Нулевое влияние |
-| DKG setup | Однократно | ~1.4 sec | Нулевое влияние |
-| FROST signing | При withdrawal | ~300 ms | Незаметно на фоне XRPL finality |
+| Key gen + SignerListSet | Однократно | ~7-11 sec | Нулевое влияние |
+| Multisig signing (2 ECDSA) | При withdrawal | ~100 ms | Незаметно на фоне XRPL finality |
 
-**Заключение: задержки multi-machine FROST signing (~300 ms) и enclave computation (~5-10 ms) пренебрежимо малы по сравнению с XRPL settlement (3-5 sec). Система production-ready по latency.**
+**Заключение: задержки multi-machine multisig signing (~100 ms) и enclave computation (~5-10 ms) пренебрежимо малы по сравнению с XRPL settlement (3-5 sec). Система production-ready по latency.**
