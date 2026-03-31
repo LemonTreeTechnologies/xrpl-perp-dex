@@ -62,6 +62,8 @@ Users ──[encrypted orders]──> SGX Enclave (TEE)
 | [TEE Rationale & API (EN)](research/05-tee-rationale-and-api-design.en.md) | English version |
 | [Latency Analysis (RU)](research/06-latency-analysis.md) | Per-operation latency, comparison with CEX/DEX |
 | [Latency Analysis (EN)](research/06-latency-analysis.en.md) | English version |
+| [Failure Modes & Recovery (RU)](research/07-failure-modes-and-recovery.md) | 11 failure scenarios, recovery procedures, risk matrix |
+| [Failure Modes & Recovery (EN)](research/07-failure-modes-and-recovery.en.md) | English version |
 
 ## Timeline
 
