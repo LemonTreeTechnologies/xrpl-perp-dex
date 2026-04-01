@@ -138,12 +138,78 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/markets/{market}/ticker", get(get_ticker))
         .route("/v1/markets/{market}/trades", get(get_trades))
         .route("/v1/openapi.json", get(openapi_spec))
+        .route("/v1/attestation/quote", post(attestation_quote))
         .layer(axum::middleware::from_fn(auth::auth_middleware))
         .layer(cors)
         .with_state(state)
 }
 
 /// Serve OpenAPI spec
+/// DCAP Remote Attestation — proxy to enclave.
+/// Public endpoint (no auth) — anyone can verify the enclave.
+/// Returns SGX Quote v3 with Intel ECDSA signature chain.
+/// On hardware without DCAP support: returns 503.
+async fn attestation_quote(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    // Parse optional user_data from body
+    let user_data = if body.is_empty() {
+        "0x00".to_string()
+    } else {
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(v) => v.get("user_data")
+                .and_then(|u| u.as_str())
+                .unwrap_or("0x00")
+                .to_string(),
+            Err(_) => "0x00".to_string(),
+        }
+    };
+
+    // Proxy to enclave attestation-quote endpoint
+    let enclave_url = format!(
+        "{}/pool/attestation-quote",
+        state.perp.base_url().replace("/v1", "").replace("/perp", "")
+    );
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .unwrap();
+
+    match client.post(&format!("{}/v1/pool/attestation-quote",
+            state.perp.base_url().trim_end_matches("/v1").trim_end_matches("/")))
+        .json(&serde_json::json!({"user_data": user_data}))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(data) => {
+                    if data.get("status").and_then(|s| s.as_str()) == Some("success") {
+                        (StatusCode::OK, Json(data)).into_response()
+                    } else {
+                        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                            "status": "error",
+                            "message": "DCAP attestation not available on this platform. Use Azure DCsv3 for hardware attestation.",
+                            "enclave_response": data
+                        }))).into_response()
+                    }
+                }
+                Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("Failed to parse enclave response: {}", e)
+                }))).into_response()
+            }
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+            "status": "error",
+            "message": format!("Failed to reach enclave: {}", e)
+        }))).into_response()
+    }
+}
+
 async fn openapi_spec() -> impl IntoResponse {
     let spec = serde_json::json!({
         "openapi": "3.0.3",

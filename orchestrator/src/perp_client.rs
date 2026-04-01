@@ -27,6 +27,11 @@ impl PerpClient {
         })
     }
 
+    /// Get base URL for proxying.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     // ── State management ────────────────────────────────────────
 
     /// Credit user margin after verified XRPL deposit.
