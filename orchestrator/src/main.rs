@@ -6,6 +6,7 @@
 
 mod api;
 mod auth;
+mod commitment;
 mod enclave_client;
 mod orderbook;
 mod p2p;

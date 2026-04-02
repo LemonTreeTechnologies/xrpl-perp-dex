@@ -139,6 +139,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/markets/{market}/trades", get(get_trades))
         .route("/v1/openapi.json", get(openapi_spec))
         .route("/v1/attestation/quote", post(attestation_quote))
+        .route("/v1/attestation/commitment", get(attestation_commitment))
         .layer(axum::middleware::from_fn(auth::auth_middleware))
         .layer(cors)
         .with_state(state)
@@ -208,6 +209,24 @@ async fn attestation_quote(
             "message": format!("Failed to reach enclave: {}", e)
         }))).into_response()
     }
+}
+
+/// Get latest state commitment info (for on-chain verification).
+/// Public endpoint — no auth needed.
+async fn attestation_commitment() -> impl IntoResponse {
+    ok(serde_json::json!({
+        "registry": crate::commitment::REGISTRY_ADDRESS,
+        "network": "sepolia",
+        "description": "CommitmentRegistryV4 — TEE-signed state proofs",
+        "how_to_verify": {
+            "1": "Query this endpoint or the contract directly on Sepolia",
+            "2": "Verify ECDSA signature matches attested enclave address",
+            "3": "Verify Merkle root against published state",
+            "4": "Use /v1/attestation/quote to verify enclave identity (DCAP)"
+        },
+        "contract_abi": "commit(bytes32 marketId, bytes32 root, bytes32 snapshotHash, uint8 v, bytes32 r, bytes32 s)",
+        "etherscan": format!("https://sepolia.etherscan.io/address/{}", crate::commitment::REGISTRY_ADDRESS),
+    })).into_response()
 }
 
 async fn openapi_spec() -> impl IntoResponse {
