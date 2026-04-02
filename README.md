@@ -163,4 +163,5 @@ Verify with: `python3 dcap_verifier.py --url http://host:3000/v1/attestation/quo
 
 ## License
 
-TBD
+- **Code** (orchestrator, tools, tests): [Business Source License 1.1](LICENSE) — free to view, modify, and use non-commercially. Production use of a competing perp DEX requires a commercial license. Converts to GPL-2.0 on 2028-04-02.
+- **Research documents**: [CC BY-NC-ND 4.0](research/LICENSE) — free to read and share with attribution. No commercial use, no derivatives.
