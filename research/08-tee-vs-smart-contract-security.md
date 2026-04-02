@@ -5,19 +5,51 @@
 
 ---
 
-## Что произошло с Drift
+## Что произошло с Drift (детальный анализ)
 
-1. Атакующий получил доступ к **приватному ключу admin signer**
-2. Подготовился: профондировал кошельки за неделю, сделал тестовую транзакцию
-3. Одним батчем транзакций вывел **всё**: SOL, WETH, BTC, стейблкоины
-4. Конвертировал в USDC, bridged в Ethereum
-5. Протокол опубликовал "unusual activity" когда было уже поздно
+Атака была значительно сложнее чем "кража ключа". Drift **имел multisig** (Security Council, 5 подписантов) — но это не спасло.
 
-**Корневая причина:** один приватный ключ контролировал все средства. Кто имеет ключ — тот имеет всё.
+**Хронология:**
+
+1. **23 марта:** Атакующий создал 4 кошелька с **durable nonces** (механизм Solana для отложенного исполнения транзакций). Два кошелька были привязаны к членам Security Council.
+2. **30 марта:** Drift провёл ротацию Security Council. Атакующий адаптировался — создал новый кошелёк, соответствующий обновлённым параметрам multisig.
+3. **1 апреля:** Drift провёл легитимный тест вывода из insurance fund. **В течение ~1 минуты** атакующий активировал две предварительно авторизованные транзакции, получив административные права.
+4. **Вывод:** $155.6M JPL, $60.4M USDC, $11.3M CBBTC, $4.7M WETH, $4.5M DSOL, $4.4M WBTC, $4.1M FARTCOIN и другие. **Итого: ~$280M.**
+
+**Как прошла атака через multisig:**
+
+Атакующий использовал **social engineering** — убедил минимум 2 из 5 подписантов Security Council одобрить транзакции. Durable nonces позволили подготовить транзакции заранее и исполнить автоматически.
+
+**Корневые причины:**
+- Подписанты multisig — **люди**, подверженные social engineering
+- Durable nonces позволяют **pre-sign** транзакции без немедленного исполнения
+- Нет верификации что подписанная транзакция **разумна** (margin check, amount limit)
+- Мониторинг не обнаружил подготовку за неделю до атаки
 
 ---
 
 ## Почему это невозможно в нашей архитектуре
+
+### 0. Подписанты — hardware, не люди
+
+```
+Drift multisig:                  Наша архитектура:
+┌──────────┐                     ┌──────────────────┐
+│ Человек 1│ ← social           │ SGX Enclave A    │
+│ Человек 2│    engineering     │ SGX Enclave B    │
+│ Человек 3│    возможен        │ SGX Enclave C    │
+│ Человек 4│                     │                  │
+│ Человек 5│                     │ (hardware, не    │
+└──────────┘                     │  поддаётся       │
+     │                           │  уговорам)       │
+  2 of 5 убеждены →             └──────────────────┘
+  полный доступ                        │
+                                 Enclave подпишет ТОЛЬКО
+                                 если margin check пройден
+                                 и tx валидна по коду
+```
+
+**Drift's multisig was defeated by social engineering.** Атакующий убедил 2 человек подписать. В нашей архитектуре подписанты — SGX enclaves. Нельзя "убедить" процессор подписать невалидную транзакцию.
 
 ### 1. Ключ не существует вне SGX
 
@@ -114,15 +146,16 @@ Drift: все средства внутри smart contract на Solana
 
 ## Сравнительная таблица атак
 
-| Вектор атаки | Drift (Smart Contract) | Наша архитектура (TEE + Multisig) |
+| Вектор атаки | Drift ($280M, реальная атака) | Наша архитектура (TEE + Multisig) |
 |---|---|---|
-| **Кража admin key** | ✅ Полный доступ ($200M) | ❌ Нет admin key. Ключи в SGX, multisig 2-of-3 |
-| **Insider threat** | ✅ Один человек с ключом | ❌ Нужен сговор 2 из 3 операторов + SGX compromise |
-| **Social engineering** | ✅ Убедить хранителя ключа | ❌ Ключ нельзя "показать" — он в hardware |
-| **Phishing** | ✅ Подписать фейковую tx | ❌ Enclave проверяет что tx валидна (margin check) |
-| **Supply chain attack** | ✅ Подменить contract upgrade | ❌ MRENCLAVE изменится → attestation fail |
-| **Rehearsal attack** | ✅ Тестовая tx → ждать → drain | ❌ Каждая tx проходит margin check в enclave |
-| **Rug pull** | ✅ Admin выводит всё | ❌ Master key disabled, SignerListSet неизменяем без multisig |
+| **Social engineering multisig** | ✅ 2 из 5 людей убеждены подписать | ❌ Подписанты = SGX hardware, не люди |
+| **Durable nonces (pre-signed tx)** | ✅ Транзакции подготовлены за неделю | ❌ Enclave подписывает только в момент запроса, каждый раз с margin check |
+| **Rehearsal (подготовка)** | ✅ Тестовые кошельки, адаптация к ротации | ❌ DCAP attestation — код неизменяем, нет "адаптации" |
+| **Timing attack** | ✅ Атака во время легитимной операции | ❌ Enclave не различает "легитимное" и "атаку" — проверяет одинаково |
+| **Admin key compromise** | ✅ Полный контроль через Council | ❌ Нет admin key. Master key disabled на XRPL |
+| **Insider threat** | ✅ Члены Council = потенциальные инсайдеры | ❌ Операторы не имеют доступа к ключам (SGX hardware) |
+| **Supply chain attack** | ✅ Подменить contract upgrade | ❌ MRENCLAVE изменится → DCAP attestation fail |
+| **Rug pull** | ✅ Council выводит всё | ❌ Enclave подпишет withdrawal ТОЛЬКО после margin check |
 
 ---
 
@@ -172,14 +205,16 @@ Drift: все средства внутри smart contract на Solana
 
 ## Итог
 
-| | Drift (до взлома) | Наша архитектура |
+| | Drift (реальная атака, $280M) | Наша архитектура |
 |---|---|---|
-| Модель безопасности | Один admin key | TEE + Multisig 2-of-3 |
-| Минимум для кражи | 1 ключ | 2 SGX compromise + 2 operator collusion |
-| Время на реакцию | 0 (одна tx) | Есть (key rotation, 2-of-3 продолжает работать) |
+| Модель безопасности | Multisig 2-of-5 (люди) | TEE Multisig 2-of-3 (SGX hardware) |
+| Вектор атаки | Social engineering 2 людей | Невозможно — hardware не подвержен social engineering |
+| Подготовка | Durable nonces за неделю | Enclave не хранит pre-signed tx |
+| Минимум для кражи | Убедить 2 человек | Скомпрометировать 2 SGX на разных серверах |
+| Время на реакцию | ~1 минута (между legit op и drain) | Есть (key rotation, 2-of-3 продолжает работать) |
 | Верификация кода | Audit отчёт (статический) | DCAP attestation (runtime, Intel-signed) |
-| Средства | В smart contract (admin control) | На XRPL L1 (SignerListSet, no admin) |
-| Recovery | Невозможно (средства ушли) | Key rotation + новый escrow + перевод средств |
+| Средства | В smart contract (Council control) | На XRPL L1 (SignerListSet, master disabled) |
+| Recovery | $280M ушли, протокол на грани смерти | Key rotation + новый escrow + перевод средств |
 
-**$200M Drift hack невозможен в TEE + Multisig архитектуре.**
-Не потому что мы умнее — а потому что **ключ физически недоступен** оператору.
+**$280M Drift hack невозможен в TEE + Multisig архитектуре.**
+Не потому что мы умнее — а потому что **подписанты = hardware, а не люди**. Social engineering не работает на процессоры.

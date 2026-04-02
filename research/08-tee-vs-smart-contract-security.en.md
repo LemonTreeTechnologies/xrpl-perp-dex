@@ -5,19 +5,51 @@
 
 ---
 
-## What Happened to Drift
+## What Happened to Drift (Detailed Analysis)
 
-1. The attacker gained access to the **admin signer private key**
-2. Prepared in advance: funded wallets a week earlier, made a test transaction
-3. In a single batch of transactions drained **everything**: SOL, WETH, BTC, stablecoins
-4. Converted to USDC, bridged to Ethereum
-5. The protocol posted "unusual activity" when it was already too late
+The attack was significantly more complex than "key theft". Drift **had a multisig** (Security Council, 5 signers) — but it didn't help.
 
-**Root cause:** a single private key controlled all funds. Whoever has the key has everything.
+**Timeline:**
+
+1. **March 23:** The attacker created 4 wallets with **durable nonces** (a Solana mechanism for deferred transaction execution). Two wallets were linked to Security Council members.
+2. **March 30:** Drift performed a Security Council rotation. The attacker adapted — created a new wallet matching the updated multisig parameters.
+3. **April 1:** Drift performed a legitimate test withdrawal from the insurance fund. **Within ~1 minute** the attacker activated two pre-authorized transactions, gaining administrative rights.
+4. **Withdrawal:** $155.6M JPL, $60.4M USDC, $11.3M CBBTC, $4.7M WETH, $4.5M DSOL, $4.4M WBTC, $4.1M FARTCOIN and others. **Total: ~$280M.**
+
+**How the attack bypassed multisig:**
+
+The attacker used **social engineering** — convinced at least 2 of the 5 Security Council signers to approve transactions. Durable nonces allowed preparing transactions in advance and executing them automatically.
+
+**Root causes:**
+- Multisig signers are **people**, susceptible to social engineering
+- Durable nonces allow **pre-signing** transactions without immediate execution
+- No verification that the signed transaction is **reasonable** (margin check, amount limit)
+- Monitoring failed to detect the preparation a week before the attack
 
 ---
 
 ## Why This Is Impossible in Our Architecture
+
+### 0. Signers Are Hardware, Not People
+
+```
+Drift multisig:                  Our architecture:
+┌──────────┐                     ┌──────────────────┐
+│ Person 1 │ ← social           │ SGX Enclave A    │
+│ Person 2 │    engineering      │ SGX Enclave B    │
+│ Person 3 │    possible         │ SGX Enclave C    │
+│ Person 4 │                     │                  │
+│ Person 5 │                     │ (hardware, not   │
+└──────────┘                     │  susceptible to  │
+     │                           │  persuasion)     │
+  2 of 5 convinced →            └──────────────────┘
+  full access                          │
+                                 Enclave will ONLY sign
+                                 if margin check passes
+                                 and tx is valid per code
+```
+
+**Drift's multisig was defeated by social engineering.** The attacker convinced 2 people to sign. In our architecture the signers are SGX enclaves. You cannot "convince" a processor to sign an invalid transaction.
 
 ### 1. The Key Does Not Exist Outside SGX
 
@@ -33,7 +65,7 @@ Drift:                           Our architecture:
      │ stolen →                  │ └──────────────┘ │
      │ full access               └──────────────────┘
      ▼                                    │
-  $200M withdrawal               Operator CANNOT
+  $280M withdrawal               Operator CANNOT
                                   extract the key
 ```
 
@@ -114,15 +146,16 @@ Our architecture:
 
 ## Attack Comparison Table
 
-| Attack Vector | Drift (Smart Contract) | Our Architecture (TEE + Multisig) |
+| Attack Vector | Drift ($280M, actual attack) | Our Architecture (TEE + Multisig) |
 |---|---|---|
-| **Admin key theft** | ✅ Full access ($200M) | ❌ No admin key. Keys in SGX, multisig 2-of-3 |
-| **Insider threat** | ✅ One person with the key | ❌ Requires collusion of 2 of 3 operators + SGX compromise |
-| **Social engineering** | ✅ Convince the key holder | ❌ The key cannot be "shown" — it is in hardware |
-| **Phishing** | ✅ Sign a fake tx | ❌ Enclave verifies that tx is valid (margin check) |
-| **Supply chain attack** | ✅ Swap out contract upgrade | ❌ MRENCLAVE changes → attestation fail |
-| **Rehearsal attack** | ✅ Test tx → wait → drain | ❌ Every tx goes through margin check in enclave |
-| **Rug pull** | ✅ Admin withdraws everything | ❌ Master key disabled, SignerListSet immutable without multisig |
+| **Social engineering multisig** | ✅ 2 of 5 people convinced to sign | ❌ Signers = SGX hardware, not people |
+| **Durable nonces (pre-signed tx)** | ✅ Transactions prepared a week in advance | ❌ Enclave signs only at the moment of request, each time with margin check |
+| **Rehearsal (preparation)** | ✅ Test wallets, adaptation to rotation | ❌ DCAP attestation — code is immutable, no "adaptation" |
+| **Timing attack** | ✅ Attack during a legitimate operation | ❌ Enclave does not distinguish "legitimate" from "attack" — checks the same way |
+| **Admin key compromise** | ✅ Full control via Council | ❌ No admin key. Master key disabled on XRPL |
+| **Insider threat** | ✅ Council members = potential insiders | ❌ Operators have no access to keys (SGX hardware) |
+| **Supply chain attack** | ✅ Swap out contract upgrade | ❌ MRENCLAVE changes → DCAP attestation fail |
+| **Rug pull** | ✅ Council withdraws everything | ❌ Enclave will sign withdrawal ONLY after margin check |
 
 ---
 
@@ -143,7 +176,7 @@ Compare: in Drift, once a key is stolen — it's stolen **forever**. In our arch
 
 | Operator Action | Drift | Our Architecture |
 |---|---|---|
-| Withdraw all funds | ✅ One tx (admin key) | ❌ Requires 2-of-3 + enclave only signs valid tx |
+| Withdraw all funds | ✅ One tx (admin key) | ❌ Requires 2-of-3 + enclave will only sign valid tx |
 | Swap out code | ✅ Upgrade contract | ❌ MRENCLAVE changes → DCAP attestation fail |
 | Delay withdrawals | ✅ Pause contract | ⚠️ Can delay if they are the sequencer, but 2 other operators continue |
 | Front-run users | ✅ MEV (sees all tx) | ❌ Orders encrypted for enclave |
@@ -172,14 +205,16 @@ Compare: in Drift, once a key is stolen — it's stolen **forever**. In our arch
 
 ## Summary
 
-| | Drift (before hack) | Our Architecture |
+| | Drift (actual attack, $280M) | Our Architecture |
 |---|---|---|
-| Security model | Single admin key | TEE + Multisig 2-of-3 |
-| Minimum for theft | 1 key | 2 SGX compromise + 2 operator collusion |
-| Time to react | 0 (one tx) | Available (key rotation, 2-of-3 continues operating) |
+| Security model | Multisig 2-of-5 (people) | TEE Multisig 2-of-3 (SGX hardware) |
+| Attack vector | Social engineering of 2 people | Impossible — hardware is not susceptible to social engineering |
+| Preparation | Durable nonces a week in advance | Enclave does not store pre-signed tx |
+| Minimum for theft | Convince 2 people | Compromise 2 SGX on different servers |
+| Time to react | ~1 minute (between legit op and drain) | Available (key rotation, 2-of-3 continues operating) |
 | Code verification | Audit report (static) | DCAP attestation (runtime, Intel-signed) |
-| Funds | In smart contract (admin control) | On XRPL L1 (SignerListSet, no admin) |
-| Recovery | Impossible (funds are gone) | Key rotation + new escrow + fund transfer |
+| Funds | In smart contract (Council control) | On XRPL L1 (SignerListSet, master disabled) |
+| Recovery | $280M gone, protocol on the brink of death | Key rotation + new escrow + fund transfer |
 
-**The $200M Drift hack is impossible in a TEE + Multisig architecture.**
-Not because we are smarter — but because **the key is physically inaccessible** to the operator.
+**The $280M Drift hack is impossible in a TEE + Multisig architecture.**
+Not because we are smarter — but because **the signers are hardware, not people**. Social engineering doesn't work on processors.
