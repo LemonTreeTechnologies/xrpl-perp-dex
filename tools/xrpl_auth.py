@@ -22,7 +22,7 @@ Usage as CLI:
     python3 xrpl_auth.py --generate
 
     # Full request example with curl
-    python3 xrpl_auth.py --secret sEdV... --curl POST http://94.130.18.162:3000/v1/orders \
+    python3 xrpl_auth.py --secret sEdV... --curl POST http://YOUR_SERVER:3000/v1/orders \
         '{"user_id":"rXXX","side":"buy","type":"limit","price":"0.55","size":"100","leverage":5}'
 """
 
@@ -183,7 +183,7 @@ Examples:
   python3 xrpl_auth.py --secret sEdV... --path '/v1/orders?user_id=rXXX'
 
   # Full curl command
-  python3 xrpl_auth.py --secret sEdV... --curl POST http://94.130.18.162:3000/v1/orders \\
+  python3 xrpl_auth.py --secret sEdV... --curl POST http://YOUR_SERVER:3000/v1/orders \\
       '{"user_id":"rXXX","side":"buy","type":"limit","price":"0.55","size":"100","leverage":5}'
         """)
     parser.add_argument("--secret", help="XRPL wallet secret (sEdV... or s...)")

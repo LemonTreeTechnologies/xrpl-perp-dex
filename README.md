@@ -73,7 +73,7 @@ EthSignerEnclave/
 
 ## Public API
 
-**Base URL:** `http://94.130.18.162:3000` (testnet)
+**Base URL:** `http://YOUR_SERVER:3000` (testnet)
 
 ### Trading (requires XRPL signature auth)
 

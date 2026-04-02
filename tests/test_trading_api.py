@@ -4,13 +4,14 @@ Self-test for Perp DEX Trading API.
 
 Usage:
   python3 test_trading_api.py
-  python3 test_trading_api.py http://94.130.18.162:3000
+  PERP_DEX_API=http://your-server:3000 python3 test_trading_api.py
 """
 
+import os
 import sys
 import requests
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://94.130.18.162:3000"
+BASE = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("PERP_DEX_API", "http://localhost:3000")
 MARKET = "XRP-RLUSD-PERP"
 OK = 0
 FAIL = 0

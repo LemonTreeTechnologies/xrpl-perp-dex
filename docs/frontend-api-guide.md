@@ -1,8 +1,8 @@
 # Frontend Developer API Guide
 
-**Base URL:** `http://94.130.18.162:3000`
+**Base URL:** `http://YOUR_SERVER:3000`
 **Market:** `XRP-RLUSD-PERP`
-**OpenAPI Spec:** `http://94.130.18.162:3000/v1/openapi.json`
+**OpenAPI Spec:** `http://YOUR_SERVER:3000/v1/openapi.json`
 
 ---
 
@@ -12,18 +12,18 @@
 
 ```bash
 # DCAP Remote Attestation (verify enclave integrity)
-curl -X POST http://94.130.18.162:3000/v1/attestation/quote \
+curl -X POST http://YOUR_SERVER:3000/v1/attestation/quote \
   -H "Content-Type: application/json" \
   -d '{"user_data": "0xdeadbeef"}'
 
 # Order book
-curl http://94.130.18.162:3000/v1/markets/XRP-RLUSD-PERP/orderbook
+curl http://YOUR_SERVER:3000/v1/markets/XRP-RLUSD-PERP/orderbook
 
 # Ticker (best bid/ask)
-curl http://94.130.18.162:3000/v1/markets/XRP-RLUSD-PERP/ticker
+curl http://YOUR_SERVER:3000/v1/markets/XRP-RLUSD-PERP/ticker
 
 # Recent trades
-curl http://94.130.18.162:3000/v1/markets/XRP-RLUSD-PERP/trades
+curl http://YOUR_SERVER:3000/v1/markets/XRP-RLUSD-PERP/trades
 ```
 
 ### 2. Authenticated endpoints (require XRPL signature)
@@ -38,7 +38,7 @@ python3 tools/xrpl_auth.py --generate
 
 # Submit an order
 python3 tools/xrpl_auth.py --secret spXXX... \
-  --request POST http://94.130.18.162:3000/v1/orders \
+  --request POST http://YOUR_SERVER:3000/v1/orders \
   '{"user_id":"X","side":"buy","type":"limit","price":"0.55000000","size":"100.00000000","leverage":5}'
 ```
 
@@ -104,7 +104,7 @@ from ecdsa.util import sigencode_der, sigdecode_der
 from xrpl.core.keypairs import derive_keypair, derive_classic_address
 
 # Your XRPL secret (secp256k1)
-SECRET = "spAXY4rj5Bvb2kaytJTH6UzpoKsWh"
+SECRET = "YOUR_XRPL_SECRET"  # from xrpl_auth.py --generate
 
 # Derive keys
 pub_hex, priv_hex = derive_keypair(SECRET)
@@ -143,7 +143,7 @@ body = json.dumps({
 })
 
 resp = requests.post(
-    "http://94.130.18.162:3000/v1/orders",
+    "http://YOUR_SERVER:3000/v1/orders",
     headers=sign_request(body),
     data=body,
 )
@@ -190,7 +190,7 @@ const body = JSON.stringify({
     leverage: 5,
 });
 
-fetch('http://94.130.18.162:3000/v1/orders', {
+fetch('http://YOUR_SERVER:3000/v1/orders', {
     method: 'POST',
     headers: signRequest(body),
     body: body,
@@ -510,7 +510,7 @@ HTTP status: 503
 
 **Verification:** Use `dcap_verifier.py` from the enclave repo to independently verify the quote:
 ```bash
-python3 dcap_verifier.py --url http://94.130.18.162:3000/v1 --expected-mrenclave <HASH>
+python3 dcap_verifier.py --url http://YOUR_SERVER:3000/v1 --expected-mrenclave <HASH>
 ```
 
 ---
@@ -554,15 +554,15 @@ export SECRET="spXXX..."
 
 # Place a limit buy
 python3 tools/xrpl_auth.py --secret $SECRET \
-  --request POST http://94.130.18.162:3000/v1/orders \
+  --request POST http://YOUR_SERVER:3000/v1/orders \
   '{"user_id":"X","side":"buy","type":"limit","price":"0.55","size":"100","leverage":5}'
 
 # Check orderbook (no auth needed)
-curl http://94.130.18.162:3000/v1/markets/XRP-RLUSD-PERP/orderbook
+curl http://YOUR_SERVER:3000/v1/markets/XRP-RLUSD-PERP/orderbook
 
 # Get your orders
 python3 tools/xrpl_auth.py --secret $SECRET \
-  --request GET "http://94.130.18.162:3000/v1/orders?user_id=YOUR_ADDRESS"
+  --request GET "http://YOUR_SERVER:3000/v1/orders?user_id=YOUR_ADDRESS"
 ```
 
 Note: For `--request GET`, the tool signs the URI path. For `--request POST`, it signs the body.

@@ -238,7 +238,7 @@ async fn openapi_spec() -> impl IntoResponse {
             "version": "0.1.0"
         },
         "servers": [
-            {"url": "http://94.130.18.162:3000", "description": "Testnet (Hetzner SGX)"}
+            {"url": "/", "description": "Current server (relative URL)"}
         ],
         "paths": {
             "/v1/orders": {
