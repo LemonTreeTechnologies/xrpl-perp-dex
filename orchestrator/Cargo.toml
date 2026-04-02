@@ -37,5 +37,8 @@ tower-http = { version = "0.6", features = ["cors"] }
 # P2P (order flow replication between operators)
 libp2p = { version = "0.54", features = ["gossipsub", "tcp", "noise", "yamux", "tokio", "macros", "identify"] }
 
+# Ethereum (Sepolia CommitmentRegistry submission)
+ethers = { version = "2", features = ["abigen"] }
+
 # Error handling
 anyhow = "1"

@@ -2,56 +2,51 @@
 //!
 //! Periodically publishes TEE-signed Merkle root of perp state to Ethereum,
 //! providing proof-of-reserves and audit trail.
-//!
-//! Flow:
-//! 1. Query enclave for state hash (balances, positions, insurance fund)
-//! 2. Enclave signs keccak256(root || snapshot_hash) with ECDSA key
-//! 3. Orchestrator submits commit() to CommitmentRegistryV4 on Sepolia
 
 use anyhow::{Context, Result};
+use ethers::prelude::*;
+use ethers::types::{Address, H256, U64, U256};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::{error, info, warn};
 
 /// CommitmentRegistryV4 on Sepolia
 pub const REGISTRY_ADDRESS: &str = "0x77291022F57D2E94E70D619623f917C6D7edA626";
 pub const SEPOLIA_RPC: &str = "https://rpc.sepolia.org";
+pub const SEPOLIA_CHAIN_ID: u64 = 11155111;
+
+// ABI for commit() function
+abigen!(
+    CommitmentRegistry,
+    r#"[
+        function commit(bytes32 marketId, bytes32 root, bytes32 snapshotHash, uint8 v, bytes32 r, bytes32 s) external
+        function get(bytes32 marketId) external view returns (bytes32 root, bytes32 snapshotHash, uint64 committedAt, address committer)
+        function isCommitted(bytes32 marketId) external view returns (bool)
+    ]"#
+);
 
 /// State commitment data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateCommitment {
-    /// Merkle root of state (users + positions + balances)
-    pub root: [u8; 32],
-    /// Hash of raw state snapshot
-    pub snapshot_hash: [u8; 32],
-    /// ECDSA signature (v, r, s) from enclave
+    pub root: String,
+    pub snapshot_hash: String,
     pub v: u8,
-    pub r: [u8; 32],
-    pub s: [u8; 32],
-    /// Market/state identifier
-    pub market_id: [u8; 32],
-    /// Enclave address that signed
+    pub r: String,
+    pub s: String,
+    pub market_id: String,
     pub enclave_address: String,
-    /// Timestamp
     pub timestamp: u64,
 }
 
 /// Compute state hash from enclave balance data.
-/// Returns (root, snapshot_hash) as hex strings.
 pub fn compute_state_hashes(balance_json: &str) -> Result<(String, String)> {
     use sha2::{Digest, Sha256};
-
-    // snapshot_hash = SHA-256 of raw balance JSON
     let snapshot_hash = Sha256::digest(balance_json.as_bytes());
-
-    // root = SHA-256 of snapshot_hash (simplified Merkle — single leaf for PoC)
-    // In production: proper Merkle tree of individual user balances
     let root = Sha256::digest(&snapshot_hash);
-
     Ok((hex::encode(root), hex::encode(snapshot_hash)))
 }
 
-/// Sign state commitment via enclave.
-/// Enclave signs keccak256(root || snapshot_hash) with its ECDSA key.
+/// Sign state commitment via enclave (keccak256(root || snapshot_hash)).
 pub async fn sign_commitment(
     enclave_url: &str,
     account_address: &str,
@@ -59,9 +54,8 @@ pub async fn sign_commitment(
     root_hex: &str,
     snapshot_hash_hex: &str,
 ) -> Result<(String, String, u8)> {
-    // Compute keccak256(root || snapshot_hash)
-    // For Ethereum ecrecover compatibility
     use sha3::{Digest, Keccak256};
+
     let root_bytes = hex::decode(root_hex).context("invalid root hex")?;
     let snap_bytes = hex::decode(snapshot_hash_hex).context("invalid snapshot hex")?;
 
@@ -71,7 +65,6 @@ pub async fn sign_commitment(
     let digest = hasher.finalize();
     let hash_hex = format!("0x{}", hex::encode(&digest));
 
-    // Sign via enclave
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(30))
@@ -97,31 +90,92 @@ pub async fn sign_commitment(
     Ok((r.to_string(), s.to_string(), v))
 }
 
-/// Log commitment info (for PoC — actual Sepolia submission requires ethers.rs or web3)
-pub fn log_commitment(
-    market_id: &str,
-    root: &str,
-    snapshot_hash: &str,
-    r: &str,
-    s: &str,
+/// Submit commitment to Sepolia CommitmentRegistryV4.
+pub async fn submit_to_sepolia(
+    private_key_hex: &str,
+    market_id: [u8; 32],
+    root: [u8; 32],
+    snapshot_hash: [u8; 32],
     v: u8,
-    enclave_address: &str,
-) {
-    info!(
-        market_id = %market_id,
-        root = %root,
-        snapshot_hash = %snapshot_hash,
-        enclave = %enclave_address,
-        "State commitment ready for Sepolia submission"
+    r: [u8; 32],
+    s: [u8; 32],
+) -> Result<String> {
+    let provider = Provider::<Http>::try_from(SEPOLIA_RPC)
+        .context("failed to connect to Sepolia RPC")?;
+
+    let wallet: LocalWallet = private_key_hex
+        .parse::<LocalWallet>()
+        .context("invalid private key")?
+        .with_chain_id(SEPOLIA_CHAIN_ID);
+
+    let client = SignerMiddleware::new(provider, wallet);
+    let client = Arc::new(client);
+
+    let registry_addr: Address = REGISTRY_ADDRESS.parse().context("invalid registry address")?;
+    let registry = CommitmentRegistry::new(registry_addr, client);
+
+    let tx = registry.commit(
+        market_id,
+        root,
+        snapshot_hash,
+        v,
+        r.into(),
+        s.into(),
     );
+
+    info!("Submitting commitment to Sepolia...");
+    let pending = tx.send().await.context("failed to send tx")?;
+    let tx_hash = pending.tx_hash();
+    info!(tx_hash = %tx_hash, "Commitment tx submitted");
+
+    let receipt = pending
+        .await
+        .context("failed to get receipt")?
+        .context("tx dropped")?;
+
+    let status = receipt.status.unwrap_or(U64::zero());
+    if status == U64::zero() {
+        error!(tx_hash = %tx_hash, "Commitment tx REVERTED");
+        anyhow::bail!("tx reverted");
+    }
+
     info!(
-        "CommitmentRegistryV4.commit(marketId, root, snapshotHash, v={}, r=0x{}, s=0x{})",
-        v, r, s
+        tx_hash = %tx_hash,
+        block = %receipt.block_number.unwrap_or_default(),
+        gas = %receipt.gas_used.unwrap_or_default(),
+        "Commitment published on Sepolia"
     );
-    info!(
-        "Contract: {} on Sepolia",
-        REGISTRY_ADDRESS
-    );
+
+    Ok(format!("0x{:x}", tx_hash))
+}
+
+/// Query existing commitment from Sepolia.
+pub async fn query_commitment(market_id: [u8; 32]) -> Result<Option<StateCommitment>> {
+    let provider = Provider::<Http>::try_from(SEPOLIA_RPC)
+        .context("failed to connect to Sepolia RPC")?;
+    let client = Arc::new(provider);
+
+    let registry_addr: Address = REGISTRY_ADDRESS.parse()?;
+    let registry = CommitmentRegistry::new(registry_addr, client);
+
+    let is_committed = registry.is_committed(market_id).call().await?;
+    if !is_committed {
+        return Ok(None);
+    }
+
+    let (root, snapshot_hash, committed_at, committer) =
+        registry.get(market_id).call().await?;
+
+    Ok(Some(StateCommitment {
+        root: hex::encode(root),
+        snapshot_hash: hex::encode(snapshot_hash),
+        v: 0,
+        r: String::new(),
+        s: String::new(),
+        market_id: hex::encode(market_id),
+        enclave_address: format!("{:?}", committer),
+        timestamp: committed_at,
+    }))
 }
 
 #[cfg(test)]
@@ -132,8 +186,8 @@ mod tests {
     fn test_compute_state_hashes() {
         let json = r#"{"margin_balance":"100.00000000","positions":[]}"#;
         let (root, snap) = compute_state_hashes(json).unwrap();
-        assert_eq!(root.len(), 64); // 32 bytes hex
+        assert_eq!(root.len(), 64);
         assert_eq!(snap.len(), 64);
-        assert_ne!(root, snap); // root != snapshot (root = hash of hash)
+        assert_ne!(root, snap);
     }
 }
