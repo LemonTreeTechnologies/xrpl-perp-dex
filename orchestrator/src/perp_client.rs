@@ -34,7 +34,7 @@ impl PerpClient {
 
     // ── State management ────────────────────────────────────────
 
-    /// Credit user margin after verified XRPL deposit.
+    /// Credit user RLUSD margin after verified XRPL deposit.
     pub async fn deposit(
         &self,
         user_id: &str,
@@ -46,6 +46,24 @@ impl PerpClient {
             serde_json::json!({
                 "user_id": user_id,
                 "amount": amount,
+                "xrpl_tx_hash": xrpl_tx_hash,
+            }),
+        )
+        .await
+    }
+
+    /// Credit user XRP collateral (valued at mark_price × 90% haircut).
+    pub async fn deposit_xrp(
+        &self,
+        user_id: &str,
+        xrp_amount: &str,
+        xrpl_tx_hash: &str,
+    ) -> Result<Value> {
+        self.post(
+            "/perp/deposit-xrp",
+            serde_json::json!({
+                "user_id": user_id,
+                "xrp_amount": xrp_amount,
                 "xrpl_tx_hash": xrpl_tx_hash,
             }),
         )
