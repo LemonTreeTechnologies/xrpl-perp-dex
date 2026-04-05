@@ -49,6 +49,51 @@ Enclave instances are not directly accessible from the internet (localhost only)
 
 ---
 
+## MVP vs Production: why 3 enclave instances
+
+### MVP (current state)
+
+```
+nginx :443 → Orchestrator :3000 → Enclave :9088 (single instance)
+```
+
+A single enclave instance is sufficient to demonstrate the full logic:
+deposit → trade → liquidation → funding → withdraw. The escrow account on XRPL
+is controlled by one key (regular signature).
+
+### Production (target state)
+
+```
+nginx :443 → Orchestrator :3000 → Enclave :9088 ─┐
+                                 → Enclave :9089 ─┤ SignerListSet 2-of-3
+                                 → Enclave :9090 ─┘
+```
+
+3 instances are needed **not for performance** (each is single-threaded anyway),
+but for **withdrawal security**:
+
+1. **XRPL native multisig (SignerListSet quorum=2).** The escrow account is
+   configured so that sending a Payment (withdrawal) requires signatures from
+   at least 2 of 3 instances. Master key is disabled — single point of failure
+   is eliminated.
+
+2. **Protection against single-instance compromise.** Even if an attacker gains
+   access to one enclave's memory (side-channel attack, SGX vulnerability), they
+   obtain only 1 of 3 keys — insufficient to sign a withdrawal transaction.
+
+3. **Fault tolerance.** If one instance crashes or its sealed state is corrupted,
+   the remaining 2 continue to serve withdrawals (2-of-3).
+
+4. **Independent verification.** Each instance independently checks margin
+   before signing. Orchestrator collects 2 signatures and assembles the XRPL
+   Signers array for ledger submission.
+
+> **Note:** All 3 instances run identical `enclave.signed.so` (same MRENCLAVE),
+> which is verified via DCAP remote attestation. The only difference is the
+> generated ECDSA keys.
+
+---
+
 ## API Separation: Public vs Internal
 
 ### Public API (via nginx, accessible to users)
