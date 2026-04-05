@@ -89,11 +89,10 @@ in [04-multi-operator-architecture](04-multi-operator-architecture.en.md).
 # /etc/nginx/sites-available/api-perp.ph18.io
 
 server {
-    listen 443 ssl http2;
     server_name api-perp.ph18.io;
 
-    ssl_certificate     /etc/letsencrypt/live/api-perp.ph18.io/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/api-perp.ph18.io/privkey.pem;
+    # === Whitelist (restricted during testing, removed for public launch) ===
+    # include /etc/nginx/perp_whitelist.conf;
 
     # === Public API → Orchestrator (:3000) ===
     # Orchestrator handles auth, orderbook, concurrency (Mutex → enclave)
@@ -126,13 +125,36 @@ server {
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
 
-    # Rate limiting
-    limit_req zone=perp_api burst=20 nodelay;
+    # CORS preflight
+    if ($request_method = 'OPTIONS') {
+        add_header 'Access-Control-Allow-Origin' '*';
+        add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS';
+        add_header 'Access-Control-Allow-Headers' '*';
+        add_header 'Content-Length' 0;
+        add_header 'Content-Type' 'text/plain';
+        return 204;
+    }
+
+    listen 443 ssl; # managed by Certbot
+    ssl_certificate /etc/letsencrypt/live/api-perp.ph18.io/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/api-perp.ph18.io/privkey.pem; # managed by Certbot
+    include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # managed by Certbot
 }
 
-# Rate limit zone (in http block)
-# limit_req_zone $binary_remote_addr zone=perp_api:10m rate=10r/s;
+server {
+    if ($host = api-perp.ph18.io) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+    listen 80;
+    server_name api-perp.ph18.io;
+    return 404; # managed by Certbot
+}
 ```
+
+Optional — IP whitelist via `/etc/nginx/perp_whitelist.conf` (same pattern as PM API).
+During testing access is restricted; after launch the whitelist is removed for public access.
 
 **Whitelist approach:** nginx proxies **only explicitly listed** public endpoints.
 Everything else (including internal endpoints like `/v1/perp/deposit`, `/v1/perp/price`,
