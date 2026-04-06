@@ -1,0 +1,18 @@
+[project]
+name = "xrpl-perp-dex"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "8baller",email = "8baller@station.codes"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "ecdsa (>=0.19.2,<0.20.0)",
+    "xrpl-py (>=4.5.0,<5.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
