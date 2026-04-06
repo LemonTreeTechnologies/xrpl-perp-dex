@@ -41,6 +41,12 @@ pub struct AppState {
     pub perp: PerpClient,
     pub ws_tx: broadcast::Sender<WsEvent>,
     pub is_sequencer: Arc<AtomicBool>,
+    /// Current mark price (updated by background price feed)
+    pub mark_price: Arc<std::sync::atomic::AtomicI64>,
+    /// Current funding rate (FP8 raw value)
+    pub funding_rate: Arc<std::sync::atomic::AtomicI64>,
+    /// Last funding application timestamp
+    pub last_funding_time: Arc<std::sync::atomic::AtomicU64>,
 }
 
 // ── Request/Response types ──────────────────────────────────────
@@ -143,6 +149,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/markets/{market}/orderbook", get(get_orderbook))
         .route("/v1/markets/{market}/ticker", get(get_ticker))
         .route("/v1/markets/{market}/trades", get(get_trades))
+        .route("/v1/markets/{market}/funding", get(get_funding))
         .route("/v1/openapi.json", get(openapi_spec))
         .route("/v1/attestation/quote", post(attestation_quote))
         .route("/v1/attestation/commitment", get(attestation_commitment))
@@ -317,6 +324,33 @@ async fn openapi_spec() -> impl IntoResponse {
                     "summary": "Recent trades",
                     "parameters": [{"name": "market", "in": "path", "required": true, "schema": {"type": "string"}}],
                     "responses": {"200": {"description": "Last 100 trades"}}
+                }
+            },
+            "/v1/markets/{market}/funding": {
+                "get": {
+                    "summary": "Current funding rate",
+                    "parameters": [{"name": "market", "in": "path", "required": true, "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": "Funding rate, mark price, next funding time"}}
+                }
+            },
+            "/v1/attestation/quote": {
+                "post": {
+                    "summary": "DCAP remote attestation (SGX Quote v3)",
+                    "description": "Returns Intel-signed SGX Quote v3. Azure DCsv3 only. Send user_data as challenge nonce.",
+                    "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"user_data": {"type": "string"}}}}}},
+                    "responses": {"200": {"description": "SGX Quote hex"}, "503": {"description": "DCAP not available"}}
+                }
+            },
+            "/v1/attestation/commitment": {
+                "get": {
+                    "summary": "On-chain state commitment info (Sepolia)",
+                    "responses": {"200": {"description": "CommitmentRegistryV4 contract details"}}
+                }
+            },
+            "/ws": {
+                "get": {
+                    "summary": "WebSocket — real-time market data",
+                    "description": "Upgrade to WebSocket. Receives JSON events: trade, orderbook, ticker, liquidation. No auth required."
                 }
             }
         },
@@ -560,4 +594,20 @@ async fn get_trades(
         })
     }).collect();
     ok(serde_json::json!({ "trades": trades_json })).into_response()
+}
+
+async fn get_funding(
+    State(state): State<Arc<AppState>>,
+    Path(_market): Path<String>,
+) -> impl IntoResponse {
+    let rate_raw = state.funding_rate.load(Ordering::Relaxed);
+    let mark_raw = state.mark_price.load(Ordering::Relaxed);
+    let last_ts = state.last_funding_time.load(Ordering::Relaxed);
+
+    ok(serde_json::json!({
+        "funding_rate": FP8(rate_raw).to_string(),
+        "mark_price": FP8(mark_raw).to_string(),
+        "next_funding_time": last_ts + 8 * 3600,
+        "interval_hours": 8,
+    })).into_response()
 }

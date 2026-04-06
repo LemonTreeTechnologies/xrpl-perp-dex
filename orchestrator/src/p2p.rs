@@ -254,7 +254,8 @@ impl P2PNode {
                     }
                 } => {
                     if let Err(e) = self.publish_election(&msg) {
-                        warn!("election publish failed: {}", e);
+                        // InsufficientPeers is expected when running solo (no P2P peers)
+                        tracing::debug!("election publish: {}", e);
                     }
                 }
 

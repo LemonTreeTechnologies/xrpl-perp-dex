@@ -125,6 +125,7 @@ pub fn verify_request(
 
 /// Derive XRPL r-address from compressed secp256k1 public key bytes.
 /// Used in tests and utilities.
+#[cfg(test)]
 pub fn pubkey_to_xrpl_address(pubkey_bytes: &[u8]) -> String {
     let sha256_hash = Sha256::digest(pubkey_bytes);
     let ripemd_hash = Ripemd160::digest(&sha256_hash);

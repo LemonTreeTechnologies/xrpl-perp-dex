@@ -193,12 +193,18 @@ async fn main() -> Result<()> {
     engine = engine.with_batch_publisher(trade_batch_tx.clone());
 
     let is_sequencer = Arc::new(AtomicBool::new(cli.priority == 0));
+    let mark_price = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let funding_rate = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let last_funding_time = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (ws_tx, _) = tokio::sync::broadcast::channel::<WsEvent>(256);
     let app_state = Arc::new(AppState {
         engine,
         perp: PerpClient::new(&cli.enclave_url)?,
         ws_tx: ws_tx.clone(),
         is_sequencer: is_sequencer.clone(),
+        mark_price: mark_price.clone(),
+        funding_rate: funding_rate.clone(),
+        last_funding_time: last_funding_time.clone(),
     });
 
     // Start API server
@@ -328,7 +334,7 @@ async fn main() -> Result<()> {
     let mut last_price_update = Instant::now() - Duration::from_secs(cli.price_interval + 1);
     let mut last_liquidation_scan =
         Instant::now() - Duration::from_secs(cli.liquidation_interval + 1);
-    let mut last_funding_time = Instant::now();
+    let mut last_funding_instant = Instant::now();
     let mut last_state_save = Instant::now();
 
     let price_interval = Duration::from_secs(cli.price_interval);
@@ -354,6 +360,10 @@ async fn main() -> Result<()> {
                     if let Err(e) = perp.update_price(&fp8, &fp8, now_ts).await {
                         error!("price update failed: {}", e);
                     }
+                    app_state.mark_price.store(
+                        crate::types::FP8::from_f64(price).raw(),
+                        Ordering::Relaxed,
+                    );
                     let _ = app_state.ws_tx.send(WsEvent::Ticker {
                         mark_price: fp8.clone(),
                         index_price: fp8,
@@ -388,14 +398,21 @@ async fn main() -> Result<()> {
         }
 
         // Funding rate (every 8 hours)
-        if last_funding_time.elapsed() >= FUNDING_INTERVAL && current_price > 0.0 {
+        if last_funding_instant.elapsed() >= FUNDING_INTERVAL && current_price > 0.0 {
             let rate = compute_funding_rate(current_price, current_price);
             let fp8_rate = float_to_fp8_string(rate);
             match perp.apply_funding(&fp8_rate, now_ts).await {
-                Ok(_) => info!(rate = %fp8_rate, "applied funding rate"),
+                Ok(_) => {
+                    info!(rate = %fp8_rate, "applied funding rate");
+                    app_state.funding_rate.store(
+                        crate::types::FP8::from_f64(rate).raw(),
+                        Ordering::Relaxed,
+                    );
+                    app_state.last_funding_time.store(now_ts, Ordering::Relaxed);
+                }
                 Err(e) => error!("funding application failed: {}", e),
             }
-            last_funding_time = Instant::now();
+            last_funding_instant = Instant::now();
         }
 
         // State save (every 5 minutes)
