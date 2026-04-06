@@ -31,7 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 
 # Web server (user-facing API)
-axum = { version = "0.8", features = ["json"] }
+axum = { version = "0.8", features = ["json", "ws"] }
 tower-http = { version = "0.6", features = ["cors"] }
 
 # P2P (order flow replication between operators)

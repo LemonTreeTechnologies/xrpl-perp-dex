@@ -14,6 +14,7 @@ mod perp_client;
 mod price_feed;
 mod trading;
 mod types;
+mod ws;
 mod xrpl_monitor;
 mod xrpl_signer;
 
@@ -29,6 +30,7 @@ use crate::api::AppState;
 use crate::perp_client::PerpClient;
 use crate::trading::TradingEngine;
 use crate::types::float_to_fp8_string;
+use crate::ws::WsEvent;
 use crate::xrpl_monitor::XrplMonitor;
 
 // ── CLI ─────────────────────────────────────────────────────────
@@ -96,7 +98,11 @@ fn compute_funding_rate(mark_price: f64, index_price: f64) -> f64 {
 
 // ── Liquidation scanning ────────────────────────────────────────
 
-async fn run_liquidation_scan(perp: &PerpClient, current_price: f64) {
+async fn run_liquidation_scan(
+    perp: &PerpClient,
+    current_price: f64,
+    ws_tx: &tokio::sync::broadcast::Sender<WsEvent>,
+) {
     let result = match perp.check_liquidations().await {
         Ok(r) => r,
         Err(e) => {
@@ -124,7 +130,14 @@ async fn run_liquidation_scan(perp: &PerpClient, current_price: f64) {
                 .liquidate(pos_id, &float_to_fp8_string(current_price))
                 .await
             {
-                Ok(_) => info!(position_id = pos_id, user, "liquidated position"),
+                Ok(_) => {
+                    info!(position_id = pos_id, user, "liquidated position");
+                    let _ = ws_tx.send(WsEvent::Liquidation {
+                        position_id: pos_id,
+                        user_id: user.to_string(),
+                        price: float_to_fp8_string(current_price),
+                    });
+                }
                 Err(e) => error!(position_id = pos_id, "liquidation failed: {}", e),
             }
         }
@@ -180,9 +193,11 @@ async fn main() -> Result<()> {
     if cli.sequencer {
         engine = engine.with_batch_publisher(trade_batch_tx.clone());
     }
+    let (ws_tx, _) = tokio::sync::broadcast::channel::<WsEvent>(256);
     let app_state = Arc::new(AppState {
         engine,
         perp: PerpClient::new(&cli.enclave_url)?,
+        ws_tx: ws_tx.clone(),
     });
 
     // Start API server
@@ -292,6 +307,11 @@ async fn main() -> Result<()> {
                     if let Err(e) = perp.update_price(&fp8, &fp8, now_ts).await {
                         error!("price update failed: {}", e);
                     }
+                    let _ = app_state.ws_tx.send(WsEvent::Ticker {
+                        mark_price: fp8.clone(),
+                        index_price: fp8,
+                        timestamp: now_ts,
+                    });
                 }
                 Err(e) => warn!("price fetch failed: {}", e),
             }
@@ -316,7 +336,7 @@ async fn main() -> Result<()> {
 
         // Liquidation scanning
         if last_liquidation_scan.elapsed() >= liquidation_interval && current_price > 0.0 {
-            run_liquidation_scan(&perp, current_price).await;
+            run_liquidation_scan(&perp, current_price, &app_state.ws_tx).await;
             last_liquidation_scan = Instant::now();
         }
 

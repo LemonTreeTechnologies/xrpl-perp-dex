@@ -24,18 +24,21 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tracing::error;
 
-use crate::auth;
+use tokio::sync::broadcast;
 
+use crate::auth;
 use crate::orderbook::{OrderType, TimeInForce};
 use crate::perp_client::PerpClient;
 use crate::trading::TradingEngine;
 use crate::types::{FP8, Side};
+use crate::ws::{self, WsEvent};
 
 // ── App state ───────────────────────────────────────────────────
 
 pub struct AppState {
     pub engine: TradingEngine,
     pub perp: PerpClient,
+    pub ws_tx: broadcast::Sender<WsEvent>,
 }
 
 // ── Request/Response types ──────────────────────────────────────
@@ -141,6 +144,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/attestation/quote", post(attestation_quote))
         .route("/v1/attestation/commitment", get(attestation_commitment))
         .layer(axum::middleware::from_fn(auth::auth_middleware))
+        .route("/ws", get(ws::ws_handler))
         .layer(cors)
         .with_state(state)
 }
@@ -388,6 +392,27 @@ async fn submit_order(
         req.client_order_id,
     ).await {
         Ok(result) => {
+            // Broadcast trade events via WebSocket
+            for t in &result.trades {
+                let _ = state.ws_tx.send(WsEvent::Trade {
+                    trade_id: t.trade_id,
+                    price: t.price.to_string(),
+                    size: t.size.to_string(),
+                    taker_side: format!("{}", t.taker_side),
+                    maker_user_id: t.maker_user_id.clone(),
+                    taker_user_id: t.taker_user_id.clone(),
+                    timestamp_ms: t.timestamp_ms,
+                });
+            }
+            // Broadcast orderbook snapshot after trade
+            if !result.trades.is_empty() {
+                let (bids, asks) = state.engine.depth(20).await;
+                let _ = state.ws_tx.send(WsEvent::Orderbook {
+                    bids: bids.iter().map(|(p, s)| [p.to_string(), s.to_string()]).collect(),
+                    asks: asks.iter().map(|(p, s)| [p.to_string(), s.to_string()]).collect(),
+                });
+            }
+
             let trades_json: Vec<serde_json::Value> = result.trades.iter().map(|t| {
                 serde_json::json!({
                     "trade_id": t.trade_id,
