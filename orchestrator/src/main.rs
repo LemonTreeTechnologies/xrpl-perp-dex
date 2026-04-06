@@ -7,6 +7,7 @@
 mod api;
 mod auth;
 mod commitment;
+mod election;
 mod enclave_client;
 mod orderbook;
 mod p2p;
@@ -19,6 +20,7 @@ mod xrpl_monitor;
 mod xrpl_signer;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -78,9 +80,9 @@ struct Cli {
     #[arg(long)]
     p2p_peers: Option<String>,
 
-    /// Run as sequencer (publishes order batches) vs validator (subscribes only)
-    #[arg(long, default_value_t = false)]
-    sequencer: bool,
+    /// Operator priority for sequencer election (0=highest, 2=lowest)
+    #[arg(long, default_value_t = 0)]
+    priority: u8,
 }
 
 // ── Funding rate ────────────────────────────────────────────────
@@ -186,18 +188,18 @@ async fn main() -> Result<()> {
         Err(_) => info!("no persisted state, starting fresh"),
     }
 
-    // Create trading engine
-    // For sequencer: create batch channel for P2P publishing
+    // Create trading engine — always wire batch publisher (gated by is_sequencer flag)
     let (trade_batch_tx, mut trade_batch_rx) = tokio::sync::mpsc::channel::<p2p::OrderBatch>(100);
     let mut engine = TradingEngine::new(&cli.market, perp_for_api);
-    if cli.sequencer {
-        engine = engine.with_batch_publisher(trade_batch_tx.clone());
-    }
+    engine = engine.with_batch_publisher(trade_batch_tx.clone());
+
+    let is_sequencer = Arc::new(AtomicBool::new(cli.priority == 0));
     let (ws_tx, _) = tokio::sync::broadcast::channel::<WsEvent>(256);
     let app_state = Arc::new(AppState {
         engine,
         perp: PerpClient::new(&cli.enclave_url)?,
         ws_tx: ws_tx.clone(),
+        is_sequencer: is_sequencer.clone(),
     });
 
     // Start API server
@@ -210,26 +212,33 @@ async fn main() -> Result<()> {
         axum::serve(listener, router).await.unwrap();
     });
 
-    // Start P2P node (gossipsub for order flow replication)
+    // Start P2P node (gossipsub for order flow replication + election)
     let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<p2p::OrderBatch>(100);
-    let mut p2p_node = p2p::P2PNode::new(&cli.p2p_listen, batch_tx)
+    let (election_inbound_tx, election_inbound_rx) =
+        tokio::sync::mpsc::channel::<election::ElectionMessage>(100);
+    let mut p2p_node = p2p::P2PNode::new(&cli.p2p_listen, batch_tx, election_inbound_tx)
         .await
         .context("failed to start P2P node")?;
 
-    // Sequencer: wire trade batch channel to P2P publishing
-    if cli.sequencer {
-        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<p2p::OrderBatch>(100);
-        p2p_node.set_publish_channel(pub_rx);
+    // Wire P2P publishing channels
+    let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<p2p::OrderBatch>(100);
+    p2p_node.set_publish_channel(pub_rx);
 
-        // Forward trade batches to P2P publish channel
-        let _fwd_handle = tokio::spawn(async move {
-            while let Some(batch) = trade_batch_rx.recv().await {
+    let (election_outbound_tx, election_outbound_rx) =
+        tokio::sync::mpsc::channel::<election::ElectionMessage>(100);
+    p2p_node.set_election_publish_channel(election_outbound_rx);
+
+    // Forward trade batches to P2P — only when sequencer
+    let is_seq_fwd = is_sequencer.clone();
+    let _fwd_handle = tokio::spawn(async move {
+        while let Some(batch) = trade_batch_rx.recv().await {
+            if is_seq_fwd.load(Ordering::Relaxed) {
                 if let Err(e) = pub_tx.send(batch).await {
-                    warn!("failed to forward batch to P2P publish: {}", e);
+                    warn!("failed to forward batch to P2P: {}", e);
                 }
             }
-        });
-    }
+        }
+    });
 
     // Connect to peers
     if let Some(peers_str) = &cli.p2p_peers {
@@ -244,22 +253,61 @@ async fn main() -> Result<()> {
         }
     }
 
-    let is_sequencer = cli.sequencer;
     info!(
-        role = if is_sequencer { "sequencer" } else { "validator" },
+        priority = cli.priority,
+        initial_role = if cli.priority == 0 { "sequencer" } else { "validator" },
         peer_id = %p2p_node.peer_id,
         "P2P started"
     );
+
+    // Start election state machine
+    let (role_tx, mut role_rx) = tokio::sync::watch::channel(
+        if cli.priority == 0 {
+            election::Role::Sequencer
+        } else {
+            election::Role::Validator
+        },
+    );
+    let election_config = election::ElectionConfig {
+        our_peer_id: p2p_node.peer_id.to_string(),
+        our_priority: cli.priority,
+        heartbeat_interval: Duration::from_secs(5),
+        heartbeat_timeout: Duration::from_secs(15),
+    };
+    let mut election_state =
+        election::ElectionState::new(election_config, election_outbound_tx, election_inbound_rx, role_tx);
+    let _election_handle = tokio::spawn(async move {
+        election_state.run().await;
+    });
+
+    // Role change watcher — flips is_sequencer AtomicBool
+    let is_seq_watcher = is_sequencer.clone();
+    let _role_handle = tokio::spawn(async move {
+        while role_rx.changed().await.is_ok() {
+            let new_role = *role_rx.borrow();
+            match new_role {
+                election::Role::Sequencer => {
+                    info!("ROLE CHANGE → Sequencer");
+                    is_seq_watcher.store(true, Ordering::Relaxed);
+                }
+                election::Role::Validator => {
+                    info!("ROLE CHANGE → Validator");
+                    is_seq_watcher.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+    });
 
     // P2P event loop
     let _p2p_handle = tokio::spawn(async move {
         p2p_node.run().await;
     });
 
-    // Validator: process received batches from P2P
-    if !is_sequencer {
-        let _validator_handle = tokio::spawn(async move {
-            while let Some(batch) = batch_rx.recv().await {
+    // Validator: process received batches from P2P (only when not sequencer)
+    let is_seq_validator = is_sequencer.clone();
+    let _validator_handle = tokio::spawn(async move {
+        while let Some(batch) = batch_rx.recv().await {
+            if !is_seq_validator.load(Ordering::Relaxed) {
                 info!(
                     seq = batch.seq_num,
                     orders = batch.orders.len(),
@@ -271,8 +319,8 @@ async fn main() -> Result<()> {
                 // TODO: call enclave open_position for each fill
                 // TODO: verify state_hash matches after replay
             }
-        });
-    }
+        }
+    });
 
     // Background orchestration loop
     let mut last_ledger: u32 = 0;

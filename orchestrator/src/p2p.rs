@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::types::FP8;
+use crate::election::ElectionMessage;
 
 // ── Message types ───────────────────────────────────────────────
 
@@ -68,7 +68,8 @@ pub struct FillMessage {
 
 // ── Network behaviour ───────────────────────────────────────────
 
-const TOPIC: &str = "perp-dex/orders";
+const ORDERS_TOPIC: &str = "perp-dex/orders";
+const ELECTION_TOPIC: &str = "perp-dex/election";
 
 #[derive(NetworkBehaviour)]
 struct PerpBehaviour {
@@ -80,11 +81,16 @@ struct PerpBehaviour {
 
 pub struct P2PNode {
     swarm: Swarm<PerpBehaviour>,
-    topic: gossipsub::IdentTopic,
+    orders_topic: gossipsub::IdentTopic,
+    election_topic: gossipsub::IdentTopic,
     /// Channel to send received batches to the orchestrator (validator).
     batch_tx: mpsc::Sender<OrderBatch>,
     /// Channel to receive batches to publish (sequencer).
     publish_rx: Option<mpsc::Receiver<OrderBatch>>,
+    /// Election messages received from gossipsub → forwarded to election module.
+    election_inbound_tx: mpsc::Sender<ElectionMessage>,
+    /// Election messages to publish via gossipsub.
+    election_outbound_rx: Option<mpsc::Receiver<ElectionMessage>>,
     /// Our peer ID.
     pub peer_id: PeerId,
 }
@@ -96,6 +102,7 @@ impl P2PNode {
     pub async fn new(
         listen_addr: &str,
         batch_tx: mpsc::Sender<OrderBatch>,
+        election_inbound_tx: mpsc::Sender<ElectionMessage>,
     ) -> Result<Self> {
         let swarm = SwarmBuilder::with_new_identity()
             .with_tokio()
@@ -139,22 +146,31 @@ impl P2PNode {
             .build();
 
         let peer_id = *swarm.local_peer_id();
-        let topic = gossipsub::IdentTopic::new(TOPIC);
+        let orders_topic = gossipsub::IdentTopic::new(ORDERS_TOPIC);
+        let election_topic = gossipsub::IdentTopic::new(ELECTION_TOPIC);
 
         let mut node = P2PNode {
             swarm,
-            topic,
+            orders_topic,
+            election_topic,
             batch_tx,
             publish_rx: None,
+            election_inbound_tx,
+            election_outbound_rx: None,
             peer_id,
         };
 
-        // Subscribe to topic
+        // Subscribe to topics
         node.swarm
             .behaviour_mut()
             .gossipsub
-            .subscribe(&node.topic)
-            .context("failed to subscribe to gossipsub topic")?;
+            .subscribe(&node.orders_topic)
+            .context("failed to subscribe to orders topic")?;
+        node.swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&node.election_topic)
+            .context("failed to subscribe to election topic")?;
 
         // Listen
         let addr: Multiaddr = listen_addr.parse().context("invalid listen address")?;
@@ -167,6 +183,11 @@ impl P2PNode {
     /// Set publish channel (sequencer mode).
     pub fn set_publish_channel(&mut self, rx: mpsc::Receiver<OrderBatch>) {
         self.publish_rx = Some(rx);
+    }
+
+    /// Set election publish channel.
+    pub fn set_election_publish_channel(&mut self, rx: mpsc::Receiver<ElectionMessage>) {
+        self.election_outbound_rx = Some(rx);
     }
 
     /// Connect to a peer (bootstrap).
@@ -182,15 +203,29 @@ impl P2PNode {
         self.swarm
             .behaviour_mut()
             .gossipsub
-            .publish(self.topic.clone(), data)
+            .publish(self.orders_topic.clone(), data)
             .map_err(|e| anyhow::anyhow!("publish failed: {}", e))?;
+        Ok(())
+    }
+
+    fn publish_election(&mut self, msg: &ElectionMessage) -> Result<()> {
+        let data = serde_json::to_vec(msg).context("failed to serialize election msg")?;
+        self.swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(self.election_topic.clone(), data)
+            .map_err(|e| anyhow::anyhow!("election publish failed: {}", e))?;
         Ok(())
     }
 
     /// Run the event loop. Call this in a tokio::spawn.
     pub async fn run(&mut self) {
-        // Take publish_rx out of self for use in select!
+        // Take channels out of self for use in select!
         let mut publish_rx = self.publish_rx.take();
+        let mut election_rx = self.election_outbound_rx.take();
+
+        let orders_topic_hash = self.orders_topic.hash();
+        let election_topic_hash = self.election_topic.hash();
 
         loop {
             tokio::select! {
@@ -211,6 +246,18 @@ impl P2PNode {
                     }
                 }
 
+                // Handle election messages to publish
+                Some(msg) = async {
+                    match &mut election_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<ElectionMessage>>().await,
+                    }
+                } => {
+                    if let Err(e) = self.publish_election(&msg) {
+                        warn!("election publish failed: {}", e);
+                    }
+                }
+
                 // Handle swarm events
                 event = self.swarm.select_next_some() => {
             match event {
@@ -221,20 +268,35 @@ impl P2PNode {
                         ..
                     },
                 )) => {
-                    match serde_json::from_slice::<OrderBatch>(&message.data) {
-                        Ok(batch) => {
-                            info!(
-                                seq = batch.seq_num,
-                                orders = batch.orders.len(),
-                                from = %propagation_source,
-                                "received order batch"
-                            );
-                            if let Err(e) = self.batch_tx.send(batch).await {
-                                error!("failed to forward batch: {}", e);
+                    if message.topic == orders_topic_hash {
+                        // Order batch from sequencer
+                        match serde_json::from_slice::<OrderBatch>(&message.data) {
+                            Ok(batch) => {
+                                info!(
+                                    seq = batch.seq_num,
+                                    orders = batch.orders.len(),
+                                    from = %propagation_source,
+                                    "received order batch"
+                                );
+                                if let Err(e) = self.batch_tx.send(batch).await {
+                                    error!("failed to forward batch: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("invalid batch from {}: {}", propagation_source, e);
                             }
                         }
-                        Err(e) => {
-                            warn!("invalid batch from {}: {}", propagation_source, e);
+                    } else if message.topic == election_topic_hash {
+                        // Election message
+                        match serde_json::from_slice::<ElectionMessage>(&message.data) {
+                            Ok(msg) => {
+                                if let Err(e) = self.election_inbound_tx.send(msg).await {
+                                    error!("failed to forward election msg: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("invalid election msg from {}: {}", propagation_source, e);
+                            }
                         }
                     }
                 }

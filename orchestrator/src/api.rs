@@ -11,6 +11,7 @@
 //!   GET /v1/markets/:market/ticker     — best bid/ask/mid
 //!   GET /v1/markets/:market/trades     — recent trades
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::{
@@ -39,6 +40,7 @@ pub struct AppState {
     pub engine: TradingEngine,
     pub perp: PerpClient,
     pub ws_tx: broadcast::Sender<WsEvent>,
+    pub is_sequencer: Arc<AtomicBool>,
 }
 
 // ── Request/Response types ──────────────────────────────────────
@@ -346,6 +348,10 @@ async fn submit_order(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SubmitOrderRequest>,
 ) -> impl IntoResponse {
+    if !state.is_sequencer.load(Ordering::Relaxed) {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "this node is not the sequencer").into_response();
+    }
+
     let side = match parse_side(&req.side) {
         Ok(s) => s,
         Err(e) => return err(StatusCode::BAD_REQUEST, &e).into_response(),
