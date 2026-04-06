@@ -150,7 +150,7 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
         || uri == "/v1/pool/status"
         || uri.starts_with("/v1/attestation/")
         || uri.starts_with("/v1/perp/liquidations/")
-        || (method == "GET" && uri.starts_with("/v1/markets/"))
+        || (method == "GET" && (uri == "/v1/markets" || uri.starts_with("/v1/markets/")))
     {
         return next.run(request).await;
     }

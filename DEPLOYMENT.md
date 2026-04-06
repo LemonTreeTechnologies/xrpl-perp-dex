@@ -36,20 +36,60 @@ SGX Enclave :9088 (localhost)       ← private keys, margin engine, signing
 
 ## What is exposed externally (via nginx)
 
-| Method | Endpoint | Auth | Description |
-|--------|----------|------|-------------|
-| GET | `/v1/perp/balance` | Yes | User balance and positions |
-| POST | `/v1/perp/position/open` | Yes | Open position |
-| POST | `/v1/perp/position/close` | Yes | Close position |
-| POST | `/v1/perp/withdraw` | Yes | Withdraw (margin check + SGX signing) |
-| GET | `/v1/perp/liquidations/check` | No | View liquidatable positions |
-| GET | `/v1/pool/status` | No | Enclave health |
-| POST | `/v1/attestation/quote` | No | DCAP remote attestation |
-| WS | `/ws` | No | Real-time trades, orderbook, ticker |
+These are the **Orchestrator** endpoints that users/frontends call.
+The Orchestrator handles auth, orderbook matching, and proxies state queries to the Enclave internally.
 
-**Everything else returns 403.** nginx uses a whitelist — only explicitly listed
-endpoints are proxied. If a new endpoint is added to the enclave, it is blocked
-by default until added to the nginx config.
+### Trading (require XRPL signature auth)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/v1/orders` | Submit order (limit/market) |
+| GET | `/v1/orders?user_id=rXXX` | Get user's open orders |
+| DELETE | `/v1/orders?user_id=rXXX` | Cancel all user's orders |
+| DELETE | `/v1/orders/{order_id}` | Cancel specific order |
+| GET | `/v1/account/balance?user_id=rXXX` | Balance, positions, unrealized PnL |
+
+### Market data (no auth)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/v1/markets/{market}/orderbook?levels=20` | Order book depth (bids/asks) |
+| GET | `/v1/markets/{market}/ticker` | Best bid/ask/mid price |
+| GET | `/v1/markets/{market}/trades` | Last 100 trades |
+| GET | `/v1/markets/{market}/funding` | Current funding rate, mark price, next funding time |
+| WS | `/ws` | Real-time events: trade, orderbook, ticker, liquidation |
+
+### System (no auth)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/v1/openapi.json` | OpenAPI 3.0 specification |
+| POST | `/v1/attestation/quote` | DCAP remote attestation (SGX Quote v3) |
+| GET | `/v1/attestation/commitment` | Sepolia on-chain state proof info |
+
+### NOT exposed (internal Enclave endpoints, blocked by nginx)
+
+These endpoints exist on the Enclave (:9088) but are **never accessible from outside**.
+Only the Orchestrator calls them on localhost:
+
+| Endpoint | Called by | Purpose |
+|----------|-----------|---------|
+| `/v1/perp/deposit` | Orchestrator (XRPL deposit monitor) | Credit user balance |
+| `/v1/perp/price` | Orchestrator (Binance price feed) | Update mark/index price |
+| `/v1/perp/position/open` | Orchestrator (after orderbook match) | Open position with margin check |
+| `/v1/perp/position/close` | Orchestrator | Close position, realize PnL |
+| `/v1/perp/withdraw` | Orchestrator | Margin check + SGX signing |
+| `/v1/perp/liquidate` | Orchestrator (liquidation scanner) | Force-close position |
+| `/v1/perp/funding/apply` | Orchestrator (every 8 hours) | Apply funding rate |
+| `/v1/perp/state/save` | Orchestrator (every 5 min) | Seal state to disk |
+| `/v1/perp/state/load` | Orchestrator (on startup) | Unseal state |
+
+**Users submit orders via `POST /v1/orders` → Orchestrator matches on the orderbook →
+Orchestrator calls Enclave `/v1/perp/position/open` for each fill.**
+Users never call Enclave endpoints directly.
+
+**Everything not listed above returns 403.** nginx uses a whitelist — only explicitly
+listed endpoints are proxied.
 
 ---
 

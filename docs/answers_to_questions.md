@@ -153,6 +153,10 @@ Not yet implemented as a separate endpoint. Currently the funding rate is comput
 
 Not tracked per-user currently. The enclave applies funding to all open positions atomically. Individual payment history would require adding a transaction log to the enclave state. This is a valid feature request for post-MVP.
 
+### markets/get
+
+**Added:** `GET /v1/markets` — returns market details (name, mark price, fees, leverage, status).
+
 ---
 
 ## 8. OpenAPI spec drift
@@ -167,11 +171,20 @@ For the current PoC, hand-written spec is acceptable. For production, we should 
 
 ---
 
-## 9. DEPLOYMENT.md endpoints "out of date"
+## 9. DEPLOYMENT.md endpoints mismatch (follow-up)
 
-The DEPLOYMENT.md was written today (2026-04-06). The endpoints listed match `src/api.rs` router. If there are specific endpoints missing or wrong, please list them and we'll fix.
+**Fixed.** The original DEPLOYMENT.md mixed Enclave endpoints (`/v1/perp/position/open`)
+with Orchestrator endpoints (`/v1/orders`). This was confusing.
 
-The endpoints in the table are the **nginx-whitelisted** public endpoints. The orchestrator may have additional routes (like `/v1/openapi.json`) that are also accessible — nginx has explicit `location` blocks for each.
+DEPLOYMENT.md now has three clear tables:
+
+1. **Trading endpoints** (require auth): `/v1/orders`, `/v1/account/balance`
+2. **Market data** (no auth): `/v1/markets/*`, `/ws`
+3. **Internal Enclave endpoints** (NOT exposed): `/v1/perp/*` — called by Orchestrator only
+
+The key clarification: **users submit orders via `POST /v1/orders`**, not via
+`/v1/perp/position/open`. The Orchestrator matches on the orderbook first, then
+calls the Enclave internally for each fill. Users never see or call Enclave endpoints.
 
 ---
 

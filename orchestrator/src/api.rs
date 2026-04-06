@@ -150,6 +150,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/markets/{market}/ticker", get(get_ticker))
         .route("/v1/markets/{market}/trades", get(get_trades))
         .route("/v1/markets/{market}/funding", get(get_funding))
+        .route("/v1/markets", get(get_markets))
         .route("/v1/openapi.json", get(openapi_spec))
         .route("/v1/attestation/quote", post(attestation_quote))
         .route("/v1/attestation/commitment", get(attestation_commitment))
@@ -331,6 +332,12 @@ async fn openapi_spec() -> impl IntoResponse {
                     "summary": "Current funding rate",
                     "parameters": [{"name": "market", "in": "path", "required": true, "schema": {"type": "string"}}],
                     "responses": {"200": {"description": "Funding rate, mark price, next funding time"}}
+                }
+            },
+            "/v1/markets": {
+                "get": {
+                    "summary": "List available markets",
+                    "responses": {"200": {"description": "Market details: name, mark price, fees, leverage"}}
                 }
             },
             "/v1/attestation/quote": {
@@ -609,5 +616,28 @@ async fn get_funding(
         "mark_price": FP8(mark_raw).to_string(),
         "next_funding_time": last_ts + 8 * 3600,
         "interval_hours": 8,
+    })).into_response()
+}
+
+async fn get_markets(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let mark_raw = state.mark_price.load(Ordering::Relaxed);
+    let (bid, ask, _) = state.engine.ticker().await;
+
+    ok(serde_json::json!({
+        "markets": [{
+            "market": "XRP-RLUSD-PERP",
+            "base": "XRP",
+            "quote": "RLUSD",
+            "mark_price": FP8(mark_raw).to_string(),
+            "best_bid": bid.map(|p| p.to_string()),
+            "best_ask": ask.map(|p| p.to_string()),
+            "max_leverage": 20,
+            "maintenance_margin": "0.00500000",
+            "taker_fee": "0.00050000",
+            "funding_interval_hours": 8,
+            "status": "active",
+        }]
     })).into_response()
 }
