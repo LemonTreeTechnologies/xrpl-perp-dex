@@ -159,15 +159,22 @@ Not tracked per-user currently. The enclave applies funding to all open position
 
 ---
 
-## 8. OpenAPI spec drift
+## 8. OpenAPI spec drift / two specs
 
-Valid concern. The OpenAPI spec in `/v1/openapi.json` is hand-written in `src/api.rs`. It could drift from actual endpoints.
+Valid concern about drift. The OpenAPI spec in `/v1/openapi.json` is hand-written in `src/api.rs`.
 
-Options:
-1. **Generate from code** — use `utoipa` crate to derive OpenAPI from axum handlers
-2. **Generate code from spec** — use spec in `build.rs` to generate models
+**Orchestrator spec:** This is the user-facing spec. Updated to include all current
+endpoints (orders, markets, funding, attestation, ws). For production, we should
+switch to `utoipa` (derive OpenAPI from axum handlers) to prevent drift.
 
-For the current PoC, hand-written spec is acceptable. For production, we should switch to `utoipa` (option 1) since the Rust handlers are the source of truth, not the spec.
+**Enclave spec (second spec):** Not a priority. The Enclave API is a program-to-program
+interface — only the Orchestrator calls it, via `perp_client.rs`. No human ever
+interacts with the Enclave directly. A formal OpenAPI spec for an internal machine-to-machine
+API adds maintenance burden without real benefit. The Rust client (`perp_client.rs`)
+**is** the contract — if the enclave changes, the client breaks at compile time.
+
+If we ever need an enclave spec (e.g., for a third-party operator writing their own
+orchestrator), we can generate it then. For now: post-MVP.
 
 ---
 
