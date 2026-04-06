@@ -65,6 +65,25 @@ Multi-operator координация (3 оператора, XRPL multisig 2-of-
 | GET | `/v1/pool/status` | Статус enclave |
 | POST | `/v1/pool/report` | Attestation report (legacy) |
 | POST | `/v1/attestation/quote` | DCAP remote attestation (SGX Quote v3, Azure DCsv3 only) |
+| WS | `/ws` | WebSocket — real-time trades, orderbook, ticker, liquidations |
+
+### WebSocket (`wss://api-perp.ph18.io/ws`)
+
+Публичный endpoint, без аутентификации (market data). Клиент подключается,
+сервер пушит JSON-события с полем `type`:
+
+| type | Когда | Данные |
+|------|-------|--------|
+| `trade` | При каждом fill | `trade_id`, `price`, `size`, `taker_side`, `maker_user_id`, `taker_user_id` |
+| `orderbook` | После trades | `bids`, `asks` (depth snapshot, top 20 уровней) |
+| `ticker` | Каждые 5 сек | `mark_price`, `index_price`, `timestamp` |
+| `liquidation` | При ликвидации | `position_id`, `user_id`, `price` |
+
+Путь через nginx: `wss://api-perp.ph18.io/ws` → nginx (`proxy_http_version 1.1`,
+`Upgrade`, `Connection: upgrade`, `proxy_read_timeout 86400`) → Orchestrator `:3000/ws`.
+nginx терминирует TLS и поддерживает долгоживущие WebSocket соединения (timeout 24 часа).
+
+Медленные клиенты не блокируют поток — пропущенные события скипаются (`broadcast::Lagged`).
 
 ### Internal API (только localhost, недоступно извне)
 

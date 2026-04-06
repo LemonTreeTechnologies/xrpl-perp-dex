@@ -26,6 +26,14 @@ curl http://YOUR_SERVER:3000/v1/markets/XRP-RLUSD-PERP/ticker
 curl http://YOUR_SERVER:3000/v1/markets/XRP-RLUSD-PERP/trades
 ```
 
+### 1b. WebSocket (real-time feed, no authentication)
+
+```javascript
+const ws = new WebSocket('ws://YOUR_SERVER:3000/ws');
+ws.onmessage = (e) => console.log(JSON.parse(e.data));
+// Events: trade, orderbook, ticker, liquidation
+```
+
 ### 2. Authenticated endpoints (require XRPL signature)
 
 ```bash
@@ -512,6 +520,113 @@ HTTP status: 503
 ```bash
 python3 dcap_verifier.py --url http://YOUR_SERVER:3000/v1 --expected-mrenclave <HASH>
 ```
+
+---
+
+## WebSocket (Real-Time Feed)
+
+```
+ws://YOUR_SERVER:3000/ws
+wss://api-perp.ph18.io/ws   (production, via nginx)
+Auth: Not required
+```
+
+Connect and receive JSON events pushed by the server. No subscription messages needed —
+all events are broadcast to all clients.
+
+### Event types
+
+**Trade** (on each fill):
+```json
+{
+    "type": "trade",
+    "trade_id": 42,
+    "price": "0.55000000",
+    "size": "100.00000000",
+    "taker_side": "long",
+    "maker_user_id": "rAlice...",
+    "taker_user_id": "rBob...",
+    "timestamp_ms": 1743500000000
+}
+```
+
+**Orderbook** (depth snapshot after trades):
+```json
+{
+    "type": "orderbook",
+    "bids": [["0.55000000", "100.00000000"], ["0.54000000", "200.00000000"]],
+    "asks": [["0.56000000", "150.00000000"], ["0.57000000", "50.00000000"]]
+}
+```
+
+**Ticker** (every 5 seconds):
+```json
+{
+    "type": "ticker",
+    "mark_price": "0.55120000",
+    "index_price": "0.55120000",
+    "timestamp": 1743500005
+}
+```
+
+**Liquidation** (when position is liquidated):
+```json
+{
+    "type": "liquidation",
+    "position_id": 7,
+    "user_id": "rCharlie...",
+    "price": "0.48000000"
+}
+```
+
+### JavaScript example
+
+```javascript
+const ws = new WebSocket('wss://api-perp.ph18.io/ws');
+
+ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    switch (msg.type) {
+        case 'trade':
+            console.log(`Trade: ${msg.size} XRP @ ${msg.price}`);
+            break;
+        case 'orderbook':
+            console.log(`Orderbook: ${msg.bids.length} bids, ${msg.asks.length} asks`);
+            break;
+        case 'ticker':
+            console.log(`Price: ${msg.mark_price}`);
+            break;
+        case 'liquidation':
+            console.log(`Liquidation: position ${msg.position_id}`);
+            break;
+    }
+};
+
+ws.onclose = () => console.log('Disconnected, reconnecting...');
+```
+
+### Python example
+
+```python
+import asyncio
+import json
+import websockets
+
+async def listen():
+    async with websockets.connect("wss://api-perp.ph18.io/ws") as ws:
+        async for message in ws:
+            event = json.loads(message)
+            print(f"[{event['type']}] {event}")
+
+asyncio.run(listen())
+```
+
+### Notes
+
+- No authentication — public market data feed
+- Slow clients skip events (no backpressure, no blocking)
+- Reconnect on disconnect — server doesn't store state per client
+- All prices/sizes in FP8 string format
 
 ---
 

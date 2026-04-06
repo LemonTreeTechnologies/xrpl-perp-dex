@@ -65,6 +65,25 @@ in [04-multi-operator-architecture](04-multi-operator-architecture.en.md).
 | GET | `/v1/pool/status` | Enclave status |
 | POST | `/v1/pool/report` | Attestation report (legacy) |
 | POST | `/v1/attestation/quote` | DCAP remote attestation (SGX Quote v3, Azure DCsv3 only) |
+| WS | `/ws` | WebSocket — real-time trades, orderbook, ticker, liquidations |
+
+### WebSocket (`wss://api-perp.ph18.io/ws`)
+
+Public endpoint, no authentication (market data). Client connects,
+server pushes JSON events with a `type` field:
+
+| type | When | Data |
+|------|------|------|
+| `trade` | On each fill | `trade_id`, `price`, `size`, `taker_side`, `maker_user_id`, `taker_user_id` |
+| `orderbook` | After trades | `bids`, `asks` (depth snapshot, top 20 levels) |
+| `ticker` | Every 5 sec | `mark_price`, `index_price`, `timestamp` |
+| `liquidation` | On liquidation | `position_id`, `user_id`, `price` |
+
+Path through nginx: `wss://api-perp.ph18.io/ws` → nginx (`proxy_http_version 1.1`,
+`Upgrade`, `Connection: upgrade`, `proxy_read_timeout 86400`) → Orchestrator `:3000/ws`.
+nginx terminates TLS and maintains long-lived WebSocket connections (24h timeout).
+
+Slow clients don't block producers — missed events are skipped (`broadcast::Lagged`).
 
 ### Internal API (localhost only, not exposed externally)
 
