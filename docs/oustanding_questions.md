@@ -283,3 +283,79 @@ warning: associated items `new`, `sign_xrpl_tx`, `address`, `signing_pubkey`, an
     |            ^^^^^^^^^^^^^^^
 ```
 
+
+## Follow up Questions.
+
+Missing endpoints in DEPLOYMENT.md.
+
+The api router exposes these endpoints for the orchestrator.
+
+```
+
+pub fn router(state: Arc<AppState>) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin("*".parse::<HeaderValue>().unwrap())
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_headers(tower_http::cors::Any);
+
+    Router::new()
+        .route("/v1/orders", post(submit_order))
+        .route("/v1/orders", get(get_orders))
+        .route("/v1/orders", delete(cancel_all_orders))
+        .route("/v1/orders/{order_id}", delete(cancel_order))
+        .route("/v1/account/balance", get(get_balance))
+        .route("/v1/markets/{market}/orderbook", get(get_orderbook))
+        .route("/v1/markets/{market}/ticker", get(get_ticker))
+        .route("/v1/markets/{market}/trades", get(get_trades))
+        .route("/v1/openapi.json", get(openapi_spec))
+        .route("/v1/attestation/quote", post(attestation_quote))
+        .route("/v1/attestation/commitment", get(attestation_commitment))
+        .layer(axum::middleware::from_fn(auth::auth_middleware))
+        .route("/ws", get(ws::ws_handler))
+        .layer(cors)
+        .with_state(state)
+}
+```
+
+The DEPLOYMENT.md only references the following endpoints;
+
+```
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| GET | `/v1/perp/balance` | Yes | User balance and positions |
+| POST | `/v1/perp/position/open` | Yes | Open position |
+| POST | `/v1/perp/position/close` | Yes | Close position |
+| POST | `/v1/perp/withdraw` | Yes | Withdraw (margin check + SGX signing) |
+| GET | `/v1/perp/liquidations/check` | No | View liquidatable positions |
+| GET | `/v1/pool/status` | No | Enclave health |
+| POST | `/v1/attestation/quote` | No | DCAP remote attestation |
+| WS | `/ws` | No | Real-time trades, orderbook, ticker |
+```
+
+Note, all of the following endpoints are missing from the DEPLOYMENT.md;
+
+```
+GET | `/v1/orders` | Yes | Get all orders for the user |
+DELETE | `/v1/orders` | Yes | Cancel all orders for the user |
+DELETE | `/v1/orders/{order_id}` | Yes | Cancel a specific order |
+GET | `/v1/account/balance` | Yes | Get user balance |
+GET | `/v1/markets/{market}/orderbook` | No | Get orderbook
+GET | `/v1/markets/{market}/ticker` | No | Get ticker |
+GET | `/v1/markets/{market}/trades` | No | Get recent trades
+GET | `/v1/openapi.json` | No | Get OpenAPI spec |
+GET | `/v1/attestation/commitment` | No | Get attestation commitment
+```
+
+The DEPLOYMENT.md suggests the following endpoints which are not actually implemented;
+
+```
+POST | `/v1/perp/position/open` | Yes | Open position |
+POST | `/v1/perp/position/close` | Yes | Close position |
+POST | `/v1/perp/withdraw` | Yes | Withdraw (margin check + SG
+X signing) |
+GET | `/v1/perp/liquidations/check` | No | View liquidatable positions
+```
+
+Peraps the DEPLOYMENT.md is actually exposing the enclave endpoints, which are not actually exposed by the api router? If so, this should be clarified in the DEPLOYMENT.md, and the enclave endpoints should be added to the DEPLOYMENT.md to reflect the actual state of the system. This will ensure that users of the system have accurate information about what endpoints are available and how to use them.
+
+Additionally, there appears to be a naming mismatch between the endpoints in the DEPLOYMENT.md and the actual endpoints in the api router. For example, the DEPLOYMENT.md references `/v1/perp/position/open` and `/v1/perp/position/close`, but the actual endpoints in the api router are `/v1/orders` with a POST method to open an order, and a DELETE method to close an order. This should be clarified in the DEPLOYMENT.md to reflect the actual state of the system, and to ensure that users of the system have accurate information about how to use the endpoints.
