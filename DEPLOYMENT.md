@@ -1,6 +1,21 @@
 # Deployment Guide
 
-## Architecture Overview
+## Two roles — read the one that applies to you
+
+| Role | Who | What they do | What they DON'T do |
+|------|-----|-------------|-------------------|
+| **Operator** | Runs the server (SGX hardware) | Starts enclave + orchestrator + nginx | — |
+| **Developer / SDK / Frontend** | Builds apps on top | Calls `https://api-perp.ph18.io/*` | **Never runs enclave. Never runs orchestrator. Never connects to port 9088 or 3000.** |
+
+**If you are a developer building an SDK or frontend:**
+- You only talk to `https://api-perp.ph18.io` (or the operator's public URL)
+- The enclave does not exist from your perspective
+- See [docs/frontend-api-guide.md](docs/frontend-api-guide.md) for the API reference
+- **Stop reading here** — the rest of this document is for operators
+
+---
+
+## Architecture Overview (for operators only)
 
 ```
 Internet
@@ -143,6 +158,19 @@ curl https://your-server:9088/v1/pool/status   # should timeout/refuse
 
 ## Common mistakes
 
+### "I'm a developer and I'm trying to run the orchestrator"
+
+**Don't.** The orchestrator is run by the operator on the SGX server.
+You are a developer — you call the public API. That's it.
+
+```
+# This is ALL you need:
+curl https://api-perp.ph18.io/v1/pool/status
+```
+
+You do not need `--enclave-url`, you do not need port 9088,
+you do not need to compile anything from the enclave repo.
+
 ### "401 Unauthorized on price update"
 
 ```
@@ -152,7 +180,7 @@ ERROR perp_dex_orchestrator: price update failed: HTTP status client error
 
 **Cause:** `--enclave-url` points to the Orchestrator (port 3000) instead of the Enclave (port 9088). The Orchestrator calls itself, hits its own auth middleware, and gets rejected.
 
-**Fix:**
+**Fix (for operators only):**
 ```bash
 # Wrong:
 --enclave-url http://94.130.18.162:3000
