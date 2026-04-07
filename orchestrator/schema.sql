@@ -1,0 +1,78 @@
+-- PostgreSQL schema for Perp DEX trade history
+-- Usage: psql -d perp_dex -f schema.sql
+
+CREATE TABLE IF NOT EXISTS trades (
+    id BIGSERIAL PRIMARY KEY,
+    trade_id BIGINT NOT NULL,
+    market VARCHAR(32) NOT NULL DEFAULT 'XRP-RLUSD-PERP',
+    maker_order_id BIGINT NOT NULL,
+    taker_order_id BIGINT NOT NULL,
+    maker_user_id VARCHAR(36) NOT NULL,
+    taker_user_id VARCHAR(36) NOT NULL,
+    price BIGINT NOT NULL,
+    size BIGINT NOT NULL,
+    taker_side VARCHAR(8) NOT NULL,
+    timestamp_ms BIGINT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_trades_maker ON trades(maker_user_id, timestamp_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_trades_taker ON trades(taker_user_id, timestamp_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_trades_market ON trades(market, timestamp_ms DESC);
+
+CREATE TABLE IF NOT EXISTS funding_payments (
+    id BIGSERIAL PRIMARY KEY,
+    user_id VARCHAR(36) NOT NULL,
+    position_id BIGINT NOT NULL,
+    side VARCHAR(8) NOT NULL,
+    payment BIGINT NOT NULL,
+    funding_rate BIGINT NOT NULL,
+    mark_price BIGINT NOT NULL,
+    timestamp_epoch BIGINT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_funding_user ON funding_payments(user_id, timestamp_epoch DESC);
+
+CREATE TABLE IF NOT EXISTS deposits (
+    id BIGSERIAL PRIMARY KEY,
+    user_id VARCHAR(36) NOT NULL,
+    amount BIGINT NOT NULL,
+    currency VARCHAR(8) NOT NULL DEFAULT 'RLUSD',
+    xrpl_tx_hash VARCHAR(64) NOT NULL UNIQUE,
+    ledger_index BIGINT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_deposits_user ON deposits(user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS withdrawals (
+    id BIGSERIAL PRIMARY KEY,
+    user_id VARCHAR(36) NOT NULL,
+    amount BIGINT NOT NULL,
+    destination VARCHAR(36) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    xrpl_tx_hash VARCHAR(64),
+    message TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_withdrawals_user ON withdrawals(user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS liquidations (
+    id BIGSERIAL PRIMARY KEY,
+    position_id BIGINT NOT NULL,
+    user_id VARCHAR(36) NOT NULL,
+    close_price BIGINT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_liquidations_user ON liquidations(user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS price_candles (
+    id BIGSERIAL PRIMARY KEY,
+    market VARCHAR(32) NOT NULL DEFAULT 'XRP-RLUSD-PERP',
+    open_price BIGINT NOT NULL,
+    high_price BIGINT NOT NULL,
+    low_price BIGINT NOT NULL,
+    close_price BIGINT NOT NULL,
+    volume BIGINT NOT NULL DEFAULT 0,
+    timestamp_epoch BIGINT NOT NULL,
+    UNIQUE(market, timestamp_epoch)
+);
+CREATE INDEX IF NOT EXISTS idx_candles_market ON price_candles(market, timestamp_epoch DESC);
