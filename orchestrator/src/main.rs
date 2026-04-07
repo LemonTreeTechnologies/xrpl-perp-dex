@@ -14,6 +14,7 @@ mod perp_client;
 mod price_feed;
 mod trading;
 mod types;
+mod withdrawal;
 mod ws;
 mod xrpl_monitor;
 mod xrpl_signer;
@@ -205,6 +206,8 @@ async fn main() -> Result<()> {
         mark_price: mark_price.clone(),
         funding_rate: funding_rate.clone(),
         last_funding_time: last_funding_time.clone(),
+        xrpl_url: cli.xrpl_url.clone(),
+        escrow_address: escrow_address.clone(),
     });
 
     // Start API server

@@ -47,6 +47,9 @@ pub struct AppState {
     pub funding_rate: Arc<std::sync::atomic::AtomicI64>,
     /// Last funding application timestamp
     pub last_funding_time: Arc<std::sync::atomic::AtomicU64>,
+    /// XRPL config for withdrawals
+    pub xrpl_url: String,
+    pub escrow_address: String,
 }
 
 // ── Request/Response types ──────────────────────────────────────
@@ -146,6 +149,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/orders", delete(cancel_all_orders))
         .route("/v1/orders/{order_id}", delete(cancel_order))
         .route("/v1/account/balance", get(get_balance))
+        .route("/v1/withdraw", post(withdraw))
         .route("/v1/markets/{market}/orderbook", get(get_orderbook))
         .route("/v1/markets/{market}/ticker", get(get_ticker))
         .route("/v1/markets/{market}/trades", get(get_trades))
@@ -617,6 +621,36 @@ async fn get_funding(
         "next_funding_time": last_ts + 8 * 3600,
         "interval_hours": 8,
     })).into_response()
+}
+
+async fn withdraw(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<crate::withdrawal::WithdrawRequest>,
+) -> impl IntoResponse {
+    // TODO: escrow_account_id and session_key should come from config
+    let escrow_account_id = &state.escrow_address;
+    let session_key = "00".repeat(32); // placeholder — real value from enclave account
+
+    match crate::withdrawal::process_withdrawal(
+        &state.perp,
+        &state.xrpl_url,
+        &state.escrow_address,
+        escrow_account_id,
+        &session_key,
+        &req,
+    )
+    .await
+    {
+        Ok(result) => {
+            let code = if result.status == "success" {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (code, Json(serde_json::to_value(result).unwrap())).into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response(),
+    }
 }
 
 async fn get_markets(
