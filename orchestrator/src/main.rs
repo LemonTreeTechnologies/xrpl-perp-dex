@@ -395,7 +395,15 @@ async fn main() -> Result<()> {
     });
 
     // Background orchestration loop
-    let mut last_ledger: u32 = 0;
+    // Persist last_ledger to avoid re-processing deposits on restart
+    let ledger_file = "/tmp/perp-9088/last_ledger.txt";
+    let mut last_ledger: u32 = std::fs::read_to_string(ledger_file)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    if last_ledger > 0 {
+        info!(last_ledger, "resumed from persisted ledger index");
+    }
     let mut current_price: f64 = 0.0;
 
     let mut last_price_update = Instant::now() - Duration::from_secs(cli.price_interval + 1);
@@ -453,7 +461,10 @@ async fn main() -> Result<()> {
                         error!(sender = %deposit.sender, "deposit credit failed: {}", e);
                     }
                 }
-                last_ledger = new_ledger;
+                if new_ledger > last_ledger {
+                    last_ledger = new_ledger;
+                    let _ = std::fs::write(ledger_file, last_ledger.to_string());
+                }
             }
             Err(e) => warn!("deposit scan failed: {}", e),
         }
@@ -466,7 +477,12 @@ async fn main() -> Result<()> {
 
         // Funding rate (every 8 hours)
         if last_funding_instant.elapsed() >= FUNDING_INTERVAL && current_price > 0.0 {
-            let rate = compute_funding_rate(current_price, current_price);
+            // Mark price = orderbook mid (or last trade), Index price = Binance
+            let mark = match app_state.engine.ticker().await {
+                (_, _, Some(mid)) => mid.to_f64(),
+                _ => current_price, // fallback to index if no orderbook
+            };
+            let rate = compute_funding_rate(mark, current_price);
             let fp8_rate = float_to_fp8_string(rate);
             match perp.apply_funding(&fp8_rate, now_ts).await {
                 Ok(_) => {

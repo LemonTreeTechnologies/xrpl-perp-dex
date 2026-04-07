@@ -110,8 +110,11 @@ impl Mul for FP8 {
 
 impl Div for FP8 {
     type Output = Self;
-    /// Divide two FP8 values (result is rounded).
+    /// Divide two FP8 values. Returns ZERO on division by zero (safe default).
     fn div(self, rhs: Self) -> Self {
+        if rhs.0 == 0 {
+            return FP8::ZERO;
+        }
         FP8(((self.0 as i128 * FP8_SCALE as i128) / rhs.0 as i128) as i64)
     }
 }

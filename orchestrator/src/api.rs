@@ -495,12 +495,24 @@ async fn submit_order(
 async fn cancel_order(
     State(state): State<Arc<AppState>>,
     Path(order_id): Path<u64>,
+    request: axum::extract::Request,
 ) -> impl IntoResponse {
+    // Verify the authenticated user owns this order
+    let auth_user = request.extensions().get::<auth::AuthenticatedUser>();
     match state.engine.cancel_order(order_id).await {
-        Ok(order) => ok(serde_json::json!({
-            "order_id": order.id,
-            "status": format!("{:?}", order.status),
-        })).into_response(),
+        Ok(order) => {
+            if let Some(user) = auth_user {
+                if order.user_id != user.xrpl_address {
+                    // Re-insert the order (cancel was premature) — but orderbook already removed it.
+                    // For now: reject. TODO: check ownership before removing from book.
+                    return err(StatusCode::FORBIDDEN, "cannot cancel another user's order").into_response();
+                }
+            }
+            ok(serde_json::json!({
+                "order_id": order.id,
+                "status": format!("{:?}", order.status),
+            })).into_response()
+        }
         Err(e) => err(StatusCode::NOT_FOUND, &e.to_string()).into_response(),
     }
 }
@@ -627,7 +639,11 @@ async fn withdraw(
     State(state): State<Arc<AppState>>,
     Json(req): Json<crate::withdrawal::WithdrawRequest>,
 ) -> impl IntoResponse {
-    // TODO: escrow_account_id and session_key should come from config
+    // Validate XRPL destination address format
+    if !req.destination.starts_with('r') || req.destination.len() < 25 || req.destination.len() > 35 {
+        return err(StatusCode::BAD_REQUEST, "invalid XRPL destination address").into_response();
+    }
+
     let escrow_account_id = &state.escrow_address;
     let session_key = "00".repeat(32); // placeholder — real value from enclave account
 

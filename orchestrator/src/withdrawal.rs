@@ -184,7 +184,7 @@ async fn submit_xrpl_payment(
                 "Amount": {
                     "currency": "USD",
                     "issuer": escrow_address,
-                    "value": amount.trim_end_matches('0').trim_end_matches('.')
+                    "value": amount
                 },
                 "Fee": "36"
             }

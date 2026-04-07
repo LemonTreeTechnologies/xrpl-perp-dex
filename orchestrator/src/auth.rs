@@ -159,7 +159,7 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
     let uri_string = request.uri().to_string();
 
     // For requests with body, we need to read it for signature verification
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
     let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -214,7 +214,8 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
                 }
             }
 
-            // Reconstruct request with body
+            // Inject authenticated user into request extensions
+            parts.extensions.insert(user);
             let request = Request::from_parts(parts, Body::from(body_bytes));
             next.run(request).await
         }
