@@ -48,11 +48,13 @@ The Orchestrator handles auth, orderbook matching, and proxies state queries to 
 | DELETE | `/v1/orders?user_id=rXXX` | Cancel all user's orders |
 | DELETE | `/v1/orders/{order_id}` | Cancel specific order |
 | GET | `/v1/account/balance?user_id=rXXX` | Balance, positions, unrealized PnL |
+| POST | `/v1/withdraw` | Withdraw RLUSD to XRPL address (margin check + SGX signing) |
 
 ### Market data (no auth)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| GET | `/v1/markets` | List available markets (name, mark price, fees, leverage) |
 | GET | `/v1/markets/{market}/orderbook?levels=20` | Order book depth (bids/asks) |
 | GET | `/v1/markets/{market}/ticker` | Best bid/ask/mid price |
 | GET | `/v1/markets/{market}/trades` | Last 100 trades |

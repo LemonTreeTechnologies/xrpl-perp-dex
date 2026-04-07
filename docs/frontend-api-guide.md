@@ -1,8 +1,8 @@
 # Frontend Developer API Guide
 
-**Base URL:** `http://YOUR_SERVER:3000`
+**Base URL:** `https://api-perp.ph18.io` (production) or `http://localhost:3000` (dev)
 **Market:** `XRP-RLUSD-PERP`
-**OpenAPI Spec:** `http://YOUR_SERVER:3000/v1/openapi.json`
+**OpenAPI Spec:** `https://api-perp.ph18.io/v1/openapi.json`
 
 ---
 
@@ -69,31 +69,37 @@ All trading endpoints (orders, balance, cancel) require XRPL signature authentic
 | `X-XRPL-Address` | Your XRPL r-address | `rBy1xSMqCesQ11Nh23KoddAfa5vBNHEK7` |
 | `X-XRPL-PublicKey` | Compressed secp256k1 public key (hex, 66 chars) | `03c768238bf134...` |
 | `X-XRPL-Signature` | DER-encoded ECDSA signature (hex) | `3045022100a461...` |
+| `X-XRPL-Timestamp` | Unix epoch seconds (**mandatory**, max 30s drift) | `1712500000` |
 
 ### Signing algorithm (step by step)
 
 **For POST/DELETE (with body):**
 
 ```
-1. body_bytes = UTF-8 encode the JSON body string
-2. hash = SHA-256(body_bytes)                    → 32 bytes
-3. signature = ECDSA_sign(hash, private_key)     → DER encoded
-4. Normalize S to low-S (if S > curve_order/2, S = order - S)
-5. headers = {
+1. timestamp = current Unix epoch seconds (e.g., "1712500000")
+2. body_bytes = UTF-8 encode the JSON body string
+3. hash = SHA-256(body_bytes + timestamp_bytes)  → 32 bytes
+4. signature = ECDSA_sign(hash, private_key)     → DER encoded
+5. Normalize S to low-S (if S > curve_order/2, S = order - S)
+6. headers = {
      "X-XRPL-Address": your r-address,
      "X-XRPL-PublicKey": compressed pubkey hex,
-     "X-XRPL-Signature": DER signature hex
+     "X-XRPL-Signature": DER signature hex,
+     "X-XRPL-Timestamp": timestamp string
    }
 ```
 
 **For GET (no body):**
 
 ```
-1. path = full URI path with query string (e.g., "/v1/orders?user_id=rXXX")
-2. hash = SHA-256(path as UTF-8 bytes)
-3. signature = ECDSA_sign(hash, private_key)
-4. Same headers
+1. timestamp = current Unix epoch seconds
+2. path = full URI path with query string (e.g., "/v1/orders?user_id=rXXX")
+3. hash = SHA-256(path_bytes + timestamp_bytes)
+4. signature = ECDSA_sign(hash, private_key)
+5. Same headers (including X-XRPL-Timestamp)
 ```
+
+**Important:** Timestamp must be within 30 seconds of server time. Requests with missing or expired timestamps are rejected.
 
 **Important:** The `user_id` field in the request body (or query parameter) MUST match the `X-XRPL-Address` header. The server rejects mismatches.
 
@@ -478,6 +484,92 @@ Auth: Not required
 ```
 
 Last 100 trades, most recent first.
+
+---
+
+### Funding Rate
+
+```
+GET /v1/markets/XRP-RLUSD-PERP/funding
+Auth: Not required
+```
+
+**Response:**
+```json
+{
+    "status": "success",
+    "funding_rate": "0.00010000",
+    "mark_price": "1.31000000",
+    "next_funding_time": 1712528800,
+    "interval_hours": 8
+}
+```
+
+---
+
+### List Markets
+
+```
+GET /v1/markets
+Auth: Not required
+```
+
+**Response:**
+```json
+{
+    "status": "success",
+    "markets": [{
+        "market": "XRP-RLUSD-PERP",
+        "base": "XRP",
+        "quote": "RLUSD",
+        "mark_price": "1.31000000",
+        "best_bid": "1.30500000",
+        "best_ask": "1.31500000",
+        "max_leverage": 20,
+        "maintenance_margin": "0.00500000",
+        "taker_fee": "0.00050000",
+        "funding_interval_hours": 8,
+        "status": "active"
+    }]
+}
+```
+
+---
+
+### Withdraw
+
+```
+POST /v1/withdraw
+Auth: Required
+```
+
+**Request:**
+```json
+{
+    "user_id": "rBy1xSMqCesQ11Nh23KoddAfa5vBNHEK7",
+    "amount": "100.00000000",
+    "destination": "rMyXRPLAddress..."
+}
+```
+
+**Response (success):**
+```json
+{
+    "status": "success",
+    "amount": "100.00000000",
+    "destination": "rMyXRPLAddress...",
+    "xrpl_tx_hash": "ABC123...",
+    "message": "withdrawal submitted to XRPL"
+}
+```
+
+**Response (insufficient margin):**
+```json
+{
+    "status": "error",
+    "message": "enclave rejected withdrawal"
+}
+```
 
 ---
 
