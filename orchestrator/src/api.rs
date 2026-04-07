@@ -50,6 +50,8 @@ pub struct AppState {
     /// XRPL config for withdrawals
     pub xrpl_url: String,
     pub escrow_address: String,
+    /// PostgreSQL for history (optional — trading works without it)
+    pub db: Option<crate::db::Db>,
 }
 
 // ── Request/Response types ──────────────────────────────────────
@@ -167,6 +169,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/orders", delete(cancel_all_orders))
         .route("/v1/orders/{order_id}", delete(cancel_order))
         .route("/v1/account/balance", get(get_balance))
+        .route("/v1/account/trades", get(get_user_trade_history))
+        .route("/v1/account/funding", get(get_user_funding_history))
         .route("/v1/withdraw", post(withdraw))
         .route("/v1/markets/{market}/orderbook", get(get_orderbook))
         .route("/v1/markets/{market}/ticker", get(get_ticker))
@@ -490,6 +494,19 @@ async fn submit_order(
         .await
     {
         Ok(result) => {
+            // Record trades in PostgreSQL (fire-and-forget)
+            if let Some(db) = &state.db {
+                for t in &result.trades {
+                    db.insert_trade(
+                        t.trade_id, "XRP-RLUSD-PERP",
+                        t.maker_order_id, t.taker_order_id,
+                        &t.maker_user_id, &t.taker_user_id,
+                        t.price, t.size,
+                        &format!("{}", t.taker_side), t.timestamp_ms,
+                    ).await;
+                }
+            }
+
             // Broadcast trade events via WebSocket
             for t in &result.trades {
                 let _ = state.ws_tx.send(WsEvent::Trade {
@@ -633,6 +650,44 @@ async fn get_balance(
     match state.perp.get_balance(&user_id).await {
         Ok(val) => (StatusCode::OK, Json(val)).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response(),
+    }
+}
+
+async fn get_user_trade_history(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<UserIdQuery>,
+) -> impl IntoResponse {
+    let user_id = match params.user_id {
+        Some(id) => id,
+        None => {
+            return err(StatusCode::BAD_REQUEST, "user_id query param required").into_response()
+        }
+    };
+    match &state.db {
+        Some(db) => {
+            let trades = db.get_user_trades(&user_id, 100).await;
+            ok(serde_json::json!({ "trades": trades })).into_response()
+        }
+        None => err(StatusCode::SERVICE_UNAVAILABLE, "trade history not available (no database)").into_response(),
+    }
+}
+
+async fn get_user_funding_history(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<UserIdQuery>,
+) -> impl IntoResponse {
+    let user_id = match params.user_id {
+        Some(id) => id,
+        None => {
+            return err(StatusCode::BAD_REQUEST, "user_id query param required").into_response()
+        }
+    };
+    match &state.db {
+        Some(db) => {
+            let payments = db.get_user_funding(&user_id, 100).await;
+            ok(serde_json::json!({ "payments": payments })).into_response()
+        }
+        None => err(StatusCode::SERVICE_UNAVAILABLE, "funding history not available (no database)").into_response(),
     }
 }
 

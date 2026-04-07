@@ -7,6 +7,7 @@
 mod api;
 mod auth;
 mod commitment;
+mod db;
 mod election;
 mod orderbook;
 mod p2p;
@@ -83,6 +84,10 @@ struct Cli {
     /// Operator priority for sequencer election (0=highest, 2=lowest)
     #[arg(long, default_value_t = 0)]
     priority: u8,
+
+    /// PostgreSQL connection URL (optional — history disabled if not set)
+    #[arg(long)]
+    database_url: Option<String>,
 }
 
 // ── Funding rate ────────────────────────────────────────────────
@@ -104,6 +109,7 @@ async fn run_liquidation_scan(
     perp: &PerpClient,
     current_price: f64,
     ws_tx: &tokio::sync::broadcast::Sender<WsEvent>,
+    db: &Option<db::Db>,
 ) {
     let result = match perp.check_liquidations().await {
         Ok(r) => r,
@@ -139,6 +145,9 @@ async fn run_liquidation_scan(
                         user_id: user.to_string(),
                         price: float_to_fp8_string(current_price),
                     });
+                    if let Some(db) = db {
+                        db.insert_liquidation(pos_id, user, current_price).await;
+                    }
                 }
                 Err(e) => error!(position_id = pos_id, "liquidation failed: {}", e),
             }
@@ -200,6 +209,16 @@ async fn main() -> Result<()> {
     let funding_rate = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let last_funding_time = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (ws_tx, _) = tokio::sync::broadcast::channel::<WsEvent>(256);
+
+    // Connect to PostgreSQL (optional — history disabled if not configured)
+    let db = match &cli.database_url {
+        Some(url) => db::Db::connect(url).await,
+        None => {
+            info!("no --database-url, trade history disabled");
+            None
+        }
+    };
+
     let app_state = Arc::new(AppState {
         engine,
         perp: PerpClient::new(&cli.enclave_url)?,
@@ -210,6 +229,7 @@ async fn main() -> Result<()> {
         last_funding_time: last_funding_time.clone(),
         xrpl_url: cli.xrpl_url.clone(),
         escrow_address: escrow_address.clone(),
+        db: db.clone(),
     });
 
     // Start API server
@@ -515,6 +535,8 @@ async fn main() -> Result<()> {
                         .await
                     {
                         error!(sender = %deposit.sender, "deposit credit failed: {}", e);
+                    } else if let Some(db) = &app_state.db {
+                        db.insert_deposit(&deposit.sender, &deposit.amount, &deposit.tx_hash, new_ledger).await;
                     }
                 }
                 if new_ledger > last_ledger {
@@ -527,7 +549,7 @@ async fn main() -> Result<()> {
 
         // Liquidation scanning
         if last_liquidation_scan.elapsed() >= liquidation_interval && current_price > 0.0 {
-            run_liquidation_scan(&perp, current_price, &app_state.ws_tx).await;
+            run_liquidation_scan(&perp, current_price, &app_state.ws_tx, &app_state.db).await;
             last_liquidation_scan = Instant::now();
         }
 

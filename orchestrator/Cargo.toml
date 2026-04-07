@@ -46,5 +46,8 @@ xrpl-mithril-models = "0.4"
 xrpl-mithril-tx = "0.4"
 xrpl-mithril-types = "0.1"
 
+# PostgreSQL (trade history, funding payments)
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
+
 # Error handling
 anyhow = "1"
