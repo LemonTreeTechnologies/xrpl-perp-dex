@@ -87,8 +87,8 @@ pub struct Trade {
 // ── Price level: orders at the same price ───────────────────────
 
 #[derive(Debug, Clone)]
-struct PriceLevel {
-    orders: Vec<Order>,
+pub(crate) struct PriceLevel {
+    pub(crate) orders: Vec<Order>,
 }
 
 impl PriceLevel {
@@ -116,10 +116,10 @@ pub struct OrderBook {
     pub market: String,
 
     /// Bids: price → orders (BTreeMap = sorted ascending, we iterate from highest)
-    bids: BTreeMap<i64, PriceLevel>,
+    pub(crate) bids: BTreeMap<i64, PriceLevel>,
 
     /// Asks: price → orders (BTreeMap = sorted ascending, we iterate from lowest)
-    asks: BTreeMap<i64, PriceLevel>,
+    pub(crate) asks: BTreeMap<i64, PriceLevel>,
 
     next_order_id: u64,
     next_trade_id: u64,

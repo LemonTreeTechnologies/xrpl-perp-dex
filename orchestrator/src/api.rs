@@ -497,22 +497,20 @@ async fn cancel_order(
     Path(order_id): Path<u64>,
     request: axum::extract::Request,
 ) -> impl IntoResponse {
-    // Verify the authenticated user owns this order
-    let auth_user = request.extensions().get::<auth::AuthenticatedUser>();
-    match state.engine.cancel_order(order_id).await {
-        Ok(order) => {
-            if let Some(user) = auth_user {
-                if order.user_id != user.xrpl_address {
-                    // Re-insert the order (cancel was premature) — but orderbook already removed it.
-                    // For now: reject. TODO: check ownership before removing from book.
-                    return err(StatusCode::FORBIDDEN, "cannot cancel another user's order").into_response();
-                }
+    // Check ownership BEFORE removing from orderbook (fixes TOCTOU from audit)
+    if let Some(user) = request.extensions().get::<auth::AuthenticatedUser>() {
+        if let Some(owner) = state.engine.order_owner(order_id).await {
+            if owner != user.xrpl_address {
+                return err(StatusCode::FORBIDDEN, "cannot cancel another user's order").into_response();
             }
-            ok(serde_json::json!({
-                "order_id": order.id,
-                "status": format!("{:?}", order.status),
-            })).into_response()
         }
+    }
+
+    match state.engine.cancel_order(order_id).await {
+        Ok(order) => ok(serde_json::json!({
+            "order_id": order.id,
+            "status": format!("{:?}", order.status),
+        })).into_response(),
         Err(e) => err(StatusCode::NOT_FOUND, &e.to_string()).into_response(),
     }
 }

@@ -51,13 +51,14 @@ pub fn verify_request(
         .and_then(|v| v.to_str().ok())
         .ok_or("missing X-XRPL-Signature header")?;
 
-    // Replay protection: optional timestamp header (required in production)
+    // Replay protection: timestamp header REQUIRED
     let timestamp_str = headers
         .get("x-xrpl-timestamp")
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .ok_or("missing X-XRPL-Timestamp header (required for replay protection)")?;
 
-    if let Some(ts_str) = timestamp_str {
-        let ts: u64 = ts_str.parse().map_err(|_| "invalid X-XRPL-Timestamp")?;
+    {
+        let ts: u64 = timestamp_str.parse().map_err(|_| "invalid X-XRPL-Timestamp")?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -110,24 +111,16 @@ pub fn verify_request(
         ));
     }
 
-    // Compute hash of body (or URI for GET)
-    // If timestamp header present, it's included in the hash to prevent replay
-    let hash = if let Some(ts) = timestamp_str {
+    // Compute hash of body (or URI for GET) + timestamp (always included)
+    let hash = {
         let mut hasher = Sha256::new();
         if body_bytes.is_empty() {
             hasher.update(uri_path.as_bytes());
         } else {
             hasher.update(body_bytes);
         }
-        hasher.update(ts.as_bytes());
+        hasher.update(timestamp_str.as_bytes());
         hasher.finalize()
-    } else {
-        // Legacy mode (no timestamp) — still accepted for backwards compatibility
-        if body_bytes.is_empty() {
-            Sha256::digest(uri_path.as_bytes())
-        } else {
-            Sha256::digest(body_bytes)
-        }
     };
 
     // Decode and verify signature
@@ -287,9 +280,21 @@ mod tests {
         (sk, vk, pubkey_hex, address)
     }
 
-    /// Helper: sign body and build auth headers.
+    fn current_ts() -> String {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string()
+    }
+
+    /// Helper: sign body + timestamp and build auth headers.
     fn sign_body(sk: &SigningKey, pubkey_hex: &str, address: &str, body: &[u8]) -> HeaderMap {
-        let hash = Sha256::digest(body);
+        let ts = current_ts();
+        let mut hasher = Sha256::new();
+        hasher.update(body);
+        hasher.update(ts.as_bytes());
+        let hash = hasher.finalize();
         let (sig, _): (Signature, _) = sk.sign_prehash(&hash).unwrap();
         let sig_der = sig.to_der();
 
@@ -297,10 +302,11 @@ mod tests {
         headers.insert("x-xrpl-address", address.parse().unwrap());
         headers.insert("x-xrpl-publickey", pubkey_hex.parse().unwrap());
         headers.insert("x-xrpl-signature", hex::encode(sig_der.as_bytes()).parse().unwrap());
+        headers.insert("x-xrpl-timestamp", ts.parse().unwrap());
         headers
     }
 
-    /// Helper: sign URI path (for GET requests).
+    /// Helper: sign URI path + timestamp (for GET requests).
     fn sign_uri(sk: &SigningKey, pubkey_hex: &str, address: &str, uri: &str) -> HeaderMap {
         sign_body(sk, pubkey_hex, address, uri.as_bytes())
     }
@@ -375,6 +381,7 @@ mod tests {
         headers.insert("x-xrpl-address", "rTest12345678901234567890".parse().unwrap());
         headers.insert("x-xrpl-publickey", "aabb".parse().unwrap()); // too short
         headers.insert("x-xrpl-signature", "deadbeef".parse().unwrap());
+        headers.insert("x-xrpl-timestamp", current_ts().parse().unwrap());
         let result = verify_request(&headers, b"body", "/");
         assert_eq!(result.unwrap_err(), "invalid public key length (expected 66 hex chars)");
     }
@@ -407,6 +414,7 @@ mod tests {
         headers.insert("x-xrpl-address", address.parse().unwrap());
         headers.insert("x-xrpl-publickey", pubkey_hex.parse().unwrap());
         headers.insert("x-xrpl-signature", "not_hex!!".parse().unwrap());
+        headers.insert("x-xrpl-timestamp", current_ts().parse().unwrap());
         let result = verify_request(&headers, b"body", "/");
         assert_eq!(result.unwrap_err(), "invalid signature hex");
     }
@@ -418,8 +426,24 @@ mod tests {
         headers.insert("x-xrpl-address", address.parse().unwrap());
         headers.insert("x-xrpl-publickey", pubkey_hex.parse().unwrap());
         headers.insert("x-xrpl-signature", "deadbeef".parse().unwrap());
+        headers.insert("x-xrpl-timestamp", current_ts().parse().unwrap());
         let result = verify_request(&headers, b"body", "/");
         assert_eq!(result.unwrap_err(), "invalid DER signature");
+    }
+
+    #[test]
+    fn missing_timestamp_rejected() {
+        let (sk, _, pubkey_hex, address) = test_keypair();
+        let body = b"test";
+        let hash = Sha256::digest(body);
+        let (sig, _): (Signature, _) = sk.sign_prehash(&hash).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-xrpl-address", address.parse().unwrap());
+        headers.insert("x-xrpl-publickey", pubkey_hex.parse().unwrap());
+        headers.insert("x-xrpl-signature", hex::encode(sig.to_der().as_bytes()).parse().unwrap());
+        // NO timestamp header
+        let result = verify_request(&headers, body, "/");
+        assert!(result.unwrap_err().contains("X-XRPL-Timestamp"));
     }
 
     #[test]

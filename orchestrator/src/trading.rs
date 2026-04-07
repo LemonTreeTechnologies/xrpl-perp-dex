@@ -254,6 +254,23 @@ impl TradingEngine {
         })
     }
 
+    /// Look up order owner without modifying the book.
+    pub async fn order_owner(&self, order_id: u64) -> Option<String> {
+        let book = self.book.lock().await;
+        // Search bids and asks for the order
+        for level in book.bids.values() {
+            for o in &level.orders {
+                if o.id == order_id { return Some(o.user_id.clone()); }
+            }
+        }
+        for level in book.asks.values() {
+            for o in &level.orders {
+                if o.id == order_id { return Some(o.user_id.clone()); }
+            }
+        }
+        None
+    }
+
     /// Cancel an order.
     pub async fn cancel_order(&self, order_id: u64) -> Result<Order> {
         let mut book = self.book.lock().await;
