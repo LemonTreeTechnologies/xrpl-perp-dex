@@ -30,6 +30,7 @@ import argparse
 import hashlib
 import json
 import sys
+import time
 
 from ecdsa import SECP256k1, SigningKey
 from ecdsa.util import sigencode_der, sigdecode_der
@@ -100,30 +101,40 @@ class XRPLAuth:
     def sign_body(self, body: str) -> dict:
         """
         Sign a request body (for POST/DELETE).
-        Returns dict with auth headers.
+        Returns dict with auth headers including X-XRPL-Timestamp.
         """
         body_bytes = body.encode('utf-8') if isinstance(body, str) else body
-        hash_bytes = hashlib.sha256(body_bytes).digest()
+        ts = str(int(time.time()))
+        h = hashlib.sha256()
+        h.update(body_bytes)
+        h.update(ts.encode())
+        hash_bytes = h.digest()
         signature = self._sign_hash(hash_bytes)
 
         return {
             "X-XRPL-Address": self._address,
             "X-XRPL-PublicKey": self.public_key,
             "X-XRPL-Signature": signature.hex(),
+            "X-XRPL-Timestamp": ts,
         }
 
     def sign_path(self, path: str) -> dict:
         """
         Sign a URI path (for GET requests without body).
-        Returns dict with auth headers.
+        Returns dict with auth headers including X-XRPL-Timestamp.
         """
-        hash_bytes = hashlib.sha256(path.encode('utf-8')).digest()
+        ts = str(int(time.time()))
+        h = hashlib.sha256()
+        h.update(path.encode('utf-8'))
+        h.update(ts.encode())
+        hash_bytes = h.digest()
         signature = self._sign_hash(hash_bytes)
 
         return {
             "X-XRPL-Address": self._address,
             "X-XRPL-PublicKey": self.public_key,
             "X-XRPL-Signature": signature.hex(),
+            "X-XRPL-Timestamp": ts,
         }
 
     def make_request(self, method: str, url: str, body: str = None) -> dict:
