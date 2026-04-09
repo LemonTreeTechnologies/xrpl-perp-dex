@@ -13,7 +13,12 @@ CREATE TABLE IF NOT EXISTS trades (
     size BIGINT NOT NULL,
     taker_side VARCHAR(8) NOT NULL,
     timestamp_ms BIGINT NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    -- (trade_id, market) is the idempotency key for passive replication
+    -- across operators: validators replay the same batches from the
+    -- sequencer and insert the same rows, the UNIQUE constraint lets
+    -- ON CONFLICT DO NOTHING make duplicates a no-op.
+    UNIQUE (trade_id, market)
 );
 CREATE INDEX IF NOT EXISTS idx_trades_maker ON trades(maker_user_id, timestamp_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_taker ON trades(taker_user_id, timestamp_ms DESC);
@@ -60,7 +65,12 @@ CREATE TABLE IF NOT EXISTS liquidations (
     position_id BIGINT NOT NULL,
     user_id VARCHAR(36) NOT NULL,
     close_price BIGINT NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    -- Each position can only be liquidated once. All operators run the
+    -- liquidation scan independently against their local enclave, so
+    -- without this UNIQUE constraint every operator would insert the
+    -- same liquidation row on its own PG, producing duplicates.
+    UNIQUE (position_id)
 );
 CREATE INDEX IF NOT EXISTS idx_liquidations_user ON liquidations(user_id, created_at DESC);
 

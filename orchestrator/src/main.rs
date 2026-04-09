@@ -351,6 +351,7 @@ async fn main() -> Result<()> {
     // Validator: replay received batches from sequencer via P2P
     let is_seq_validator = is_sequencer.clone();
     let validator_perp = PerpClient::new(&cli.enclave_url)?;
+    let validator_db = app_state.db.clone();
     let _validator_handle = tokio::spawn(async move {
         let mut last_seq: u64 = 0;
             let mut known_leader: Option<String> = None;
@@ -398,6 +399,10 @@ async fn main() -> Result<()> {
             last_seq = batch.seq_num;
 
             // Replay each fill: open positions in local enclave
+            // Batch-level timestamp is in seconds; trade rows want
+            // milliseconds. This loses sub-second ordering between fills
+            // in the same batch but is sufficient for historical display.
+            let batch_timestamp_ms = batch.timestamp.saturating_mul(1000);
             for order in &batch.orders {
                 for fill in &order.fills {
                     // Determine maker/taker sides
@@ -442,6 +447,39 @@ async fn main() -> Result<()> {
                             "maker replay failed: {}",
                             e
                         );
+                    }
+
+                    // Passive replication: every validator writes the same
+                    // trade row its local sequencer would have written. The
+                    // ON CONFLICT (trade_id, market) DO NOTHING clause in
+                    // insert_trade makes this safe even when the batch
+                    // loops back to its originating sequencer after a role
+                    // change. See docs/vault-design-followup.md § B3.1.
+                    if let Some(db) = &validator_db {
+                        let (price_ok, size_ok) = (
+                            fill.price.parse::<crate::types::FP8>(),
+                            fill.size.parse::<crate::types::FP8>(),
+                        );
+                        if let (Ok(price), Ok(size)) = (price_ok, size_ok) {
+                            db.insert_trade(
+                                fill.trade_id,
+                                "XRP-RLUSD-PERP",
+                                fill.maker_order_id,
+                                fill.taker_order_id,
+                                &fill.maker_user_id,
+                                &order.user_id,
+                                price,
+                                size,
+                                &fill.taker_side,
+                                batch_timestamp_ms,
+                            )
+                            .await;
+                        } else {
+                            warn!(
+                                trade_id = fill.trade_id,
+                                "validator pg replay: failed to parse fill price/size"
+                            );
+                        }
                     }
                 }
             }

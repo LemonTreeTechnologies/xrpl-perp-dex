@@ -32,6 +32,12 @@ impl Db {
     }
 
     /// Record a trade.
+    ///
+    /// Idempotent on `(trade_id, market)` via `ON CONFLICT DO NOTHING` so
+    /// that both the sequencer (which inserts from `submit_order`) and any
+    /// validator (which inserts from the P2P batch replay loop) can write
+    /// the same row without producing duplicates. Required for passive
+    /// replication across operators — see `docs/vault-design-followup.md`.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_trade(
         &self,
@@ -49,7 +55,8 @@ impl Db {
         let r = sqlx::query(
             "INSERT INTO trades (trade_id, market, maker_order_id, taker_order_id, \
              maker_user_id, taker_user_id, price, size, taker_side, timestamp_ms) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+             ON CONFLICT (trade_id, market) DO NOTHING",
         )
         .bind(trade_id as i64)
         .bind(market)
@@ -125,10 +132,16 @@ impl Db {
     }
 
     /// Record a liquidation.
+    ///
+    /// Idempotent on `position_id` via `ON CONFLICT DO NOTHING`. All operators
+    /// run the liquidation scan independently against their local enclave
+    /// state, so every operator would otherwise insert the same liquidation
+    /// row once the position falls below maintenance margin.
     pub async fn insert_liquidation(&self, position_id: u64, user_id: &str, close_price: f64) {
         let price_raw = FP8::from_f64(close_price).raw();
         let r = sqlx::query(
-            "INSERT INTO liquidations (position_id, user_id, close_price) VALUES ($1, $2, $3)",
+            "INSERT INTO liquidations (position_id, user_id, close_price) \
+             VALUES ($1, $2, $3) ON CONFLICT (position_id) DO NOTHING",
         )
         .bind(position_id as i64)
         .bind(user_id)
