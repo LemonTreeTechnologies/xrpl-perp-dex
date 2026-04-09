@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -118,6 +118,11 @@ impl ElectionState {
 
     async fn send_heartbeat(&mut self) {
         self.heartbeat_seq += 1;
+        debug!(
+            seq = self.heartbeat_seq,
+            priority = self.config.our_priority,
+            "sending heartbeat as sequencer"
+        );
         let msg = ElectionMessage::Heartbeat {
             peer_id: self.config.our_peer_id.clone(),
             priority: self.config.our_priority,
@@ -131,11 +136,17 @@ impl ElectionState {
             ElectionMessage::Heartbeat {
                 ref peer_id,
                 priority,
-                ..
+                seq_num,
             } => {
                 if peer_id == &self.config.our_peer_id {
                     return; // ignore own heartbeats
                 }
+                debug!(
+                    from = %peer_id,
+                    priority,
+                    seq_num,
+                    "received heartbeat"
+                );
 
                 // If we're in startup grace period, any heartbeat from
                 // a leader means we should stay validator
@@ -220,14 +231,21 @@ impl ElectionState {
             return;
         }
 
-        if self.role == Role::Validator
-            && self.last_heartbeat.elapsed() > self.config.heartbeat_timeout
-        {
-            warn!(
-                elapsed = ?self.last_heartbeat.elapsed(),
-                "leader heartbeat timeout — attempting takeover"
+        if self.role == Role::Validator {
+            let elapsed = self.last_heartbeat.elapsed();
+            debug!(
+                ?elapsed,
+                leader = ?self.leader,
+                timeout = ?self.config.heartbeat_timeout,
+                "validator heartbeat tick"
             );
-            self.promote();
+            if elapsed > self.config.heartbeat_timeout {
+                warn!(
+                    ?elapsed,
+                    "leader heartbeat timeout — attempting takeover"
+                );
+                self.promote();
+            }
         }
     }
 

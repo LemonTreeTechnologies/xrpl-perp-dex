@@ -81,6 +81,12 @@ struct Cli {
     #[arg(long)]
     p2p_peers: Option<String>,
 
+    /// Persistent libp2p identity key path. Auto-generated on first run so
+    /// the operator's peer_id is stable across restarts (required for any
+    /// allowlist or forensic correlation).
+    #[arg(long, default_value = "p2p_identity.key")]
+    p2p_key_path: PathBuf,
+
     /// Operator priority for sequencer election (0=highest, 2=lowest)
     #[arg(long, default_value_t = 0)]
     priority: u8,
@@ -251,7 +257,9 @@ async fn main() -> Result<()> {
     let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<p2p::OrderBatch>(100);
     let (election_inbound_tx, election_inbound_rx) =
         tokio::sync::mpsc::channel::<election::ElectionMessage>(100);
-    let mut p2p_node = p2p::P2PNode::new(&cli.p2p_listen, batch_tx, election_inbound_tx)
+    let p2p_keypair = p2p::load_or_create_identity(&cli.p2p_key_path)
+        .context("failed to load or create libp2p identity")?;
+    let mut p2p_node = p2p::P2PNode::new(&cli.p2p_listen, p2p_keypair, batch_tx, election_inbound_tx)
         .await
         .context("failed to start P2P node")?;
 

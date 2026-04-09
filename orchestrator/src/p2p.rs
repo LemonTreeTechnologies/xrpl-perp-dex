@@ -10,10 +10,14 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use libp2p::{
     futures::StreamExt,
-    gossipsub, identify, noise,
+    gossipsub, identify,
+    identity::Keypair,
+    noise,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
@@ -22,6 +26,48 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::election::ElectionMessage;
+
+/// Load a libp2p Ed25519 identity from `path` if it exists, otherwise
+/// generate a fresh one and persist it.
+///
+/// File format: protobuf-encoded keypair as produced by
+/// `Keypair::to_protobuf_encoding()`. The file is created with mode 0600 to
+/// keep the private key out of casual reach.
+pub fn load_or_create_identity(path: &Path) -> Result<Keypair> {
+    if let Ok(bytes) = std::fs::read(path) {
+        match Keypair::from_protobuf_encoding(&bytes) {
+            Ok(kp) => {
+                info!(path = %path.display(), "loaded persistent libp2p identity");
+                return Ok(kp);
+            }
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "existing identity file is corrupt — generating a new one"
+                );
+            }
+        }
+    }
+    let kp = Keypair::generate_ed25519();
+    let encoded = kp
+        .to_protobuf_encoding()
+        .context("failed to encode generated keypair")?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).ok();
+        }
+    }
+    std::fs::write(path, &encoded)
+        .with_context(|| format!("failed to write identity to {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    info!(path = %path.display(), "generated new persistent libp2p identity");
+    Ok(kp)
+}
 
 // ── Message types ───────────────────────────────────────────────
 
@@ -97,15 +143,17 @@ pub struct P2PNode {
 }
 
 impl P2PNode {
-    /// Create a new P2P node.
+    /// Create a new P2P node with the given libp2p identity.
     ///
     /// `listen_addr`: e.g., "/ip4/0.0.0.0/tcp/4001"
+    /// `keypair`:     persistent identity (use [`load_or_create_identity`])
     pub async fn new(
         listen_addr: &str,
+        keypair: Keypair,
         batch_tx: mpsc::Sender<OrderBatch>,
         election_inbound_tx: mpsc::Sender<ElectionMessage>,
     ) -> Result<Self> {
-        let swarm = SwarmBuilder::with_new_identity()
+        let swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
                 tcp::Config::default(),
