@@ -29,9 +29,17 @@ curl http://YOUR_SERVER:3000/v1/markets/XRP-RLUSD-PERP/trades
 ### 1b. WebSocket (real-time feed, no authentication)
 
 ```javascript
-const ws = new WebSocket('ws://YOUR_SERVER:3000/ws');
+const ws = new WebSocket('wss://api-perp.ph18.io/ws');
 ws.onmessage = (e) => console.log(JSON.parse(e.data));
-// Events: trade, orderbook, ticker, liquidation
+
+// Default: trades, orderbook, ticker, liquidations (market-wide).
+// Subscribe to your own fills + order updates:
+ws.onopen = () => ws.send(JSON.stringify({
+    action: "subscribe",
+    channels: ["user:rYourXrplAddress..."]
+}));
+// Full event set: trade, orderbook, ticker, liquidation,
+//                 fill, order_update, position_changed
 ```
 
 ### 2. Authenticated endpoints (require XRPL signature)
@@ -623,12 +631,46 @@ wss://api-perp.ph18.io/ws   (production, via nginx)
 Auth: Not required
 ```
 
-Connect and receive JSON events pushed by the server. No subscription messages needed —
-all events are broadcast to all clients.
+Connect and receive JSON events pushed by the server. On connect, clients are
+automatically subscribed to the default public channels
+`{trades, orderbook, ticker, liquidations}`. Send control frames to adjust
+the subscription set, including `user:rXXX` channels for per-user events.
+
+### Channels
+
+| Channel | Events delivered |
+|---|---|
+| `trades` | `trade` |
+| `orderbook` | `orderbook` |
+| `ticker` | `ticker` |
+| `liquidations` | `liquidation` (market-wide) |
+| `user:rXXX` | `fill`, `order_update`, `position_changed`, plus any `liquidation` where `user_id == rXXX` |
+
+### Control frames (client → server)
+
+Send a JSON text frame at any time to change your subscription. Each control
+frame is acknowledged with a `subscribed` event listing the current channels.
+
+```json
+// Add channels (does not remove existing)
+{"action": "subscribe",   "channels": ["trades", "user:rAlice..."]}
+
+// Remove specific channels
+{"action": "unsubscribe", "channels": ["ticker"]}
+
+// Replace the entire subscription set
+{"action": "set",         "channels": ["ticker", "user:rBob..."]}
+
+// Keepalive (server replies with {"type":"pong"})
+{"action": "ping"}
+```
+
+Unknown channels are ignored silently. Invalid JSON produces an
+`{"type":"error","message":"..."}` frame but keeps the connection open.
 
 ### Event types
 
-**Trade** (on each fill):
+**Trade** — broadcast to `trades` channel on each matched order:
 ```json
 {
     "type": "trade",
@@ -642,7 +684,7 @@ all events are broadcast to all clients.
 }
 ```
 
-**Orderbook** (depth snapshot after trades):
+**Orderbook** — broadcast to `orderbook` after each trade (depth 20):
 ```json
 {
     "type": "orderbook",
@@ -651,7 +693,7 @@ all events are broadcast to all clients.
 }
 ```
 
-**Ticker** (every 5 seconds):
+**Ticker** — broadcast to `ticker` periodically from the price feed loop:
 ```json
 {
     "type": "ticker",
@@ -661,7 +703,7 @@ all events are broadcast to all clients.
 }
 ```
 
-**Liquidation** (when position is liquidated):
+**Liquidation** — broadcast to `liquidations` AND to the victim's `user:rXXX`:
 ```json
 {
     "type": "liquidation",
@@ -671,10 +713,69 @@ all events are broadcast to all clients.
 }
 ```
 
+**Fill** — per-user execution notification. Each trade emits TWO `fill` events
+(one for the taker, one for the maker) delivered only to matching `user:rXXX`
+channels:
+```json
+{
+    "type": "fill",
+    "user_id": "rBob...",
+    "order_id": 199,
+    "trade_id": 42,
+    "side": "long",
+    "role": "taker",
+    "price": "0.55000000",
+    "size": "100.00000000",
+    "timestamp_ms": 1743500000000
+}
+```
+
+**OrderUpdate** — order lifecycle. Delivered to the order owner's `user:rXXX`:
+```json
+{
+    "type": "order_update",
+    "user_id": "rBob...",
+    "order_id": 199,
+    "status": "partiallyfilled",   // "open" | "partiallyfilled" | "filled" | "cancelled"
+    "filled": "50.00000000",
+    "remaining": "50.00000000",
+    "client_order_id": "my-42"     // null if not set by client
+}
+```
+
+**PositionChanged** — nudge to re-fetch `GET /v1/account/positions`. The
+orchestrator does not mirror positions (they live in the SGX enclave), so
+this is the signal to ask the enclave for fresh state. Delivered to the
+owner's `user:rXXX`:
+```json
+{
+    "type": "position_changed",
+    "user_id": "rBob...",
+    "reason": "fill"               // "fill" | "liquidation"
+}
+```
+
+**subscribed** — ACK after a control frame (server → client):
+```json
+{
+    "type": "subscribed",
+    "channels": ["trades", "orderbook", "ticker", "liquidations", "user:rBob..."]
+}
+```
+
 ### JavaScript example
 
 ```javascript
 const ws = new WebSocket('wss://api-perp.ph18.io/ws');
+const myAddress = 'rBobXRPLAddress...';
+
+ws.onopen = () => {
+    // Add our own user channel on top of the default public set.
+    ws.send(JSON.stringify({
+        action: 'subscribe',
+        channels: [`user:${myAddress}`]
+    }));
+};
 
 ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
@@ -686,10 +787,23 @@ ws.onmessage = (event) => {
             console.log(`Orderbook: ${msg.bids.length} bids, ${msg.asks.length} asks`);
             break;
         case 'ticker':
-            console.log(`Price: ${msg.mark_price}`);
+            console.log(`Mark: ${msg.mark_price}`);
             break;
         case 'liquidation':
             console.log(`Liquidation: position ${msg.position_id}`);
+            break;
+        case 'fill':
+            console.log(`Fill ${msg.role}: ${msg.size} @ ${msg.price}`);
+            break;
+        case 'order_update':
+            console.log(`Order ${msg.order_id}: ${msg.status}`);
+            break;
+        case 'position_changed':
+            // Re-fetch /v1/account/positions here.
+            fetchPositions();
+            break;
+        case 'subscribed':
+            console.log(`Subscribed: ${msg.channels}`);
             break;
     }
 };
@@ -704,8 +818,14 @@ import asyncio
 import json
 import websockets
 
+MY_ADDR = "rBobXRPLAddress..."
+
 async def listen():
     async with websockets.connect("wss://api-perp.ph18.io/ws") as ws:
+        await ws.send(json.dumps({
+            "action": "subscribe",
+            "channels": [f"user:{MY_ADDR}"],
+        }))
         async for message in ws:
             event = json.loads(message)
             print(f"[{event['type']}] {event}")
@@ -715,10 +835,13 @@ asyncio.run(listen())
 
 ### Notes
 
-- No authentication — public market data feed
-- Slow clients skip events (no backpressure, no blocking)
-- Reconnect on disconnect — server doesn't store state per client
-- All prices/sizes in FP8 string format
+- No authentication on `/ws`. Data is either public (market data) or
+  references xrpl_addresses that are already public. If you want to gate
+  `user:rXXX` channels, add a signed X-XRPL-Signature check on upgrade.
+- Slow clients skip events (no backpressure, no blocking of producers).
+- Reconnect on disconnect — the server keeps no per-client state across
+  connections, so always re-send your `subscribe` on reconnect.
+- All prices/sizes in FP8 string format.
 
 ---
 

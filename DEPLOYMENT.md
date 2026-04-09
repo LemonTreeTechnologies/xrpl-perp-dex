@@ -59,7 +59,7 @@ The Orchestrator handles auth, orderbook matching, and proxies state queries to 
 | GET | `/v1/markets/{market}/ticker` | Best bid/ask/mid price |
 | GET | `/v1/markets/{market}/trades` | Last 100 trades |
 | GET | `/v1/markets/{market}/funding` | Current funding rate, mark price, next funding time |
-| WS | `/ws` | Real-time events: trade, orderbook, ticker, liquidation |
+| WS | `/ws` | Real-time events (public: trade, orderbook, ticker, liquidation; per-user: fill, order_update, position_changed). Channel subscriptions via JSON control frames — see `docs/frontend-api-guide.md` |
 
 ### System (no auth)
 

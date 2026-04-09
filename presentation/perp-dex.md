@@ -225,7 +225,8 @@ Enclave: check margin → open position → deduct fee → update state
 
 **4.** Enclave rejects if insufficient margin — **hardware-enforced**
 
-**5.** WebSocket broadcasts: trade, orderbook, ticker, liquidation
+**5.** WebSocket broadcasts: trade, orderbook, ticker, liquidation (public)
+ and fill, order_update, position_changed (per-user via `user:rXXX` channel)
 
 **6.** P2P replicates to validators (multi-operator mode)
 

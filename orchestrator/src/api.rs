@@ -400,8 +400,9 @@ async fn openapi_spec() -> impl IntoResponse {
             },
             "/ws": {
                 "get": {
-                    "summary": "WebSocket — real-time market data",
-                    "description": "Upgrade to WebSocket. Receives JSON events: trade, orderbook, ticker, liquidation. No auth required."
+                    "summary": "WebSocket — real-time market data + per-user events",
+                    "description": "Upgrade to WebSocket. On connect, subscribed by default to public channels {trades, orderbook, ticker, liquidations}. Send control frames to adjust: {\"action\":\"subscribe|unsubscribe|set\",\"channels\":[...]} where channels may include \"user:<xrpl_address>\" for per-user Fill, OrderUpdate, PositionChanged and Liquidation events. {\"action\":\"ping\"} returns {\"type\":\"pong\"}. Every control frame is ACKed with {\"type\":\"subscribed\",\"channels\":[...]}. Event types: trade, orderbook, ticker, liquidation, fill, order_update, position_changed. No auth required (all data is public). See docs/frontend-api-guide.md for full event schemas.",
+                    "responses": {"101": {"description": "Switching Protocols — WebSocket upgrade"}}
                 }
             }
         },
