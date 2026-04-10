@@ -396,6 +396,162 @@ For the vault API to work correctly in a multi-operator deployment:
 
 ---
 
+## Part C — Orderbook state and failover (added 2026-04-10)
+
+In response to 8Baller's question: "Is the orderbook stored in memory
+only for the orchestrator, or is it synced using the gossip protocol?"
+
+### C1. Short answer
+
+The orderbook itself is **in-memory only on the sequencer**. It is NOT
+stored in PostgreSQL and NOT directly synced as a data structure via
+gossipsub.
+
+However, the orderbook's **outputs** (fills / trades) ARE replicated
+across all operators via the P2P batch replay mechanism. So the
+distinction is:
+
+| State | Where it lives | Replicated? |
+|---|---|---|
+| **Resting limit orders** (open, unfilled) | Sequencer in-memory CLOB (`orchestrator/src/orderbook.rs`) | ❌ No — sequencer-only |
+| **Fills / trades** (matched) | PG on every operator | ✅ Yes — via gossipsub batch replay (B3.1) |
+| **Enclave state** (margins, positions, balances) | SGX sealed state on each operator's enclave | ✅ Yes — validators replay fills into their local enclave |
+| **Orderbook depth snapshot** (bid/ask levels) | Derived from sequencer's CLOB | ❌ No — only sequencer can answer `/v1/markets/{m}/orderbook` |
+
+### C2. How it works under the hood
+
+1. **Sequencer** receives `POST /v1/orders`, runs
+   `engine.submit_order()` on its local in-memory CLOB
+   (`orchestrator/src/trading.rs` → `orchestrator/src/orderbook.rs`),
+   produces fills, then publishes an `OrderBatch` via libp2p gossipsub.
+
+   The `OrderBatch` contains (see `orchestrator/src/p2p.rs`):
+   ```rust
+   pub struct OrderBatch {
+       pub seq_num: u64,          // monotonic batch counter
+       pub orders: Vec<OrderMessage>,  // each with fills
+       pub state_hash: String,    // SHA-256 of enclave state after batch
+       pub timestamp: u64,
+       pub sequencer_id: String,  // peer_id, for source verification
+   }
+   ```
+
+2. **Validators** receive the batch, replay each fill into their local
+   enclave via `validator_perp.open_position()`, write the same trade
+   rows to their local PG via `db.insert_trade()` (B3.1), and verify
+   the `state_hash` matches. They do NOT reconstruct the full
+   orderbook — they replay the **outcomes** (fills), not the **inputs**
+   (resting limit orders).
+
+3. **The orderbook depth** is a derived view of the sequencer's
+   in-memory CLOB. Only the sequencer can answer
+   `GET /v1/markets/{market}/orderbook`. If a validator receives this
+   request, it returns whatever stale state its local engine has (which
+   may be empty or partial). In a production multi-operator setup, the
+   API gateway (nginx) should route orderbook queries to the current
+   sequencer.
+
+### C3. What happens on sequencer failover
+
+Tested live on Azure (see `research/election-split-brain-test-report.md`):
+
+1. Old sequencer dies (or is network-partitioned).
+2. After 15 s heartbeat timeout, the highest-priority surviving
+   validator promotes itself to sequencer.
+3. The new sequencer starts with an **empty orderbook**. Any resting
+   limit orders from the old sequencer that had not yet been matched
+   are **lost**.
+4. Enclave state (margins, positions) is NOT lost — it was replicated
+   into every validator's local enclave via batch replay.
+5. PG trade history is NOT lost — it was replicated via B3.1.
+
+**Impact:** users whose limit orders were sitting on the old
+sequencer's book will see them disappear after failover. They would
+need to resubmit. Market orders are unaffected (they match or reject
+instantly and don't rest).
+
+### C4. Why this matters for the vault
+
+The vault's `POST /vaults/{vault_id}/create-order` endpoint (from
+`docs/vault-requirements.md`) would place orders through the same CLOB
+on the sequencer. If the sequencer dies mid-strategy:
+
+- Any **unfilled vault orders** resting on the book are lost.
+- Any **filled vault trades** are safe (replicated via B3.1).
+- The vault's **position state** is safe (replicated via enclave batch
+  replay).
+
+So the vault's capital is never at risk, but its trading strategy may
+lose in-flight orders on failover. For a market-making vault that
+constantly refreshes quotes, this is acceptable — it just resubmits
+after the new sequencer is elected (~16 s gap). For a vault with
+long-lived resting orders, the gap is more painful.
+
+### C5. Options to fix orderbook persistence
+
+Two paths, in order of implementation effort:
+
+#### Option C5.1 — Persist resting orders to PG (recommended for v1)
+
+When the sequencer inserts a new order into the CLOB (and when it
+cancels one), also write the order to a `resting_orders` table in PG.
+On failover, the new sequencer loads resting orders from PG and
+rebuilds the book before accepting new traffic.
+
+Pros:
+- ~50 lines of Rust + 1 new PG table
+- Simple, well-understood pattern (traditional exchange resilience)
+- B3.1 already replicates PG rows to all operators, so the new
+  sequencer's PG already has the data it needs
+
+Cons:
+- PG write on every order insert/cancel adds latency (~1 ms per
+  write, fire-and-forget)
+- Book rebuild on failover takes time proportional to number of
+  resting orders (likely <100 ms for a few thousand orders)
+- Doesn't help during the ~16 s election gap — orders submitted
+  during that window are rejected (sequencer flag is false)
+
+#### Option C5.2 — Include full book state in P2P batches
+
+Every `OrderBatch` also carries a snapshot of the current book (all
+resting orders). Validators maintain a shadow copy. On failover the
+new sequencer uses its shadow copy as the starting book.
+
+Pros:
+- Zero-loss failover — no resting orders lost
+- No PG dependency for book state
+- Validators can answer orderbook queries (depth becomes replicated)
+
+Cons:
+- Much larger batch payloads (potentially 10x if book has many
+  orders)
+- Gossipsub has message size limits (default 1 MB); large books
+  would need chunking or a separate sync protocol
+- More complex — shadow book must be kept in sync perfectly
+
+#### Recommendation
+
+**Ship C5.1 first** (PG-backed resting orders). It's cheap, reliable,
+and covers the vault's needs. Reserve C5.2 for when we have evidence
+that the 16 s election gap + book rebuild latency is actually hurting
+users (unlikely before $10M+ daily volume).
+
+### C6. Immediate implications for vault development
+
+None of this blocks vault development. The vault's orders are submitted
+through the same `/v1/orders` path as retail, and the CLOB matching
+is deterministic. The only risk is order loss on failover, which is an
+operational concern (mitigated by C5.1) rather than a correctness
+concern.
+
+However, the vault's strategy loop (whatever decides when to
+`create-order`) should be resilient to the sequencer rejecting orders
+during the election gap. A simple retry-with-backoff after seeing a
+`503 Sequencer Unavailable` response is sufficient.
+
+---
+
 ## Summary for 8Baller
 
 If you'd rather skip to the punchline:
@@ -407,11 +563,17 @@ If you'd rather skip to the punchline:
 2. **"Signs with session key"** phrasing in A1 is the one thing
    worth fixing in the spec itself — other readers may take it to
    mean single-signer withdrawal which isn't what we do.
-3. **DB sync**: not done today, but cheap to fix (option B3.1,
-   ~30 lines of Rust). Before you ship the vault code, please ping
-   us to land that first, or we'll have to build the vault on top of
-   an inconsistent foundation.
-4. **Nothing here is urgent.** The grant application, hackathon pitch,
+3. **DB sync**: ✅ **DONE** (commit `a688d00`). Validator replay loop
+   now writes trade rows to local PG with `ON CONFLICT DO NOTHING`.
+   Verified live on 3-node Azure cluster: trade_id=1 present on all
+   3 PGs within 5 seconds of submission. Safe to build vault on top.
+4. **Orderbook** is in-memory on the sequencer only. Fills/trades
+   replicate, resting orders do not. On failover, unfilled orders are
+   lost. Fix path: persist resting orders to PG (C5.1, ~50 lines)
+   before vault ships, so the vault's strategy loop doesn't lose
+   in-flight quotes on sequencer death. Capital is never at risk
+   regardless (enclave state replicates via batch replay).
+5. **Nothing here is urgent.** The grant application, hackathon pitch,
    and failure mode tests don't depend on vault work. This is
    infrastructure for the post-grant roadmap.
 
