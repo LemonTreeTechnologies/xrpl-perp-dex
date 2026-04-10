@@ -154,6 +154,33 @@ impl Db {
         }
     }
 
+    // ── Funding events ────────────────────────────────────────────
+
+    /// Record a funding application event (aggregate — not per-position).
+    /// Per-position `funding_payments` rows require the enclave to return
+    /// individual payment amounts, which is a post-hackathon enhancement.
+    pub async fn insert_funding_event(
+        &self,
+        funding_rate: i64,
+        mark_price: i64,
+        index_price: i64,
+        timestamp_epoch: u64,
+    ) {
+        let r = sqlx::query(
+            "INSERT INTO funding_events (funding_rate, mark_price, index_price, timestamp_epoch) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (timestamp_epoch) DO NOTHING",
+        )
+        .bind(funding_rate)
+        .bind(mark_price)
+        .bind(index_price)
+        .bind(timestamp_epoch as i64)
+        .execute(&self.pool)
+        .await;
+        if let Err(e) = r {
+            error!("pg insert_funding_event failed: {}", e);
+        }
+    }
+
     // ── Resting orders (C5.1 orderbook persistence for failover) ──
 
     /// Upsert a resting order (insert or update filled amount).

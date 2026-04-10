@@ -625,10 +625,14 @@ async fn main() -> Result<()> {
             match perp.apply_funding(&fp8_rate, now_ts).await {
                 Ok(_) => {
                     info!(rate = %fp8_rate, "applied funding rate");
-                    app_state
-                        .funding_rate
-                        .store(crate::types::FP8::from_f64(rate).raw(), Ordering::Relaxed);
+                    let rate_raw = crate::types::FP8::from_f64(rate).raw();
+                    let mark_raw = app_state.mark_price.load(Ordering::Relaxed);
+                    let index_raw = crate::types::FP8::from_f64(current_price).raw();
+                    app_state.funding_rate.store(rate_raw, Ordering::Relaxed);
                     app_state.last_funding_time.store(now_ts, Ordering::Relaxed);
+                    if let Some(db) = &app_state.db {
+                        db.insert_funding_event(rate_raw, mark_raw, index_raw, now_ts).await;
+                    }
                 }
                 Err(e) => error!("funding application failed: {}", e),
             }

@@ -74,6 +74,20 @@ CREATE TABLE IF NOT EXISTS liquidations (
 );
 CREATE INDEX IF NOT EXISTS idx_liquidations_user ON liquidations(user_id, created_at DESC);
 
+-- Aggregate funding events. One row per funding application. Per-position
+-- breakdown requires enclave changes (post-hackathon) — see funding_payments
+-- table which is currently unpopulated.
+CREATE TABLE IF NOT EXISTS funding_events (
+    id BIGSERIAL PRIMARY KEY,
+    funding_rate BIGINT NOT NULL,
+    mark_price BIGINT NOT NULL,
+    index_price BIGINT NOT NULL,
+    timestamp_epoch BIGINT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (timestamp_epoch)
+);
+CREATE INDEX IF NOT EXISTS idx_funding_events_ts ON funding_events(timestamp_epoch DESC);
+
 -- Resting limit orders currently on the in-memory CLOB. Persisted so that
 -- a new sequencer can rebuild the book from PG on failover (C5.1).
 CREATE TABLE IF NOT EXISTS resting_orders (
