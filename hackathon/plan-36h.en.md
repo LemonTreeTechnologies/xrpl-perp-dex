@@ -9,22 +9,30 @@
 ## Positioning (what judges see)
 
 **Public narrative:** the first perpetual futures exchange that settles
-natively in RLUSD on XRPL mainnet. User funds are held in an XRPL
-`SignerListSet` 2-of-3 multisig between independent operators. No
-sidechain, no bridge, no custodial trust.
+natively in RLUSD on XRPL mainnet, powered by **Intel SGX Trusted
+Execution Environments**. User funds held in XRPL `SignerListSet` 2-of-3
+multisig between independent SGX operators. DCAP remote attestation
+proves the enclave runs authentic code. No sidechain, no bridge, no
+custodial trust.
 
-**What we DON'T reveal:** the secure computation backend (enclave
-technology, hardware specifics, DCAP attestation internals). On stage,
-it's a **working black box** — "our proprietary secure computation layer
-ensures that margin checks and signing happen in a tamper-proof
-environment; we'll publish the full architecture post-launch."
+**What we talk about freely:**
+- Intel SGX as the technology (it's a well-known standard)
+- DCAP attestation: "anyone can verify the enclave is real"
+- Architecture: User → Orchestrator → SGX Enclave → XRPL
+- MRENCLAVE hash, quote size, Azure DCsv3 as the platform
+- 2-of-3 multisig, margin enforcement in hardware
 
-If judges ask "how does the signing work?":
-> "Each operator runs a secure computation module that holds signing keys
-> in isolated memory. The module checks margin before signing any
-> withdrawal. Even if the operator's server is compromised, the signing
-> module refuses to sign an undercollateralized withdrawal. We use
-> industry-standard hardware security — details under NDA until mainnet."
+**What we DON'T share:**
+- The enclave source code (`xrpl-perp-dex-enclave` repo stays private)
+- Internal implementation details of the margin engine C/C++ code
+- Sealed state format, key derivation specifics
+
+If judges ask to see the enclave code:
+> "The orchestrator and all integration code is open source (BSL 1.1).
+> The enclave binary is published for attestation verification — anyone
+> can hash it and compare against the MRENCLAVE in a DCAP quote. The
+> source code for the enclave will be published post-mainnet audit.
+> Right now you can verify the binary, just not read the source."
 
 ---
 
@@ -68,13 +76,14 @@ Build a minimal but polished web UI at `perp.ph18.io`:
 - [ ] Submit limit/market orders via authenticated REST (sign with wallet)
 - [ ] Show user's open orders + positions (polling /v1/orders, /v1/account/balance)
 - [ ] Show real-time fills via WebSocket `user:rXXX` channel subscription
-- [ ] "About" section: "settlement on XRPL, 2-of-3 operator multisig, RLUSD native"
+- [ ] "Verify Enclave" button → calls `/v1/attestation/quote` → shows MRENCLAVE + quote size + "Intel SGX ✅"
+- [ ] "About" section: "Intel SGX enclave, XRPL settlement, 2-of-3 multisig, RLUSD native"
 
 **Stack suggestion:** React or Next.js, Tailwind CSS, lightweight. No
 backend — pure API client. WebSocket for live data. API is CORS-enabled.
 
 **Minimum viable for demo:** price display + submit order + see fills
-live. The "it's actually on XRPL" moment is the wow-factor.
+live. The "Verify Enclave" button is the wow-factor — proves hardware trust.
 
 **Track B — Live trading demo setup (Andrey, ~4h)**
 
@@ -90,11 +99,15 @@ live. The "it's actually on XRPL" moment is the wow-factor.
 
 **Track C — Pitch, materials, networking (Alex, ~6h)**
 
-- [ ] Build a "how it works" landing page at `perp.ph18.io/about`:
-  - Architecture diagram (User → API → Orchestrator → Secure Module → XRPL)
-  - "2-of-3 operator multisig protects your funds"
-  - "Operators run independent secure computation modules"
-  - "All deposits and withdrawals are on XRPL — verify yourself"
+- [ ] Build attestation verifier page `verify.ph18.io` (or `perp.ph18.io/verify`):
+  - "Fetch quote from live node" button → calls `/v1/attestation/quote`
+  - Parse and display: MRENCLAVE, quote size (4,734 bytes), "Intel SGX ✅"
+  - Compare MRENCLAVE against published enclave binary hash
+  - Note: verifier shows the quote is real but does NOT expose enclave source
+- [ ] Build "how it works" section on `perp.ph18.io/about`:
+  - Architecture diagram (User → API → Orchestrator → SGX Enclave → XRPL)
+  - "2-of-3 SGX operator multisig protects your funds"
+  - "DCAP remote attestation — anyone can verify the enclave"
   - Link to XRPL testnet explorer with escrow account
 - [ ] Refine 5-minute pitch for judges:
   - Problem (no DeFi derivatives on XRPL) → Solution (off-chain matching,
@@ -114,8 +127,9 @@ live. The "it's actually on XRPL" moment is the wow-factor.
   2. Connect wallet
   3. Submit limit order → visible in orderbook
   4. Crossing order from second wallet → fill on WebSocket
-  5. Show XRPL escrow on testnet explorer → "funds are here, on XRPL"
-  6. Withdraw via multisig → show tx hash on explorer
+  5. Click "Verify Enclave" → DCAP quote → MRENCLAVE → "Intel SGX verified"
+  6. Show XRPL escrow on testnet explorer → "funds are here, on XRPL"
+  7. Withdraw via multisig → show tx hash on explorer
 - [ ] If time: record 2-minute video walkthrough as backup
 
 ### Hours 18-24: Sleep + buffer
@@ -152,21 +166,33 @@ Be realistic — 6 hours of sleep. Don't skip it.
 ## What NOT to do during the hackathon
 
 1. **Don't rewrite the backend** — it works, 16/16 E2E passing
-2. **Don't touch the secure computation module** — rebuild cycle is long
+2. **Don't rebuild the SGX enclave** — rebuild + signing cycle is long
 3. **Don't add new trading features** (order types, markets) — scope creep
-4. **Don't reveal the computation layer internals** — "proprietary secure module, details at mainnet"
+4. **Don't share enclave source code** — binary is published, source is private until post-mainnet audit
 5. **Don't try mainnet launch** — testnet is safe for live demo
 
-## What to say if asked about the "secure module"
+## What to say (and not say)
+
+**Talk freely about:**
+- Intel SGX as a technology, DCAP attestation, MRENCLAVE
+- Architecture: orchestrator (Rust, open source) talks to SGX enclave
+- 2-of-3 multisig via XRPL SignerListSet
+- Azure DCsv3 as the hosting platform
+- DCAP quote verification flow
+
+**Don't share:**
+- Enclave C/C++ source code (repo is private, binary is published)
+- Internal margin engine implementation details
+- Sealed state format, key derivation specifics
 
 | Question | Answer |
 |---|---|
-| "What hardware do you use?" | "Industry-standard hardware security modules. Details under NDA until mainnet." |
-| "Is this an MPC?" | "No, it's a single secure computation boundary per operator, not a multi-party protocol. The multisig is XRPL-native SignerListSet." |
-| "Can the operator steal funds?" | "No. The signing module enforces margin checks in hardware. Even a compromised operator can't make the module sign an invalid withdrawal." |
-| "How do users verify?" | "Deposits and withdrawals are on XRPL — anyone can check the escrow account. We'll add a public verification flow at mainnet." |
-| "Is this audited?" | "52 findings in security audit, 50 fixed, 2 documented as by-design. Full audit report in the repo." |
-| "Open source?" | "BSL 1.1 license — converts to Apache 2.0 in 4 years. Code is public on GitHub today." |
+| "Can we see the enclave code?" | "The orchestrator is fully open source (BSL 1.1). The enclave binary is published for DCAP verification — you can hash it and compare MRENCLAVE. Source will be published post-mainnet audit." |
+| "Is this an MPC?" | "No — each operator runs its own SGX enclave. The multisig is XRPL-native SignerListSet, not a threshold signature." |
+| "Can the operator steal funds?" | "No. The enclave enforces margin checks in hardware-isolated memory. A compromised operator can't make the enclave sign an undercollateralized withdrawal." |
+| "How do users verify?" | "Two ways: DCAP attestation proves the enclave is real, and XRPL escrow account is publicly visible in any explorer." |
+| "Is this audited?" | "52 findings, 50 fixed, 2 by-design. Report in the repo." |
+| "Open source?" | "Orchestrator: BSL 1.1 → Apache 2.0 in 4 years, public on GitHub. Enclave binary: published. Enclave source: post-mainnet." |
 
 ---
 
@@ -198,8 +224,9 @@ custody, and an API you can hit right now."**
 ## Key numbers for the pitch
 
 - **$280M** — Drift Protocol loss from social engineering on human multisig (April 2026)
-- **2-of-3** — XRPL native SignerListSet multisig between independent operators
-- **16.5 sec** — sequencer failover time (live tested on 3-node cluster)
+- **4,734 bytes** — Intel-signed DCAP attestation quote from our SGX enclaves
+- **2-of-3** — XRPL native SignerListSet multisig between independent SGX operators
+- **16.5 sec** — sequencer failover time (live tested on 3-node Azure cluster)
 - **3 sec** — network partition reconvergence (live tested)
 - **12** — verified multisig transactions on XRPL testnet
 - **16/16** — E2E test pass rate

@@ -9,23 +9,27 @@
 ## Позиционирование (что видят судьи)
 
 **Публичный нарратив:** первая биржа бессрочных фьючерсов с нативным
-расчётом в RLUSD на XRPL mainnet. Средства пользователей хранятся в
-XRPL `SignerListSet` 2-of-3 multisig между независимыми операторами.
-Без sidechain, без моста, без кастодиального доверия.
+расчётом в RLUSD на XRPL mainnet, на базе **Intel SGX Trusted Execution
+Environments**. Средства пользователей хранятся в XRPL `SignerListSet`
+2-of-3 multisig между независимыми SGX операторами. DCAP remote
+attestation доказывает подлинность enclave. Без sidechain, без моста.
 
-**Что мы НЕ раскрываем:** secure computation backend (технология
-анклава, детали аппаратного обеспечения, DCAP attestation). На сцене
-это **работающий чёрный ящик** — "наш проприетарный модуль безопасных
-вычислений гарантирует что margin check и подпись происходят в
-tamper-proof среде; полную архитектуру опубликуем на mainnet launch."
+**Говорим свободно:**
+- Intel SGX как технология (известный стандарт)
+- DCAP attestation: "любой может проверить что enclave настоящий"
+- Архитектура: User → Orchestrator → SGX Enclave → XRPL
+- MRENCLAVE, quote size, Azure DCsv3
+- 2-of-3 multisig, margin enforcement в hardware
 
-Если судьи спросят "как работает подпись?":
-> "Каждый оператор запускает модуль безопасных вычислений который
-> хранит signing keys в изолированной памяти. Модуль проверяет margin
-> перед подписью любого withdrawal. Даже если сервер оператора
-> скомпрометирован, модуль отказывается подписать undercollateralized
-> withdrawal. Мы используем индустриальный стандарт hardware security —
-> детали под NDA до mainnet."
+**НЕ раскрываем:**
+- Исходный код enclave (`xrpl-perp-dex-enclave` репо private)
+- Внутренние детали margin engine C/C++ кода
+- Формат sealed state, key derivation специфика
+
+Если спросят исходный код enclave:
+> "Orchestrator полностью open source (BSL 1.1). Бинарник enclave
+> опубликован для DCAP верификации — можно захешировать и сравнить с
+> MRENCLAVE. Исходный код будет опубликован после mainnet аудита."
 
 ---
 
@@ -67,9 +71,10 @@ XRPL прямо сейчас".**
 - [ ] Отправка limit/market ордеров (подпись кошельком)
 - [ ] Открытые ордера + позиции
 - [ ] Real-time fills через WebSocket `user:rXXX`
-- [ ] Секция "About": "расчёт на XRPL, 2-of-3 multisig, RLUSD нативно"
+- [ ] Кнопка "Verify Enclave" → `/v1/attestation/quote` → MRENCLAVE + "Intel SGX ✅"
+- [ ] Секция "About": "Intel SGX enclave, XRPL settlement, 2-of-3 multisig, RLUSD"
 
-**Минимум для демо:** цена + submit order + live fills.
+**Минимум для демо:** цена + submit order + live fills. Кнопка "Verify Enclave" — wow-фактор.
 
 **Трек B — Live trading демо (Andrey, ~4ч)**
 
@@ -82,11 +87,15 @@ XRPL прямо сейчас".**
 
 **Трек C — Питч и материалы (Alex, ~6ч)**
 
+- [ ] Attestation verifier `perp.ph18.io/verify`:
+  - Кнопка "Fetch quote" → `/v1/attestation/quote` → MRENCLAVE + 4,734 bytes + "Intel SGX ✅"
+  - Сравнение с хешем опубликованного бинарника
+  - Не показывает исходный код — только верификацию бинарника
 - [ ] Landing page `perp.ph18.io/about`:
-  - Диаграмма (User → API → Orchestrator → Secure Module → XRPL)
-  - "2-of-3 multisig защищает ваши средства"
-  - "Все deposit/withdrawal на XRPL — проверяйте сами"
-  - Ссылка на testnet explorer с escrow
+  - Диаграмма (User → API → Orchestrator → SGX Enclave → XRPL)
+  - "2-of-3 SGX multisig защищает ваши средства"
+  - "DCAP attestation — любой может проверить enclave"
+  - Ссылка на XRPL testnet explorer с escrow
 - [ ] 5-минутный питч:
   - Проблема → Решение → Почему XRPL → Live демо → "проверьте на XRPL" → Призыв
   - Прогнать 2 раза
@@ -100,8 +109,9 @@ XRPL прямо сейчас".**
   1. UI → живые цены
   2. Кошелёк → limit order → стакан
   3. Crossing order → fill на WS
-  4. Explorer → "funds тут, на XRPL"
-  5. Withdraw multisig → tx hash на explorer
+  4. "Verify Enclave" → DCAP quote → MRENCLAVE → "Intel SGX ✅"
+  5. Explorer → "funds тут, на XRPL"
+  6. Withdraw multisig → tx hash на explorer
 - [ ] Backup видео если время
 
 ### Часы 18-24: Сон (не пропускать)
@@ -119,35 +129,41 @@ XRPL прямо сейчас".**
 
 ---
 
-## Что говорить если спросят про "secure module"
+## Что говорить (и что нет)
+
+**Говорим свободно:** Intel SGX, DCAP attestation, MRENCLAVE, Azure DCsv3, архитектура, 2-of-3 multisig.
+
+**Не раскрываем:** исходный код enclave (бинарник опубликован, исходники private до mainnet аудита).
 
 | Вопрос | Ответ |
 |---|---|
-| "Какое hardware?" | "Индустриальный стандарт HSM. Детали под NDA до mainnet." |
-| "Это MPC?" | "Нет. Один secure computation boundary на оператора. Multisig — нативный XRPL SignerListSet." |
-| "Оператор может украсть?" | "Нет. Модуль подписи проверяет margin в hardware. Даже скомпрометированный оператор не может заставить модуль подписать невалидный withdrawal." |
-| "Как проверить?" | "Deposit и withdrawal на XRPL — escrow account можно посмотреть в любом explorer. Публичная верификация на mainnet." |
+| "Можно посмотреть код enclave?" | "Orchestrator полностью open source. Enclave бинарник опубликован для DCAP верификации. Исходный код — после mainnet аудита." |
+| "Это MPC?" | "Нет. Каждый оператор — свой SGX enclave. Multisig — нативный XRPL SignerListSet." |
+| "Оператор может украсть?" | "Нет. Enclave проверяет margin в hardware-isolated memory. Скомпрометированный оператор не может заставить enclave подписать невалидный withdrawal." |
+| "Как проверить?" | "Два пути: DCAP attestation доказывает подлинность enclave, и XRPL escrow видно в любом explorer." |
 | "Аудит?" | "52 findings, 50 fixed, 2 by-design. Отчёт в репо." |
-| "Open source?" | "BSL 1.1 — конвертируется в Apache 2.0 через 4 года. Код на GitHub." |
+| "Open source?" | "Orchestrator: BSL 1.1 → Apache 2.0 через 4 года, на GitHub. Enclave бинарник: опубликован. Исходный код enclave: после mainnet." |
 
 ---
 
 ## Чего НЕ делать
 
 1. **Не трогать backend** — работает, 16/16 тестов
-2. **Не трогать secure module** — долгий rebuild
+2. **Не пересобирать SGX enclave** — долгий rebuild + signing
 3. **Не добавлять фичи** — scope creep
-4. **Не раскрывать детали computation layer** — "проприетарный модуль, детали на mainnet"
+4. **Не раскрывать исходный код enclave** — бинарник публичен, исходники после mainnet аудита
 5. **Не пытаться mainnet** — testnet безопаснее
 
 ---
 
 ## Ключевые цифры
 
-- **$280M** — потери Drift Protocol (social engineering, апрель 2026)
-- **2-of-3** — XRPL нативный SignerListSet multisig
-- **16.5 сек** — failover sequencer (live test)
+- **$280M** — потери Drift Protocol (social engineering на human multisig, апрель 2026)
+- **4,734 байт** — Intel-signed DCAP attestation quote наших SGX enclave
+- **2-of-3** — XRPL нативный SignerListSet multisig между SGX операторами
+- **16.5 сек** — failover sequencer (live test на 3-нодовом Azure кластере)
 - **3 сек** — reconvergence после network partition
 - **12** — верифицированных multisig tx на XRPL testnet
 - **16/16** — E2E test pass rate
+- **52** — findings в security audit (50 fixed, 2 by-design)
 - **$150K** — заявка на грант готова
