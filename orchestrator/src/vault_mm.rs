@@ -24,6 +24,18 @@ use crate::api::AppState;
 use crate::orderbook::OrderType;
 use crate::types::{FP8, Side};
 
+/// Vault strategy type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VaultStrategy {
+    /// Quote both sides symmetrically around mark price.
+    MarketMaking,
+    /// Quote both sides but bias toward reducing net delta.
+    /// If net long → heavier asks; if net short → heavier bids.
+    /// Target: keep |net_delta| below max_delta.
+    DeltaNeutral,
+}
+
 /// Configuration for the Market Making Vault.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VaultMmConfig {
@@ -45,6 +57,13 @@ pub struct VaultMmConfig {
     /// Max number of open order levels per side.
     #[serde(default = "default_levels")]
     pub levels: usize,
+    /// Strategy: market_making (default) or delta_neutral.
+    #[serde(default = "default_strategy")]
+    pub strategy: VaultStrategy,
+    /// Max acceptable net delta (in XRP, FP8). Beyond this the vault
+    /// quotes one-sided to reduce exposure. Only used for delta_neutral.
+    #[serde(default = "default_max_delta")]
+    pub max_delta: f64,
 }
 
 fn default_vault_user_id() -> String { "vault:mm".into() }
@@ -53,6 +72,8 @@ fn default_order_size() -> String { "100.00000000".into() }
 fn default_interval() -> u64 { 5 }
 fn default_initial_deposit() -> String { "10000.00000000".into() }
 fn default_levels() -> usize { 3 }
+fn default_strategy() -> VaultStrategy { VaultStrategy::MarketMaking }
+fn default_max_delta() -> f64 { 500.0 }
 
 impl Default for VaultMmConfig {
     fn default() -> Self {
@@ -63,6 +84,8 @@ impl Default for VaultMmConfig {
             interval_secs: default_interval(),
             initial_deposit: default_initial_deposit(),
             levels: default_levels(),
+            strategy: default_strategy(),
+            max_delta: default_max_delta(),
         }
     }
 }
@@ -149,10 +172,28 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
             Err(_) => fallback_size,
         };
 
+        // Delta Neutral: compute net position delta to decide quoting bias
+        let (quote_bids, quote_asks) = if config.strategy == VaultStrategy::DeltaNeutral {
+            let net_delta = compute_net_delta(&state.perp, &config.user_id).await;
+            if net_delta > config.max_delta {
+                // Too long → only sell (asks) to reduce
+                debug!(net_delta, max = config.max_delta, "vault DN: over max delta, asks only");
+                (false, true)
+            } else if net_delta < -config.max_delta {
+                // Too short → only buy (bids) to reduce
+                debug!(net_delta, max = config.max_delta, "vault DN: under -max delta, bids only");
+                (true, false)
+            } else {
+                (true, true)
+            }
+        } else {
+            (true, true) // MM: always quote both sides
+        };
+
         // Cancel all existing vault orders
         let cancelled = state.engine.cancel_all(&config.user_id).await;
         if !cancelled.is_empty() {
-            debug!(cancelled = cancelled.len(), "vault MM: cancelled stale orders");
+            debug!(cancelled = cancelled.len(), "vault: cancelled stale orders");
         }
 
         // Place levels on each side
@@ -165,49 +206,85 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
                 continue;
             }
 
-            // Place bid
-            if let Err(e) = state
-                .engine
-                .submit_order(
-                    config.user_id.clone(),
-                    Side::Long,
-                    OrderType::Limit,
-                    bid_price,
-                    order_size,
-                    1, // leverage
-                    crate::orderbook::TimeInForce::Gtc,
-                    false,
-                    Some(format!("vault-mm-bid-{}", level)),
-                )
-                .await
-            {
-                warn!(level, price = %bid_price, "vault MM bid failed: {}", e);
+            // Place bid (skipped if delta neutral says "asks only")
+            if quote_bids {
+                if let Err(e) = state
+                    .engine
+                    .submit_order(
+                        config.user_id.clone(),
+                        Side::Long,
+                        OrderType::Limit,
+                        bid_price,
+                        order_size,
+                        1, // leverage
+                        crate::orderbook::TimeInForce::Gtc,
+                        false,
+                        Some(format!("vault-bid-{}", level)),
+                    )
+                    .await
+                {
+                    warn!(level, price = %bid_price, "vault bid failed: {}", e);
+                }
             }
 
-            // Place ask
-            if let Err(e) = state
-                .engine
-                .submit_order(
-                    config.user_id.clone(),
-                    Side::Short,
-                    OrderType::Limit,
-                    ask_price,
-                    order_size,
-                    1,
-                    crate::orderbook::TimeInForce::Gtc,
-                    false,
-                    Some(format!("vault-mm-ask-{}", level)),
-                )
-                .await
-            {
-                warn!(level, price = %ask_price, "vault MM ask failed: {}", e);
+            // Place ask (skipped if delta neutral says "bids only")
+            if quote_asks {
+                if let Err(e) = state
+                    .engine
+                    .submit_order(
+                        config.user_id.clone(),
+                        Side::Short,
+                        OrderType::Limit,
+                        ask_price,
+                        order_size,
+                        1,
+                        crate::orderbook::TimeInForce::Gtc,
+                        false,
+                        Some(format!("vault-ask-{}", level)),
+                    )
+                    .await
+                {
+                    warn!(level, price = %ask_price, "vault ask failed: {}", e);
+                }
             }
         }
 
         debug!(
             mark = %mark,
             levels = config.levels,
-            "vault MM: placed fresh quotes"
+            quote_bids,
+            quote_asks,
+            "vault: placed fresh quotes"
         );
     }
+}
+
+/// Compute the vault's net delta (sum of long sizes - sum of short sizes).
+/// Returns 0.0 if the query fails or the vault has no positions.
+async fn compute_net_delta(
+    perp: &crate::perp_client::PerpClient,
+    user_id: &str,
+) -> f64 {
+    let bal = match perp.get_balance(user_id).await {
+        Ok(b) => b,
+        Err(_) => return 0.0,
+    };
+    let positions = match bal["data"]["positions"].as_array() {
+        Some(arr) => arr,
+        None => return 0.0,
+    };
+    let mut net: f64 = 0.0;
+    for pos in positions {
+        let size: f64 = pos["size"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let side = pos["side"].as_str().unwrap_or("");
+        match side {
+            "long" | "1" => net += size,
+            "short" | "2" => net -= size,
+            _ => {}
+        }
+    }
+    net
 }

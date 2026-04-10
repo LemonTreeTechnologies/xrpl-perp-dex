@@ -120,6 +120,10 @@ struct Cli {
     /// Vault MM number of price levels per side.
     #[arg(long, default_value_t = 3)]
     vault_mm_levels: usize,
+
+    /// Enable Delta Neutral vault (quotes both sides, biases to reduce net delta).
+    #[arg(long)]
+    vault_dn: bool,
 }
 
 // ── Funding rate ────────────────────────────────────────────────
@@ -604,6 +608,25 @@ async fn main() -> Result<()> {
             half_spread: cli.vault_mm_spread,
             order_size: cli.vault_mm_size.clone(),
             levels: cli.vault_mm_levels,
+            strategy: vault_mm::VaultStrategy::MarketMaking,
+            ..Default::default()
+        };
+        vault_mm::seed_vault_deposit(&perp, &vault_config).await;
+        let vault_state = app_state.clone();
+        tokio::spawn(async move {
+            vault_mm::run_vault_mm(vault_state, vault_config).await;
+        });
+    }
+
+    // Delta Neutral Vault (optional — enabled via --vault-dn)
+    if cli.vault_dn {
+        let vault_config = vault_mm::VaultMmConfig {
+            user_id: "vault:dn".into(),
+            half_spread: cli.vault_mm_spread,
+            order_size: cli.vault_mm_size.clone(),
+            levels: cli.vault_mm_levels,
+            strategy: vault_mm::VaultStrategy::DeltaNeutral,
+            max_delta: 500.0,
             ..Default::default()
         };
         vault_mm::seed_vault_deposit(&perp, &vault_config).await;
