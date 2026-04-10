@@ -99,12 +99,16 @@ pub async fn seed_vault_deposit(
 /// Run the market-making loop. Call via `tokio::spawn`.
 pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
     let mut interval = tokio::time::interval(Duration::from_secs(config.interval_secs));
-    let order_size: FP8 = config.order_size.parse().unwrap_or(FP8(100_00000000));
+    // Fallback order size if balance query fails
+    let fallback_size: FP8 = config.order_size.parse().unwrap_or(FP8(100_00000000));
+    // Max fraction of available margin to allocate across ALL levels per side
+    let size_pct: f64 = 0.01; // 1% of balance total, split across levels
 
     info!(
         user = %config.user_id,
         half_spread = config.half_spread,
-        order_size = %order_size,
+        size_pct = size_pct,
+        fallback_size = %fallback_size,
         interval = config.interval_secs,
         levels = config.levels,
         "vault MM started"
@@ -125,6 +129,25 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
         }
         let mark = FP8(mark_raw);
         let mark_f = mark.to_f64();
+
+        // Query vault's available margin from enclave to size orders as %
+        let order_size = match state.perp.get_balance(&config.user_id).await {
+            Ok(bal) => {
+                let avail_str = bal["data"]["available_margin"]
+                    .as_str()
+                    .unwrap_or("0");
+                let avail: f64 = avail_str.parse().unwrap_or(0.0);
+                if avail <= 0.0 {
+                    debug!(user = %config.user_id, "vault MM: no available margin");
+                    continue;
+                }
+                // 1% of available margin / number of levels = per-level size
+                let per_level = avail * size_pct / config.levels as f64;
+                let sized = FP8::from_f64(per_level);
+                if sized.raw() <= 0 { fallback_size } else { sized }
+            }
+            Err(_) => fallback_size,
+        };
 
         // Cancel all existing vault orders
         let cancelled = state.engine.cancel_all(&config.user_id).await;
