@@ -219,17 +219,6 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
             );
             let level_size = if level_size.raw() <= 0 { order_size } else { level_size };
 
-            info!(
-                user = %config.user_id,
-                level,
-                weight = level_weights[level],
-                base_size = %order_size,
-                level_size = %level_size,
-                bid = %bid_price,
-                ask = %ask_price,
-                "vault: placing level"
-            );
-
             // Place bid (skipped if delta neutral says "asks only")
             if quote_bids {
                 if let Err(e) = state
