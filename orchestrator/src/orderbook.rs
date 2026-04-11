@@ -114,7 +114,7 @@ impl PriceLevel {
 
 // ── Order Book ──────────────────────────────────────────────────
 
-/// CLOB for a single market (e.g., XRP-RLUSD-PERP).
+/// CLOB for a single market (e.g., XRP-USD-PERP).
 pub struct OrderBook {
     pub market: String,
 
@@ -561,7 +561,7 @@ mod tests {
     use super::*;
 
     fn book() -> OrderBook {
-        OrderBook::new("XRP-RLUSD-PERP")
+        OrderBook::new("XRP-USD-PERP")
     }
 
     #[test]

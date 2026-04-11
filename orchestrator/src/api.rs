@@ -296,7 +296,7 @@ async fn openapi_spec() -> impl IntoResponse {
         "openapi": "3.0.3",
         "info": {
             "title": "Perp DEX Trading API",
-            "description": "Perpetual futures DEX on XRPL with TEE (Intel SGX). Settlement in RLUSD.",
+            "description": "Perpetual futures DEX on XRPL with TEE (Intel SGX). Settlement in native XRP on XRPL mainnet.",
             "version": "0.1.0"
         },
         "servers": [
@@ -354,7 +354,7 @@ async fn openapi_spec() -> impl IntoResponse {
                 "get": {
                     "summary": "Order book depth",
                     "parameters": [
-                        {"name": "market", "in": "path", "required": true, "schema": {"type": "string"}, "example": "XRP-RLUSD-PERP"},
+                        {"name": "market", "in": "path", "required": true, "schema": {"type": "string"}, "example": "XRP-USD-PERP"},
                         {"name": "levels", "in": "query", "schema": {"type": "integer", "default": 20}}
                     ],
                     "responses": {"200": {"description": "Bids and asks arrays"}}
@@ -502,7 +502,7 @@ async fn submit_order(
             if let Some(db) = &state.db {
                 for t in &result.trades {
                     db.insert_trade(
-                        t.trade_id, "XRP-RLUSD-PERP",
+                        t.trade_id, "XRP-USD-PERP",
                         t.maker_order_id, t.taker_order_id,
                         &t.maker_user_id, &t.taker_user_id,
                         t.price, t.size,
@@ -954,9 +954,9 @@ async fn get_markets(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     ok(serde_json::json!({
         "markets": [{
-            "market": "XRP-RLUSD-PERP",
+            "market": "XRP-USD-PERP",
             "base": "XRP",
-            "quote": "RLUSD",
+            "quote": "USD",
             "mark_price": FP8(mark_raw).to_string(),
             "best_bid": bid.map(|p| p.to_string()),
             "best_ask": ask.map(|p| p.to_string()),

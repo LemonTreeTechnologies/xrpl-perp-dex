@@ -1,7 +1,7 @@
 # Frontend Developer API Guide
 
 **Base URL:** `https://api-perp.ph18.io` (production) or `http://localhost:3000` (dev)
-**Market:** `XRP-RLUSD-PERP`
+**Market:** `XRP-USD-PERP`
 **OpenAPI Spec:** `https://api-perp.ph18.io/v1/openapi.json`
 
 ---
@@ -106,13 +106,13 @@ curl -X POST http://YOUR_SERVER:3000/v1/attestation/quote \
   -d '{"user_data": "0xdeadbeef"}'
 
 # Order book
-curl http://YOUR_SERVER:3000/v1/markets/XRP-RLUSD-PERP/orderbook
+curl http://YOUR_SERVER:3000/v1/markets/XRP-USD-PERP/orderbook
 
 # Ticker (best bid/ask)
-curl http://YOUR_SERVER:3000/v1/markets/XRP-RLUSD-PERP/ticker
+curl http://YOUR_SERVER:3000/v1/markets/XRP-USD-PERP/ticker
 
 # Recent trades
-curl http://YOUR_SERVER:3000/v1/markets/XRP-RLUSD-PERP/trades
+curl http://YOUR_SERVER:3000/v1/markets/XRP-USD-PERP/trades
 ```
 
 ### 1b. WebSocket (real-time feed, no authentication)
@@ -543,7 +543,7 @@ Auth: Required (user_id must match)
 ### Order Book
 
 ```
-GET /v1/markets/XRP-RLUSD-PERP/orderbook?levels=20
+GET /v1/markets/XRP-USD-PERP/orderbook?levels=20
 Auth: Not required
 ```
 
@@ -569,7 +569,7 @@ Format: `[price, total_size_at_price]`, bids descending, asks ascending.
 ### Ticker
 
 ```
-GET /v1/markets/XRP-RLUSD-PERP/ticker
+GET /v1/markets/XRP-USD-PERP/ticker
 Auth: Not required
 ```
 
@@ -590,7 +590,7 @@ Values are `null` if no orders on that side.
 ### Recent Trades
 
 ```
-GET /v1/markets/XRP-RLUSD-PERP/trades
+GET /v1/markets/XRP-USD-PERP/trades
 Auth: Not required
 ```
 
@@ -617,7 +617,7 @@ Last 100 trades, most recent first.
 ### Funding Rate
 
 ```
-GET /v1/markets/XRP-RLUSD-PERP/funding
+GET /v1/markets/XRP-USD-PERP/funding
 Auth: Not required
 ```
 
@@ -646,9 +646,9 @@ Auth: Not required
 {
     "status": "success",
     "markets": [{
-        "market": "XRP-RLUSD-PERP",
+        "market": "XRP-USD-PERP",
         "base": "XRP",
-        "quote": "RLUSD",
+        "quote": "USD",
         "mark_price": "1.31000000",
         "best_bid": "1.30500000",
         "best_ask": "1.31500000",
@@ -1080,7 +1080,7 @@ python3 tools/xrpl_auth.py --secret $SECRET \
   '{"user_id":"X","side":"buy","type":"limit","price":"0.55","size":"100","leverage":5}'
 
 # Check orderbook (no auth needed)
-curl http://YOUR_SERVER:3000/v1/markets/XRP-RLUSD-PERP/orderbook
+curl http://YOUR_SERVER:3000/v1/markets/XRP-USD-PERP/orderbook
 
 # Get your orders
 python3 tools/xrpl_auth.py --secret $SECRET \

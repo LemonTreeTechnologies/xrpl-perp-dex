@@ -105,7 +105,7 @@ impl XrplMonitor {
                 continue;
             }
 
-            // Extract amount — RLUSD is an issued currency (object with "value")
+            // Extract amount — native XRP (drops) or issued currency (object with "value")
             let amount =
                 if meta.get("delivered_amount").is_some() && !meta["delivered_amount"].is_null() {
                     &meta["delivered_amount"]
@@ -113,7 +113,7 @@ impl XrplMonitor {
                     &tx["Amount"]
                 };
 
-            // Handle both issued currency (RLUSD) and native XRP (drops string)
+            // Handle both native XRP (drops string/number) and issued currency (object)
             let value = if let Some(obj) = amount.as_object() {
                 // Issued currency: {"value": "100.50", "currency": "...", "issuer": "..."}
                 match obj.get("value").and_then(|v| v.as_str()) {

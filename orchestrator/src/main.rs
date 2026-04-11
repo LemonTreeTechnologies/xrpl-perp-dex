@@ -71,7 +71,7 @@ struct Cli {
     api_listen: String,
 
     /// Market name
-    #[arg(long, default_value = "XRP-RLUSD-PERP")]
+    #[arg(long, default_value = "XRP-USD-PERP")]
     market: String,
 
     /// P2P listen address (libp2p multiaddr)
@@ -526,7 +526,7 @@ async fn main() -> Result<()> {
                         if let (Ok(price), Ok(size)) = (price_ok, size_ok) {
                             db.insert_trade(
                                 fill.trade_id,
-                                "XRP-RLUSD-PERP",
+                                "XRP-USD-PERP",
                                 fill.maker_order_id,
                                 fill.taker_order_id,
                                 &fill.maker_user_id,
