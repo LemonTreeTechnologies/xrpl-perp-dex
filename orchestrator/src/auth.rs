@@ -10,6 +10,10 @@
 //!
 //! For GET requests (no body): signs the full URI path + query string.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use axum::{
     body::Body,
     extract::Request,
@@ -21,12 +25,72 @@ use axum::{
 use k256::ecdsa::{signature::hazmat::PrehashVerifier, Signature, VerifyingKey};
 use ripemd::Ripemd160;
 use sha2::{Digest, Sha256, Sha512};
+use tokio::sync::RwLock;
 use tracing::warn;
+use uuid::Uuid;
 
 /// Authentication result: verified XRPL address.
 #[derive(Clone, Debug)]
 pub struct AuthenticatedUser {
     pub xrpl_address: String,
+}
+
+// ── Session token store ──────────────────────────────────────────
+
+const SESSION_TTL: Duration = Duration::from_secs(30 * 60); // 30 minutes
+
+struct Session {
+    address: String,
+    expires: Instant,
+}
+
+/// In-memory session store for Bearer token auth.
+pub struct SessionStore {
+    sessions: RwLock<HashMap<String, Session>>,
+}
+
+impl SessionStore {
+    pub fn new() -> Self {
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Create a new session, returning the token.
+    pub async fn create(&self, address: String) -> String {
+        let token = Uuid::new_v4().to_string();
+        let session = Session {
+            address,
+            expires: Instant::now() + SESSION_TTL,
+        };
+        let mut map = self.sessions.write().await;
+        // Lazy cleanup: remove expired sessions
+        map.retain(|_, s| s.expires > Instant::now());
+        map.insert(token.clone(), session);
+        token
+    }
+
+    /// Look up a session by token. Returns the address if valid.
+    pub async fn get(&self, token: &str) -> Option<String> {
+        let map = self.sessions.read().await;
+        match map.get(token) {
+            Some(s) if s.expires > Instant::now() => Some(s.address.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Global session store — initialized once, shared via Arc in AppState.
+pub static SESSION_STORE: std::sync::OnceLock<Arc<SessionStore>> = std::sync::OnceLock::new();
+
+pub fn init_session_store() -> Arc<SessionStore> {
+    let store = Arc::new(SessionStore::new());
+    let _ = SESSION_STORE.set(store.clone());
+    store
+}
+
+pub fn session_store() -> &'static Arc<SessionStore> {
+    SESSION_STORE.get_or_init(|| Arc::new(SessionStore::new()))
 }
 
 /// Extract and verify XRPL signature from request headers.
@@ -187,6 +251,7 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
     // Public endpoints — no auth required
     if uri == "/v1/openapi.json"
         || uri == "/v1/pool/status"
+        || uri == "/v1/auth/login"
         || uri.starts_with("/v1/attestation/")
         || uri.starts_with("/v1/perp/liquidations/")
         || (method == "GET" && (uri == "/v1/markets" || uri.starts_with("/v1/markets/")))
@@ -196,6 +261,78 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
 
     let headers = request.headers().clone();
     let uri_string = request.uri().to_string();
+
+    // Check for Bearer token first (session-based auth)
+    if let Some(auth_header) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        if let Some(token) = auth_header.strip_prefix("Bearer ") {
+            if let Some(address) = session_store().get(token).await {
+                let user = AuthenticatedUser {
+                    xrpl_address: address,
+                };
+
+                let (mut parts, body) = request.into_parts();
+                let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"status": "error", "message": "failed to read body"})),
+                        )
+                            .into_response();
+                    }
+                };
+
+                // Verify user_id matches token's address (same checks as signature auth)
+                if !body_bytes.is_empty() {
+                    if let Ok(body_json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                        if let Some(body_user_id) = body_json.get("user_id").and_then(|v| v.as_str()) {
+                            if body_user_id != user.xrpl_address {
+                                return (
+                                    StatusCode::FORBIDDEN,
+                                    Json(serde_json::json!({
+                                        "status": "error",
+                                        "message": format!(
+                                            "user_id '{}' does not match session address '{}'",
+                                            body_user_id, user.xrpl_address
+                                        )
+                                    })),
+                                )
+                                    .into_response();
+                            }
+                        }
+                    }
+                }
+                if method == "GET" {
+                    if let Some(query) = parts.uri.query() {
+                        for pair in query.split('&') {
+                            if let Some(val) = pair.strip_prefix("user_id=") {
+                                if val != user.xrpl_address {
+                                    return (
+                                        StatusCode::FORBIDDEN,
+                                        Json(serde_json::json!({
+                                            "status": "error",
+                                            "message": "user_id does not match session address"
+                                        })),
+                                    )
+                                        .into_response();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                parts.extensions.insert(user);
+                let request = Request::from_parts(parts, Body::from(body_bytes));
+                return next.run(request).await;
+            } else {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"status": "error", "message": "session expired or invalid token"})),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     // For requests with body, we need to read it for signature verification
     let (mut parts, body) = request.into_parts();

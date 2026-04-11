@@ -182,6 +182,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/openapi.json", get(openapi_spec))
         .route("/v1/attestation/quote", post(attestation_quote))
         .route("/v1/attestation/commitment", get(attestation_commitment))
+        .route("/v1/auth/login", post(auth_login))
         .layer(axum::middleware::from_fn(auth::auth_middleware))
         .route("/ws", get(ws::ws_handler))
         .layer(cors)
@@ -917,6 +918,33 @@ async fn withdraw(
             (code, Json(serde_json::to_value(result).unwrap())).into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response(),
+    }
+}
+
+/// POST /v1/auth/login — sign once, get a session token valid for 30 minutes.
+/// Requires the same 4 XRPL auth headers. Returns a Bearer token for subsequent requests.
+async fn auth_login(
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // The login endpoint is exempt from the middleware, so we verify manually here.
+    let body_bytes = b"";
+    let uri = "/v1/auth/login";
+    match auth::verify_request(&headers, body_bytes, uri) {
+        Ok(user) => {
+            let token = auth::session_store().create(user.xrpl_address.clone()).await;
+            (StatusCode::OK, Json(serde_json::json!({
+                "status": "success",
+                "token": token,
+                "expires_in": 1800,
+                "address": user.xrpl_address,
+            }))).into_response()
+        }
+        Err(msg) => {
+            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+                "status": "error",
+                "message": msg,
+            }))).into_response()
+        }
     }
 }
 
