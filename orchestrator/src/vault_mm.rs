@@ -197,8 +197,9 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
         }
 
         // Fixed pyramid sizes per level (split across both vaults: mm + dn)
-        // Target visible book: 38 / 76 / 152 — each vault places half
-        let fixed_sizes: [f64; 3] = [19.0, 38.0, 76.0];
+        // Target visible book: 3.8 / 7.6 / 15.2 — each vault places half
+        // Reduced 10x for mainnet safety (limits max position size)
+        let fixed_sizes: [f64; 3] = [1.9, 3.8, 7.6];
 
         // Place levels on each side
         for level in 0..config.levels {
