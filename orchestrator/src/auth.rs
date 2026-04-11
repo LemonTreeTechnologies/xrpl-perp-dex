@@ -20,7 +20,7 @@ use axum::{
 };
 use k256::ecdsa::{signature::hazmat::PrehashVerifier, Signature, VerifyingKey};
 use ripemd::Ripemd160;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use tracing::warn;
 
 /// Authentication result: verified XRPL address.
@@ -132,14 +132,27 @@ pub fn verify_request(
     let sig_bytes = hex::decode(sig_hex).map_err(|_| "invalid signature hex")?;
     let signature = Signature::from_der(&sig_bytes).map_err(|_| "invalid DER signature")?;
 
-    // Verify ECDSA signature over pre-hashed data (SHA-256 already computed)
-    if let Err(e) = verifying_key.verify_prehash(&hash, &signature) {
+    // Verify ECDSA signature over pre-hashed data.
+    // Mode 1 (default): client signs SHA-256(body+timestamp) directly (Python, Node.js, raw secp256k1).
+    // Mode 2 (XRPL wallets): Crossmark/GemWallet use ripple-keypairs which applies
+    //   SHA-512Half(message) before ECDSA. The client passes SHA-256(body+timestamp) as hex,
+    //   the wallet internally computes SHA512(hex_bytes)[0..32] and signs that.
+    let mode1_ok = verifying_key.verify_prehash(&hash, &signature).is_ok();
+    let mode2_ok = if !mode1_ok {
+        // SHA-512Half: SHA-512 of the raw hash bytes, take first 32 bytes
+        let sha512_full = Sha512::digest(&hash);
+        let sha512_half: [u8; 32] = sha512_full[..32].try_into().unwrap();
+        verifying_key.verify_prehash(&sha512_half, &signature).is_ok()
+    } else {
+        false
+    };
+
+    if !mode1_ok && !mode2_ok {
         tracing::debug!(
-            hash_hex = %hex::encode(hash),
+            hash_hex = %hex::encode(&hash),
             sig_hex = %sig_hex,
             pubkey_hex = %pubkey_hex,
-            err = %e,
-            "signature verification details"
+            "signature verification failed (tried both direct SHA-256 and XRPL SHA-512Half)"
         );
         return Err("signature verification failed".into());
     }
@@ -484,6 +497,75 @@ mod tests {
         let (_, _, pubkey_hex, address) = test_keypair();
         assert!(address.starts_with('r'));
         assert!(address.len() >= 25 && address.len() <= 35);
+    }
+
+    /// Helper: sign body with XRPL wallet style (SHA-512Half wrapping).
+    /// Mimics what Crossmark/GemWallet do: SHA512(SHA256(body+ts))[0..32] → ECDSA sign.
+    fn sign_body_xrpl_wallet(
+        sk: &SigningKey,
+        pubkey_hex: &str,
+        address: &str,
+        body: &[u8],
+    ) -> HeaderMap {
+        use sha2::Sha512;
+        let ts = current_ts();
+        let mut hasher = Sha256::new();
+        hasher.update(body);
+        hasher.update(ts.as_bytes());
+        let sha256_hash = hasher.finalize();
+        // XRPL wallet applies SHA-512Half on top
+        let sha512_full = Sha512::digest(&sha256_hash);
+        let sha512_half: [u8; 32] = sha512_full[..32].try_into().unwrap();
+        let (sig, _): (Signature, _) = sk.sign_prehash(&sha512_half).unwrap();
+        let sig_der = sig.to_der();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-xrpl-address", address.parse().unwrap());
+        headers.insert("x-xrpl-publickey", pubkey_hex.parse().unwrap());
+        headers.insert(
+            "x-xrpl-signature",
+            hex::encode(sig_der.as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-xrpl-timestamp", ts.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn xrpl_wallet_sha512half_signature_passes() {
+        let (sk, _, pubkey_hex, address) = test_keypair();
+        let body = b"{\"user_id\":\"test\",\"side\":\"buy\"}";
+        let headers = sign_body_xrpl_wallet(&sk, &pubkey_hex, &address, body);
+        let result = verify_request(&headers, body, "/v1/orders");
+        assert!(result.is_ok(), "SHA-512Half wallet signature should pass");
+        assert_eq!(result.unwrap().xrpl_address, address);
+    }
+
+    #[test]
+    fn xrpl_wallet_get_signature_passes() {
+        use sha2::Sha512;
+        let (sk, _, pubkey_hex, address) = test_keypair();
+        let uri = "/v1/orders?user_id=rTest123";
+        let ts = current_ts();
+        // GET: sign URI path with SHA-512Half wrapping
+        let mut hasher = Sha256::new();
+        hasher.update(uri.as_bytes());
+        hasher.update(ts.as_bytes());
+        let sha256_hash = hasher.finalize();
+        let sha512_full = Sha512::digest(&sha256_hash);
+        let sha512_half: [u8; 32] = sha512_full[..32].try_into().unwrap();
+        let (sig, _): (Signature, _) = sk.sign_prehash(&sha512_half).unwrap();
+        let sig_der = sig.to_der();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-xrpl-address", address.parse().unwrap());
+        headers.insert("x-xrpl-publickey", pubkey_hex.parse().unwrap());
+        headers.insert(
+            "x-xrpl-signature",
+            hex::encode(sig_der.as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-xrpl-timestamp", ts.parse().unwrap());
+        let result = verify_request(&headers, &[], uri);
+        assert!(result.is_ok(), "SHA-512Half GET signature should pass");
     }
 
     #[test]
