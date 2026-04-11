@@ -66,9 +66,9 @@ pub fn verify_request(
             .unwrap()
             .as_secs();
         let drift = now.abs_diff(ts);
-        if drift > 30 {
+        if drift > 60 {
             return Err(format!(
-                "request expired: timestamp drift {}s (max 30s)",
+                "request expired: timestamp drift {}s (max 60s)",
                 drift
             ));
         }
