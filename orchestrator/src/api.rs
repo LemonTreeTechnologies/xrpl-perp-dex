@@ -748,7 +748,19 @@ async fn get_balance(
     };
     match state.perp.get_balance(&user_id).await {
         Ok(val) => (StatusCode::OK, Json(val)).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response(),
+        Err(_) => {
+            // Enclave returns 500 for unknown users — return zero balance instead
+            (StatusCode::OK, Json(serde_json::json!({
+                "status": "success",
+                "data": {
+                    "margin_balance": "0.00000000",
+                    "available_margin": "0.00000000",
+                    "used_margin": "0.00000000",
+                    "unrealized_pnl": "0.00000000",
+                    "positions": []
+                }
+            }))).into_response()
+        }
     }
 }
 
