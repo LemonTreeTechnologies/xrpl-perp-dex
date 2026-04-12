@@ -172,8 +172,10 @@ impl OrderBook {
         }
     }
 
-    /// Submit a new order. Returns (order, fills).
+    /// Submit a new order. Returns (order, fills, stp_cancelled).
     /// Fills are produced immediately if the order crosses the book.
+    /// `stp_cancelled` lists any of the user's resting orders that were
+    /// cancelled by self-trade prevention to make way for this new order.
     #[allow(clippy::too_many_arguments)]
     pub fn submit_order(
         &mut self,
@@ -186,7 +188,7 @@ impl OrderBook {
         time_in_force: TimeInForce,
         reduce_only: bool,
         client_order_id: Option<String>,
-    ) -> Result<(Order, Vec<Trade>)> {
+    ) -> Result<(Order, Vec<Trade>, Vec<(Order, i64)>)> {
         if size.0 <= 0 {
             bail!("order size must be positive");
         }
@@ -224,48 +226,53 @@ impl OrderBook {
             let available = self.available_liquidity(&order);
             if available < size.0 {
                 order.status = OrderStatus::Cancelled;
-                return Ok((order, Vec::new()));
+                return Ok((order, Vec::new(), Vec::new()));
             }
         }
 
         // Match against resting orders
-        let trades = self.match_order(&mut order);
+        let (trades, stp_cancelled) = self.match_order(&mut order);
 
-        // Handle remaining quantity
-        match order_type {
-            OrderType::Market => {
-                // Market order: cancel unfilled remainder
-                if order.remaining().0 > 0 {
-                    order.status = if order.filled.0 > 0 {
-                        OrderStatus::PartiallyFilled
-                    } else {
-                        OrderStatus::Cancelled
-                    };
+        // If STP shrank the taker size to zero, the order is fully self-cancelled.
+        if order.size.0 == 0 {
+            order.status = OrderStatus::Cancelled;
+        } else {
+            // Handle remaining quantity
+            match order_type {
+                OrderType::Market => {
+                    // Market order: cancel unfilled remainder
+                    if order.remaining().0 > 0 {
+                        order.status = if order.filled.0 > 0 {
+                            OrderStatus::PartiallyFilled
+                        } else {
+                            OrderStatus::Cancelled
+                        };
+                    }
                 }
+                OrderType::Limit => match time_in_force {
+                    TimeInForce::Ioc => {
+                        // IOC: cancel unfilled remainder
+                        if order.remaining().0 > 0 && order.filled.0 > 0 {
+                            order.status = OrderStatus::PartiallyFilled;
+                        } else if order.filled.0 == 0 {
+                            order.status = OrderStatus::Cancelled;
+                        }
+                    }
+                    TimeInForce::Fok => {
+                        // Already pre-checked — if we get here, it was fully filled
+                    }
+                    TimeInForce::Gtc => {
+                        // GTC: rest unfilled on the book
+                        if order.remaining().0 > 0 && order.status == OrderStatus::Open {
+                            self.add_to_book(order.clone());
+                        }
+                    }
+                },
             }
-            OrderType::Limit => match time_in_force {
-                TimeInForce::Ioc => {
-                    // IOC: cancel unfilled remainder
-                    if order.remaining().0 > 0 && order.filled.0 > 0 {
-                        order.status = OrderStatus::PartiallyFilled;
-                    } else if order.filled.0 == 0 {
-                        order.status = OrderStatus::Cancelled;
-                    }
-                }
-                TimeInForce::Fok => {
-                    // Already pre-checked — if we get here, it was fully filled
-                }
-                TimeInForce::Gtc => {
-                    // GTC: rest unfilled on the book
-                    if order.remaining().0 > 0 && order.status == OrderStatus::Open {
-                        self.add_to_book(order.clone());
-                    }
-                }
-            },
-        }
 
-        if order.filled == order.size {
-            order.status = OrderStatus::Filled;
+            if order.filled == order.size {
+                order.status = OrderStatus::Filled;
+            }
         }
 
         if !trades.is_empty() {
@@ -278,7 +285,15 @@ impl OrderBook {
             );
         }
 
-        Ok((order, trades))
+        if !stp_cancelled.is_empty() {
+            info!(
+                order_id,
+                cancelled = stp_cancelled.len(),
+                "self-trade prevention: cancelled crossing resting orders"
+            );
+        }
+
+        Ok((order, trades, stp_cancelled))
     }
 
     /// Cancel an order by ID. Returns the cancelled order or error.
@@ -445,8 +460,14 @@ impl OrderBook {
             .add(order);
     }
 
-    fn match_order(&mut self, taker: &mut Order) -> Vec<Trade> {
+    fn match_order(&mut self, taker: &mut Order) -> (Vec<Trade>, Vec<(Order, i64)>) {
         let mut trades = Vec::new();
+        // Self-trade prevention (Decrement-and-Cancel mode):
+        // When a new taker order would cross with a resting maker from the
+        // same user, both sides are decremented by the cross amount and NO
+        // trade is generated. The (Order, i64) tuple is the maker order's
+        // current state and the amount that was cancelled.
+        let mut stp_cancelled: Vec<(Order, i64)> = Vec::new();
 
         let opposite_book = match taker.side {
             Side::Long => &mut self.asks,  // buyer matches against asks
@@ -488,9 +509,32 @@ impl OrderBook {
                 while i < level.orders.len() && taker.remaining().0 > 0 {
                     let maker = &mut level.orders[i];
 
-                    // Don't self-trade
+                    // Self-trade prevention: Decrement-and-Cancel
+                    // Cancel ONLY the crossed amount on both sides (no trade).
                     if maker.user_id == taker.user_id {
-                        i += 1;
+                        let cross = std::cmp::min(taker.remaining().0, maker.remaining().0);
+                        if cross <= 0 {
+                            i += 1;
+                            continue;
+                        }
+                        // Shrink taker by cross amount (size, not filled — no trade happened)
+                        taker.size = FP8(taker.size.0 - cross);
+                        // Bump maker.filled to "consume" cross from the resting order
+                        maker.filled = FP8(maker.filled.0 + cross);
+
+                        // Snapshot maker for caller notification
+                        let snapshot = maker.clone();
+                        if maker.filled.0 >= maker.size.0 {
+                            // Fully consumed — remove from book, mark Cancelled
+                            let mut removed = level.orders.remove(i);
+                            removed.status = OrderStatus::Cancelled;
+                            stp_cancelled.push((removed, cross));
+                            // do not increment i (vec shifted)
+                        } else {
+                            // Partially consumed — stays in book with reduced remaining
+                            stp_cancelled.push((snapshot, cross));
+                            i += 1;
+                        }
                         continue;
                     }
 
@@ -550,7 +594,7 @@ impl OrderBook {
         // Clean empty levels
         opposite_book.retain(|_, l| !l.is_empty());
 
-        trades
+        (trades, stp_cancelled)
     }
 }
 
@@ -567,7 +611,7 @@ mod tests {
     #[test]
     fn limit_order_rests_on_book() {
         let mut ob = book();
-        let (order, trades) = ob
+        let (order, trades, _stp) = ob
             .submit_order(
                 "alice".into(),
                 Side::Long,
@@ -606,7 +650,7 @@ mod tests {
         .unwrap();
 
         // Bob places sell at 0.55 → should match
-        let (order, trades) = ob
+        let (order, trades, _stp) = ob
             .submit_order(
                 "bob".into(),
                 Side::Short,
@@ -672,7 +716,7 @@ mod tests {
         .unwrap();
 
         // Market buy 250 → should fill 100@0.55 + 100@0.56 + 50@0.57
-        let (order, trades) = ob
+        let (order, trades, _stp) = ob
             .submit_order(
                 "buyer".into(),
                 Side::Long,
@@ -698,7 +742,7 @@ mod tests {
     #[test]
     fn cancel_order() {
         let mut ob = book();
-        let (order, _) = ob
+        let (order, _, _) = ob
             .submit_order(
                 "alice".into(),
                 Side::Long,
@@ -715,6 +759,100 @@ mod tests {
         let cancelled = ob.cancel_order(order.id).unwrap();
         assert_eq!(cancelled.status, OrderStatus::Cancelled);
         assert_eq!(ob.best_bid(), None);
+    }
+
+    #[test]
+    fn stp_decrement_and_cancel_partial() {
+        // Tom's case: 1 buy resting + 1 sell crossing for 1.0 — both fully cancelled.
+        let mut ob = book();
+
+        ob.submit_order(
+            "alice".into(),
+            Side::Long,
+            OrderType::Limit,
+            FP8::from_f64(1.3898),
+            FP8::from_f64(1.0),
+            5,
+            TimeInForce::Gtc,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let (taker, trades, stp) = ob
+            .submit_order(
+                "alice".into(),
+                Side::Short,
+                OrderType::Limit,
+                FP8::from_f64(1.3890),
+                FP8::from_f64(1.0),
+                5,
+                TimeInForce::Gtc,
+                false,
+                None,
+            )
+            .unwrap();
+
+        // No actual trade should happen (STP)
+        assert!(trades.is_empty());
+        // Taker fully self-cancelled — should be marked Cancelled, size shrunk to 0
+        assert_eq!(taker.size, FP8::ZERO);
+        assert_eq!(taker.status, OrderStatus::Cancelled);
+        // Maker fully consumed by STP — book should be empty
+        assert_eq!(stp.len(), 1);
+        assert_eq!(stp[0].0.status, OrderStatus::Cancelled);
+        assert_eq!(stp[0].1, FP8::from_f64(1.0).0);
+        assert_eq!(ob.best_bid(), None);
+    }
+
+    #[test]
+    fn stp_decrement_and_cancel_only_crossed_amount() {
+        // Tom's example: "1 buy and sell which crosses for 0.5 — buy should update to 0.5"
+        let mut ob = book();
+
+        // Alice rests 1.0 buy at 1.50
+        ob.submit_order(
+            "alice".into(),
+            Side::Long,
+            OrderType::Limit,
+            FP8::from_f64(1.50),
+            FP8::from_f64(1.0),
+            5,
+            TimeInForce::Gtc,
+            false,
+            None,
+        )
+        .unwrap();
+
+        // Alice sends 0.5 sell at 1.50 — STP decrements her buy to 0.5
+        let (taker, trades, stp) = ob
+            .submit_order(
+                "alice".into(),
+                Side::Short,
+                OrderType::Limit,
+                FP8::from_f64(1.50),
+                FP8::from_f64(0.5),
+                5,
+                TimeInForce::Gtc,
+                false,
+                None,
+            )
+            .unwrap();
+
+        // No trades produced
+        assert!(trades.is_empty());
+        // Taker (the 0.5 sell) is fully self-cancelled
+        assert_eq!(taker.size, FP8::ZERO);
+        assert_eq!(taker.status, OrderStatus::Cancelled);
+        // Maker survives with 0.5 remaining
+        assert_eq!(stp.len(), 1);
+        assert_eq!(stp[0].1, FP8::from_f64(0.5).0); // cancelled portion
+        assert_eq!(ob.best_bid(), Some(FP8::from_f64(1.50)));
+
+        // Confirm Alice's resting buy is now 0.5
+        let alices = ob.user_orders("alice");
+        assert_eq!(alices.len(), 1);
+        assert_eq!(alices[0].remaining(), FP8::from_f64(0.5));
     }
 
     #[test]
@@ -735,7 +873,7 @@ mod tests {
         .unwrap();
 
         // Alice sells — should NOT match her own buy
-        let (_, trades) = ob
+        let (_, trades, _stp) = ob
             .submit_order(
                 "alice".into(),
                 Side::Short,
@@ -829,7 +967,7 @@ mod tests {
         .unwrap();
 
         // Sell 50 — should match Alice (first in queue)
-        let (_, trades) = ob
+        let (_, trades, _stp) = ob
             .submit_order(
                 "charlie".into(),
                 Side::Short,
@@ -864,7 +1002,7 @@ mod tests {
         .unwrap();
 
         // Partial fill: sell 30
-        let (_, trades) = ob
+        let (_, trades, _stp) = ob
             .submit_order(
                 "bob".into(),
                 Side::Short,
@@ -1003,7 +1141,7 @@ mod tests {
         )
         .unwrap();
 
-        let (_, trades1) = ob
+        let (_, trades1, _stp) = ob
             .submit_order(
                 "charlie".into(),
                 Side::Short,
@@ -1028,7 +1166,7 @@ mod tests {
     #[test]
     fn order_ids_increment() {
         let mut ob = book();
-        let (o1, _) = ob
+        let (o1, _, _) = ob
             .submit_order(
                 "a".into(),
                 Side::Long,
@@ -1041,7 +1179,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let (o2, _) = ob
+        let (o2, _, _) = ob
             .submit_order(
                 "b".into(),
                 Side::Short,

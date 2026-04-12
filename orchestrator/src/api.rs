@@ -170,6 +170,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/orders", get(get_orders))
         .route("/v1/orders", delete(cancel_all_orders))
         .route("/v1/orders/{order_id}", delete(cancel_order))
+        .route("/v1/positions/close/{position_id}", post(close_position))
         .route("/v1/account/balance", get(get_balance))
         .route("/v1/account/trades", get(get_user_trade_history))
         .route("/v1/account/funding", get(get_user_funding_history))
@@ -341,6 +342,19 @@ async fn openapi_spec() -> impl IntoResponse {
                     "summary": "Cancel order by ID",
                     "parameters": [{"name": "order_id", "in": "path", "required": true, "schema": {"type": "integer"}}],
                     "responses": {"200": {"description": "Cancelled order"}}
+                }
+            },
+            "/v1/positions/close/{position_id}": {
+                "post": {
+                    "summary": "Close a position at current mark price (isolated margin)",
+                    "description": "Closes the named open position at the current mark price, realizes PnL, and frees the position's margin. Auth required — caller's X-XRPL-Address must own the position.",
+                    "parameters": [{"name": "position_id", "in": "path", "required": true, "schema": {"type": "integer"}}],
+                    "responses": {
+                        "200": {"description": "Position closed; realized PnL and freed margin returned"},
+                        "401": {"description": "Authentication required"},
+                        "404": {"description": "Position not found or not owned by caller"},
+                        "503": {"description": "Mark price unavailable"}
+                    }
                 }
             },
             "/v1/account/balance": {
@@ -587,6 +601,19 @@ async fn submit_order(
                 client_order_id: result.order.client_order_id.clone(),
             });
 
+            // STP cancellations: emit OrderUpdate for each maker order whose
+            // remaining size was reduced (or fully cancelled) by self-trade prevention.
+            for (maker, _cross) in &result.stp_cancelled {
+                let _ = state.ws_tx.send(WsEvent::OrderUpdate {
+                    user_id: maker.user_id.clone(),
+                    order_id: maker.id,
+                    status: format!("{:?}", maker.status).to_lowercase(),
+                    filled: maker.filled.to_string(),
+                    remaining: maker.remaining().to_string(),
+                    client_order_id: maker.client_order_id.clone(),
+                });
+            }
+
             // C5.1: persist resting-order changes to PG for failover recovery.
             // Taker rested?
             if let Some(db) = &state.db {
@@ -600,6 +627,14 @@ async fn submit_order(
                     match state.engine.get_order(t.maker_order_id).await {
                         Some(maker) => db.upsert_resting_order(&maker).await, // partial fill
                         None => db.delete_resting_order(t.maker_order_id).await, // fully filled
+                    }
+                }
+                // STP-cancelled maker orders: delete (fully cancelled) or upsert (partial).
+                for (maker, _cross) in &result.stp_cancelled {
+                    if maker.status == crate::orderbook::OrderStatus::Cancelled {
+                        db.delete_resting_order(maker.id).await;
+                    } else {
+                        db.upsert_resting_order(maker).await;
                     }
                 }
             }
@@ -619,6 +654,20 @@ async fn submit_order(
                 })
                 .collect();
 
+            let stp_cancelled_json: Vec<serde_json::Value> = result
+                .stp_cancelled
+                .iter()
+                .map(|(maker, cross)| {
+                    serde_json::json!({
+                        "order_id": maker.id,
+                        "status": format!("{:?}", maker.status).to_lowercase(),
+                        "filled": maker.filled.to_string(),
+                        "remaining": maker.remaining().to_string(),
+                        "cancelled_size": FP8(*cross).to_string(),
+                    })
+                })
+                .collect();
+
             ok(serde_json::json!({
                 "order_id": result.order.id,
                 "order_status": format!("{:?}", result.order.status),
@@ -626,6 +675,7 @@ async fn submit_order(
                 "remaining": result.order.remaining().to_string(),
                 "trades": trades_json,
                 "failed_fills": result.failed_fills.len(),
+                "stp_cancelled": stp_cancelled_json,
             }))
             .into_response()
         }
@@ -706,6 +756,74 @@ async fn cancel_all_orders(
         "cancelled": cancelled.len(),
     }))
     .into_response()
+}
+
+/// Close a position at current mark price (isolated margin model).
+/// Calls enclave `close_position` ecall, which realizes PnL and frees margin.
+async fn close_position(
+    State(state): State<Arc<AppState>>,
+    Path(position_id): Path<u64>,
+    request: axum::extract::Request,
+) -> impl IntoResponse {
+    // Auth: caller must be authenticated; positions are owned by caller's address.
+    let caller = match request.extensions().get::<auth::AuthenticatedUser>() {
+        Some(u) => u.xrpl_address.clone(),
+        None => return err(StatusCode::UNAUTHORIZED, "authentication required").into_response(),
+    };
+
+    // Verify the position belongs to the caller by querying balance.
+    let balance = match state.perp.get_balance(&caller).await {
+        Ok(v) => v,
+        Err(e) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to query balance: {}", e),
+            )
+            .into_response();
+        }
+    };
+    let owns_position = balance["data"]["positions"]
+        .as_array()
+        .map(|arr| {
+            arr.iter().any(|p| {
+                p.get("position_id").and_then(|v| v.as_u64()) == Some(position_id)
+                    && p.get("status").and_then(|v| v.as_str()) == Some("open")
+            })
+        })
+        .unwrap_or(false);
+    if !owns_position {
+        return err(
+            StatusCode::NOT_FOUND,
+            "position not found or not owned by caller",
+        )
+        .into_response();
+    }
+
+    // Use current mark price.
+    let mark_raw = state.mark_price.load(Ordering::Relaxed);
+    if mark_raw <= 0 {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "mark price not available").into_response();
+    }
+    let close_price = FP8(mark_raw).to_string();
+
+    match state
+        .perp
+        .close_position(&caller, position_id, &close_price)
+        .await
+    {
+        Ok(val) => {
+            // Notify clients to re-fetch positions/balance.
+            let _ = state.ws_tx.send(WsEvent::PositionChanged {
+                user_id: caller.clone(),
+                reason: "close".into(),
+            });
+            (StatusCode::OK, Json(val)).into_response()
+        }
+        Err(e) => {
+            error!("close_position error: {}", e);
+            err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response()
+        }
+    }
 }
 
 async fn get_orders(

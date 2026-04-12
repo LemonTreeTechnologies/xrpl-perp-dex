@@ -32,6 +32,9 @@ pub struct OrderResult {
     pub order: Order,
     pub trades: Vec<Trade>,
     pub failed_fills: Vec<FailedFill>,
+    /// Resting orders cancelled by self-trade prevention (decrement-and-cancel).
+    /// Each entry is (the maker order's current state, amount cancelled).
+    pub stp_cancelled: Vec<(Order, i64)>,
 }
 
 /// A fill that was rejected by the enclave (margin insufficient).
@@ -99,7 +102,7 @@ impl TradingEngine {
         }
 
         // Step 1: Match on the order book
-        let (order, trades) = {
+        let (order, trades, stp_cancelled) = {
             let mut book = self.book.lock().await;
             book.submit_order(
                 user_id,
@@ -119,6 +122,7 @@ impl TradingEngine {
                 order,
                 trades,
                 failed_fills: Vec::new(),
+                stp_cancelled,
             });
         }
 
@@ -289,6 +293,7 @@ impl TradingEngine {
             order,
             trades,
             failed_fills,
+            stp_cancelled,
         })
     }
 
