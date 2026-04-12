@@ -171,7 +171,7 @@ migration for existing databases: `orchestrator/migrations/001_passive_replicati
 
 | Repo | Language | Purpose |
 |---|---|---|
-| [`77ph/xrpl-perp-dex`](https://github.com/77ph/xrpl-perp-dex) | Rust (orchestrator), Python (tests), Markdown (research) | Off-enclave business logic, CLOB, P2P, REST, WebSocket, failure-mode tests |
+| [`LemonTreeTechnologies/xrpl-perp-dex`](https://github.com/LemonTreeTechnologies/xrpl-perp-dex) | Rust (orchestrator), Python (tests), Markdown (research) | Off-enclave business logic, CLOB, P2P, REST, WebSocket, failure-mode tests |
 | [`77ph/xrpl-perp-dex-enclave`](https://github.com/77ph/xrpl-perp-dex-enclave) | C/C++ (SGX enclave), C++ (server), CMake | Margin engine, position tracking, ECDSA signing, DCAP attestation |
 
 ### Test counts

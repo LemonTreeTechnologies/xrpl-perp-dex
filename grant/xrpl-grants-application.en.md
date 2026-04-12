@@ -7,7 +7,7 @@
 **Funding track:** Software Developer Grants Program
 **Live demo:** https://api-perp.ph18.io
 **GitHub:**
-- https://github.com/77ph/xrpl-perp-dex (Rust orchestrator, tests, research)
+- https://github.com/LemonTreeTechnologies/xrpl-perp-dex (Rust orchestrator, tests, research)
 - https://github.com/77ph/xrpl-perp-dex-enclave (C/C++ SGX enclave, perp engine)
 
 ---
@@ -548,7 +548,7 @@ the community will inherit a permissively licensed codebase in 4 years.
 ## 15. Contact and next steps
 
 **Primary contact:** ph18.io team (contact email in GitHub profile)
-**Demo:** https://api-perp.ph18.io (live), https://github.com/77ph/xrpl-perp-dex
+**Demo:** https://api-perp.ph18.io (live), https://github.com/LemonTreeTechnologies/xrpl-perp-dex
 **Demo video:** `presentation/demo.cast` (asciinema) in the repository
 **Appearing at:** Hack the Block, Paris Blockchain Week, April 11-12, 2026
 (Challenge 2: Impact Finance)

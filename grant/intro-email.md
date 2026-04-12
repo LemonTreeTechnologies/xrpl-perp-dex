@@ -65,7 +65,7 @@ rather than discover us in a pile of fresh submissions:
 
 - Open source from day one under BSL 1.1 (auto-converts to Apache 2.0
   in four years). Both repositories public at
-  https://github.com/77ph/xrpl-perp-dex and
+  https://github.com/LemonTreeTechnologies/xrpl-perp-dex and
   https://github.com/77ph/xrpl-perp-dex-enclave.
 
 **The ask:**

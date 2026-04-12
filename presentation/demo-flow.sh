@@ -58,6 +58,6 @@ echo ""
 
 cecho "═══════════════════════════════════════════════"
 cecho "  ✓ Live, audited, open source"
-cecho "  github.com/77ph/xrpl-perp-dex"
+cecho "  github.com/LemonTreeTechnologies/xrpl-perp-dex"
 cecho "═══════════════════════════════════════════════"
 sleep 2

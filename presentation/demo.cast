@@ -21,5 +21,5 @@
 [35.411429, "o", "[\r\n  \"/v1/account/balance\",\r\n  \"/v1/attestation/commitment\",\r\n  \"/v1/attestation/quote\",\r\n  \"/v1/markets\",\r\n  \"/v1/markets/{market}/funding\",\r\n  \"/v1/markets/{market}/orderbook\",\r\n  \"/v1/markets/{market}/ticker\",\r\n  \"/v1/markets/{market}/trades\",\r\n  \"/v1/orders\",\r\n  \"/v1/orders/{order_id}\",\r\n  \"/ws\"\r\n]\r\n"]
 [38.415861, "o", "\r\n\u001b[1;36m═══════════════════════════════════════════════\u001b[0m\r\n"]
 [39.417478, "o", "\u001b[1;36m  ✓ Live, audited, open source\u001b[0m\r\n"]
-[40.418992, "o", "\u001b[1;36m  github.com/77ph/xrpl-perp-dex\u001b[0m\r\n"]
+[40.418992, "o", "\u001b[1;36m  github.com/LemonTreeTechnologies/xrpl-perp-dex\u001b[0m\r\n"]
 [41.420773, "o", "\u001b[1;36m═══════════════════════════════════════════════\u001b[0m\r\n"]

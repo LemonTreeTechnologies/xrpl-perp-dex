@@ -7,7 +7,7 @@
 **Трек:** Software Developer Grants Program
 **Live демо:** https://api-perp.ph18.io
 **GitHub:**
-- https://github.com/77ph/xrpl-perp-dex (Rust orchestrator, тесты, research)
+- https://github.com/LemonTreeTechnologies/xrpl-perp-dex (Rust orchestrator, тесты, research)
 - https://github.com/77ph/xrpl-perp-dex-enclave (C/C++ SGX enclave, perp engine)
 
 ---
@@ -561,7 +561,7 @@ licensed codebase через 4 года.
 ## 15. Контакт и следующие шаги
 
 **Основной контакт:** ph18.io team (email в GitHub profile)
-**Demo:** https://api-perp.ph18.io (live), https://github.com/77ph/xrpl-perp-dex
+**Demo:** https://api-perp.ph18.io (live), https://github.com/LemonTreeTechnologies/xrpl-perp-dex
 **Demo видео:** `presentation/demo.cast` (asciinema) в репозитории
 **Appearing at:** Hack the Block, Paris Blockchain Week, 11-12 апреля 2026
 (Challenge 2: Impact Finance)

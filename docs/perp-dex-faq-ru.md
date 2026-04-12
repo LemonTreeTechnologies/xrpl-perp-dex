@@ -467,7 +467,7 @@ A: Hyperliquid — свой L1, мы используем существующи
 
 - Live API: https://api-perp.ph18.io
 - OpenAPI spec: https://api-perp.ph18.io/v1/openapi.json
-- GitHub: https://github.com/77ph/xrpl-perp-dex
+- GitHub: https://github.com/LemonTreeTechnologies/xrpl-perp-dex
 - Enclave: https://github.com/77ph/xrpl-perp-dex-enclave
 - Presentation: `presentation/perp-dex-pitch.html`
 - Demo recording: `presentation/demo.cast` (asciinema, can convert to gif)
