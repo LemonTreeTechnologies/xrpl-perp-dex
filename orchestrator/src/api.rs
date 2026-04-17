@@ -58,6 +58,10 @@ pub struct AppState {
     pub db: Option<crate::db::Db>,
     /// Shard router — routes user_id → shard → enclave. Phase 1: single shard.
     pub shard_router: Arc<crate::shard_router::ShardRouter>,
+    /// Connected P2P peers (updated by P2P node).
+    pub peer_count: Arc<std::sync::atomic::AtomicU32>,
+    /// Start time for uptime reporting.
+    pub start_time: std::time::Instant,
 }
 
 // ── Request/Response types ──────────────────────────────────────
@@ -161,6 +165,29 @@ fn parse_tif(s: &str) -> Result<TimeInForce, String> {
     }
 }
 
+// ── Health ──────────────────────────────────────────────────────
+
+async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let role = if state.is_sequencer.load(std::sync::atomic::Ordering::Relaxed) {
+        "sequencer"
+    } else {
+        "validator"
+    };
+    let peers = state.peer_count.load(std::sync::atomic::Ordering::Relaxed);
+    let uptime_secs = state.start_time.elapsed().as_secs();
+
+    let enclave_ok = state.perp.get_balance("__health_check__").await.is_ok();
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "role": role,
+        "peers": peers,
+        "enclave": if enclave_ok { "ok" } else { "error" },
+        "uptime_secs": uptime_secs,
+    }))
+}
+
 // ── Router ──────────────────────────────────────────────────────
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -188,6 +215,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/attestation/quote", post(attestation_quote))
         .route("/v1/attestation/commitment", get(attestation_commitment))
         .route("/v1/auth/login", post(auth_login))
+        .route("/v1/health", get(health))
         .layer(axum::middleware::from_fn(auth::auth_middleware))
         .route("/ws", get(ws::ws_handler))
         .layer(cors)

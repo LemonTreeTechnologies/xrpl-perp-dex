@@ -10,6 +10,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::Duration;
 
 use std::path::Path;
@@ -191,6 +192,8 @@ pub struct P2PNode {
     local_signer: Option<LocalSigner>,
     /// Our peer ID.
     pub peer_id: PeerId,
+    /// Shared counter of connected peers (read by health endpoint).
+    peer_count: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl P2PNode {
@@ -203,6 +206,7 @@ impl P2PNode {
         keypair: Keypair,
         batch_tx: mpsc::Sender<OrderBatch>,
         election_inbound_tx: mpsc::Sender<ElectionMessage>,
+        peer_count: Arc<std::sync::atomic::AtomicU32>,
     ) -> Result<Self> {
         let swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -263,6 +267,7 @@ impl P2PNode {
             pending_signing: HashMap::new(),
             local_signer: None,
             peer_id,
+            peer_count,
         };
 
         // Subscribe to topics
@@ -635,10 +640,12 @@ impl P2PNode {
                     info!(addr = %address, "listening on");
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    info!(peer = %peer_id, "connected");
+                    self.peer_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    info!(peer = %peer_id, peers = self.peer_count.load(std::sync::atomic::Ordering::Relaxed), "connected");
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                    warn!(peer = %peer_id, "disconnected");
+                    self.peer_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    warn!(peer = %peer_id, peers = self.peer_count.load(std::sync::atomic::Ordering::Relaxed), "disconnected");
                 }
                 _ => {}
             }

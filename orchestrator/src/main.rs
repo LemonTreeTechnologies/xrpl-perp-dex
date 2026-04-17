@@ -377,6 +377,8 @@ async fn main() -> Result<()> {
     let (signing_tx, signing_rx) =
         tokio::sync::mpsc::channel::<p2p::SigningRelay>(32);
 
+    let peer_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
     let app_state = Arc::new(AppState {
         engine,
         perp: PerpClient::new(&cli.enclave_url)?,
@@ -391,6 +393,8 @@ async fn main() -> Result<()> {
         signing_tx: if signers_config.is_some() { Some(signing_tx) } else { None },
         db: db.clone(),
         shard_router: shard_router.clone(),
+        peer_count: peer_count.clone(),
+        start_time: Instant::now(),
     });
 
     // Start API server
@@ -409,7 +413,7 @@ async fn main() -> Result<()> {
         tokio::sync::mpsc::channel::<election::ElectionMessage>(100);
     let p2p_keypair = p2p::load_or_create_identity(&cli.p2p_key_path)
         .context("failed to load or create libp2p identity")?;
-    let mut p2p_node = p2p::P2PNode::new(&cli.p2p_listen, p2p_keypair, batch_tx, election_inbound_tx)
+    let mut p2p_node = p2p::P2PNode::new(&cli.p2p_listen, p2p_keypair, batch_tx, election_inbound_tx, peer_count.clone())
         .await
         .context("failed to start P2P node")?;
 

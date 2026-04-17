@@ -405,7 +405,16 @@ async fn sign_and_submit(
 
     let signed_blob = sign_resp["result"]["tx_blob"]
         .as_str()
-        .context("no tx_blob in sign response — check seed format")?;
+        .with_context(|| {
+            let err = sign_resp["result"]["error_message"]
+                .as_str()
+                .unwrap_or("unknown");
+            format!(
+                "XRPL sign RPC failed: {err}. \
+                 Public nodes disable the sign RPC. Use a local rippled, \
+                 or use scripts/setup_testnet_escrow.py instead."
+            )
+        })?;
 
     info!(
         tx_type = tx_json["TransactionType"].as_str().unwrap_or("?"),
