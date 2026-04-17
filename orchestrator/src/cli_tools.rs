@@ -153,6 +153,7 @@ pub async fn escrow_setup(
     xrpl_url: &str,
     signers_config_path: &std::path::Path,
     escrow_seed: &str,
+    escrow_address_override: Option<&str>,
     disable_master: bool,
 ) -> Result<()> {
     let config_data = std::fs::read_to_string(signers_config_path)
@@ -173,10 +174,16 @@ pub async fn escrow_setup(
 
     let http = reqwest::Client::new();
 
-    // Step 1: Derive escrow address from seed
-    println!("[1/4] Deriving escrow address from seed...");
-    let escrow_address = derive_xrpl_address_from_seed(&escrow_seed)?;
-    println!("  Escrow address: {escrow_address}");
+    // Step 1: Derive escrow address from seed (or use override)
+    println!("[1/4] Resolving escrow address...");
+    let escrow_address = if let Some(addr) = escrow_address_override {
+        println!("  Using provided address: {addr}");
+        addr.to_string()
+    } else {
+        let addr = derive_xrpl_address_from_seed(escrow_seed)?;
+        println!("  Derived from seed: {addr}");
+        addr
+    };
 
     // Step 2: Check account exists
     println!("\n[2/4] Checking account on XRPL...");

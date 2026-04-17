@@ -77,6 +77,9 @@ enum Command {
         /// XRPL escrow account seed (secret)
         #[arg(long)]
         escrow_seed: String,
+        /// Escrow r-address (optional — skips derivation from seed, needed for Ed25519 sEd seeds)
+        #[arg(long)]
+        escrow_address: Option<String>,
         /// Disable master key after setting SignerList (irreversible without multisig!)
         #[arg(long)]
         disable_master: bool,
@@ -268,9 +271,10 @@ async fn main() -> Result<()> {
             xrpl_url,
             signers_config,
             escrow_seed,
+            escrow_address,
             disable_master,
         }) => {
-            return cli_tools::escrow_setup(&xrpl_url, &signers_config, &escrow_seed, disable_master).await;
+            return cli_tools::escrow_setup(&xrpl_url, &signers_config, &escrow_seed, escrow_address.as_deref(), disable_master).await;
         }
         None => {
             // Default: run orchestrator with flattened RunArgs
