@@ -140,4 +140,42 @@ Bug 3 (deployment) blocks:
   └── CI/CD pipeline
 ```
 
-**Priority order:** Bug 1 → Bug 2 → Bug 3. Bug 1 is the foundation — without it, the withdrawal system only works through SSH tunnels.
+**Priority order:** Bug 1 → Bug 2 → Bug 3 → Bug 4. Bug 1 is the foundation — without it, the withdrawal system only works through SSH tunnels.
+
+---
+
+## Bug 4: No CLI test tooling for authenticated endpoints
+
+**Symptom:** To test the `/v1/withdraw` endpoint, we had to write a throwaway Python script that:
+- Generates a secp256k1 keypair
+- Derives XRPL r-address
+- Signs the request body with SHA-256 + ECDSA + DER encoding + low-S normalization
+- Sets X-XRPL-Address, X-XRPL-PublicKey, X-XRPL-Signature, X-XRPL-Timestamp headers
+
+This is the same pattern as Bug 2 — every test of an authenticated endpoint requires a custom script.
+
+**Root cause:** The system requires XRPL wallet signature auth (correct for production), but provides no tooling to generate signed requests outside of the Crossmark browser extension. There is no `curl`-equivalent for testing.
+
+**What's needed:** A CLI tool (part of orchestrator binary or standalone):
+
+```
+./perp-cli withdraw \
+  --api http://localhost:3000 \
+  --seed sEdXXX \
+  --amount 1 \
+  --destination rXXX
+```
+
+That handles auth internally. Or at minimum, a `sign-request` subcommand:
+
+```
+./perp-cli sign-request \
+  --seed sEdXXX \
+  --body '{"user_id":"rXXX","amount":"1","destination":"rYYY"}'
+# Outputs: curl -H "X-XRPL-Address: ..." -H "X-XRPL-PublicKey: ..." ...
+```
+
+This unblocks:
+- Automated integration testing
+- Operator-level failure testing without ad-hoc scripts
+- CI/CD pipeline health checks

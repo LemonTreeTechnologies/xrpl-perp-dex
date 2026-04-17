@@ -485,6 +485,22 @@ impl P2PNode {
                         None => std::future::pending::<Option<SigningRelay>>().await,
                     }
                 } => {
+                    // If the request is for our own local signer, handle locally
+                    // (gossipsub doesn't deliver messages back to the sender)
+                    if let Some(ref local) = self.local_signer {
+                        if local.xrpl_address == relay.signer_xrpl_address {
+                            info!(
+                                req_id = %relay.request_id,
+                                "signing locally (own address)"
+                            );
+                            let response = Self::handle_signing_request(
+                                local, &relay.request_id, &relay.hash_hex,
+                            ).await;
+                            let _ = relay.response_tx.send(response);
+                            continue;
+                        }
+                    }
+
                     let msg = SigningMessage::Request {
                         request_id: relay.request_id.clone(),
                         requester_peer_id: self.peer_id.to_string(),
