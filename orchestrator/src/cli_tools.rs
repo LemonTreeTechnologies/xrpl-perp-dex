@@ -22,7 +22,7 @@ struct SignerEntry {
 struct GenerateResponse {
     status: String,
     address: Option<String>,
-    uncompressed_pubkey: Option<String>,
+    public_key: Option<String>,
     session_key: Option<String>,
     message: Option<String>,
 }
@@ -76,8 +76,8 @@ pub async fn operator_setup(
 
     let eth_address = resp.address.context("missing address in response")?;
     let uncompressed_pubkey = resp
-        .uncompressed_pubkey
-        .context("missing uncompressed_pubkey in response")?;
+        .public_key
+        .context("missing public_key in response")?;
     let session_key = resp
         .session_key
         .context("missing session_key in response")?;
