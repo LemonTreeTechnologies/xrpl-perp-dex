@@ -189,6 +189,17 @@ impl PerpClient {
         .await
     }
 
+    // ── Shard identity ──────────────────────────────────────────
+
+    /// Set shard_id on the enclave (called once at startup).
+    pub async fn set_shard_id(&self, shard_id: u32) -> Result<Value> {
+        self.post(
+            "/perp/shard/set",
+            serde_json::json!({ "shard_id": shard_id }),
+        )
+        .await
+    }
+
     // ── State persistence ───────────────────────────────────────
 
     /// Seal perp state to disk.

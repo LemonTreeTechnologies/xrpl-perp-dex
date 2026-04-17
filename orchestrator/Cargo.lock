@@ -3803,6 +3803,7 @@ dependencies = [
  "sha3",
  "sqlx",
  "tokio",
+ "toml",
  "tower-http",
  "tracing",
  "tracing-subscriber",

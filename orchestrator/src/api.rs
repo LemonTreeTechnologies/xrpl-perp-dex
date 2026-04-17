@@ -54,6 +54,8 @@ pub struct AppState {
     pub signers_config: Option<crate::withdrawal::SignersConfig>,
     /// PostgreSQL for history (optional — trading works without it)
     pub db: Option<crate::db::Db>,
+    /// Shard router — routes user_id → shard → enclave. Phase 1: single shard.
+    pub shard_router: Arc<crate::shard_router::ShardRouter>,
 }
 
 // ── Request/Response types ──────────────────────────────────────

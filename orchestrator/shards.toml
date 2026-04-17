@@ -1,0 +1,12 @@
+# Shard configuration — one entry per shard.
+# Phase 1: single shard. Growth: add entries and restart.
+# Shard 0 is the vault shard by convention.
+
+[[shards]]
+shard_id = 0
+enclave_url = "https://localhost:9088/v1"
+
+# Example: adding a second shard
+# [[shards]]
+# shard_id = 1
+# enclave_url = "https://shard1.example.com:9088/v1"

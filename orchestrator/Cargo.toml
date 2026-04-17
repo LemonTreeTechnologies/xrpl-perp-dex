@@ -52,5 +52,8 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 # Session tokens
 uuid = { version = "1", features = ["v4"] }
 
+# Config files
+toml = "0.8"
+
 # Error handling
 anyhow = "1"

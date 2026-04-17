@@ -13,6 +13,7 @@ mod orderbook;
 mod p2p;
 mod perp_client;
 mod price_feed;
+pub mod shard_router;
 mod trading;
 mod types;
 mod vault_mm;
@@ -124,6 +125,11 @@ struct Cli {
     /// Enable Delta Neutral vault (quotes both sides, biases to reduce net delta).
     #[arg(long)]
     vault_dn: bool,
+
+    /// Path to shards.toml config. If not set, a single-shard router is
+    /// created from --enclave-url with shard_id=0.
+    #[arg(long)]
+    shards_config: Option<PathBuf>,
 }
 
 // ── Funding rate ────────────────────────────────────────────────
@@ -227,6 +233,13 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Initialize shard router — sets shard_id on each enclave at startup
+    let shard_router = match &cli.shards_config {
+        Some(path) => shard_router::ShardRouter::from_config(path).await?,
+        None => shard_router::ShardRouter::single(&cli.enclave_url, 0).await?,
+    };
+    let shard_router = Arc::new(shard_router);
+
     // Initialize clients
     let perp = PerpClient::new(&cli.enclave_url)?;
     let perp_for_api = PerpClient::new(&cli.enclave_url)?;
@@ -304,6 +317,7 @@ async fn main() -> Result<()> {
         escrow_address: escrow_address.clone(),
         signers_config,
         db: db.clone(),
+        shard_router: shard_router.clone(),
     });
 
     // Start API server
