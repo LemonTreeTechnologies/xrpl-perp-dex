@@ -13,7 +13,6 @@ set -euo pipefail
 # Safety: This script ONLY deploys to TESTNET Azure VMs.
 #         Mainnet (Hetzner) is never touched.
 
-HETZNER="andrey@94.130.18.162"
 BINARY_PATH="$HOME/llm-perp-xrpl/orchestrator/target/release/perp-dex-orchestrator"
 REMOTE_DIR="/home/azureuser/perp"
 
@@ -33,6 +32,8 @@ log()  { echo -e "${GREEN}[deploy]${NC} $*"; }
 warn() { echo -e "${YELLOW}[warn]${NC} $*"; }
 err()  { echo -e "${RED}[error]${NC} $*" >&2; }
 
+run_local() { eval "$@"; }
+
 # ── Pre-flight checks ──────────────────────────────────────────
 
 preflight() {
@@ -40,23 +41,23 @@ preflight() {
 
     # 1. Mainnet still running on Hetzner?
     local mainnet_pid
-    mainnet_pid=$(ssh "$HETZNER" 'pgrep -f "perp-dex-orchestrator.*mainnet" 2>/dev/null || echo "none"')
+    mainnet_pid=$(pgrep -f "perp-dex-orchestrator" 2>/dev/null | head -1 || echo "none")
     if [ "$mainnet_pid" = "none" ]; then
-        warn "No mainnet orchestrator detected on Hetzner (may be expected)"
+        warn "No orchestrator detected on Hetzner (may be expected)"
     else
-        log "Mainnet orchestrator running (PID $mainnet_pid) — will not touch"
+        log "Orchestrator running on Hetzner (PID $mainnet_pid) — will not touch"
     fi
 
     # 2. Binary exists?
-    if ! ssh "$HETZNER" "test -f $BINARY_PATH"; then
-        err "Binary not found at $BINARY_PATH on Hetzner"
-        err "Run: ssh $HETZNER 'source ~/.cargo/env && cd ~/llm-perp-xrpl/orchestrator && cargo build --release'"
+    if [ ! -f "$BINARY_PATH" ]; then
+        err "Binary not found at $BINARY_PATH"
+        err "Run: source ~/.cargo/env && cd ~/llm-perp-xrpl/orchestrator && cargo build --release"
         exit 1
     fi
 
     # 3. Binary version
     local version
-    version=$(ssh "$HETZNER" "$BINARY_PATH --version 2>/dev/null || echo unknown")
+    version=$("$BINARY_PATH" --version 2>/dev/null || echo "unknown")
     log "Binary version: $version"
 }
 
@@ -70,28 +71,28 @@ deploy_node() {
 
     # Stop old process
     log "[$name] Stopping old process..."
-    ssh "$HETZNER" "ssh -o StrictHostKeyChecking=no azureuser@$ip 'pkill -f perp-dex-orchestrator || true'" || true
+    ssh -o StrictHostKeyChecking=no azureuser@"$ip" 'killall perp-dex-orchestrator 2>/dev/null; echo stopped' || true
 
     sleep 2
 
-    # Copy binary via Hetzner bastion
+    # Copy binary
     log "[$name] Copying binary..."
-    ssh "$HETZNER" "scp -o StrictHostKeyChecking=no $BINARY_PATH azureuser@$ip:$REMOTE_DIR/perp-dex-orchestrator.new"
+    scp -o StrictHostKeyChecking=no "$BINARY_PATH" azureuser@"$ip":"$REMOTE_DIR"/perp-dex-orchestrator.new
 
     # Atomic swap
     log "[$name] Swapping binary..."
-    ssh "$HETZNER" "ssh azureuser@$ip 'cd $REMOTE_DIR && mv perp-dex-orchestrator.new perp-dex-orchestrator && chmod +x perp-dex-orchestrator'"
+    ssh azureuser@"$ip" "cd $REMOTE_DIR && mv perp-dex-orchestrator.new perp-dex-orchestrator && chmod +x perp-dex-orchestrator"
 
-    # Start (use systemd if available, otherwise nohup)
+    # Start (use systemd if available, otherwise nohup with existing start_orchestrator.sh)
     log "[$name] Starting..."
-    ssh "$HETZNER" "ssh azureuser@$ip 'sudo systemctl restart perp-dex-orchestrator 2>/dev/null || (cd $REMOTE_DIR && nohup ./start.sh > orchestrator.log 2>&1 &)'"
+    ssh azureuser@"$ip" "sudo systemctl restart perp-dex-orchestrator 2>/dev/null || (cd $REMOTE_DIR && nohup ./start_orchestrator.sh > orchestrator.log 2>&1 &)"
 
     sleep 3
 
     # Health check
     log "[$name] Health check..."
     local health
-    health=$(ssh "$HETZNER" "ssh azureuser@$ip 'curl -s http://localhost:3000/v1/health'" 2>/dev/null || echo '{"status":"unreachable"}')
+    health=$(ssh azureuser@"$ip" 'curl -s http://localhost:3000/v1/health' 2>/dev/null || echo '{"status":"unreachable"}')
     log "[$name] $health"
 
     if echo "$health" | grep -q '"status":"ok"'; then
@@ -126,6 +127,6 @@ sleep 10
 log "Final health status:"
 for node in "${!NODES[@]}"; do
     ip="${NODES[$node]}"
-    health=$(ssh "$HETZNER" "ssh azureuser@$ip 'curl -s http://localhost:3000/v1/health'" 2>/dev/null || echo "unreachable")
+    health=$(ssh azureuser@"$ip" 'curl -s http://localhost:3000/v1/health' 2>/dev/null || echo "unreachable")
     log "  $node ($ip): $health"
 done
