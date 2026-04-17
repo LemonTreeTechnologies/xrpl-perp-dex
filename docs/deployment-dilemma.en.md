@@ -10,7 +10,7 @@ feature-complete. This creates a deployment bottleneck:
 
 | Host | Role | Can deploy new code? | SGX? |
 |------|------|---------------------|------|
-| Hetzner EX44 (94.130.18.162) | **Mainnet** (~108 XRP in escrow) | No — risk to live funds | No (Xeon E3, no SGX2) |
+| Hetzner EX44 (94.130.18.162) | **Mainnet** (~108 XRP in escrow) | No — risk to live funds | Yes (SGX1 HW mode, no DCAP attestation) |
 | Azure node-1 (20.71.184.176) | Testnet | Yes | Yes (DCsv3, SGX2+DCAP) |
 | Azure node-2 (20.224.243.60) | Testnet | Yes | Yes (DCsv3, SGX2+DCAP) |
 | Azure node-3 (52.236.130.102) | Testnet | Yes | Yes (DCsv3, SGX2+DCAP) |
@@ -37,7 +37,7 @@ against XRPL testnet, then manually promote to mainnet Hetzner.
 
 | Pros | Cons |
 |------|------|
-| Cheapest (€39/mo vs €300/mo Azure) | No SGX — can't test DCAP attestation |
+| Cheapest (€39/mo vs €300/mo Azure) | Likely no SGX — can't test DCAP (depends on CPU model) |
 | Same glibc/arch as mainnet | Manual promotion step |
 | SSH from anywhere | Still no blue/green |
 
@@ -121,6 +121,204 @@ procedure. Proposed checklist:
 
 **Downtime:** ~30 seconds (stop → swap → start → health check).
 Acceptable for current traffic level (near zero).
+
+---
+
+## The Hard Problem: Enclave Upgrade
+
+Everything above discusses **orchestrator** deployment (Rust binary).
+The enclave (C++ `enclave.signed.so`) is a fundamentally harder problem
+because of **MRENCLAVE binding**.
+
+### Why enclave upgrades are different from orchestrator upgrades
+
+| Property | Orchestrator (Rust) | Enclave (C++ SGX) |
+|----------|--------------------|--------------------|
+| State | PostgreSQL (external) | Sealed to CPU + MRENCLAVE |
+| Binary swap | Stop → replace → start | New MRENCLAVE → **all sealed keys lost** |
+| Rollback | Copy old binary back | Old MRENCLAVE sealed data still works |
+| Key continuity | Keys live in enclave, orchestrator has none | Keys **are** the enclave state |
+| Impact of bad deploy | 502 for 30 seconds | **Permanent key loss** if old binary not preserved |
+
+### The MRENCLAVE problem in detail
+
+SGX `sgx_seal_data()` binds sealed blobs to:
+1. **MRENCLAVE** — hash of the enclave binary (changes on ANY code change)
+2. **CPU identity** — per-platform provisioning key
+
+This means:
+- A new `enclave.signed.so` (even fixing a typo in a comment that
+  affects compilation) produces a **different MRENCLAVE**
+- The new enclave **cannot unseal** any data sealed by the old enclave
+- Private keys generated inside the old enclave are **irrecoverable**
+  by the new enclave
+- This is by SGX design, not a bug — it prevents code substitution attacks
+
+### What we lose if we naively rebuild the enclave
+
+1. **All enclave-generated private keys** — the secp256k1 keys that
+   derive to XRPL addresses used in SignerListSet
+2. **XRPL multisig becomes unusable** — the escrow's SignerListSet
+   points to XRPL addresses derived from now-inaccessible keys
+3. **User funds locked** — the escrow can only be spent by 2-of-3
+   signers whose keys are sealed inside old-MRENCLAVE enclaves
+4. **FROST shares** (if used) — sealed shares cannot be transported
+   cross-machine (see SHARED-ENCLAVE-BUGS.md Bug 1)
+
+### When we WILL need to rebuild the enclave
+
+Known triggers (not hypothetical):
+
+1. **FROST cross-machine share transport** — currently broken
+   (`sgx_seal_data` makes shares non-portable). Fix requires C++ change
+   → new MRENCLAVE. See `SHARED-ENCLAVE-BUGS.md` Bug 1.
+2. **BTC signing path** — if Phoenix PM needs it, several bugs need fixing
+3. **`MAX_FROST_GROUPS = 4`** — too low for production, needs bump
+4. **DKG "share already received" no reset** — blocks retry
+5. **Security patches** — any CVE in enclave code forces a rebuild
+6. **New features** — spending limits, perp margin engine inside enclave
+
+### Enclave upgrade strategies
+
+#### Strategy 1: Dual-Server Migration (documented in enclave_versioning.md)
+
+Run old enclave (port 9088) and new enclave (port 9089) side by side.
+
+```
+Old enclave v1.0 (port 9088)     New enclave v1.1 (port 9089)
+├── enclave.signed.so-OLD        ├── enclave.signed.so-NEW
+├── accounts/ (sealed to OLD)    ├── accounts/ (empty)
+└── MRENCLAVE: 0xabc...          └── MRENCLAVE: 0xdef...
+```
+
+**Migration procedure:**
+1. Deploy new enclave on separate port, keep old running
+2. Generate new keypair in new enclave → new XRPL address
+3. Use old enclave to sign a SignerListSet transaction that
+   **adds the new address** to the signer list (e.g. 2-of-4 temporarily)
+4. Use old enclave to sign another SignerListSet that
+   **removes the old address** (back to 2-of-3 with new key)
+5. Old enclave can now be decommissioned
+
+**Critical requirement:** the old enclave must remain running and
+functional throughout the migration. If it crashes before step 4,
+the key rotation is incomplete and manual intervention is needed.
+
+**Orchestrator changes needed:**
+- Support talking to two enclave URLs simultaneously
+- Route signing requests to the correct enclave based on which
+  key (old or new) is being used
+- CLI command: `orchestrator enclave-migrate --old-url ... --new-url ...`
+
+**Time window:** migration per node takes ~5 minutes (generate key +
+2 XRPL transactions + verification). For 3-node cluster, sequential
+migration takes ~15 minutes.
+
+#### Strategy 2: MRSIGNER-based Sealing (weaker security, simpler migration)
+
+Change `sgx_seal_data()` policy from MRENCLAVE to MRSIGNER:
+```cpp
+// Instead of: sgx_seal_data(0, NULL, ...) → MRENCLAVE-bound
+// Use:        sgx_seal_data_ex(SGX_KEYPOLICY_MRSIGNER, ...) → MRSIGNER-bound
+```
+
+This means any enclave signed by the same vendor key can unseal the
+data. The new enclave v1.1 can directly read v1.0's sealed keys.
+
+| Pros | Cons |
+|------|------|
+| Zero-downtime upgrade | Weaker security: any enclave signed by same key can read secrets |
+| No key migration needed | A compromised build pipeline → full key extraction |
+| Simple: just replace binary and restart | Loses the code-binding guarantee of MRENCLAVE |
+| Works for cross-machine FROST too | Security auditors will flag this |
+
+**Verdict:** acceptable for testnet/dev, NOT for mainnet with real funds.
+Could be used as a **transition step** — switch to MRSIGNER temporarily
+during migration, then switch back to MRENCLAVE after new keys are
+generated.
+
+#### Strategy 3: Key Export via Recovery Mechanism
+
+The enclave already has `account.recovery` files (encrypted private key
+backups). Use them:
+
+1. Before upgrade: export recovery for all active keys
+2. Deploy new enclave
+3. Import keys via recovery mechanism into new enclave
+4. Keys now sealed under new MRENCLAVE
+
+**Problem:** recovery files are encrypted with a user-held key. For the
+perp-DEX escrow, the "user" is the operator. This means the operator
+momentarily has the raw private key outside the enclave — violating the
+core trust model.
+
+**Verdict:** only acceptable if the recovery key is itself held inside
+another enclave or HSM. Otherwise defeats the purpose of SGX.
+
+#### Strategy 4: Pre-planned Key Rotation (recommended)
+
+Design the system so key rotation is a **normal operation**, not an
+emergency procedure:
+
+1. **Each enclave version gets its own keypair.** On deployment,
+   the new enclave generates a fresh key, and the orchestrator
+   initiates a SignerListSet rotation automatically.
+2. **SignerListSet supports 3+ signers temporarily.** During rotation,
+   the list has 4 signers (3 old + 1 new). Quorum stays at 2. The
+   old signer's key is removed after the new one is confirmed.
+3. **Rolling upgrade:** rotate one node at a time. At no point are
+   more than 1 out of 3 signers in migration state.
+4. **Automated by orchestrator CLI:**
+   ```
+   orchestrator enclave-upgrade \
+     --node node-1 \
+     --new-enclave /path/to/enclave.signed.so \
+     --escrow-address rLTFG...
+   ```
+   This command:
+   a. Starts new enclave on a staging port
+   b. Generates new keypair → new XRPL address
+   c. Submits SignerListSet (add new signer, quorum unchanged)
+   d. Waits for XRPL validation
+   e. Submits SignerListSet (remove old signer)
+   f. Stops old enclave
+   g. Promotes new enclave to production port
+
+**This is the only strategy that preserves the security model
+(MRENCLAVE binding), is automated, and does not require operator
+access to private keys.**
+
+### Recommendation
+
+| Phase | Strategy | Why |
+|-------|----------|-----|
+| **Now** (testnet) | Strategy 2 (MRSIGNER) | Fast iteration, no real funds at risk |
+| **Pre-mainnet** | Build Strategy 4 tooling | Must be ready before mainnet goes live with real funds |
+| **Mainnet** | Strategy 4 (rolling key rotation) | Only option that preserves SGX trust model |
+| **Emergency** | Strategy 1 (dual-server) as fallback | Manual but safe, for when automated rotation fails |
+
+### What this means for the deployment dilemma
+
+The enclave upgrade problem **compounds** the Hetzner-vs-Azure problem:
+
+1. **Hetzner runs SGX in HW mode** — MRENCLAVE binding is real, sealing
+   works, keys are genuinely hardware-bound. An enclave upgrade on
+   Hetzner will lose access to sealed keys just like on Azure.
+2. **Hetzner does NOT support DCAP attestation** — no PCK provisioning,
+   no PCCS. So while enclave upgrade (key rotation) can be tested on
+   Hetzner, attestation-dependent flows (quote generation, remote
+   verification) can only be tested on Azure DCsv3.
+3. **Enclave upgrade CAN be tested on Hetzner** — the key rotation
+   procedure (dual-server, SignerListSet swap) works identically
+   because SGX HW mode is real. However, testing on mainnet with live
+   funds is risky — a staging Hetzner (Option A) or one Azure VM
+   (Option B) is still needed for safe rehearsal.
+
+The argument for **keeping at least one Azure VM** is specifically
+about DCAP attestation testing — not about enclave upgrades, which
+can be rehearsed on any SGX-capable hardware including Hetzner.
+
+---
 
 ## What NOT to do
 
