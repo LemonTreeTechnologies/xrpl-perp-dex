@@ -229,7 +229,7 @@ This:
 the testnet code diverges from the mainnet security model, and the
 divergence will bite when it matters most.
 
-#### Strategy 3: Key Export via Recovery Mechanism
+#### ~~Strategy 3: Key Export via Recovery Mechanism~~ — REJECTED
 
 The enclave already has `account.recovery` files (encrypted private key
 backups). Use them:
