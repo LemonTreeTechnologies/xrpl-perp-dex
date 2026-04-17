@@ -22,6 +22,7 @@ sha3 = "0.10"
 ripemd = "0.1"
 bs58 = { version = "0.5", features = ["check"] }
 hex = "0.4"
+rand = "0.8"
 
 # Logging
 tracing = "0.1"

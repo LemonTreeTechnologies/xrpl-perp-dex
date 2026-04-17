@@ -52,6 +52,8 @@ pub struct AppState {
     pub escrow_address: String,
     /// Multisig signers config (None = single-operator fallback)
     pub signers_config: Option<crate::withdrawal::SignersConfig>,
+    /// P2P signing relay channel (None = fall back to direct HTTP)
+    pub signing_tx: Option<tokio::sync::mpsc::Sender<crate::p2p::SigningRelay>>,
     /// PostgreSQL for history (optional — trading works without it)
     pub db: Option<crate::db::Db>,
     /// Shard router — routes user_id → shard → enclave. Phase 1: single shard.
@@ -1067,6 +1069,7 @@ async fn withdraw(
         &state.escrow_address,
         &signers,
         &req,
+        state.signing_tx.as_ref(),
     )
     .await
     {

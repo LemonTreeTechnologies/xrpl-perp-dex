@@ -305,6 +305,10 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Create P2P signing relay channel
+    let (signing_tx, signing_rx) =
+        tokio::sync::mpsc::channel::<p2p::SigningRelay>(32);
+
     let app_state = Arc::new(AppState {
         engine,
         perp: PerpClient::new(&cli.enclave_url)?,
@@ -315,7 +319,8 @@ async fn main() -> Result<()> {
         last_funding_time: last_funding_time.clone(),
         xrpl_url: cli.xrpl_url.clone(),
         escrow_address: escrow_address.clone(),
-        signers_config,
+        signers_config: signers_config.clone(),
+        signing_tx: if signers_config.is_some() { Some(signing_tx) } else { None },
         db: db.clone(),
         shard_router: shard_router.clone(),
     });
@@ -347,6 +352,28 @@ async fn main() -> Result<()> {
     let (election_outbound_tx, election_outbound_rx) =
         tokio::sync::mpsc::channel::<election::ElectionMessage>(100);
     p2p_node.set_election_publish_channel(election_outbound_rx);
+
+    // Wire P2P signing relay
+    if let Some(ref cfg) = signers_config {
+        p2p_node.set_signing_channel(signing_rx);
+        if let Some(ref local) = cfg.local_signer {
+            p2p_node.set_local_signer(p2p::LocalSigner {
+                enclave_url: local.enclave_url.clone(),
+                address: local.address.clone(),
+                session_key: local.session_key.clone(),
+                compressed_pubkey: local.compressed_pubkey.clone(),
+                xrpl_address: local.xrpl_address.clone(),
+            });
+        } else if let Some(first) = cfg.signers.first() {
+            p2p_node.set_local_signer(p2p::LocalSigner {
+                enclave_url: cli.enclave_url.clone(),
+                address: first.address.clone(),
+                session_key: first.session_key.clone(),
+                compressed_pubkey: first.compressed_pubkey.clone(),
+                xrpl_address: first.xrpl_address.clone(),
+            });
+        }
+    }
 
     // Forward trade batches to P2P — only when sequencer
     let is_seq_fwd = is_sequencer.clone();

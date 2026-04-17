@@ -3,10 +3,12 @@
 //! Uses libp2p gossipsub:
 //! - Sequencer publishes order batches
 //! - Validators subscribe and replay deterministically
+//! - Any operator can request cross-signing via signing relay
 //!
-//! Topic: "perp-dex/orders"
+//! Topics: "perp-dex/orders", "perp-dex/election", "perp-dex/signing"
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
@@ -113,10 +115,52 @@ pub struct FillMessage {
     pub taker_side: String,
 }
 
+// ── Signing relay messages ──────────────────────────────────────
+
+/// Messages for cross-operator signing via P2P.
+/// Replaces direct HTTP calls to remote enclaves — enclave stays localhost-only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SigningMessage {
+    Request {
+        request_id: String,
+        requester_peer_id: String,
+        hash_hex: String,
+        signer_xrpl_address: String,
+    },
+    Response {
+        request_id: String,
+        signer_xrpl_address: String,
+        der_signature: Option<String>,
+        compressed_pubkey: Option<String>,
+        error: Option<String>,
+    },
+}
+
+/// Outbound signing request from withdrawal module to P2P.
+#[derive(Debug)]
+pub struct SigningRelay {
+    pub request_id: String,
+    pub hash_hex: String,
+    pub signer_xrpl_address: String,
+    pub response_tx: tokio::sync::oneshot::Sender<SigningMessage>,
+}
+
+/// Local signer credentials — used to handle incoming signing requests.
+#[derive(Debug, Clone)]
+pub struct LocalSigner {
+    pub enclave_url: String,
+    pub address: String,
+    pub session_key: String,
+    pub compressed_pubkey: String,
+    pub xrpl_address: String,
+}
+
 // ── Network behaviour ───────────────────────────────────────────
 
 const ORDERS_TOPIC: &str = "perp-dex/orders";
 const ELECTION_TOPIC: &str = "perp-dex/election";
+const SIGNING_TOPIC: &str = "perp-dex/signing";
 
 #[derive(NetworkBehaviour)]
 struct PerpBehaviour {
@@ -130,6 +174,7 @@ pub struct P2PNode {
     swarm: Swarm<PerpBehaviour>,
     orders_topic: gossipsub::IdentTopic,
     election_topic: gossipsub::IdentTopic,
+    signing_topic: gossipsub::IdentTopic,
     /// Channel to send received batches to the orchestrator (validator).
     batch_tx: mpsc::Sender<OrderBatch>,
     /// Channel to receive batches to publish (sequencer).
@@ -138,6 +183,12 @@ pub struct P2PNode {
     election_inbound_tx: mpsc::Sender<ElectionMessage>,
     /// Election messages to publish via gossipsub.
     election_outbound_rx: Option<mpsc::Receiver<ElectionMessage>>,
+    /// Outbound signing requests from withdrawal module.
+    signing_request_rx: Option<mpsc::Receiver<SigningRelay>>,
+    /// In-flight signing requests waiting for P2P responses.
+    pending_signing: HashMap<String, tokio::sync::oneshot::Sender<SigningMessage>>,
+    /// Local signer credentials for handling incoming signing requests.
+    local_signer: Option<LocalSigner>,
     /// Our peer ID.
     pub peer_id: PeerId,
 }
@@ -197,15 +248,20 @@ impl P2PNode {
         let peer_id = *swarm.local_peer_id();
         let orders_topic = gossipsub::IdentTopic::new(ORDERS_TOPIC);
         let election_topic = gossipsub::IdentTopic::new(ELECTION_TOPIC);
+        let signing_topic = gossipsub::IdentTopic::new(SIGNING_TOPIC);
 
         let mut node = P2PNode {
             swarm,
             orders_topic,
             election_topic,
+            signing_topic,
             batch_tx,
             publish_rx: None,
             election_inbound_tx,
             election_outbound_rx: None,
+            signing_request_rx: None,
+            pending_signing: HashMap::new(),
+            local_signer: None,
             peer_id,
         };
 
@@ -220,6 +276,11 @@ impl P2PNode {
             .gossipsub
             .subscribe(&node.election_topic)
             .context("failed to subscribe to election topic")?;
+        node.swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&node.signing_topic)
+            .context("failed to subscribe to signing topic")?;
 
         // Listen
         let addr: Multiaddr = listen_addr.parse().context("invalid listen address")?;
@@ -237,6 +298,17 @@ impl P2PNode {
     /// Set election publish channel.
     pub fn set_election_publish_channel(&mut self, rx: mpsc::Receiver<ElectionMessage>) {
         self.election_outbound_rx = Some(rx);
+    }
+
+    /// Set signing request channel (withdrawal module sends requests here).
+    pub fn set_signing_channel(&mut self, rx: mpsc::Receiver<SigningRelay>) {
+        self.signing_request_rx = Some(rx);
+    }
+
+    /// Set local signer credentials for handling incoming signing requests.
+    pub fn set_local_signer(&mut self, signer: LocalSigner) {
+        info!(xrpl_addr = %signer.xrpl_address, "P2P signing relay: local signer configured");
+        self.local_signer = Some(signer);
     }
 
     /// Connect to a peer (bootstrap).
@@ -267,14 +339,113 @@ impl P2PNode {
         Ok(())
     }
 
+    fn publish_signing(&mut self, msg: &SigningMessage) -> Result<()> {
+        let data = serde_json::to_vec(msg).context("failed to serialize signing msg")?;
+        self.swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(self.signing_topic.clone(), data)
+            .map_err(|e| anyhow::anyhow!("signing publish failed: {}", e))?;
+        Ok(())
+    }
+
+    /// Handle an incoming signing request: sign with local enclave if we own the address.
+    async fn handle_signing_request(
+        local_signer: &LocalSigner,
+        request_id: &str,
+        hash_hex: &str,
+    ) -> SigningMessage {
+        let http = match reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(Duration::from_secs(15))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return SigningMessage::Response {
+                    request_id: request_id.to_string(),
+                    signer_xrpl_address: local_signer.xrpl_address.clone(),
+                    der_signature: None,
+                    compressed_pubkey: None,
+                    error: Some(format!("http client: {e}")),
+                };
+            }
+        };
+
+        let sign_url = format!("{}/pool/sign", local_signer.enclave_url);
+        let resp = http
+            .post(&sign_url)
+            .json(&serde_json::json!({
+                "from": local_signer.address,
+                "hash": hash_hex,
+                "session_key": local_signer.session_key,
+            }))
+            .send()
+            .await;
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                return SigningMessage::Response {
+                    request_id: request_id.to_string(),
+                    signer_xrpl_address: local_signer.xrpl_address.clone(),
+                    der_signature: None,
+                    compressed_pubkey: None,
+                    error: Some(format!("enclave request: {e}")),
+                };
+            }
+        };
+
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                return SigningMessage::Response {
+                    request_id: request_id.to_string(),
+                    signer_xrpl_address: local_signer.xrpl_address.clone(),
+                    der_signature: None,
+                    compressed_pubkey: None,
+                    error: Some(format!("enclave response parse: {e}")),
+                };
+            }
+        };
+
+        if body["status"].as_str() != Some("success") {
+            return SigningMessage::Response {
+                request_id: request_id.to_string(),
+                signer_xrpl_address: local_signer.xrpl_address.clone(),
+                der_signature: None,
+                compressed_pubkey: None,
+                error: Some(format!("enclave: {}", body.get("message").unwrap_or(&body))),
+            };
+        }
+
+        let r_hex = body["signature"]["r"].as_str().unwrap_or("");
+        let s_hex = body["signature"]["s"].as_str().unwrap_or("");
+        let r_bytes = hex::decode(r_hex).unwrap_or_default();
+        let s_bytes = hex::decode(s_hex).unwrap_or_default();
+        let der = crate::xrpl_signer::der_encode_signature(&r_bytes, &s_bytes);
+
+        SigningMessage::Response {
+            request_id: request_id.to_string(),
+            signer_xrpl_address: local_signer.xrpl_address.clone(),
+            der_signature: Some(hex::encode_upper(&der)),
+            compressed_pubkey: Some(local_signer.compressed_pubkey.to_uppercase()),
+            error: None,
+        }
+    }
+
     /// Run the event loop. Call this in a tokio::spawn.
     pub async fn run(&mut self) {
         // Take channels out of self for use in select!
         let mut publish_rx = self.publish_rx.take();
         let mut election_rx = self.election_outbound_rx.take();
+        let mut signing_rx = self.signing_request_rx.take();
 
         let orders_topic_hash = self.orders_topic.hash();
         let election_topic_hash = self.election_topic.hash();
+        let signing_topic_hash = self.signing_topic.hash();
+
+        let mut signing_cleanup = tokio::time::interval(Duration::from_secs(5));
 
         loop {
             tokio::select! {
@@ -303,9 +474,44 @@ impl P2PNode {
                     }
                 } => {
                     if let Err(e) = self.publish_election(&msg) {
-                        // InsufficientPeers is expected when running solo (no P2P peers)
                         tracing::debug!("election publish: {}", e);
                     }
+                }
+
+                // Handle signing relay requests from withdrawal module
+                Some(relay) = async {
+                    match &mut signing_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<SigningRelay>>().await,
+                    }
+                } => {
+                    let msg = SigningMessage::Request {
+                        request_id: relay.request_id.clone(),
+                        requester_peer_id: self.peer_id.to_string(),
+                        hash_hex: relay.hash_hex,
+                        signer_xrpl_address: relay.signer_xrpl_address,
+                    };
+                    match self.publish_signing(&msg) {
+                        Ok(_) => {
+                            self.pending_signing.insert(relay.request_id, relay.response_tx);
+                        }
+                        Err(e) => {
+                            warn!("signing publish failed: {}", e);
+                            let _ = relay.response_tx.send(SigningMessage::Response {
+                                request_id: "".into(),
+                                signer_xrpl_address: "".into(),
+                                der_signature: None,
+                                compressed_pubkey: None,
+                                error: Some(format!("P2P publish failed: {e}")),
+                            });
+                        }
+                    }
+                }
+
+                // Cleanup timed-out signing requests
+                _ = signing_cleanup.tick() => {
+                    // oneshot senders that are closed (receiver dropped) get cleaned up
+                    self.pending_signing.retain(|_, tx| !tx.is_closed());
                 }
 
                 // Handle swarm events
@@ -319,7 +525,6 @@ impl P2PNode {
                     },
                 )) => {
                     if message.topic == orders_topic_hash {
-                        // Order batch from sequencer
                         match serde_json::from_slice::<OrderBatch>(&message.data) {
                             Ok(batch) => {
                                 info!(
@@ -337,7 +542,6 @@ impl P2PNode {
                             }
                         }
                     } else if message.topic == election_topic_hash {
-                        // Election message
                         match serde_json::from_slice::<ElectionMessage>(&message.data) {
                             Ok(msg) => {
                                 if let Err(e) = self.election_inbound_tx.send(msg).await {
@@ -346,6 +550,49 @@ impl P2PNode {
                             }
                             Err(e) => {
                                 warn!("invalid election msg from {}: {}", propagation_source, e);
+                            }
+                        }
+                    } else if message.topic == signing_topic_hash {
+                        match serde_json::from_slice::<SigningMessage>(&message.data) {
+                            Ok(SigningMessage::Request {
+                                request_id,
+                                requester_peer_id,
+                                hash_hex,
+                                signer_xrpl_address,
+                            }) => {
+                                // Check if this request is for our local signer
+                                if let Some(ref local) = self.local_signer {
+                                    if local.xrpl_address == signer_xrpl_address {
+                                        info!(
+                                            req_id = %request_id,
+                                            from = %requester_peer_id,
+                                            "signing request received — signing locally"
+                                        );
+                                        let local = local.clone();
+                                        let req_id = request_id.clone();
+                                        let hash = hash_hex.clone();
+                                        let response = Self::handle_signing_request(
+                                            &local, &req_id, &hash,
+                                        ).await;
+                                        if let Err(e) = self.publish_signing(&response) {
+                                            error!("failed to publish signing response: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(SigningMessage::Response {
+                                request_id,
+                                ..
+                            }) => {
+                                // Deliver to waiting withdrawal task
+                                if let Some(tx) = self.pending_signing.remove(&request_id) {
+                                    if let Ok(msg) = serde_json::from_slice::<SigningMessage>(&message.data) {
+                                        let _ = tx.send(msg);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("invalid signing msg from {}: {}", propagation_source, e);
                             }
                         }
                     }
@@ -360,7 +607,6 @@ impl P2PNode {
                         protocol = %info.protocol_version,
                         "peer identified"
                     );
-                    // Add peer's listen addresses to gossipsub
                     for addr in info.listen_addrs {
                         self.swarm
                             .behaviour_mut()

@@ -14,9 +14,11 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use xrpl_mithril_codec::signing;
 
+use crate::p2p::{SigningMessage, SigningRelay};
 use crate::xrpl_signer;
 
 // ── Types ─────────────────────────────────────────────────────────
@@ -112,15 +114,60 @@ async fn sign_with_enclave(
     Ok((der_hex, signer.compressed_pubkey.to_uppercase()))
 }
 
+/// Collect a signature from a remote signer via P2P relay.
+async fn sign_via_p2p(
+    signing_tx: &mpsc::Sender<SigningRelay>,
+    signer: &SignerConfig,
+    hash: &[u8; 32],
+    timeout_secs: u64,
+) -> Result<(String, String)> {
+    let request_id = format!("{:016x}", rand::random::<u64>());
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+
+    signing_tx
+        .send(SigningRelay {
+            request_id: request_id.clone(),
+            hash_hex: format!("0x{}", hex::encode(hash)),
+            signer_xrpl_address: signer.xrpl_address.clone(),
+            response_tx: resp_tx,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("P2P signing channel closed"))?;
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        resp_rx,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("P2P signing timeout ({}s)", timeout_secs))?
+    .map_err(|_| anyhow::anyhow!("P2P signing response dropped"))?;
+
+    match response {
+        SigningMessage::Response {
+            der_signature: Some(der),
+            compressed_pubkey: Some(pubkey),
+            error: None,
+            ..
+        } => Ok((der, pubkey)),
+        SigningMessage::Response { error: Some(e), .. } => {
+            anyhow::bail!("remote signer error: {}", e)
+        }
+        _ => anyhow::bail!("unexpected signing response"),
+    }
+}
+
 // ── Main withdrawal flow ──────────────────────────────────────────
 
 /// Submit a multisig withdrawal: margin check in enclave + 2-of-N signing.
+/// If `signing_tx` is provided, uses P2P relay for remote signatures.
+/// Otherwise falls back to direct HTTP (legacy, requires SSH tunnels).
 pub async fn process_withdrawal(
     perp: &crate::perp_client::PerpClient,
     xrpl_url: &str,
     escrow_address: &str,
     signers_config: &SignersConfig,
     req: &WithdrawRequest,
+    signing_tx: Option<&mpsc::Sender<SigningRelay>>,
 ) -> Result<WithdrawResult> {
     info!(
         user = %req.user_id,
@@ -207,7 +254,7 @@ pub async fn process_withdrawal(
 
     // Step 4: Collect signatures from quorum signers
     let http = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true) // self-signed TLS on enclaves
+        .danger_accept_invalid_certs(true)
         .build()
         .context("failed to build HTTP client")?;
 
@@ -217,7 +264,6 @@ pub async fn process_withdrawal(
         if collected_signers.len() >= signers_config.quorum {
             break;
         }
-        // Decode r-address → 20-byte AccountID for multi_signing_hash
         let account_id = match xrpl_signer::decode_xrpl_address(&signer.xrpl_address) {
             Ok(id) => id,
             Err(e) => {
@@ -226,17 +272,23 @@ pub async fn process_withdrawal(
             }
         };
 
-        // Compute per-signer multisig hash
         let hash = signing::multi_signing_hash(tx_map, &account_id)
             .map_err(|e| anyhow::anyhow!("multi_signing_hash for {} failed: {:?}", signer.name, e))?;
 
-        // Call signer's enclave
-        match sign_with_enclave(&http, signer, &hash).await {
+        // Use P2P relay if available, otherwise fall back to direct HTTP
+        let sign_result = if let Some(stx) = signing_tx {
+            sign_via_p2p(stx, signer, &hash, 30).await
+        } else {
+            sign_with_enclave(&http, signer, &hash).await
+        };
+
+        match sign_result {
             Ok((der_hex, pubkey_hex)) => {
                 info!(
                     signer = %signer.name,
                     xrpl_addr = %signer.xrpl_address,
                     der_len = der_hex.len() / 2,
+                    via = if signing_tx.is_some() { "p2p" } else { "http" },
                     "collected multisig signature"
                 );
                 collected_signers.push(serde_json::json!({
@@ -249,7 +301,6 @@ pub async fn process_withdrawal(
             }
             Err(e) => {
                 warn!(signer = %signer.name, "signing failed: {}", e);
-                // Continue to next signer — we may still reach quorum
             }
         }
     }
