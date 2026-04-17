@@ -6,6 +6,143 @@ use tracing::info;
 
 use crate::xrpl_signer;
 
+// ── XRPL binary serialization ──────────────────────────────────
+//
+// Minimal implementation covering SignerListSet and AccountSet.
+// Reference: https://xrpl.org/serialization.html
+
+const HASH_PREFIX_TX_SIGN: [u8; 4] = [0x53, 0x54, 0x58, 0x00]; // "STX\0"
+
+const XRPL_ALPHABET: &[u8; 58] =
+    b"rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
+
+fn xrpl_alphabet() -> &'static bs58::Alphabet {
+    static ALPHA: std::sync::OnceLock<bs58::Alphabet> = std::sync::OnceLock::new();
+    ALPHA.get_or_init(|| bs58::Alphabet::new(XRPL_ALPHABET).expect("valid alphabet"))
+}
+
+fn decode_xrpl_address(address: &str) -> Result<[u8; 20]> {
+    let decoded = bs58::decode(address)
+        .with_alphabet(xrpl_alphabet())
+        .into_vec()
+        .context("invalid XRPL address encoding")?;
+    if decoded.len() != 25 || decoded[0] != 0x00 {
+        anyhow::bail!("invalid XRPL address: wrong length or prefix");
+    }
+    let mut account_id = [0u8; 20];
+    account_id.copy_from_slice(&decoded[1..21]);
+    Ok(account_id)
+}
+
+fn encode_field_id(type_code: u8, field_code: u8) -> Vec<u8> {
+    match (type_code < 16, field_code < 16) {
+        (true, true) => vec![(type_code << 4) | field_code],
+        (true, false) => vec![type_code << 4, field_code],
+        (false, true) => vec![field_code, type_code],
+        (false, false) => vec![0, type_code, field_code],
+    }
+}
+
+fn encode_vl_length(len: usize) -> Vec<u8> {
+    if len <= 192 {
+        vec![len as u8]
+    } else {
+        let adj = len - 193;
+        vec![193 + (adj >> 8) as u8, (adj & 0xff) as u8]
+    }
+}
+
+struct XrplField {
+    type_code: u8,
+    field_code: u8,
+    data: Vec<u8>,
+}
+
+impl XrplField {
+    fn uint16(field_code: u8, val: u16) -> Self {
+        Self { type_code: 1, field_code, data: val.to_be_bytes().to_vec() }
+    }
+    fn uint32(field_code: u8, val: u32) -> Self {
+        Self { type_code: 2, field_code, data: val.to_be_bytes().to_vec() }
+    }
+    fn amount_drops(field_code: u8, drops: u64) -> Self {
+        Self { type_code: 6, field_code, data: (0x4000000000000000u64 | drops).to_be_bytes().to_vec() }
+    }
+    fn blob(field_code: u8, bytes: &[u8]) -> Self {
+        let mut data = encode_vl_length(bytes.len());
+        data.extend_from_slice(bytes);
+        Self { type_code: 7, field_code, data }
+    }
+    fn account_id(field_code: u8, id: &[u8; 20]) -> Self {
+        let mut data = vec![20u8];
+        data.extend_from_slice(id);
+        Self { type_code: 8, field_code, data }
+    }
+    fn sort_key(&self) -> (u8, u8) { (self.type_code, self.field_code) }
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = encode_field_id(self.type_code, self.field_code);
+        out.extend_from_slice(&self.data);
+        out
+    }
+}
+
+fn serialize_signer_entries(entries: &[([u8; 20], u16)]) -> Vec<u8> {
+    let mut out = encode_field_id(15, 4); // STArray SignerEntries
+    for (account_id, weight) in entries {
+        out.extend_from_slice(&encode_field_id(14, 11)); // STObject SignerEntry (field 11)
+        // Inner fields sorted: UInt16(1,3) then AccountID(8,1)
+        out.extend_from_slice(&encode_field_id(1, 3)); // SignerWeight
+        out.extend_from_slice(&weight.to_be_bytes());
+        out.extend_from_slice(&encode_field_id(8, 1)); // Account
+        out.push(20);
+        out.extend_from_slice(account_id);
+        out.push(0xe1); // ObjectEndMarker
+    }
+    out.push(0xf1); // ArrayEndMarker
+    out
+}
+
+fn serialize_fields(fields: &mut Vec<XrplField>, array_suffix: Option<&[u8]>) -> Vec<u8> {
+    fields.sort_by_key(|f| f.sort_key());
+    let mut out = Vec::new();
+    for f in fields.iter() {
+        out.extend_from_slice(&f.serialize());
+    }
+    if let Some(suffix) = array_suffix {
+        out.extend_from_slice(suffix);
+    }
+    out
+}
+
+fn sign_xrpl_tx(
+    keypair: &XrplKeypair,
+    fields: &mut Vec<XrplField>,
+    array_suffix: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    use sha2::Digest;
+
+    let pubkey_bytes = keypair.pubkey_bytes();
+    fields.push(XrplField::blob(3, &pubkey_bytes)); // SigningPubKey
+
+    let mut signing_data = HASH_PREFIX_TX_SIGN.to_vec();
+    signing_data.extend_from_slice(&serialize_fields(fields, array_suffix));
+
+    let sig_bytes = match &keypair.key {
+        XrplSigningKey::Secp256k1(_) => {
+            let hash = sha2::Sha512::digest(&signing_data);
+            let hash_half: [u8; 32] = hash[..32].try_into().unwrap();
+            keypair.sign_hash(&hash_half)?
+        }
+        XrplSigningKey::Ed25519(sk) => {
+            use ed25519_dalek::Signer;
+            sk.sign(&signing_data).to_bytes().to_vec()
+        }
+    };
+
+    fields.push(XrplField::blob(4, &sig_bytes)); // TxnSignature
+    Ok(serialize_fields(fields, array_suffix))
+}
+
 // ── operator-setup ───────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -174,18 +311,19 @@ pub async fn escrow_setup(
 
     let http = reqwest::Client::new();
 
-    // Step 1: Derive escrow address from seed (or use override)
-    println!("[1/4] Resolving escrow address...");
+    // Step 1: Derive keypair from seed
+    println!("[1/4] Resolving escrow keypair...");
+    let keypair = derive_keypair_from_seed(escrow_seed)?;
     let escrow_address = if let Some(addr) = escrow_address_override {
         println!("  Using provided address: {addr}");
         addr.to_string()
     } else {
-        let addr = derive_xrpl_address_from_seed(escrow_seed)?;
-        println!("  Derived from seed: {addr}");
-        addr
+        println!("  Derived from seed: {}", keypair.address);
+        keypair.address.clone()
     };
+    let account_id = decode_xrpl_address(&escrow_address)?;
 
-    // Step 2: Check account exists
+    // Step 2: Check account exists + get sequence
     println!("\n[2/4] Checking account on XRPL...");
     let account_info: serde_json::Value = http
         .post(xrpl_url)
@@ -211,29 +349,30 @@ pub async fn escrow_setup(
         sequence
     );
 
-    // Step 3: Submit SignerListSet
+    // Step 3: Submit SignerListSet (locally signed)
     println!("\n[3/4] Submitting SignerListSet...");
-    let signer_entries: Vec<serde_json::Value> = config
+    let signer_entries_bin: Vec<([u8; 20], u16)> = config
         .signers
         .iter()
-        .map(|s| {
-            serde_json::json!({
-                "SignerEntry": {
-                    "Account": s.xrpl_address,
-                    "SignerWeight": 1
-                }
-            })
-        })
-        .collect();
+        .map(|s| Ok((decode_xrpl_address(&s.xrpl_address)?, 1u16)))
+        .collect::<Result<Vec<_>>>()?;
+    let signer_entries_suffix = serialize_signer_entries(&signer_entries_bin);
 
-    let sls_tx = serde_json::json!({
-        "TransactionType": "SignerListSet",
-        "Account": escrow_address,
-        "SignerQuorum": config.quorum,
-        "SignerEntries": signer_entries,
-    });
+    let mut sls_fields = vec![
+        XrplField::uint16(2, 12),                              // TransactionType = SignerListSet
+        XrplField::uint32(4, sequence as u32),                 // Sequence
+        XrplField::uint32(35, config.quorum),                  // SignerQuorum
+        XrplField::amount_drops(8, 12),                        // Fee = 12 drops
+        XrplField::account_id(1, &account_id),                 // Account
+    ];
 
-    let sls_result = sign_and_submit(xrpl_url, &escrow_seed, &sls_tx).await?;
+    let sls_blob = sign_xrpl_tx(
+        &keypair,
+        &mut sls_fields,
+        Some(&signer_entries_suffix),
+    )?;
+
+    let sls_result = submit_tx_blob(xrpl_url, &sls_blob).await?;
     let sls_status = sls_result["result"]["engine_result"]
         .as_str()
         .unwrap_or("unknown");
@@ -250,13 +389,21 @@ pub async fn escrow_setup(
     // Step 4: Disable master key
     if disable_master {
         println!("\n[4/4] Disabling master key (AccountSet asfDisableMaster)...");
-        let acset_tx = serde_json::json!({
-            "TransactionType": "AccountSet",
-            "Account": escrow_address,
-            "SetFlag": 4, // asfDisableMaster
-        });
+        let mut acset_fields = vec![
+            XrplField::uint16(2, 3),                           // TransactionType = AccountSet
+            XrplField::uint32(4, (sequence + 1) as u32),       // Sequence (next)
+            XrplField::uint32(33, 4),                          // SetFlag = asfDisableMaster
+            XrplField::amount_drops(8, 12),                    // Fee = 12 drops
+            XrplField::account_id(1, &account_id),             // Account
+        ];
 
-        let acset_result = sign_and_submit(xrpl_url, &escrow_seed, &acset_tx).await?;
+        let acset_blob = sign_xrpl_tx(
+            &keypair,
+            &mut acset_fields,
+            None,
+        )?;
+
+        let acset_result = submit_tx_blob(xrpl_url, &acset_blob).await?;
         let acset_status = acset_result["result"]["engine_result"]
             .as_str()
             .unwrap_or("unknown");
@@ -280,22 +427,81 @@ pub async fn escrow_setup(
     Ok(())
 }
 
+async fn submit_tx_blob(xrpl_url: &str, blob: &[u8]) -> Result<serde_json::Value> {
+    let http = reqwest::Client::new();
+    let hex = hex::encode_upper(blob);
+    info!(blob_len = blob.len(), "submitting tx_blob");
+    let resp: serde_json::Value = http
+        .post(xrpl_url)
+        .json(&serde_json::json!({
+            "method": "submit",
+            "params": [{"tx_blob": hex}]
+        }))
+        .send()
+        .await
+        .context("XRPL submit request failed")?
+        .json()
+        .await
+        .context("XRPL submit response parse failed")?;
+    Ok(resp)
+}
+
+enum XrplSigningKey {
+    Secp256k1(k256::ecdsa::SigningKey),
+    Ed25519(ed25519_dalek::SigningKey),
+}
+
 struct XrplKeypair {
-    signing_key: k256::ecdsa::SigningKey,
+    key: XrplSigningKey,
     compressed_pubkey_hex: String,
     address: String,
 }
 
+impl XrplKeypair {
+    fn pubkey_bytes(&self) -> Vec<u8> {
+        hex::decode(&self.compressed_pubkey_hex).expect("valid hex")
+    }
+
+    fn sign_hash(&self, hash: &[u8; 32]) -> Result<Vec<u8>> {
+        match &self.key {
+            XrplSigningKey::Secp256k1(sk) => {
+                use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature};
+                let (sig, _): (Signature, _) = sk
+                    .sign_prehash(hash)
+                    .map_err(|e| anyhow::anyhow!("secp256k1 signing failed: {e}"))?;
+                Ok(sig.to_der().as_bytes().to_vec())
+            }
+            XrplSigningKey::Ed25519(sk) => {
+                use ed25519_dalek::Signer;
+                let sig = sk.sign(hash);
+                Ok(sig.to_bytes().to_vec())
+            }
+        }
+    }
+}
+
+fn derive_address_from_pubkey(pubkey_bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let sha256 = sha2::Sha256::digest(pubkey_bytes);
+    let account_id = ripemd::Ripemd160::digest(sha256);
+
+    let mut payload = Vec::with_capacity(25);
+    payload.push(0x00);
+    payload.extend_from_slice(&account_id);
+    let h1 = sha2::Sha256::digest(&payload);
+    let h2 = sha2::Sha256::digest(h1);
+    payload.extend_from_slice(&h2[..4]);
+
+    bs58::encode(&payload)
+        .with_alphabet(xrpl_alphabet())
+        .into_string()
+}
+
 fn derive_keypair_from_seed(seed: &str) -> Result<XrplKeypair> {
-    use k256::ecdsa::SigningKey;
     use sha2::Digest;
 
-    const XRPL_ALPHABET: &[u8; 58] =
-        b"rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
-    let alphabet = bs58::Alphabet::new(XRPL_ALPHABET).expect("valid alphabet");
-
     let decoded = bs58::decode(seed)
-        .with_alphabet(&alphabet)
+        .with_alphabet(xrpl_alphabet())
         .into_vec()
         .context("invalid seed encoding")?;
 
@@ -303,24 +509,45 @@ fn derive_keypair_from_seed(seed: &str) -> Result<XrplKeypair> {
         anyhow::bail!("seed too short: {} bytes", decoded.len());
     }
 
-    let version = decoded[0];
-    let entropy = &decoded[1..17];
+    // Ed25519 seeds have 3-byte prefix [0x01, 0xE1, 0x4B], entropy at [3..19]
+    // secp256k1 seeds have 1-byte prefix [0x21], entropy at [1..17]
+    let is_ed25519 = decoded.len() >= 23
+        && decoded[0] == 0x01
+        && decoded[1] == 0xE1
+        && decoded[2] == 0x4B;
 
-    if version == 0x01 {
-        anyhow::bail!(
-            "Ed25519 seeds (sEd...) not supported yet. Use secp256k1 seed."
-        );
+    if is_ed25519 {
+        let entropy = &decoded[3..19];
+        // Ed25519: private key = SHA-512(entropy)[0..32]
+        let hash = sha2::Sha512::digest(entropy);
+        let secret_bytes: [u8; 32] = hash[..32].try_into().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_bytes);
+        let verifying_key = signing_key.verifying_key();
+
+        // XRPL Ed25519 pubkey: 0xED prefix + 32 bytes
+        let mut pubkey = Vec::with_capacity(33);
+        pubkey.push(0xED);
+        pubkey.extend_from_slice(verifying_key.as_bytes());
+        let pubkey_hex = hex::encode(&pubkey);
+        let address = derive_address_from_pubkey(&pubkey);
+
+        return Ok(XrplKeypair {
+            key: XrplSigningKey::Ed25519(signing_key),
+            compressed_pubkey_hex: pubkey_hex,
+            address,
+        });
     }
 
-    use sha2::Sha512;
+    // secp256k1 derivation (version 0x21)
+    let entropy = &decoded[1..17];
+    use k256::ecdsa::SigningKey;
     let mut seq: u32 = 0;
     let signing_key = loop {
-        let mut hasher = Sha512::new();
+        let mut hasher = sha2::Sha512::new();
         hasher.update(entropy);
         hasher.update(seq.to_be_bytes());
         let hash = hasher.finalize();
-        let candidate = &hash[..32];
-        if let Ok(sk) = SigningKey::from_slice(candidate) {
+        if let Ok(sk) = SigningKey::from_slice(&hash[..32]) {
             break sk;
         }
         seq += 1;
@@ -332,25 +559,12 @@ fn derive_keypair_from_seed(seed: &str) -> Result<XrplKeypair> {
     let verifying_key = signing_key.verifying_key();
     let compressed = verifying_key.to_encoded_point(true);
     let compressed_bytes = compressed.as_bytes();
-    let compressed_hex = hex::encode(compressed_bytes);
-
-    let sha256 = sha2::Sha256::digest(compressed_bytes);
-    let account_id = ripemd::Ripemd160::digest(sha256);
-
-    let mut payload = Vec::with_capacity(25);
-    payload.push(0x00);
-    payload.extend_from_slice(&account_id);
-    let h1 = sha2::Sha256::digest(&payload);
-    let h2 = sha2::Sha256::digest(h1);
-    payload.extend_from_slice(&h2[..4]);
-
-    let address = bs58::encode(&payload)
-        .with_alphabet(&alphabet)
-        .into_string();
+    let pubkey_hex = hex::encode(compressed_bytes);
+    let address = derive_address_from_pubkey(compressed_bytes);
 
     Ok(XrplKeypair {
-        signing_key,
-        compressed_pubkey_hex: compressed_hex,
+        key: XrplSigningKey::Secp256k1(signing_key),
+        compressed_pubkey_hex: pubkey_hex,
         address,
     })
 }
@@ -362,24 +576,15 @@ fn derive_xrpl_address_from_seed(seed: &str) -> Result<String> {
 // ── sign-request (Bug 4) ───────────────────────────────────────
 
 fn sign_body(keypair: &XrplKeypair, body: &[u8], timestamp: u64) -> Result<String> {
-    use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature};
     use sha2::Digest;
 
     let mut hasher = sha2::Sha256::new();
-    if body.is_empty() {
-        hasher.update(b"");
-    } else {
-        hasher.update(body);
-    }
+    hasher.update(body);
     hasher.update(timestamp.to_string().as_bytes());
-    let hash = hasher.finalize();
+    let hash: [u8; 32] = hasher.finalize().into();
 
-    let (signature, _): (Signature, _) = keypair
-        .signing_key
-        .sign_prehash(&hash)
-        .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
-
-    Ok(hex::encode(signature.to_der()))
+    let sig_bytes = keypair.sign_hash(&hash)?;
+    Ok(hex::encode(&sig_bytes))
 }
 
 pub async fn sign_request(
@@ -482,18 +687,14 @@ pub async fn cli_balance(api_url: &str, seed: &str) -> Result<()> {
         .as_secs();
 
     let uri_path = format!("/v1/account/balance?user_id={}", keypair.address);
-    let mut hasher = sha2::Sha256::new();
     use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
     hasher.update(uri_path.as_bytes());
     hasher.update(timestamp.to_string().as_bytes());
-    let hash = hasher.finalize();
+    let hash: [u8; 32] = hasher.finalize().into();
 
-    use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature};
-    let (signature, _): (Signature, _) = keypair
-        .signing_key
-        .sign_prehash(&hash)
-        .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
-    let sig_hex = hex::encode(signature.to_der());
+    let sig_bytes = keypair.sign_hash(&hash)?;
+    let sig_hex = hex::encode(&sig_bytes);
 
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -522,62 +723,3 @@ pub async fn cli_balance(api_url: &str, seed: &str) -> Result<()> {
     Ok(())
 }
 
-/// Sign a transaction using the XRPL `sign` RPC and submit it.
-async fn sign_and_submit(
-    xrpl_url: &str,
-    seed: &str,
-    tx_json: &serde_json::Value,
-) -> Result<serde_json::Value> {
-    let http = reqwest::Client::new();
-
-    // Use XRPL sign RPC (sends seed to the server — acceptable for testnet)
-    let sign_resp: serde_json::Value = http
-        .post(xrpl_url)
-        .json(&serde_json::json!({
-            "method": "sign",
-            "params": [{
-                "secret": seed,
-                "tx_json": tx_json,
-            }]
-        }))
-        .send()
-        .await
-        .context("XRPL sign request failed")?
-        .json()
-        .await
-        .context("XRPL sign response parse failed")?;
-
-    let signed_blob = sign_resp["result"]["tx_blob"]
-        .as_str()
-        .with_context(|| {
-            let err = sign_resp["result"]["error_message"]
-                .as_str()
-                .unwrap_or("unknown");
-            format!(
-                "XRPL sign RPC failed: {err}. \
-                 Public nodes disable the sign RPC. Use a local rippled, \
-                 or use scripts/setup_testnet_escrow.py instead."
-            )
-        })?;
-
-    info!(
-        tx_type = tx_json["TransactionType"].as_str().unwrap_or("?"),
-        "signed, submitting..."
-    );
-
-    // Submit
-    let submit_resp: serde_json::Value = http
-        .post(xrpl_url)
-        .json(&serde_json::json!({
-            "method": "submit",
-            "params": [{"tx_blob": signed_blob}]
-        }))
-        .send()
-        .await
-        .context("XRPL submit request failed")?
-        .json()
-        .await
-        .context("XRPL submit response parse failed")?;
-
-    Ok(submit_resp)
-}

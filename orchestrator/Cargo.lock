@@ -3791,6 +3791,7 @@ dependencies = [
  "axum",
  "bs58",
  "clap",
+ "ed25519-dalek",
  "ethers",
  "hex",
  "k256",
