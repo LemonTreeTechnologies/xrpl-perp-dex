@@ -92,7 +92,7 @@ deploy_node() {
     # Health check
     log "[$name] Health check..."
     local health
-    health=$(ssh azureuser@"$ip" 'curl -s http://localhost:3000/v1/health' 2>/dev/null || echo '{"status":"unreachable"}')
+    health=$(ssh azureuser@"$ip" 'curl -s --connect-timeout 5 --max-time 10 http://localhost:3000/v1/health' 2>/dev/null || echo '{"status":"unreachable"}')
     log "[$name] $health"
 
     if echo "$health" | grep -q '"status":"ok"'; then
@@ -127,6 +127,6 @@ sleep 10
 log "Final health status:"
 for node in "${!NODES[@]}"; do
     ip="${NODES[$node]}"
-    health=$(ssh azureuser@"$ip" 'curl -s http://localhost:3000/v1/health' 2>/dev/null || echo "unreachable")
+    health=$(ssh azureuser@"$ip" 'curl -s --connect-timeout 5 --max-time 10 http://localhost:3000/v1/health' 2>/dev/null || echo "unreachable")
     log "  $node ($ip): $health"
 done
