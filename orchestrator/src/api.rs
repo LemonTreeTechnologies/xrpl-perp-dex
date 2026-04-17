@@ -176,7 +176,17 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let peers = state.peer_count.load(std::sync::atomic::Ordering::Relaxed);
     let uptime_secs = state.start_time.elapsed().as_secs();
 
-    let enclave_ok = state.perp.get_balance("__health_check__").await.is_ok();
+    let enclave_ok = match reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => {
+            let url = format!("{}/pool/status", state.perp.base_url());
+            c.get(&url).send().await.map(|r| r.status().is_success()).unwrap_or(false)
+        }
+        Err(_) => false,
+    };
 
     Json(serde_json::json!({
         "status": "ok",
