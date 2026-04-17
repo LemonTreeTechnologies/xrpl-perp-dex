@@ -6,6 +6,7 @@
 
 mod api;
 mod auth;
+mod cli_tools;
 mod commitment;
 mod db;
 mod election;
@@ -28,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing::{error, info, warn};
 
 use crate::api::AppState;
@@ -43,6 +44,47 @@ use crate::xrpl_monitor::XrplMonitor;
 #[derive(Parser, Debug)]
 #[command(name = "perp-dex-orchestrator", about = "Perp DEX Orchestrator")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Generate a new signer identity from an SGX enclave.
+    OperatorSetup {
+        /// Enclave REST API base URL
+        #[arg(long, default_value = "https://localhost:9088/v1")]
+        enclave_url: String,
+        /// Operator name (label for config files)
+        #[arg(long)]
+        name: String,
+        /// Write signer entry JSON to this file
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Configure an XRPL escrow account with a 2-of-N SignerListSet.
+    EscrowSetup {
+        /// XRPL JSON-RPC URL
+        #[arg(long, default_value = "https://s.altnet.rippletest.net:51234")]
+        xrpl_url: String,
+        /// Path to signers config JSON (must have "signers" array with xrpl_address)
+        #[arg(long)]
+        signers_config: PathBuf,
+        /// XRPL escrow account seed (secret)
+        #[arg(long)]
+        escrow_seed: String,
+        /// Disable master key after setting SignerList (irreversible without multisig!)
+        #[arg(long)]
+        disable_master: bool,
+    },
+}
+
+#[derive(Parser, Debug)]
+struct RunArgs {
     /// Enclave REST API base URL
     #[arg(long, default_value = "https://localhost:9088/v1")]
     enclave_url: String,
@@ -214,6 +256,28 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    match cli.command {
+        Some(Command::OperatorSetup {
+            enclave_url,
+            name,
+            output,
+        }) => {
+            return cli_tools::operator_setup(&enclave_url, &name, output.as_deref()).await;
+        }
+        Some(Command::EscrowSetup {
+            xrpl_url,
+            signers_config,
+            escrow_seed,
+            disable_master,
+        }) => {
+            return cli_tools::escrow_setup(&xrpl_url, &signers_config, &escrow_seed, disable_master).await;
+        }
+        None => {
+            // Default: run orchestrator with flattened RunArgs
+        }
+    }
+
+    let cli = cli.run;
     // Resolve escrow address
     let escrow_address = match cli.escrow_address {
         Some(addr) => addr,
