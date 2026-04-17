@@ -85,7 +85,7 @@ deploy_node() {
 
     # Start (use systemd if available, otherwise nohup with existing start_orchestrator.sh)
     log "[$name] Starting..."
-    ssh azureuser@"$ip" "sudo systemctl restart perp-dex-orchestrator 2>/dev/null || (cd $REMOTE_DIR && nohup ./start_orchestrator.sh > orchestrator.log 2>&1 &)"
+    ssh azureuser@"$ip" "sudo systemctl restart perp-dex-orchestrator 2>/dev/null || (cd $REMOTE_DIR && nohup ./start_orchestrator.sh </dev/null > orchestrator.log 2>&1 & echo PID=\$!)"
 
     sleep 3
 
