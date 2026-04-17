@@ -19,8 +19,8 @@ REMOTE_DIR="/home/azureuser/perp"
 
 declare -A NODES=(
     [node-1]="20.71.184.176"
-    [node-2]="48.209.17.158"
-    [node-3]="74.234.43.107"
+    [node-2]="20.224.243.60"
+    [node-3]="52.236.130.102"
 )
 
 # Colors
