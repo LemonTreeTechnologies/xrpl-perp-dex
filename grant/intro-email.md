@@ -36,12 +36,24 @@ API is live at https://api-perp.ph18.io and I would like reviewers to
 be able to poke at it before the formal application window opens,
 rather than discover us in a pile of fresh submissions:
 
-- **Ten verified on-chain transactions on XRPL testnet**, one per
-  failure-mode scenario from our research document 07, including 2-of-3
-  withdrawal, malicious-operator rejection, three SignerListSet rotation
-  scenarios (SGX compromise, hardware failure, cloud migration), and a
-  2-of-3 → 3-of-4 expansion.
-  Escrow: https://testnet.xrpl.org/accounts/rM44W1FkXrvwiQ6p4GLNP2yfERA12d4Qqx
+- **On-chain multisig escrow with real SGX enclave keys** on XRPL
+  testnet — 2-of-3 `SignerListSet` with master key disabled, keys
+  derived inside Intel SGX enclaves on three independent Azure DCsv3
+  nodes. Fully automated via a single CLI command (`escrow-setup`).
+  Escrow: https://testnet.xrpl.org/accounts/rLTFGDeYhE6zAAHhErjhMjegNQYb2y7rUP
+
+- **11 of 11 failure-mode scenarios** verified on the live 3-node
+  cluster: 5 component-level (sequencer crash with 15s failover,
+  validator crash, enclave crash, Binance API down, XRPL node down)
+  and 6 operator-level multisig scenarios (normal 2-of-3, one/two
+  operators offline, malicious signer rejection, all 3 pairwise
+  combinations). No mocks — real ECDSA inside SGX enclaves, real
+  XRPL testnet transactions.
+  Report: `docs/failure-test-results-2026-04-17.md`
+
+- **P2P signing relay** — cross-operator withdrawal signing over
+  authenticated gossipsub mesh, <10ms for quorum collection. No new
+  ports, no new attack surface.
 
 - **Three Azure DCsv3 nodes** with Intel SGX, all returning valid
   4,734-byte Intel-signed DCAP quotes. Full deployment recipe published
@@ -53,15 +65,14 @@ rather than discover us in a pile of fresh submissions:
   new one, and reconvergence happens in 3 seconds after the network
   heals. Report: `research/election-split-brain-test-report.md`.
 
-- **9 of 9 failure-mode scenarios** pass reproducibly with a single
-  command against the live cluster (`python3 tests/scenarios_runner.py all`).
-  No mocks; the signatures are real ECDSA produced inside the SGX
-  enclaves.
+- **Production deployment pipeline**: systemd units with auto-restart,
+  `/v1/health` endpoint (enclave status, peer count, uptime), deploy
+  script with rolling updates and health checks.
 
 - Full test coverage: 86 Rust unit tests, 22 Python e2e tests, 19
-  enclave invariant tests, 9 scenarios. External security audit with
-  52 findings, 50 fixed and 2 documented as by-design for single-
-  operator MVP.
+  enclave invariant tests, 11 failure-mode scenarios. External security
+  audit with 52 findings, 50 fixed and 2 documented as by-design for
+  single-operator MVP.
 
 - Open source from day one under BSL 1.1 (auto-converts to Apache 2.0
   in four years). Both repositories public at
@@ -74,11 +85,10 @@ rather than discover us in a pile of fresh submissions:
    wave so we are not lost in the queue when applications open.
 2. If there is any pre-application conversation, office hours, or
    technical review offered before the wave opens, I would welcome it.
-3. If a demo would be useful, I am available to join any call. I will
-   also be presenting at **Hack the Block, Paris Blockchain Week,
-   April 11-12, 2026** (Challenge 2: Impact Finance) — if anyone from
-   the XRPL Grants team is attending, I would love to show the live
-   DCAP attestation step and the on-chain multisig flow in person.
+3. If a demo would be useful, I am available to join any call. We
+   presented at **Hack the Block, Paris Blockchain Week** (April 11-12,
+   2026) — the live DCAP attestation and on-chain multisig flow demo
+   is available on request.
 
 **Full application package** (single `.md` file, ~900 lines, including
 problem statement, architecture, team, 5 milestones with 30% product +
