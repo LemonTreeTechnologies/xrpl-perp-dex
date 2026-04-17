@@ -1,0 +1,18 @@
+[Unit]
+Description=Perp DEX Orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=azureuser
+WorkingDirectory=/home/azureuser/perp
+ExecStart=/home/azureuser/perp/start_orchestrator.sh
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
