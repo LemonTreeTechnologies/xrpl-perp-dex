@@ -77,32 +77,70 @@ impl TradingEngine {
         reduce_only: bool,
         client_order_id: Option<String>,
     ) -> Result<OrderResult> {
-        // Step 0: Pre-check margin in enclave before matching
-        // This prevents consuming maker liquidity for orders that enclave will reject
-        let balance = self.perp.get_balance(&user_id).await;
-        if let Ok(bal) = &balance {
-            if let Some(avail_str) = bal["data"]["available_margin"].as_str() {
-                if let Ok(avail) = avail_str.parse::<FP8>() {
-                    let est_price = if price.raw() > 0 {
-                        price
-                    } else {
-                        FP8::from_f64(1.0)
-                    };
-                    let notional = size * est_price;
-                    let est_margin = FP8(notional.raw() / leverage as i64);
-                    if avail.raw() < est_margin.raw() {
-                        anyhow::bail!(
-                            "insufficient margin: available={}, required~={}",
-                            avail,
-                            est_margin
-                        );
+        self.submit_order_inner(
+            user_id, side, order_type, price, size, leverage,
+            time_in_force, reduce_only, client_order_id, None,
+        ).await
+    }
+
+    /// Submit a close order that routes through the CLOB.
+    /// The taker side of fills will call close_position instead of open_position.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_close_order(
+        &self,
+        user_id: String,
+        close_side: Side,
+        size: FP8,
+        leverage: u32,
+        close_position_id: u32,
+    ) -> Result<OrderResult> {
+        self.submit_order_inner(
+            user_id, close_side, OrderType::Market, FP8::ZERO, size, leverage,
+            TimeInForce::Ioc, true, None, Some(close_position_id),
+        ).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_order_inner(
+        &self,
+        user_id: String,
+        side: Side,
+        order_type: OrderType,
+        price: FP8,
+        size: FP8,
+        leverage: u32,
+        time_in_force: TimeInForce,
+        reduce_only: bool,
+        client_order_id: Option<String>,
+        close_position_id: Option<u32>,
+    ) -> Result<OrderResult> {
+        // Step 0: Pre-check margin in enclave before matching (skip for close orders)
+        if close_position_id.is_none() {
+            let balance = self.perp.get_balance(&user_id).await;
+            if let Ok(bal) = &balance {
+                if let Some(avail_str) = bal["data"]["available_margin"].as_str() {
+                    if let Ok(avail) = avail_str.parse::<FP8>() {
+                        let est_price = if price.raw() > 0 {
+                            price
+                        } else {
+                            FP8::from_f64(1.0)
+                        };
+                        let notional = size * est_price;
+                        let est_margin = FP8(notional.raw() / leverage as i64);
+                        if avail.raw() < est_margin.raw() {
+                            anyhow::bail!(
+                                "insufficient margin: available={}, required~={}",
+                                avail,
+                                est_margin
+                            );
+                        }
                     }
                 }
             }
         }
 
         // Step 1: Match on the order book
-        let (order, trades, stp_cancelled) = {
+        let (mut order, trades, stp_cancelled) = {
             let mut book = self.book.lock().await;
             book.submit_order(
                 user_id,
@@ -116,6 +154,7 @@ impl TradingEngine {
                 client_order_id,
             )?
         };
+        order.close_position_id = close_position_id;
 
         if trades.is_empty() {
             return Ok(OrderResult {
@@ -139,41 +178,63 @@ impl TradingEngine {
                 Side::Short => ("long", "short"),
             };
 
-            // Open position for taker
-            let taker_result = self
-                .perp
-                .open_position(
-                    &trade.taker_user_id,
-                    taker_side,
-                    &fill_size,
-                    &fill_price,
-                    leverage,
-                )
-                .await;
-
-            let taker_err = match &taker_result {
-                Ok(v) => {
-                    let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
-                    if status == "success" {
-                        info!(
-                            trade_id = trade.trade_id,
-                            user = %trade.taker_user_id,
-                            side = taker_side,
-                            size = %trade.size,
-                            price = %trade.price,
-                            "taker position opened"
-                        );
-                        None
-                    } else {
-                        let msg = format!("enclave returned: {}", v);
-                        warn!(trade_id = trade.trade_id, user = %trade.taker_user_id, "taker position failed: {}", msg);
-                        Some(msg)
+            // Settle taker: close_position if this is a close order, else open_position
+            let taker_err = if let Some(pos_id) = close_position_id {
+                let result = self
+                    .perp
+                    .close_position(&trade.taker_user_id, pos_id as u64, &fill_price)
+                    .await;
+                match &result {
+                    Ok(v) => {
+                        let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                        if status == "success" {
+                            info!(
+                                trade_id = trade.trade_id,
+                                user = %trade.taker_user_id,
+                                position_id = pos_id,
+                                price = %trade.price,
+                                "position closed via CLOB"
+                            );
+                            None
+                        } else {
+                            let msg = format!("enclave close returned: {}", v);
+                            warn!(trade_id = trade.trade_id, "close_position failed: {}", msg);
+                            Some(msg)
+                        }
                     }
+                    Err(e) => Some(format!("{}", e)),
                 }
-                Err(e) => {
-                    let msg = format!("{}", e);
-                    error!(trade_id = trade.trade_id, user = %trade.taker_user_id, "taker position error: {}", msg);
-                    Some(msg)
+            } else {
+                let result = self
+                    .perp
+                    .open_position(
+                        &trade.taker_user_id,
+                        taker_side,
+                        &fill_size,
+                        &fill_price,
+                        leverage,
+                    )
+                    .await;
+                match &result {
+                    Ok(v) => {
+                        let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                        if status == "success" {
+                            info!(
+                                trade_id = trade.trade_id,
+                                user = %trade.taker_user_id,
+                                side = taker_side,
+                                size = %trade.size,
+                                price = %trade.price,
+                                "taker position opened"
+                            );
+                            None
+                        } else {
+                            let msg = format!("enclave returned: {}", v);
+                            warn!(trade_id = trade.trade_id, user = %trade.taker_user_id, "taker position failed: {}", msg);
+                            Some(msg)
+                        }
+                    }
+                    Err(e) => Some(format!("{}", e)),
                 }
             };
 

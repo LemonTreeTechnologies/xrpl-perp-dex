@@ -760,20 +760,18 @@ async fn cancel_all_orders(
     .into_response()
 }
 
-/// Close a position at current mark price (isolated margin model).
-/// Calls enclave `close_position` ecall, which realizes PnL and frees margin.
+/// Close a position by routing a reduce_only IOC order through the CLOB.
+/// This ensures price discovery happens on the order book, not at mark price.
 async fn close_position(
     State(state): State<Arc<AppState>>,
     Path(position_id): Path<u64>,
     request: axum::extract::Request,
 ) -> impl IntoResponse {
-    // Auth: caller must be authenticated; positions are owned by caller's address.
     let caller = match request.extensions().get::<auth::AuthenticatedUser>() {
         Some(u) => u.xrpl_address.clone(),
         None => return err(StatusCode::UNAUTHORIZED, "authentication required").into_response(),
     };
 
-    // Verify the position belongs to the caller by querying balance.
     let balance = match state.perp.get_balance(&caller).await {
         Ok(v) => v,
         Err(e) => {
@@ -784,46 +782,88 @@ async fn close_position(
             .into_response();
         }
     };
-    // The enclave only returns currently-open positions in the balance response
-    // (closed positions are removed from the array), so an ownership check is
-    // sufficient — there's no `status` field to check.
-    let owns_position = balance["data"]["positions"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .any(|p| p.get("position_id").and_then(|v| v.as_u64()) == Some(position_id))
-        })
-        .unwrap_or(false);
-    if !owns_position {
-        return err(
-            StatusCode::NOT_FOUND,
-            "position not found or not owned by caller",
-        )
-        .into_response();
-    }
 
-    // Use current mark price.
-    let mark_raw = state.mark_price.load(Ordering::Relaxed);
-    if mark_raw <= 0 {
-        return err(StatusCode::SERVICE_UNAVAILABLE, "mark price not available").into_response();
-    }
-    let close_price = FP8(mark_raw).to_string();
+    // Find the position and extract side + size for the opposite-side close order.
+    let position = balance["data"]["positions"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter().find(|p| {
+                p.get("position_id").and_then(|v| v.as_u64()) == Some(position_id)
+            })
+        });
+    let position = match position {
+        Some(p) => p,
+        None => {
+            return err(
+                StatusCode::NOT_FOUND,
+                "position not found or not owned by caller",
+            )
+            .into_response();
+        }
+    };
+
+    let pos_side = position["side"].as_str().unwrap_or("long");
+    let pos_size_str = position["size"].as_str().unwrap_or("0");
+    let pos_size = match pos_size_str.parse::<FP8>() {
+        Ok(s) if s.raw() > 0 => s,
+        _ => return err(StatusCode::BAD_REQUEST, "invalid position size").into_response(),
+    };
+
+    // Close long → sell (short IOC), close short → buy (long IOC)
+    let close_side = match pos_side {
+        "long" => Side::Short,
+        _ => Side::Long,
+    };
 
     match state
-        .perp
-        .close_position(&caller, position_id, &close_price)
+        .engine
+        .submit_close_order(
+            caller.clone(),
+            close_side,
+            pos_size,
+            1, // leverage irrelevant for close
+            position_id as u32,
+        )
         .await
     {
-        Ok(val) => {
-            // Notify clients to re-fetch positions/balance.
+        Ok(result) => {
+            if result.trades.is_empty() {
+                return err(
+                    StatusCode::CONFLICT,
+                    "no liquidity to close position — place a limit reduce_only order instead",
+                )
+                .into_response();
+            }
+
+            // Record trades in PG
+            if let Some(db) = &state.db {
+                for t in &result.trades {
+                    db.insert_trade(
+                        t.trade_id, "XRP-USD-PERP",
+                        t.maker_order_id, t.taker_order_id,
+                        &t.maker_user_id, &t.taker_user_id,
+                        t.price, t.size,
+                        &format!("{}", t.taker_side), t.timestamp_ms,
+                    ).await;
+                }
+            }
+
+            // Notify via WebSocket
             let _ = state.ws_tx.send(WsEvent::PositionChanged {
                 user_id: caller.clone(),
                 reason: "close".into(),
             });
-            (StatusCode::OK, Json(val)).into_response()
+
+            let resp = serde_json::json!({
+                "status": "success",
+                "position_id": position_id,
+                "trades": result.trades.len(),
+                "fill_price": result.trades.first().map(|t| t.price.to_string()),
+            });
+            (StatusCode::OK, Json(resp)).into_response()
         }
         Err(e) => {
-            error!("close_position error: {}", e);
+            error!("close_position via CLOB error: {}", e);
             err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response()
         }
     }

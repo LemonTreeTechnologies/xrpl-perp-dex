@@ -279,6 +279,7 @@ impl Db {
                     reduce_only,
                     timestamp_ms: ts as u64,
                     client_order_id: coid,
+                    close_position_id: None,
                 })
             })
             .collect()

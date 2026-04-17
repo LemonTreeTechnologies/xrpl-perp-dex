@@ -60,6 +60,9 @@ pub struct Order {
     pub reduce_only: bool,
     pub timestamp_ms: u64,
     pub client_order_id: Option<String>,
+    /// When set, fills on this order call close_position instead of open_position.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_position_id: Option<u32>,
 }
 
 impl Order {
@@ -219,6 +222,7 @@ impl OrderBook {
             reduce_only,
             timestamp_ms: now_ms,
             client_order_id,
+            close_position_id: None,
         };
 
         // FOK pre-check: verify sufficient liquidity before matching
