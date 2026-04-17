@@ -280,22 +280,13 @@ pub async fn escrow_setup(
     Ok(())
 }
 
-/// Derive XRPL classic address from an XRPL seed (sEd... format).
-/// Uses the Ed25519 or secp256k1 derivation depending on seed prefix.
-fn derive_xrpl_address_from_seed(seed: &str) -> Result<String> {
-    // XRPL seeds starting with sEd are Ed25519
-    // For secp256k1 seeds (s...), we'd need different derivation
-    // Use the sign_and_submit with account_info as a workaround:
-    // we can't easily derive without xrpl-py, so we'll use the sign RPC
-    // which returns the Account field.
-    //
-    // Actually, for the CLI tool we just need the address. The simplest
-    // approach: sign a dummy tx and extract Account from the response.
-    // But that requires network access.
-    //
-    // Alternative: decode the seed and derive. XRPL seeds are base58-encoded
-    // with the XRPL alphabet. Let's decode and derive.
+struct XrplKeypair {
+    signing_key: k256::ecdsa::SigningKey,
+    compressed_pubkey_hex: String,
+    address: String,
+}
 
+fn derive_keypair_from_seed(seed: &str) -> Result<XrplKeypair> {
     use k256::ecdsa::SigningKey;
     use sha2::Digest;
 
@@ -308,7 +299,6 @@ fn derive_xrpl_address_from_seed(seed: &str) -> Result<String> {
         .into_vec()
         .context("invalid seed encoding")?;
 
-    // decoded = [version_byte] [16_byte_entropy] [4_byte_checksum]
     if decoded.len() < 21 {
         anyhow::bail!("seed too short: {} bytes", decoded.len());
     }
@@ -316,28 +306,12 @@ fn derive_xrpl_address_from_seed(seed: &str) -> Result<String> {
     let version = decoded[0];
     let entropy = &decoded[1..17];
 
-    // version 0x21 = secp256k1 family key, 0x01 = Ed25519
-    // sEd... seeds use 0x01 (Ed25519), but XRPL testnet faucet
-    // generates secp256k1 seeds by default.
-
     if version == 0x01 {
-        // Ed25519 derivation
-        // Private key = SHA-512(entropy)[0..32]
-        use sha2::Sha512;
-        let hash = Sha512::digest(entropy);
-        let privkey_bytes = &hash[..32];
-
-        // Ed25519 public key derivation
-        // For Ed25519, we'd need the ed25519-dalek crate. Since XRPL
-        // sEd seeds are Ed25519, let's handle this:
-        let _ = &hash[..32]; // suppress unused warning
         anyhow::bail!(
-            "Ed25519 seeds (sEd...) not supported yet. Use secp256k1 seed or provide --escrow-address directly."
+            "Ed25519 seeds (sEd...) not supported yet. Use secp256k1 seed."
         );
     }
 
-    // secp256k1 derivation (version 0x21)
-    // Root keypair: SHA-512(entropy + sequence)[0..32] until valid
     use sha2::Sha512;
     let mut seq: u32 = 0;
     let signing_key = loop {
@@ -355,12 +329,11 @@ fn derive_xrpl_address_from_seed(seed: &str) -> Result<String> {
         }
     };
 
-    // Get public key (compressed)
     let verifying_key = signing_key.verifying_key();
     let compressed = verifying_key.to_encoded_point(true);
     let compressed_bytes = compressed.as_bytes();
+    let compressed_hex = hex::encode(compressed_bytes);
 
-    // XRPL address from compressed pubkey
     let sha256 = sha2::Sha256::digest(compressed_bytes);
     let account_id = ripemd::Ripemd160::digest(sha256);
 
@@ -375,7 +348,178 @@ fn derive_xrpl_address_from_seed(seed: &str) -> Result<String> {
         .with_alphabet(&alphabet)
         .into_string();
 
-    Ok(address)
+    Ok(XrplKeypair {
+        signing_key,
+        compressed_pubkey_hex: compressed_hex,
+        address,
+    })
+}
+
+fn derive_xrpl_address_from_seed(seed: &str) -> Result<String> {
+    Ok(derive_keypair_from_seed(seed)?.address)
+}
+
+// ── sign-request (Bug 4) ───────────────────────────────────────
+
+fn sign_body(keypair: &XrplKeypair, body: &[u8], timestamp: u64) -> Result<String> {
+    use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature};
+    use sha2::Digest;
+
+    let mut hasher = sha2::Sha256::new();
+    if body.is_empty() {
+        hasher.update(b"");
+    } else {
+        hasher.update(body);
+    }
+    hasher.update(timestamp.to_string().as_bytes());
+    let hash = hasher.finalize();
+
+    let (signature, _): (Signature, _) = keypair
+        .signing_key
+        .sign_prehash(&hash)
+        .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
+
+    Ok(hex::encode(signature.to_der()))
+}
+
+pub async fn sign_request(
+    seed: &str,
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+) -> Result<()> {
+    let keypair = derive_keypair_from_seed(seed)?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let body_bytes = body.unwrap_or("").as_bytes();
+    let sig_hex = sign_body(&keypair, body_bytes, timestamp)?;
+
+    println!("# XRPL address: {}", keypair.address);
+    println!("# Public key:   {}", keypair.compressed_pubkey_hex);
+    println!();
+
+    let mut cmd = format!(
+        "curl -X {method} '{url}' \\\n  -H 'Content-Type: application/json' \\\n  -H 'X-XRPL-Address: {}' \\\n  -H 'X-XRPL-PublicKey: {}' \\\n  -H 'X-XRPL-Signature: {sig_hex}' \\\n  -H 'X-XRPL-Timestamp: {timestamp}'",
+        keypair.address, keypair.compressed_pubkey_hex,
+    );
+    if let Some(b) = body {
+        cmd.push_str(&format!(" \\\n  -d '{b}'"));
+    }
+
+    println!("{cmd}");
+    Ok(())
+}
+
+// ── withdraw (Bug 4) ───────────────────────────────────────────
+
+pub async fn cli_withdraw(
+    api_url: &str,
+    seed: &str,
+    amount: &str,
+    destination: &str,
+) -> Result<()> {
+    let keypair = derive_keypair_from_seed(seed)?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let body = serde_json::json!({
+        "user_id": keypair.address,
+        "amount": amount,
+        "destination": destination,
+    });
+    let body_str = serde_json::to_string(&body)?;
+    let sig_hex = sign_body(&keypair, body_str.as_bytes(), timestamp)?;
+
+    println!("Withdraw");
+    println!("========");
+    println!("From:        {}", keypair.address);
+    println!("Amount:      {amount}");
+    println!("Destination: {destination}");
+    println!("API:         {api_url}");
+    println!();
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    let resp = http
+        .post(format!("{api_url}/v1/withdraw"))
+        .header("Content-Type", "application/json")
+        .header("X-XRPL-Address", &keypair.address)
+        .header("X-XRPL-PublicKey", &keypair.compressed_pubkey_hex)
+        .header("X-XRPL-Signature", &sig_hex)
+        .header("X-XRPL-Timestamp", timestamp.to_string())
+        .body(body_str)
+        .send()
+        .await
+        .context("failed to reach API")?;
+
+    let status = resp.status();
+    let resp_body: serde_json::Value = resp.json().await.context("invalid JSON response")?;
+    let pretty = serde_json::to_string_pretty(&resp_body)?;
+
+    if status.is_success() {
+        println!("✓ {pretty}");
+    } else {
+        println!("✗ HTTP {status}\n{pretty}");
+    }
+
+    Ok(())
+}
+
+// ── balance (Bug 4) ────────────────────────────────────────────
+
+pub async fn cli_balance(api_url: &str, seed: &str) -> Result<()> {
+    let keypair = derive_keypair_from_seed(seed)?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let uri_path = format!("/v1/account/balance?user_id={}", keypair.address);
+    let mut hasher = sha2::Sha256::new();
+    use sha2::Digest;
+    hasher.update(uri_path.as_bytes());
+    hasher.update(timestamp.to_string().as_bytes());
+    let hash = hasher.finalize();
+
+    use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature};
+    let (signature, _): (Signature, _) = keypair
+        .signing_key
+        .sign_prehash(&hash)
+        .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
+    let sig_hex = hex::encode(signature.to_der());
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let resp = http
+        .get(format!("{api_url}{uri_path}"))
+        .header("X-XRPL-Address", &keypair.address)
+        .header("X-XRPL-PublicKey", &keypair.compressed_pubkey_hex)
+        .header("X-XRPL-Signature", &sig_hex)
+        .header("X-XRPL-Timestamp", timestamp.to_string())
+        .send()
+        .await
+        .context("failed to reach API")?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.context("invalid JSON response")?;
+    let pretty = serde_json::to_string_pretty(&body)?;
+
+    if status.is_success() {
+        println!("{pretty}");
+    } else {
+        println!("✗ HTTP {status}\n{pretty}");
+    }
+
+    Ok(())
 }
 
 /// Sign a transaction using the XRPL `sign` RPC and submit it.

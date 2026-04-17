@@ -84,6 +84,48 @@ enum Command {
         #[arg(long)]
         disable_master: bool,
     },
+
+    /// Generate a signed curl command for any API endpoint.
+    SignRequest {
+        /// XRPL secp256k1 seed (secret)
+        #[arg(long)]
+        seed: String,
+        /// HTTP method (GET, POST, DELETE)
+        #[arg(long, default_value = "POST")]
+        method: String,
+        /// Full URL to sign against
+        #[arg(long)]
+        url: String,
+        /// JSON request body (optional)
+        #[arg(long)]
+        body: Option<String>,
+    },
+
+    /// Submit an authenticated withdrawal request.
+    Withdraw {
+        /// API server URL
+        #[arg(long, default_value = "http://localhost:3000")]
+        api: String,
+        /// XRPL secp256k1 seed (secret)
+        #[arg(long)]
+        seed: String,
+        /// Withdrawal amount (FP8 string, e.g. "1.00000000")
+        #[arg(long)]
+        amount: String,
+        /// Destination XRPL r-address
+        #[arg(long)]
+        destination: String,
+    },
+
+    /// Query account balance with authentication.
+    Balance {
+        /// API server URL
+        #[arg(long, default_value = "http://localhost:3000")]
+        api: String,
+        /// XRPL secp256k1 seed (secret)
+        #[arg(long)]
+        seed: String,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -275,6 +317,15 @@ async fn main() -> Result<()> {
             disable_master,
         }) => {
             return cli_tools::escrow_setup(&xrpl_url, &signers_config, &escrow_seed, escrow_address.as_deref(), disable_master).await;
+        }
+        Some(Command::SignRequest { seed, method, url, body }) => {
+            return cli_tools::sign_request(&seed, &method, &url, body.as_deref()).await;
+        }
+        Some(Command::Withdraw { api, seed, amount, destination }) => {
+            return cli_tools::cli_withdraw(&api, &seed, &amount, &destination).await;
+        }
+        Some(Command::Balance { api, seed }) => {
+            return cli_tools::cli_balance(&api, &seed).await;
         }
         None => {
             // Default: run orchestrator with flattened RunArgs
