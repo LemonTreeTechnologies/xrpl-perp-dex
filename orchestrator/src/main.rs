@@ -711,7 +711,7 @@ async fn main() -> Result<()> {
             let rate = compute_funding_rate(mark, current_price);
             let fp8_rate = float_to_fp8_string(rate);
             match perp.apply_funding(&fp8_rate, now_ts).await {
-                Ok(_) => {
+                Ok(resp) => {
                     info!(rate = %fp8_rate, "applied funding rate");
                     let rate_raw = crate::types::FP8::from_f64(rate).raw();
                     let mark_raw = app_state.mark_price.load(Ordering::Relaxed);
@@ -720,6 +720,22 @@ async fn main() -> Result<()> {
                     app_state.last_funding_time.store(now_ts, Ordering::Relaxed);
                     if let Some(db) = &app_state.db {
                         db.insert_funding_event(rate_raw, mark_raw, index_raw, now_ts).await;
+                        if let Some(payments) = resp.get("payments").and_then(|v| v.as_array()) {
+                            for p in payments {
+                                let user_id = p["user_id"].as_str().unwrap_or("");
+                                let pos_id = p["position_id"].as_i64().unwrap_or(0);
+                                let side = p["side"].as_str().unwrap_or("");
+                                let payment = p["payment"].as_str()
+                                    .and_then(|s| s.parse::<crate::types::FP8>().ok())
+                                    .map(|fp| fp.raw())
+                                    .unwrap_or(0);
+                                db.insert_funding_payment(
+                                    user_id, pos_id, side, payment,
+                                    rate_raw, mark_raw, now_ts,
+                                ).await;
+                            }
+                            info!(count = payments.len(), "persisted funding payments");
+                        }
                     }
                 }
                 Err(e) => error!("funding application failed: {}", e),

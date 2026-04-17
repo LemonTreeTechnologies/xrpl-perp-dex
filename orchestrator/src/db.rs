@@ -156,9 +156,37 @@ impl Db {
 
     // ── Funding events ────────────────────────────────────────────
 
-    /// Record a funding application event (aggregate — not per-position).
-    /// Per-position `funding_payments` rows require the enclave to return
-    /// individual payment amounts, which is a post-hackathon enhancement.
+    /// Record per-position funding payment (called once per open position per funding tick).
+    pub async fn insert_funding_payment(
+        &self,
+        user_id: &str,
+        position_id: i64,
+        side: &str,
+        payment: i64,
+        funding_rate: i64,
+        mark_price: i64,
+        timestamp_epoch: u64,
+    ) {
+        let r = sqlx::query(
+            "INSERT INTO funding_payments \
+             (user_id, position_id, side, payment, funding_rate, mark_price, timestamp_epoch) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(user_id)
+        .bind(position_id)
+        .bind(side)
+        .bind(payment)
+        .bind(funding_rate)
+        .bind(mark_price)
+        .bind(timestamp_epoch as i64)
+        .execute(&self.pool)
+        .await;
+        if let Err(e) = r {
+            error!("pg insert_funding_payment failed: {}", e);
+        }
+    }
+
+    /// Record a funding application event (aggregate).
     pub async fn insert_funding_event(
         &self,
         funding_rate: i64,
