@@ -43,7 +43,13 @@ impl ShardRouter {
         let mut sorted_ids = Vec::new();
         for entry in &config.shards {
             let client = PerpClient::new(&entry.enclave_url)?;
-            client.set_shard_id(entry.shard_id).await?;
+            match client.set_shard_id(entry.shard_id).await {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(shard_id = entry.shard_id, url = %entry.enclave_url,
+                        "set_shard_id not supported by enclave: {}", e);
+                }
+            }
             info!(shard_id = entry.shard_id, url = %entry.enclave_url, "shard registered");
             shards.insert(entry.shard_id, client);
             sorted_ids.push(entry.shard_id);
@@ -61,8 +67,13 @@ impl ShardRouter {
     /// Build a single-shard router (no config file needed).
     pub async fn single(enclave_url: &str, shard_id: u32) -> Result<Self> {
         let client = PerpClient::new(enclave_url)?;
-        client.set_shard_id(shard_id).await?;
-        info!(shard_id, url = %enclave_url, "single-shard router");
+        match client.set_shard_id(shard_id).await {
+            Ok(_) => info!(shard_id, url = %enclave_url, "single-shard router"),
+            Err(e) => {
+                tracing::warn!(shard_id, url = %enclave_url,
+                    "set_shard_id not supported by enclave (old binary?): {}", e);
+            }
+        }
 
         let mut shards = HashMap::new();
         shards.insert(shard_id, client);
