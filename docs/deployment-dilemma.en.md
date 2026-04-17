@@ -214,28 +214,20 @@ the key rotation is incomplete and manual intervention is needed.
 2 XRPL transactions + verification). For 3-node cluster, sequential
 migration takes ~15 minutes.
 
-#### Strategy 2: MRSIGNER-based Sealing (weaker security, simpler migration)
+#### ~~Strategy 2: MRSIGNER-based Sealing~~ — REJECTED
 
-Change `sgx_seal_data()` policy from MRENCLAVE to MRSIGNER:
-```cpp
-// Instead of: sgx_seal_data(0, NULL, ...) → MRENCLAVE-bound
-// Use:        sgx_seal_data_ex(SGX_KEYPOLICY_MRSIGNER, ...) → MRSIGNER-bound
-```
+**Rejected.** Switching `sgx_seal_data()` from MRENCLAVE to MRSIGNER
+means any enclave signed by the same vendor key can unseal all secrets.
+This:
+- Fails security audit — attestation verifiers check MRENCLAVE, not MRSIGNER
+- Creates a one-way door: once sealed data is MRSIGNER-bound, migrating
+  back to MRENCLAVE requires the same key-rotation procedure as Strategy 4,
+  so there is no shortcut
+- A compromised build pipeline → full key extraction
 
-This means any enclave signed by the same vendor key can unseal the
-data. The new enclave v1.1 can directly read v1.0's sealed keys.
-
-| Pros | Cons |
-|------|------|
-| Zero-downtime upgrade | Weaker security: any enclave signed by same key can read secrets |
-| No key migration needed | A compromised build pipeline → full key extraction |
-| Simple: just replace binary and restart | Loses the code-binding guarantee of MRENCLAVE |
-| Works for cross-machine FROST too | Security auditors will flag this |
-
-**Verdict:** acceptable for testnet/dev, NOT for mainnet with real funds.
-Could be used as a **transition step** — switch to MRSIGNER temporarily
-during migration, then switch back to MRENCLAVE after new keys are
-generated.
+**Not even for testnet.** Building habits around MRSIGNER sealing means
+the testnet code diverges from the mainnet security model, and the
+divergence will bite when it matters most.
 
 #### Strategy 3: Key Export via Recovery Mechanism
 
@@ -247,13 +239,12 @@ backups). Use them:
 3. Import keys via recovery mechanism into new enclave
 4. Keys now sealed under new MRENCLAVE
 
-**Problem:** recovery files are encrypted with a user-held key. For the
-perp-DEX escrow, the "user" is the operator. This means the operator
-momentarily has the raw private key outside the enclave — violating the
-core trust model.
+**Problem:** the recovery mechanism allows the operator to extract private
+keys from the enclave at any time — this is a fundamental violation of
+the trust model, not a temporary compromise. If the key can be extracted,
+the SGX enclave ceases to be a trust boundary.
 
-**Verdict:** only acceptable if the recovery key is itself held inside
-another enclave or HSM. Otherwise defeats the purpose of SGX.
+**Verdict:** rejected. Violates the trust model by definition.
 
 #### Strategy 4: Pre-planned Key Rotation (recommended)
 
@@ -263,9 +254,12 @@ emergency procedure:
 1. **Each enclave version gets its own keypair.** On deployment,
    the new enclave generates a fresh key, and the orchestrator
    initiates a SignerListSet rotation automatically.
-2. **SignerListSet supports 3+ signers temporarily.** During rotation,
-   the list has 4 signers (3 old + 1 new). Quorum stays at 2. The
-   old signer's key is removed after the new one is confirmed.
+2. **SignerListSet has 4 signers temporarily, quorum raised to 3.**
+   During rotation the list has 4 signers (3 old + 1 new). Quorum
+   is raised from 2 to **3** for the duration of the rotation window.
+   This prevents a single compromised old key + the new key from
+   reaching quorum. The old signer is removed and quorum lowered
+   back to 2 after the new one is confirmed.
 3. **Rolling upgrade:** rotate one node at a time. At no point are
    more than 1 out of 3 signers in migration state.
 4. **Automated by orchestrator CLI:**
@@ -278,24 +272,290 @@ emergency procedure:
    This command:
    a. Starts new enclave on a staging port
    b. Generates new keypair → new XRPL address
-   c. Submits SignerListSet (add new signer, quorum unchanged)
-   d. Waits for XRPL validation
-   e. Submits SignerListSet (remove old signer)
-   f. Stops old enclave
-   g. Promotes new enclave to production port
+   c. New enclave produces DCAP attestation quote binding its MRENCLAVE
+      to the new public key
+   d. Each existing enclave independently verifies the DCAP quote before
+      agreeing to co-sign the SignerListSet change
+   e. Submits SignerListSet (add new signer, **raise quorum to 3**)
+   f. Waits for XRPL validation (bounded by `LastLedgerSequence`)
+   g. Submits SignerListSet (remove old signer, **lower quorum to 2**)
+   h. Stops old enclave, securely deletes old sealed data
+   i. Promotes new enclave to production port
 
 **This is the only strategy that preserves the security model
 (MRENCLAVE binding), is automated, and does not require operator
 access to private keys.**
 
+#### Attack surface analysis
+
+Key rotation via SignerListSet is functionally an ownership transfer —
+historically the #1 target in multisig attacks. Each vector below has
+a concrete defense; a vector without a defense is not acceptable.
+
+**Vector 1: Quorum theft during 4-signer window**
+
+*Attack:* during rotation the signer list has 4 entries. If quorum stays
+at 2, an attacker controlling 1 compromised old key + 1 new key has
+quorum and can drain the escrow.
+
+*Defense:* quorum is **raised to 3** for the duration of the rotation
+window (step e above). With 4 signers and quorum=3, an attacker needs
+3 keys — strictly harder than the normal 2-of-3. Quorum returns to 2
+only after the old signer is removed and the list is back to 3 entries.
+
+**Vector 2: New key substitution**
+
+*Attack:* the orchestrator (or a MITM) replaces the new enclave's real
+public key with an attacker-controlled address in the SignerListSet
+transaction.
+
+*Defense:* the new enclave generates its keypair internally and produces
+a **DCAP attestation quote** that binds the MRENCLAVE hash to the new
+public key. Each of the 3 existing enclaves independently verifies this
+quote before co-signing the SignerListSet transaction. The orchestrator
+proposes the transaction but cannot forge enclave signatures — it needs
+2-of-3 existing enclaves to agree, and each one checks the DCAP proof.
+A substituted key would fail quote verification on all honest enclaves.
+
+**Vector 3: Old signer removal failure (stale key)**
+
+*Attack:* step g (remove old signer) fails — network timeout, fee spike,
+orchestrator crash. The old key remains in the signer list indefinitely,
+expanding the attack surface to 4 keys instead of 3.
+
+*Defense:*
+1. `LastLedgerSequence` on the add-signer tx: if it doesn't confirm
+   within N ledgers (~20 seconds), the entire migration aborts and no
+   key was added.
+2. After successful add: the remove-signer tx is retried with
+   exponential backoff until confirmed. The orchestrator refuses to
+   report migration as "complete" until the on-chain signer list is
+   back to exactly 3 entries.
+3. **Hard timeout:** if remove-signer hasn't confirmed within 10 minutes,
+   the system rolls back — submits a SignerListSet that removes the
+   NEW key instead, returning to the original 3-of-3 state. Better
+   to abort the upgrade than leave a 4-key window open.
+4. Health check monitors signer count: any count ≠ 3 triggers an alert.
+
+**Vector 4: SignerListSet transaction reordering**
+
+*Attack:* the two SignerListSet transactions (add new, remove old) arrive
+out of order or the second validates while the first is still pending.
+
+*Defense:* XRPL enforces strict `Sequence` ordering per account. The
+remove-signer tx has Sequence = add-signer Sequence + 1, so it
+**cannot** validate before the add-signer tx. If the first tx is dropped,
+the second is automatically invalid. This is an XRPL protocol guarantee,
+not application logic.
+
+**Vector 5: Orchestrator compromise (single point of trust)**
+
+*Attack:* the orchestrator is the component that constructs SignerListSet
+transactions and talks to all enclaves. A compromised orchestrator could
+propose adding an attacker's key.
+
+*Defense:* the orchestrator constructs but does not sign — only enclaves
+sign. Adding a new signer requires 2-of-3 existing enclaves to co-sign
+the transaction. Each enclave verifies the DCAP quote of the new key
+before signing (Vector 2 defense). A compromised orchestrator can
+propose a malicious key, but the enclaves will reject it because the
+DCAP quote won't verify. The orchestrator is a coordinator, not a
+trust root.
+
+**Vector 6: Rollback to old enclave after rotation**
+
+*Attack:* after successful rotation, the attacker forces the system to
+revert to the old enclave binary (which still has the old sealed keys).
+If the old key wasn't properly removed from SignerListSet, the attacker
+now controls a valid signer.
+
+*Defense:*
+1. Step h explicitly deletes old sealed data (`shred` + `rm` of the old
+   enclave's account directory and sealed blobs).
+2. The old `enclave.signed.so` binary is removed from disk.
+3. Even if the old binary is restored, the sealed data is gone — the
+   old MRENCLAVE has no keys to unseal.
+4. On-chain: the old address was removed from SignerListSet, so even
+   if the old key somehow exists, it cannot participate in signing.
+
+**Vector 7: Parallel rotation on multiple nodes**
+
+*Attack:* two nodes rotate simultaneously, producing conflicting
+SignerListSet transactions (e.g. both try to expand from 3→4 signers,
+resulting in 5 signers or inconsistent state).
+
+*Defense:* strictly sequential rotation enforced by the orchestrator CLI.
+The tool takes a `--node` parameter and rotates exactly one node per
+invocation. The second invocation checks on-chain signer count — if it's
+not exactly 3 (i.e. a previous rotation is in progress or incomplete),
+it refuses to start.
+
+**Vector 8: Denial of service during rotation window**
+
+*Attack:* attacker prevents the rotation from completing (network
+partition, XRPL congestion, enclave crash), keeping the system in the
+elevated-quorum 4-signer state indefinitely. While not a direct theft,
+it degrades the system — quorum=3 means all 3 old signers + the new
+one must cooperate, making normal operations harder.
+
+*Defense:* the hard timeout from Vector 3 applies: if the full rotation
+(add + remove) doesn't complete within 10 minutes, the system
+automatically rolls back by removing the new key and restoring
+quorum=2. The rotation can be retried later when conditions are stable.
+During the elevated-quorum window, normal operations (withdrawals)
+still work — they just need 3 signatures instead of 2, which is
+stricter but functional.
+
+### Strategy 1 vs Strategy 4: detailed comparison
+
+Strategies 1 and 4 share the same core mechanism — generate new key in
+new enclave, add it to SignerListSet, remove old key. The difference is
+not *what* they do but *how many safeguards surround the operation*.
+
+| Property | Strategy 1 (dual-server) | Strategy 4 (pre-planned rotation) |
+|----------|--------------------------|-----------------------------------|
+| **Execution** | Manual — operator runs commands step by step | Automated — single CLI command |
+| **Quorum during rotation** | Unchanged (stays at 2-of-4) | Raised to 3-of-4 during window |
+| **New key verification** | None — operator visually confirms the address | DCAP quote: each existing enclave cryptographically verifies the new key belongs to a real enclave with known MRENCLAVE |
+| **Timeout / rollback** | None — if step 4 fails, operator must notice and intervene | Hard 10-minute timeout; auto-rollback removes new key, restores quorum=2 |
+| **Old key cleanup** | Operator responsibility — may forget | Automated shred+rm of sealed data and old binary |
+| **Parallel rotation guard** | None — operator must remember "one at a time" | CLI checks on-chain signer count, refuses to start if ≠ 3 |
+| **Transaction ordering** | Operator submits manually — could make mistakes | Automated Sequence numbering + LastLedgerSequence bounds |
+| **Orchestrator trust** | Operator IS the trust root — they pick the new key and submit txs | Orchestrator is coordinator only; enclaves verify DCAP before signing |
+| **Signer count monitoring** | Manual — operator checks XRPL explorer | Health check alert on signer count ≠ 3 |
+| **Time to complete (3 nodes)** | ~15 min (operator-dependent) | ~15 min (automated, same XRPL latency) |
+| **Implementation cost** | Low — just a runbook | High — DCAP verification in enclave, CLI tooling, rollback logic |
+| **Can operate without DCAP** | Yes — no attestation step | Degraded — without DCAP, Vector 2 (key substitution) defense is weakened |
+
+#### When Strategy 1 is the right choice
+
+Strategy 1 is not a "worse version" of Strategy 4. It is the correct
+choice when:
+
+1. **DCAP is unavailable.** On Hetzner (SGX1, no DCAP), Vector 2
+   defense (DCAP-based new key verification) cannot work. Strategy 1
+   with a trusted operator who manually verifies the new enclave's
+   key is the only option. The operator compensates for the lack of
+   cryptographic verification with physical access + visual confirmation.
+
+2. **Strategy 4 automation has failed.** If the CLI tool crashes, the
+   rollback logic doesn't trigger, or the system is in an unexpected
+   state, Strategy 1 is the manual recovery procedure. Every automated
+   system needs a manual fallback.
+
+3. **First-time rotation on testnet.** Before trusting the automation,
+   run the procedure manually to build operational understanding. You
+   cannot debug an automated rotation if you have never done it by hand.
+
+#### When Strategy 4 is required
+
+Strategy 4 is required when:
+
+1. **Real funds are at risk.** Manual procedures have human error rates.
+   The quorum elevation (2→3 during window), hard timeout, and automated
+   rollback exist specifically because a human operator can forget a step,
+   get distracted, or be socially engineered.
+
+2. **Multiple operators exist.** With 3 independent operators, Strategy 1
+   requires coordination ("I'm rotating my node, don't rotate yours").
+   Strategy 4 enforces this at the protocol level — the CLI checks
+   on-chain state.
+
+3. **Audit trail matters.** Strategy 4 produces a machine-verifiable
+   audit log: DCAP quote, SignerListSet transactions with Sequence
+   numbers, timestamps, rollback events. Strategy 1 produces "the
+   operator says they did it correctly."
+
+#### The relationship
+
+Strategy 4 = Strategy 1 + quorum elevation + DCAP verification +
+automated timeout/rollback + signer count guards + sealed data cleanup.
+
+Strategy 1 is the *degenerate case* of Strategy 4 where every safeguard
+is replaced by "the operator does it right." This is acceptable for
+testnet and emergencies. It is not acceptable for mainnet with real funds
+and independent operators who do not fully trust each other — which is
+the entire point of multisig.
+
 ### Recommendation
 
 | Phase | Strategy | Why |
 |-------|----------|-----|
-| **Now** (testnet) | Strategy 2 (MRSIGNER) | Fast iteration, no real funds at risk |
+| **Now** (testnet) | Strategy 1 (dual-server) | Manual but safe; practice on testnet before mainnet. Build operational muscle memory. |
 | **Pre-mainnet** | Build Strategy 4 tooling | Must be ready before mainnet goes live with real funds |
-| **Mainnet** | Strategy 4 (rolling key rotation) | Only option that preserves SGX trust model |
-| **Emergency** | Strategy 1 (dual-server) as fallback | Manual but safe, for when automated rotation fails |
+| **Mainnet** | Strategy 4 (rolling key rotation) | Only option that preserves SGX trust model under adversarial conditions |
+| **Emergency** | Strategy 1 (dual-server) as fallback | Manual recovery when Strategy 4 automation fails |
+| **Hetzner (no DCAP)** | Strategy 1 with trusted operator | DCAP unavailable — operator compensates with physical verification |
+
+### MVP phase: practical setup (current stage)
+
+**Important for collaborators:** Strategy 4 is the long-term target, not
+something to implement right now. At the MVP stage — with ~108 XRP in
+escrow, near-zero traffic, a single trusted operator, and an LLM
+assistant executing commands under operator supervision — Strategy 1 is
+the correct and sufficient approach.
+
+#### Dual-instance layout on Hetzner EX44
+
+The deployment dilemma (Options A–E above) is resolved for the MVP phase
+by running two fully isolated instances on the existing Hetzner server:
+
+```
+Hetzner EX44 (94.130.18.162)
+├── MAINNET (production)
+│   ├── Enclave:      port 9088, SGX HW mode
+│   ├── Orchestrator: port 3000, connected to XRPL mainnet
+│   ├── Sealed data:  /tmp/perp-9088/
+│   └── Database:     perp_dex (PostgreSQL)
+│
+└── DEV/STAGING (development)
+    ├── Enclave:      port 9089, SGX HW mode
+    ├── Orchestrator: port 3001, connected to XRPL testnet
+    ├── Sealed data:  /tmp/perp-9089/
+    └── Database:     perp_dex_dev (PostgreSQL)
+```
+
+This is **not** Option C from the deployment dilemma (which shares one
+enclave between mainnet and staging). These are two completely separate
+enclave processes with separate sealed data, separate databases, and
+separate XRPL networks. The only shared resource is the physical machine.
+
+**Risk:** an OOM or CPU spike on the dev instance could crash mainnet.
+Acceptable at current traffic levels (~0 TPS, ~108 XRP). Unacceptable
+when funds grow — at that point, move to a second Hetzner (Option A)
+or EX130 (Option D).
+
+#### Enclave upgrade workflow at MVP stage
+
+This is Strategy 1 executed with the LLM assistant under operator
+control:
+
+1. **Build** new `enclave.signed.so` on Hetzner from git
+2. **Deploy to dev** (port 9089) — new enclave gets new MRENCLAVE
+3. **Generate new key** in dev enclave → new XRPL testnet address
+4. **Test rotation on testnet** — SignerListSet add new signer, then
+   remove old signer. Verify on XRPL testnet explorer.
+5. **Repeat on mainnet** (port 9088) only after testnet success:
+   - Deploy new enclave on a temporary staging port (9090)
+   - Generate new key → new mainnet address
+   - SignerListSet: add new signer to mainnet escrow
+   - Verify on-chain
+   - SignerListSet: remove old signer
+   - Stop old enclave (9088), promote new enclave to port 9088
+   - Delete old sealed data
+
+**The operator sees every command before execution and can abort at any
+step.** This is the Strategy 1 trust model: the operator is the root of
+trust, not cryptographic verification.
+
+#### When to move beyond this setup
+
+| Signal | Action |
+|--------|--------|
+| Escrow balance exceeds 10,000 XRP | Move dev to separate server (Option A or D) |
+| Second independent operator joins | Begin Strategy 4 tooling |
+| Grant audit requires audit trail | Begin Strategy 4 tooling |
+| Azure VMs no longer needed by PM | Deallocate Azure, save €300/month |
 
 ### What this means for the deployment dilemma
 
