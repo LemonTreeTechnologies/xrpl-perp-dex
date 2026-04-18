@@ -84,7 +84,7 @@ When signing a withdrawal Payment, include `DestinationTag` if the user has spec
 
 ## For Phoenix PM
 
-Tom — check if your deposit scanner has the same issue. If you're using `account_tx` and keying deposits by sender address, you have the same bug. Any user depositing from a centralized exchange will have their funds credited to the exchange's hot wallet address instead of their own account.
+Check if your deposit scanner has the same issue. If you're using `account_tx` and keying deposits by sender address, you have the same bug. Any user depositing from a centralized exchange will have their funds credited to the exchange's hot wallet address instead of their own account.
 
 Quick grep: search for `DestinationTag` in your deposit monitoring code. If zero hits — you have this bug.
 
