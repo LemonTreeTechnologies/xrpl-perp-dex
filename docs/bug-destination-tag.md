@@ -38,11 +38,7 @@ This means:
 
 ## Proposed fix
 
-### 1. Escrow account: enable `RequireDest`
-
-Set `asfRequireDest` flag on escrow account via `AccountSet` transaction. This makes XRPL itself reject any Payment without a destination tag — prevents unattributable deposits at the protocol level.
-
-### 2. Deposit flow
+### 1. Deposit flow
 
 ```
 DepositEvent {
@@ -54,20 +50,21 @@ DepositEvent {
 ```
 
 User identification logic:
-- If `destination_tag` is present → look up `user_id` from a registration mapping
-- If no tag and `RequireDest` is set → XRPL rejects the tx (never reaches us)
-- Fallback (tag present but unknown) → hold in pending, don't credit
+- If `destination_tag` is present → look up `user_id` from a registration mapping (for exchange/custodial users)
+- If no tag → use sender address as `user_id` (default, works for personal wallets)
+- If tag is present but unknown → hold in pending, don't credit
 
-### 3. User registration
+### 2. User registration (for exchange/custodial users only)
 
 Need a mapping: `destination_tag (u32) → user_id (String)`
+
+This is only needed for users who deposit from custodial wallets (exchanges). Users with personal wallets don't need tags — their sender address is their identity.
 
 Options:
 - **Simple:** tag = hash(user_xrpl_address) mod 2^32, displayed in UI at registration
 - **Explicit:** user registers on DEX, gets assigned a unique tag, must include it in deposits
-- **Account-based:** keep using sender address as primary ID, tag is optional qualifier
 
-### 4. Withdraw flow
+### 3. Withdraw flow
 
 When signing a withdrawal Payment, include `DestinationTag` if the user has specified one (e.g., withdrawing to an exchange).
 
@@ -107,7 +104,7 @@ Quick grep: search for `DestinationTag` in your deposit monitoring code. If zero
 
 ## Исправление
 
-1. Включить флаг `RequireDest` на escrow аккаунте — XRPL будет отклонять платежи без тега
-2. Парсить `DestinationTag` в сканере депозитов
-3. Создать маппинг `tag → user_id` при регистрации пользователя
-4. Включать `DestinationTag` в транзакции вывода
+1. Парсить `DestinationTag` в сканере депозитов (DONE — commit `16a678e`)
+2. Без тега → sender address как user_id (работает для личных кошельков, как сейчас)
+3. С тегом → lookup user_id по маппингу (нужно для пользователей с бирж/кастодиальных кошельков)
+4. Включать `DestinationTag` в транзакции вывода (DONE — commit `16a678e`)
