@@ -790,6 +790,7 @@ pub async fn cli_withdraw(
     seed: &str,
     amount: &str,
     destination: &str,
+    destination_tag: Option<u32>,
 ) -> Result<()> {
     let keypair = derive_keypair_from_seed(seed)?;
     let timestamp = std::time::SystemTime::now()
@@ -797,11 +798,14 @@ pub async fn cli_withdraw(
         .unwrap()
         .as_secs();
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "user_id": keypair.address,
         "amount": amount,
         "destination": destination,
     });
+    if let Some(tag) = destination_tag {
+        body["destination_tag"] = serde_json::json!(tag);
+    }
     let body_str = serde_json::to_string(&body)?;
     let sig_hex = sign_body(&keypair, body_str.as_bytes(), timestamp)?;
 
@@ -810,6 +814,9 @@ pub async fn cli_withdraw(
     println!("From:        {}", keypair.address);
     println!("Amount:      {amount}");
     println!("Destination: {destination}");
+    if let Some(tag) = destination_tag {
+        println!("Dest Tag:    {tag}");
+    }
     println!("API:         {api_url}");
     println!();
 

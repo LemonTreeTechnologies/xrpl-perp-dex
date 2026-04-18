@@ -116,6 +116,9 @@ enum Command {
         /// Destination XRPL r-address
         #[arg(long)]
         destination: String,
+        /// XRPL DestinationTag (required for exchange addresses)
+        #[arg(long)]
+        destination_tag: Option<u32>,
     },
 
     /// Query account balance with authentication.
@@ -363,8 +366,8 @@ async fn main() -> Result<()> {
         Some(Command::SignRequest { seed, method, url, body }) => {
             return cli_tools::sign_request(&seed, &method, &url, body.as_deref()).await;
         }
-        Some(Command::Withdraw { api, seed, amount, destination }) => {
-            return cli_tools::cli_withdraw(&api, &seed, &amount, &destination).await;
+        Some(Command::Withdraw { api, seed, amount, destination, destination_tag }) => {
+            return cli_tools::cli_withdraw(&api, &seed, &amount, &destination, destination_tag).await;
         }
         Some(Command::Balance { api, seed }) => {
             return cli_tools::cli_balance(&api, &seed).await;

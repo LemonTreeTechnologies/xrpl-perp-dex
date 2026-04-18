@@ -29,6 +29,9 @@ pub struct WithdrawRequest {
     pub user_id: String,
     pub amount: String,
     pub destination: String,
+    /// XRPL DestinationTag for the receiving account (required for exchanges)
+    #[serde(default)]
+    pub destination_tag: Option<u32>,
 }
 
 /// Withdrawal result.
@@ -233,7 +236,7 @@ pub async fn process_withdrawal(
     // Step 3: Build unsigned Payment tx (SigningPubKey="" signals multisig)
     // Fee for multisig = base_fee * (1 + N_signers). Use generous fee.
     let fee = format!("{}", 12 * (1 + signers_config.quorum as u64));
-    let tx_json = serde_json::json!({
+    let mut tx_json = serde_json::json!({
         "TransactionType": "Payment",
         "Account": escrow_address,
         "Destination": req.destination,
@@ -242,6 +245,9 @@ pub async fn process_withdrawal(
         "Sequence": sequence,
         "SigningPubKey": ""
     });
+    if let Some(tag) = req.destination_tag {
+        tx_json["DestinationTag"] = serde_json::json!(tag);
+    }
     let tx_map = tx_json.as_object().context("tx_json is not an object")?;
 
     info!(

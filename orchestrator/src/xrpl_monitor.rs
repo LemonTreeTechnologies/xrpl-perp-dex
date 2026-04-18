@@ -16,6 +16,8 @@ pub struct DepositEvent {
     pub amount: String,
     /// XRPL transaction hash (lowercase hex)
     pub tx_hash: String,
+    /// XRPL DestinationTag (u32) — identifies the user within the escrow account
+    pub destination_tag: Option<u32>,
 }
 
 /// Monitors XRPL ledger for incoming deposits to an escrow account.
@@ -162,10 +164,13 @@ impl XrplMonitor {
                 None => continue,
             };
 
+            let destination_tag = tx["DestinationTag"].as_u64().map(|v| v as u32);
+
             info!(
                 sender = %sender,
                 amount = %fp8_amount,
                 tx_hash = &tx_hash[..16.min(tx_hash.len())],
+                destination_tag = ?destination_tag,
                 "deposit detected"
             );
 
@@ -173,6 +178,7 @@ impl XrplMonitor {
                 sender,
                 amount: fp8_amount,
                 tx_hash: tx_hash[..64.min(tx_hash.len())].to_string(),
+                destination_tag,
             });
 
             // Track highest ledger index
