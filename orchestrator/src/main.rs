@@ -15,6 +15,7 @@ mod p2p;
 mod perp_client;
 mod price_feed;
 pub mod shard_router;
+mod singleton;
 mod trading;
 mod types;
 mod vault_mm;
@@ -125,6 +126,41 @@ enum Command {
         /// XRPL secp256k1 seed (secret)
         #[arg(long)]
         seed: String,
+    },
+
+    /// Create a signers_config.json from multiple operator entry files.
+    ConfigInit {
+        /// Operator entry JSON files (from operator-setup --output)
+        #[arg(long, required = true, num_args = 1..)]
+        entries: Vec<PathBuf>,
+        /// XRPL escrow account r-address
+        #[arg(long)]
+        escrow_address: String,
+        /// Multisig quorum (e.g. 2 for 2-of-3)
+        #[arg(long, default_value_t = 2)]
+        quorum: u32,
+        /// Output config file path
+        #[arg(long, default_value = "signers_config.json")]
+        output: PathBuf,
+    },
+
+    /// Add a new operator to an existing signers_config.json.
+    OperatorAdd {
+        /// Enclave REST API base URL of the new operator
+        #[arg(long)]
+        enclave_url: String,
+        /// Operator name
+        #[arg(long)]
+        name: String,
+        /// Path to existing signers_config.json
+        #[arg(long)]
+        config: PathBuf,
+        /// XRPL JSON-RPC URL (if set, re-submits SignerListSet)
+        #[arg(long)]
+        xrpl_url: Option<String>,
+        /// Escrow seed (required if --xrpl-url is set, to re-submit SignerListSet)
+        #[arg(long)]
+        escrow_seed: Option<String>,
     },
 }
 
@@ -239,6 +275,7 @@ async fn run_liquidation_scan(
     current_price: f64,
     ws_tx: &tokio::sync::broadcast::Sender<WsEvent>,
     db: &Option<db::Db>,
+    events_tx: &tokio::sync::mpsc::Sender<p2p::StateEvent>,
 ) {
     let result = match perp.check_liquidations().await {
         Ok(r) => r,
@@ -282,6 +319,11 @@ async fn run_liquidation_scan(
                     if let Some(db) = db {
                         db.insert_liquidation(pos_id, user, current_price).await;
                     }
+                    let _ = events_tx.try_send(p2p::StateEvent::Liquidation {
+                        position_id: pos_id,
+                        user_id: user.to_string(),
+                        price: current_price,
+                    });
                 }
                 Err(e) => error!(position_id = pos_id, "liquidation failed: {}", e),
             }
@@ -326,6 +368,18 @@ async fn main() -> Result<()> {
         }
         Some(Command::Balance { api, seed }) => {
             return cli_tools::cli_balance(&api, &seed).await;
+        }
+        Some(Command::ConfigInit { entries, escrow_address, quorum, output }) => {
+            return cli_tools::config_init(&entries, &escrow_address, quorum, &output).await;
+        }
+        Some(Command::OperatorAdd { enclave_url, name, config, xrpl_url, escrow_seed }) => {
+            return cli_tools::operator_add(
+                &enclave_url,
+                &name,
+                &config,
+                xrpl_url.as_deref(),
+                escrow_seed.as_deref(),
+            ).await;
         }
         None => {
             // Default: run orchestrator with flattened RunArgs
@@ -476,6 +530,40 @@ async fn main() -> Result<()> {
         tokio::sync::mpsc::channel::<election::ElectionMessage>(100);
     p2p_node.set_election_publish_channel(election_outbound_rx);
 
+    // Wire P2P state events replication
+    let (events_pub_tx, events_pub_rx) = tokio::sync::mpsc::channel::<p2p::StateEvent>(256);
+    let (events_inbound_tx, mut events_inbound_rx) = tokio::sync::mpsc::channel::<p2p::StateEvent>(256);
+    p2p_node.set_events_publish_channel(events_pub_rx);
+    p2p_node.set_events_inbound_channel(events_inbound_tx);
+
+    // Validator: apply inbound state events to local PG
+    let validator_events_db = db.clone();
+    let _events_handle = tokio::spawn(async move {
+        while let Some(event) = events_inbound_rx.recv().await {
+            let Some(ref db) = validator_events_db else { continue };
+            match event {
+                p2p::StateEvent::Deposit { ref user_id, ref amount, ref tx_hash, ledger_index } => {
+                    info!(user = %user_id, amount, "replicated deposit event");
+                    db.insert_deposit(user_id, amount, tx_hash, ledger_index).await;
+                }
+                p2p::StateEvent::Funding { rate_raw, mark_raw, index_raw, timestamp, ref payments } => {
+                    info!(rate = rate_raw, "replicated funding event");
+                    db.insert_funding_event(rate_raw, mark_raw, index_raw, timestamp).await;
+                    for p in payments {
+                        db.insert_funding_payment(
+                            &p.user_id, p.position_id, &p.side, p.payment,
+                            rate_raw, mark_raw, timestamp,
+                        ).await;
+                    }
+                }
+                p2p::StateEvent::Liquidation { position_id, ref user_id, price } => {
+                    info!(pos = position_id, user = %user_id, "replicated liquidation event");
+                    db.insert_liquidation(position_id, user_id, price).await;
+                }
+            }
+        }
+    });
+
     // Wire P2P signing relay
     if let Some(ref cfg) = signers_config {
         p2p_node.set_signing_channel(signing_rx);
@@ -551,6 +639,10 @@ async fn main() -> Result<()> {
     let _election_handle = tokio::spawn(async move {
         election_state.run().await;
     });
+
+    // Clone role_rx for singletons before the watcher consumes it
+    let role_rx_vault_mm = role_rx.clone();
+    let role_rx_vault_dn = role_rx.clone();
 
     // Role change watcher — flips is_sequencer AtomicBool
     let is_seq_watcher = is_sequencer.clone();
@@ -766,8 +858,8 @@ async fn main() -> Result<()> {
 
     info!(escrow = %escrow_address, "orchestrator started");
 
-    // Market Making Vault (optional — enabled via --vault-mm)
-    if cli.vault_mm {
+    // Market Making Vault — singleton (only runs on sequencer)
+    let _vault_mm_singleton = if cli.vault_mm {
         let vault_config = vault_mm::VaultMmConfig {
             half_spread: cli.vault_mm_spread,
             order_size: cli.vault_mm_size.clone(),
@@ -777,13 +869,17 @@ async fn main() -> Result<()> {
         };
         vault_mm::seed_vault_deposit(&perp, &vault_config).await;
         let vault_state = app_state.clone();
-        tokio::spawn(async move {
-            vault_mm::run_vault_mm(vault_state, vault_config).await;
-        });
-    }
+        Some(singleton::spawn("vault-mm", role_rx_vault_mm, move || {
+            let state = vault_state.clone();
+            let cfg = vault_config.clone();
+            async move { vault_mm::run_vault_mm(state, cfg).await }
+        }))
+    } else {
+        None
+    };
 
-    // Delta Neutral Vault (optional — enabled via --vault-dn)
-    if cli.vault_dn {
+    // Delta Neutral Vault — singleton (only runs on sequencer)
+    let _vault_dn_singleton = if cli.vault_dn {
         let vault_config = vault_mm::VaultMmConfig {
             user_id: "vault:dn".into(),
             half_spread: cli.vault_mm_spread,
@@ -795,15 +891,33 @@ async fn main() -> Result<()> {
         };
         vault_mm::seed_vault_deposit(&perp, &vault_config).await;
         let vault_state = app_state.clone();
-        tokio::spawn(async move {
-            vault_mm::run_vault_mm(vault_state, vault_config).await;
-        });
-    }
+        Some(singleton::spawn("vault-dn", role_rx_vault_dn, move || {
+            let state = vault_state.clone();
+            let cfg = vault_config.clone();
+            async move { vault_mm::run_vault_mm(state, cfg).await }
+        }))
+    } else {
+        None
+    };
 
     let mut tick = tokio::time::interval(Duration::from_secs(1));
 
     loop {
         tick.tick().await;
+
+        // Sequencer-only work: price feed, deposits, liquidations, funding.
+        // Validators only replay batches from the sequencer (handled above).
+        if !is_sequencer.load(Ordering::Relaxed) {
+            // Validators still save their own sealed state periodically
+            if last_state_save.elapsed() >= STATE_SAVE_INTERVAL {
+                if let Err(e) = perp.save_state().await {
+                    warn!("state save failed: {}", e);
+                }
+                last_state_save = Instant::now();
+            }
+            continue;
+        }
+
         let now_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -847,8 +961,16 @@ async fn main() -> Result<()> {
                         .await
                     {
                         error!(sender = %deposit.sender, "deposit credit failed: {}", e);
-                    } else if let Some(db) = &app_state.db {
-                        db.insert_deposit(&deposit.sender, &deposit.amount, &deposit.tx_hash, new_ledger).await;
+                    } else {
+                        if let Some(db) = &app_state.db {
+                            db.insert_deposit(&deposit.sender, &deposit.amount, &deposit.tx_hash, new_ledger).await;
+                        }
+                        let _ = events_pub_tx.try_send(p2p::StateEvent::Deposit {
+                            user_id: deposit.sender.clone(),
+                            amount: deposit.amount.clone(),
+                            tx_hash: deposit.tx_hash.clone(),
+                            ledger_index: new_ledger,
+                        });
                     }
                 }
                 if new_ledger > last_ledger {
@@ -861,7 +983,7 @@ async fn main() -> Result<()> {
 
         // Liquidation scanning
         if last_liquidation_scan.elapsed() >= liquidation_interval && current_price > 0.0 {
-            run_liquidation_scan(&perp, current_price, &app_state.ws_tx, &app_state.db).await;
+            run_liquidation_scan(&perp, current_price, &app_state.ws_tx, &app_state.db, &events_pub_tx).await;
             last_liquidation_scan = Instant::now();
         }
 
@@ -882,6 +1004,7 @@ async fn main() -> Result<()> {
                     let index_raw = crate::types::FP8::from_f64(current_price).raw();
                     app_state.funding_rate.store(rate_raw, Ordering::Relaxed);
                     app_state.last_funding_time.store(now_ts, Ordering::Relaxed);
+                    let mut funding_payments = Vec::new();
                     if let Some(db) = &app_state.db {
                         db.insert_funding_event(rate_raw, mark_raw, index_raw, now_ts).await;
                         if let Some(payments) = resp.get("payments").and_then(|v| v.as_array()) {
@@ -897,10 +1020,20 @@ async fn main() -> Result<()> {
                                     user_id, pos_id, side, payment,
                                     rate_raw, mark_raw, now_ts,
                                 ).await;
+                                funding_payments.push(p2p::FundingPayment {
+                                    user_id: user_id.to_string(),
+                                    position_id: pos_id,
+                                    side: side.to_string(),
+                                    payment,
+                                });
                             }
                             info!(count = payments.len(), "persisted funding payments");
                         }
                     }
+                    let _ = events_pub_tx.try_send(p2p::StateEvent::Funding {
+                        rate_raw, mark_raw, index_raw, timestamp: now_ts,
+                        payments: funding_payments,
+                    });
                 }
                 Err(e) => error!("funding application failed: {}", e),
             }

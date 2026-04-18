@@ -43,139 +43,76 @@ Option A expands the enclave attack surface. Option B adds a new unauthenticated
 
 ---
 
-## Bug 2: No operator onboarding path
+## ~~Bug 2: No operator onboarding path~~ — FIXED
 
-**Symptom:** Setting up the 2-of-3 XRPL escrow required an ad-hoc Python script that:
-- Called each enclave's `/v1/pool/generate`
-- Manually compressed the uncompressed secp256k1 pubkey
-- Derived the XRPL r-address via SHA-256 + RIPEMD-160 + Base58Check
-- Used `xrpl-py` to submit `SignerListSet` and `AccountSet` (disable master key)
-- Manually wrote `signers_config.json`
+**Fixed:** 4 CLI subcommands now cover the full lifecycle:
 
-None of these steps exist as a reproducible tool.
+| Command | Purpose |
+|---------|---------|
+| `operator-setup` | Generate keypair in enclave, derive XRPL address, output signer entry JSON |
+| `config-init` | Combine multiple entry files into `signers_config.json` with quorum |
+| `escrow-setup` | Submit `SignerListSet` + optionally disable master key on XRPL |
+| `operator-add` | Add new operator to existing config + optionally re-submit SignerListSet |
 
-**Root cause:** The system has no concept of "operator identity setup". Each piece exists in isolation:
-- Enclave can generate keys (`/v1/pool/generate`)
-- Rust code can derive XRPL addresses (`xrpl_signer.rs`)
-- Orchestrator can read `signers_config.json`
-
-But there is no tool that connects them: generate → derive → register → configure.
-
-**What's needed:** A single CLI command or script:
-
-```
-./operator-setup \
-  --enclave-url https://localhost:9088/v1 \
-  --xrpl-url https://s.altnet.rippletest.net:51234 \
-  --output signers_config.json
-```
-
-That:
-1. Calls enclave `/v1/pool/generate` → gets pubkey
-2. Compresses pubkey → derives XRPL r-address (using the same Rust code as `xrpl_signer.rs`)
-3. Outputs the signer entry JSON (address, compressed_pubkey, xrpl_address, session_key)
-
-And a separate escrow setup command:
-
-```
-./escrow-setup \
-  --signers-config signers_config.json \
-  --xrpl-url https://s.altnet.rippletest.net:51234 \
-  --escrow-seed sEdXXX \
-  --quorum 2
-```
-
-That:
-1. Reads all signer XRPL addresses from config
-2. Submits `SignerListSet` to XRPL
-3. Disables master key on escrow
-4. Verifies the setup
-
----
-
-## Bug 3: No deployment lifecycle
-
-**Symptom:** During testing, old orchestrator processes (PIDs 81288, 80769) from a previous deployment were still running, binding port 4001, and interfering with new deployments. Required manual `kill -9` to clean up.
-
-**Root cause:** No process management. No deployment script. No health verification. The current "deployment" is:
+Full workflow:
 
 ```bash
-scp binary azureuser@$ip:~/perp/
-ssh azureuser@$ip "pkill old; ./new-binary [args] &"
+# 1. Generate identity on each enclave
+./orchestrator operator-setup --enclave-url https://node-1:9088/v1 --name node-1 --output node-1.json
+
+# 2. Combine into config
+./orchestrator config-init --entries node-1.json node-2.json node-3.json \
+  --escrow-address rXXX --quorum 2
+
+# 3. Set up escrow on XRPL
+./orchestrator escrow-setup --signers-config signers_config.json --escrow-seed sEdXXX --disable-master
+
+# 4. Add operator later
+./orchestrator operator-add --enclave-url https://node-4:9088/v1 --name node-4 \
+  --config signers_config.json --xrpl-url https://... --escrow-seed sEdXXX
 ```
-
-**What's missing:**
-
-| Component | Status | Impact |
-|-----------|--------|--------|
-| systemd unit files | Not created | No auto-restart on crash, no clean stop |
-| Health endpoint | Not implemented | No way to verify readiness |
-| Deploy script | Not written | No reproducibility, no audit trail |
-| Version tracking | Not implemented | No way to know what's running |
-| Rollback procedure | Not defined | Can't recover from bad deploy |
-
-**What's needed:**
-
-1. **systemd units** for `perp-dex-server` and `perp-dex-orchestrator` on each Azure VM
-2. **`GET /v1/health`** on orchestrator returning `{"status": "ok", "version": "...", "role": "sequencer|validator", "peers": N, "enclave": "ok|error"}`
-3. **`scripts/deploy.sh`** that: builds on Hetzner → verifies binary → stops old via systemd → deploys new → starts → health check → logs deployment
 
 ---
 
-## Dependency chain
+## ~~Bug 3: No deployment lifecycle~~ — FIXED
 
-```
-Bug 1 (cross-signing) blocks:
-  └── End-to-end multisig withdrawal via orchestrator API
-  └── Production-grade operator config
+All components implemented:
 
-Bug 2 (onboarding) blocks:
-  └── Adding new operators without ad-hoc scripting
-  └── Key rotation flow
-  └── Grant milestone M1 demo (clean path, not workaround)
-
-Bug 3 (deployment) blocks:
-  └── Reproducible cluster setup
-  └── Failure recovery (auto-restart)
-  └── CI/CD pipeline
-```
-
-**Priority order:** Bug 1 → Bug 2 → Bug 3 → Bug 4. Bug 1 is the foundation — without it, the withdrawal system only works through SSH tunnels.
+| Component | Status | Location |
+|-----------|--------|----------|
+| systemd unit files | Done | Hetzner: `/etc/systemd/system/perp-dex-{enclave,orchestrator}-dev.service`; Azure: `scripts/perp-dex-orchestrator.service` |
+| Health endpoint | Done | `GET /v1/health` → `{"status","version","role","peers","enclave","uptime_secs"}` |
+| Deploy script | Done | `scripts/deploy.sh` — preflight, backup, atomic swap, health check, auto-rollback on failure |
+| Version tracking | Done | `CARGO_PKG_VERSION` in health endpoint; `deploy.log` on each node |
+| Rollback procedure | Done | `./deploy.sh rollback [node\|all]` restores `.prev` binary |
 
 ---
 
-## Bug 4: No CLI test tooling for authenticated endpoints
+## Status
 
-**Symptom:** To test the `/v1/withdraw` endpoint, we had to write a throwaway Python script that:
-- Generates a secp256k1 keypair
-- Derives XRPL r-address
-- Signs the request body with SHA-256 + ECDSA + DER encoding + low-S normalization
-- Sets X-XRPL-Address, X-XRPL-PublicKey, X-XRPL-Signature, X-XRPL-Timestamp headers
+All 4 architectural bugs resolved:
 
-This is the same pattern as Bug 2 — every test of an authenticated endpoint requires a custom script.
+| Bug | Status | Fixed |
+|-----|--------|-------|
+| Bug 1: Cross-signing | FIXED | P2P signing relay via gossipsub (<10ms quorum) |
+| Bug 2: Operator onboarding | FIXED | 4 CLI commands: operator-setup, config-init, escrow-setup, operator-add |
+| Bug 3: Deployment lifecycle | FIXED | systemd + deploy.sh with rollback + health endpoint + version tracking |
+| Bug 4: CLI test tooling | FIXED | sign-request, withdraw, balance subcommands |
 
-**Root cause:** The system requires XRPL wallet signature auth (correct for production), but provides no tooling to generate signed requests outside of the Crossmark browser extension. There is no `curl`-equivalent for testing.
+---
 
-**What's needed:** A CLI tool (part of orchestrator binary or standalone):
+## ~~Bug 4: No CLI test tooling for authenticated endpoints~~ — FIXED
 
+Three CLI subcommands implemented in `cli_tools.rs`:
+
+| Command | Purpose |
+|---------|---------|
+| `sign-request` | Generate signed curl command for any endpoint |
+| `withdraw` | Submit authenticated withdrawal |
+| `balance` | Query account balance with auth |
+
+```bash
+./orchestrator sign-request --seed sEdXXX --url http://localhost:3000/v1/orderbook
+./orchestrator withdraw --seed sEdXXX --amount 1 --destination rXXX
+./orchestrator balance --seed sEdXXX
 ```
-./perp-cli withdraw \
-  --api http://localhost:3000 \
-  --seed sEdXXX \
-  --amount 1 \
-  --destination rXXX
-```
-
-That handles auth internally. Or at minimum, a `sign-request` subcommand:
-
-```
-./perp-cli sign-request \
-  --seed sEdXXX \
-  --body '{"user_id":"rXXX","amount":"1","destination":"rYYY"}'
-# Outputs: curl -H "X-XRPL-Address: ..." -H "X-XRPL-PublicKey: ..." ...
-```
-
-This unblocks:
-- Automated integration testing
-- Operator-level failure testing without ad-hoc scripts
-- CI/CD pipeline health checks

@@ -138,6 +138,38 @@ pub enum SigningMessage {
     },
 }
 
+/// Events broadcast by sequencer for validator PG replication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StateEvent {
+    Deposit {
+        user_id: String,
+        amount: String,
+        tx_hash: String,
+        ledger_index: u32,
+    },
+    Funding {
+        rate_raw: i64,
+        mark_raw: i64,
+        index_raw: i64,
+        timestamp: u64,
+        payments: Vec<FundingPayment>,
+    },
+    Liquidation {
+        position_id: u64,
+        user_id: String,
+        price: f64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FundingPayment {
+    pub user_id: String,
+    pub position_id: i64,
+    pub side: String,
+    pub payment: i64,
+}
+
 /// Outbound signing request from withdrawal module to P2P.
 #[derive(Debug)]
 pub struct SigningRelay {
@@ -162,6 +194,7 @@ pub struct LocalSigner {
 const ORDERS_TOPIC: &str = "perp-dex/orders";
 const ELECTION_TOPIC: &str = "perp-dex/election";
 const SIGNING_TOPIC: &str = "perp-dex/signing";
+const EVENTS_TOPIC: &str = "perp-dex/events";
 
 #[derive(NetworkBehaviour)]
 struct PerpBehaviour {
@@ -176,6 +209,7 @@ pub struct P2PNode {
     orders_topic: gossipsub::IdentTopic,
     election_topic: gossipsub::IdentTopic,
     signing_topic: gossipsub::IdentTopic,
+    events_topic: gossipsub::IdentTopic,
     /// Channel to send received batches to the orchestrator (validator).
     batch_tx: mpsc::Sender<OrderBatch>,
     /// Channel to receive batches to publish (sequencer).
@@ -188,6 +222,10 @@ pub struct P2PNode {
     signing_request_rx: Option<mpsc::Receiver<SigningRelay>>,
     /// In-flight signing requests waiting for P2P responses.
     pending_signing: HashMap<String, tokio::sync::oneshot::Sender<SigningMessage>>,
+    /// Channel for outbound state events (sequencer publishes).
+    events_publish_rx: Option<mpsc::Receiver<StateEvent>>,
+    /// Channel for received state events (validator consumes).
+    events_inbound_tx: Option<mpsc::Sender<StateEvent>>,
     /// Local signer credentials for handling incoming signing requests.
     local_signer: Option<LocalSigner>,
     /// Our peer ID.
@@ -253,18 +291,22 @@ impl P2PNode {
         let orders_topic = gossipsub::IdentTopic::new(ORDERS_TOPIC);
         let election_topic = gossipsub::IdentTopic::new(ELECTION_TOPIC);
         let signing_topic = gossipsub::IdentTopic::new(SIGNING_TOPIC);
+        let events_topic = gossipsub::IdentTopic::new(EVENTS_TOPIC);
 
         let mut node = P2PNode {
             swarm,
             orders_topic,
             election_topic,
             signing_topic,
+            events_topic,
             batch_tx,
             publish_rx: None,
             election_inbound_tx,
             election_outbound_rx: None,
             signing_request_rx: None,
             pending_signing: HashMap::new(),
+            events_publish_rx: None,
+            events_inbound_tx: None,
             local_signer: None,
             peer_id,
             peer_count,
@@ -286,6 +328,11 @@ impl P2PNode {
             .gossipsub
             .subscribe(&node.signing_topic)
             .context("failed to subscribe to signing topic")?;
+        node.swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&node.events_topic)
+            .context("failed to subscribe to events topic")?;
 
         // Listen
         let addr: Multiaddr = listen_addr.parse().context("invalid listen address")?;
@@ -308,6 +355,16 @@ impl P2PNode {
     /// Set signing request channel (withdrawal module sends requests here).
     pub fn set_signing_channel(&mut self, rx: mpsc::Receiver<SigningRelay>) {
         self.signing_request_rx = Some(rx);
+    }
+
+    /// Set events publish channel (sequencer sends events to broadcast).
+    pub fn set_events_publish_channel(&mut self, rx: mpsc::Receiver<StateEvent>) {
+        self.events_publish_rx = Some(rx);
+    }
+
+    /// Set events inbound channel (validator receives events to apply).
+    pub fn set_events_inbound_channel(&mut self, tx: mpsc::Sender<StateEvent>) {
+        self.events_inbound_tx = Some(tx);
     }
 
     /// Set local signer credentials for handling incoming signing requests.
@@ -445,10 +502,12 @@ impl P2PNode {
         let mut publish_rx = self.publish_rx.take();
         let mut election_rx = self.election_outbound_rx.take();
         let mut signing_rx = self.signing_request_rx.take();
+        let mut events_rx = self.events_publish_rx.take();
 
         let orders_topic_hash = self.orders_topic.hash();
         let election_topic_hash = self.election_topic.hash();
         let signing_topic_hash = self.signing_topic.hash();
+        let events_topic_hash = self.events_topic.hash();
 
         let mut signing_cleanup = tokio::time::interval(Duration::from_secs(5));
 
@@ -525,6 +584,21 @@ impl P2PNode {
                                 compressed_pubkey: None,
                                 error: Some(format!("P2P publish failed: {e}")),
                             });
+                        }
+                    }
+                }
+
+                // Publish state events (sequencer → validators)
+                Some(event) = async {
+                    match &mut events_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<StateEvent>>().await,
+                    }
+                } => {
+                    if let Ok(data) = serde_json::to_vec(&event) {
+                        if let Err(e) = self.swarm.behaviour_mut().gossipsub
+                            .publish(self.events_topic.clone(), data) {
+                            warn!("events publish failed: {}", e);
                         }
                     }
                 }
@@ -614,6 +688,19 @@ impl P2PNode {
                             }
                             Err(e) => {
                                 warn!("invalid signing msg from {}: {}", propagation_source, e);
+                            }
+                        }
+                    } else if message.topic == events_topic_hash {
+                        match serde_json::from_slice::<StateEvent>(&message.data) {
+                            Ok(event) => {
+                                if let Some(ref tx) = self.events_inbound_tx {
+                                    if let Err(e) = tx.send(event).await {
+                                        error!("failed to forward state event: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("invalid state event from {}: {}", propagation_source, e);
                             }
                         }
                     }

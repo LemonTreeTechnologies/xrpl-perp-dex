@@ -5,6 +5,7 @@ set -euo pipefail
 #
 # Usage:
 #   ./scripts/deploy.sh [node-1|node-2|node-3|all]
+#   ./scripts/deploy.sh rollback [node-1|node-2|node-3|all]
 #
 # Prerequisites:
 #   - SSH access via Hetzner bastion (94.130.18.162)
@@ -32,33 +33,32 @@ log()  { echo -e "${GREEN}[deploy]${NC} $*"; }
 warn() { echo -e "${YELLOW}[warn]${NC} $*"; }
 err()  { echo -e "${RED}[error]${NC} $*" >&2; }
 
-run_local() { eval "$@"; }
-
 # ── Pre-flight checks ──────────────────────────────────────────
 
 preflight() {
     log "Pre-flight checks..."
 
-    # 1. Mainnet still running on Hetzner?
-    local mainnet_pid
-    mainnet_pid=$(pgrep -f "perp-dex-orchestrator" 2>/dev/null | head -1 || echo "none")
-    if [ "$mainnet_pid" = "none" ]; then
-        warn "No orchestrator detected on Hetzner (may be expected)"
-    else
-        log "Orchestrator running on Hetzner (PID $mainnet_pid) — will not touch"
-    fi
-
-    # 2. Binary exists?
     if [ ! -f "$BINARY_PATH" ]; then
         err "Binary not found at $BINARY_PATH"
         err "Run: source ~/.cargo/env && cd ~/llm-perp-xrpl/orchestrator && cargo build --release"
         exit 1
     fi
 
-    # 3. Binary version
     local version
     version=$("$BINARY_PATH" --version 2>/dev/null || echo "unknown")
     log "Binary version: $version"
+    log "Binary sha256: $(sha256sum "$BINARY_PATH" | cut -d' ' -f1 | head -c 16)..."
+}
+
+# ── Health check helper ───────────────────────────────────────
+
+health_check() {
+    local name="$1" ip="$2"
+    local health
+    health=$(ssh -o ConnectTimeout=5 azureuser@"$ip" \
+        'curl -s --connect-timeout 5 --max-time 10 http://localhost:3000/v1/health' 2>/dev/null \
+        || echo '{"status":"unreachable"}')
+    echo "$health"
 }
 
 # ── Deploy to a single node ────────────────────────────────────
@@ -69,10 +69,21 @@ deploy_node() {
 
     log "[$name] Deploying to $ip..."
 
+    # Save current version before deploy
+    local old_version
+    old_version=$(ssh -o ConnectTimeout=5 azureuser@"$ip" \
+        "cd $REMOTE_DIR && ./perp-dex-orchestrator --version 2>/dev/null || echo unknown" \
+        2>/dev/null || echo "unknown")
+    log "[$name] Current version: $old_version"
+
+    # Backup current binary for rollback
+    log "[$name] Backing up current binary..."
+    ssh -o StrictHostKeyChecking=no azureuser@"$ip" \
+        "cd $REMOTE_DIR && cp -f perp-dex-orchestrator perp-dex-orchestrator.prev 2>/dev/null || true"
+
     # Stop old process
     log "[$name] Stopping old process..."
-    ssh -o StrictHostKeyChecking=no azureuser@"$ip" 'killall perp-dex-orchestrator 2>/dev/null; echo stopped' || true
-
+    ssh azureuser@"$ip" 'sudo systemctl stop perp-dex-orchestrator 2>/dev/null; killall perp-dex-orchestrator 2>/dev/null; echo stopped' || true
     sleep 2
 
     # Copy binary
@@ -83,28 +94,93 @@ deploy_node() {
     log "[$name] Swapping binary..."
     ssh azureuser@"$ip" "cd $REMOTE_DIR && mv perp-dex-orchestrator.new perp-dex-orchestrator && chmod +x perp-dex-orchestrator"
 
-    # Start (use systemd if available, otherwise nohup with existing start_orchestrator.sh)
+    # Start
     log "[$name] Starting..."
     ssh azureuser@"$ip" "sudo systemctl restart perp-dex-orchestrator 2>/dev/null || (cd $REMOTE_DIR && nohup ./start_orchestrator.sh </dev/null > orchestrator.log 2>&1 & echo PID=\$!)"
-
     sleep 3
 
     # Health check
     log "[$name] Health check..."
     local health
-    health=$(ssh azureuser@"$ip" 'curl -s --connect-timeout 5 --max-time 10 http://localhost:3000/v1/health' 2>/dev/null || echo '{"status":"unreachable"}')
+    health=$(health_check "$name" "$ip")
     log "[$name] $health"
 
     if echo "$health" | grep -q '"status":"ok"'; then
         log "[$name] ${GREEN}OK${NC}"
+        # Log deployment
+        ssh azureuser@"$ip" "echo '$(date -u +%Y-%m-%dT%H:%M:%SZ) deployed from $old_version' >> $REMOTE_DIR/deploy.log" 2>/dev/null || true
     else
-        warn "[$name] Health check did not return ok — check logs"
+        warn "[$name] Health check failed — rolling back..."
+        rollback_node "$name"
+        return 1
+    fi
+}
+
+# ── Rollback a single node ────────────────────────────────────
+
+rollback_node() {
+    local name="$1"
+    local ip="${NODES[$name]}"
+
+    log "[$name] Rolling back on $ip..."
+
+    # Check backup exists
+    local has_prev
+    has_prev=$(ssh azureuser@"$ip" "test -f $REMOTE_DIR/perp-dex-orchestrator.prev && echo yes || echo no" 2>/dev/null)
+    if [ "$has_prev" != "yes" ]; then
+        err "[$name] No backup binary found — cannot rollback"
+        return 1
+    fi
+
+    # Stop current
+    ssh azureuser@"$ip" 'sudo systemctl stop perp-dex-orchestrator 2>/dev/null; killall perp-dex-orchestrator 2>/dev/null' || true
+    sleep 2
+
+    # Restore backup
+    ssh azureuser@"$ip" "cd $REMOTE_DIR && mv perp-dex-orchestrator.prev perp-dex-orchestrator && chmod +x perp-dex-orchestrator"
+
+    # Start
+    ssh azureuser@"$ip" "sudo systemctl restart perp-dex-orchestrator 2>/dev/null || (cd $REMOTE_DIR && nohup ./start_orchestrator.sh </dev/null > orchestrator.log 2>&1 & echo PID=\$!)"
+    sleep 3
+
+    # Verify
+    local health
+    health=$(health_check "$name" "$ip")
+    log "[$name] After rollback: $health"
+
+    if echo "$health" | grep -q '"status":"ok"'; then
+        log "[$name] ${GREEN}Rollback OK${NC}"
+        ssh azureuser@"$ip" "echo '$(date -u +%Y-%m-%dT%H:%M:%SZ) ROLLBACK' >> $REMOTE_DIR/deploy.log" 2>/dev/null || true
+    else
+        err "[$name] Rollback also failed — manual intervention needed"
+        return 1
     fi
 }
 
 # ── Main ───────────────────────────────────────────────────────
 
-target="${1:-all}"
+action="${1:-deploy}"
+target="${2:-all}"
+
+# Handle "deploy rollback" syntax
+if [ "$action" = "rollback" ]; then
+    if [ "$target" = "all" ]; then
+        for node in node-1 node-2 node-3; do
+            rollback_node "$node"
+        done
+    else
+        if [[ ! -v "NODES[$target]" ]]; then
+            err "Unknown node: $target (expected node-1, node-2, node-3, or all)"
+            exit 1
+        fi
+        rollback_node "$target"
+    fi
+    exit 0
+fi
+
+# Regular deploy (first arg is target if not "rollback")
+target="$action"
+[ "$target" = "deploy" ] && target="${2:-all}"
 
 preflight
 
@@ -125,8 +201,8 @@ sleep 10
 
 # Final health check on all deployed nodes
 log "Final health status:"
-for node in "${!NODES[@]}"; do
+for node in node-1 node-2 node-3; do
     ip="${NODES[$node]}"
-    health=$(ssh azureuser@"$ip" 'curl -s --connect-timeout 5 --max-time 10 http://localhost:3000/v1/health' 2>/dev/null || echo "unreachable")
+    health=$(health_check "$node" "$ip")
     log "  $node ($ip): $health"
 done

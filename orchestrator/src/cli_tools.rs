@@ -145,7 +145,7 @@ fn sign_xrpl_tx(
 
 // ── operator-setup ───────────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct SignerEntry {
     name: String,
     enclave_url: String,
@@ -571,6 +571,171 @@ fn derive_keypair_from_seed(seed: &str) -> Result<XrplKeypair> {
 
 fn derive_xrpl_address_from_seed(seed: &str) -> Result<String> {
     Ok(derive_keypair_from_seed(seed)?.address)
+}
+
+// ── config-init ───────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FullSignersConfig {
+    escrow_address: String,
+    #[serde(default)]
+    escrow_seed: String,
+    quorum: u32,
+    #[serde(default)]
+    signer_list_set_tx_hash: String,
+    signers: Vec<SignerEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_signer: Option<SignerEntry>,
+}
+
+pub async fn config_init(
+    entry_files: &[std::path::PathBuf],
+    escrow_address: &str,
+    quorum: u32,
+    output: &std::path::Path,
+) -> Result<()> {
+    println!("Config Init");
+    println!("===========");
+
+    let mut signers = Vec::new();
+    for path in entry_files {
+        let data = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        let entry: SignerEntry =
+            serde_json::from_str(&data).with_context(|| format!("invalid JSON in {}", path.display()))?;
+        println!("  + {} → {}", entry.name, entry.xrpl_address);
+        signers.push(entry);
+    }
+
+    if signers.is_empty() {
+        anyhow::bail!("no signer entries provided");
+    }
+
+    if quorum as usize > signers.len() {
+        anyhow::bail!(
+            "quorum ({}) cannot exceed signer count ({})",
+            quorum,
+            signers.len()
+        );
+    }
+
+    let config = FullSignersConfig {
+        escrow_address: escrow_address.to_string(),
+        escrow_seed: String::new(),
+        quorum,
+        signer_list_set_tx_hash: String::new(),
+        signers,
+        local_signer: None,
+    };
+
+    let json = serde_json::to_string_pretty(&config)?;
+    std::fs::write(output, &json)
+        .with_context(|| format!("failed to write {}", output.display()))?;
+
+    println!("\nCreated {} with {} signers, quorum={}", output.display(), config.signers.len(), quorum);
+    println!("\nNext steps:");
+    println!("  1. Add escrow_seed to the config (keep it secret!)");
+    println!("  2. Run `escrow-setup --signers-config {} --escrow-seed <seed>`", output.display());
+
+    Ok(())
+}
+
+// ── operator-add ──────────────────────────────────────────────
+
+pub async fn operator_add(
+    enclave_url: &str,
+    name: &str,
+    config_path: &std::path::Path,
+    xrpl_url: Option<&str>,
+    escrow_seed: Option<&str>,
+) -> Result<()> {
+    println!("Operator Add");
+    println!("============");
+    println!("Enclave: {enclave_url}");
+    println!("Name:    {name}");
+    println!("Config:  {}", config_path.display());
+    println!();
+
+    let config_data = std::fs::read_to_string(config_path)
+        .with_context(|| format!("cannot read {}", config_path.display()))?;
+    let mut config: FullSignersConfig =
+        serde_json::from_str(&config_data).context("invalid signers config JSON")?;
+
+    if config.signers.iter().any(|s| s.name == name) {
+        anyhow::bail!("signer '{}' already exists in config", name);
+    }
+
+    // Step 1: Generate keypair
+    let http = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    println!("[1/3] Generating keypair in enclave...");
+    let resp: GenerateResponse = http
+        .post(format!("{enclave_url}/pool/generate"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .context("failed to reach enclave")?
+        .json()
+        .await?;
+
+    if resp.status != "success" {
+        anyhow::bail!("enclave failed: {}", resp.message.unwrap_or_default());
+    }
+
+    let eth_address = resp.address.context("missing address")?;
+    let uncompressed_pubkey = resp.public_key.context("missing public_key")?;
+    let session_key = resp.session_key.context("missing session_key")?;
+
+    // Step 2: Derive XRPL address
+    println!("[2/3] Deriving XRPL address...");
+    let xrpl_address = xrpl_signer::pubkey_to_xrpl_address(&uncompressed_pubkey)?;
+    let compressed_hex = {
+        let raw = hex::decode(
+            uncompressed_pubkey.strip_prefix("0x").unwrap_or(&uncompressed_pubkey),
+        )?;
+        hex::encode_upper(&xrpl_signer::compress_pubkey(&raw)?)
+    };
+
+    println!("  XRPL address:     {xrpl_address}");
+    println!("  Compressed pubkey: {compressed_hex}");
+
+    let entry = SignerEntry {
+        name: name.to_string(),
+        enclave_url: enclave_url.to_string(),
+        address: eth_address,
+        session_key,
+        compressed_pubkey: compressed_hex,
+        xrpl_address: xrpl_address.clone(),
+    };
+
+    // Step 3: Update config
+    println!("[3/3] Updating config...");
+    config.signers.push(entry);
+
+    let json = serde_json::to_string_pretty(&config)?;
+    std::fs::write(config_path, &json)
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    println!("  Added signer #{} ({})", config.signers.len(), name);
+    println!("  Config saved to {}", config_path.display());
+
+    // Optional: re-submit SignerListSet if credentials provided
+    if let (Some(xrpl_url), Some(seed)) = (xrpl_url, escrow_seed) {
+        println!("\n  Re-submitting SignerListSet with {} signers...", config.signers.len());
+        let escrow_addr = if config.escrow_address.is_empty() {
+            None
+        } else {
+            Some(config.escrow_address.as_str())
+        };
+        escrow_setup(xrpl_url, config_path, seed, escrow_addr, false).await?;
+    } else {
+        println!("\nNext: run `escrow-setup` to update the on-chain SignerListSet");
+    }
+
+    Ok(())
 }
 
 // ── sign-request (Bug 4) ───────────────────────────────────────
