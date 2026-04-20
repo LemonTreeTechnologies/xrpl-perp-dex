@@ -405,6 +405,8 @@ Total wall-clock: ~25 minutes for four nodes (5 min per node + 5 min per inter-n
 
 This is the full pre-planned key-rotation ceremony. Do not skip steps. Read `deployment-dilemma.en.md` §"Strategy 4: Pre-planned Key Rotation (recommended)" end-to-end before starting; the attack-surface analysis (vectors 1–6) is the justification for why each step exists.
 
+> **Prerequisite — not yet shipped in our enclave fork.** Steps 3 and 8 below rely on an **ECDH-over-local-attestation** state-export primitive: the old enclave on port 9088 unseals its state, establishes an authenticated channel to the new enclave on port 9089 via local attestation + ECDH, and transfers plaintext under an ephemeral session key. This is the same primitive the sibling Phoenix PM project tracks as Bug 1 Option A in `SGX_project/EthSignerEnclave/docs/SHARED-ENCLAVE-BUGS.md` (needed there for cross-CPU FROST share distribution). Our fork currently uses MRENCLAVE+CPU-bound `sgx_seal_data(0, ...)` — which **cannot cross MRENCLAVE boundaries even on the same CPU**. Until ECDH-over-local-attestation ships in `Enclave/Enclave.cpp`, Path B is **target state, not executable**: attempting it today would lose `frost_share.sealed` / `vault_state.sealed` / `margin_ledger.sealed` / `tx_dedup.sealed` and force every enclave upgrade into the §11.7 worst-case path (fresh DKG per node). Fix this primitive once — it unblocks Phoenix PM's cross-machine FROST and our cross-MRENCLAVE migration with the same piece of work.
+
 Order of nodes: **Hetzner first** (canary), then Azure node-1, node-2, node-3. Never more than one node in the rotating state at a time. The cluster must always have ≥2 nodes on a consistent MRENCLAVE to keep signing.
 
 Per-node steps:
