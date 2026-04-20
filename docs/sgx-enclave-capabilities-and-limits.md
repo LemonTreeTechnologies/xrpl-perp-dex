@@ -208,6 +208,8 @@ The SDK exposes this choice as the `policy` parameter to the seal call.
 
 In practice, long-lived persistent state (like the vault's position database) uses **MRSIGNER** sealing. Short-lived or version-specific state uses **MRENCLAVE** sealing. The choice is made per-blob, not globally.
 
+> **Project note.** The general advice above is the SGX community default. **For this project we have rejected MRSIGNER sealing entirely** — see `deployment-dilemma.en.md` §"Strategy 2: MRSIGNER-based Sealing — REJECTED" for the reasoning (attestation verifiers check MRENCLAVE, signing-key compromise → full key extraction, habits that diverge between testnet and mainnet). Every sealed blob in our production cluster is MRENCLAVE-bound, and every enclave upgrade is an on-chain key-rotation ceremony (`deployment-procedure.md` §11), not a re-seal. Part 7 of this document specifies the project's concrete per-blob policy; when it conflicts with the general discussion above, Part 7 wins.
+
 ### Q: Is there anything else that affects the sealing key?
 
 Yes, and this is where people get bitten:
@@ -426,27 +428,31 @@ From `project_fork_and_deploy.md` and the current codebase:
 
 The orchestrator is the "nervous system" — it perceives the outside world and drives the enclave via ECALLs. The enclave is the "policy core" — it decides what is allowed, signs what it approves, and never touches the wire.
 
-### Q: Which sealed blobs exist and what's their sealing policy (target state)?
+### Q: Which sealed blobs exist and what's their sealing policy?
 
-*Target state, to be implemented by the enclave ecalls plan; current state depends on what has been wired.*
+Every sealed blob in this project is **MRENCLAVE-bound**. This is a deliberate policy choice — see the project note in Part 4 and `deployment-dilemma.en.md` §"Strategy 2: MRSIGNER-based Sealing — REJECTED".
 
-| Blob | Contains | Target policy | Rationale |
+| Blob | Contains | Policy | Upgrade path |
 |---|---|---|---|
-| `frost_share.sealed` | FROST key share for this node | MRSIGNER + versioned | Must survive enclave upgrades; recovery is impossible |
-| `vault_state.sealed` | Vault balance sheet + open positions | MRSIGNER + versioned | Must survive upgrades; reconstructable from chain with effort |
-| `margin_ledger.sealed` | Per-user margin accounts | MRSIGNER + versioned | Must survive upgrades; hard to reconstruct |
-| `tx_dedup.sealed` | Processed tx hash table (deposit replay guard) | MRSIGNER + versioned | Must survive upgrades to keep replay guarantee |
-| `nonce_ctr.sealed` | Monotonic signing counter | MRENCLAVE | Fresh on each binary; old counters are irrelevant and keeping them bound to the old binary closes a minor replay surface |
+| `frost_share.sealed` | FROST key share for this node | MRENCLAVE | Node generates a fresh share under the new MRENCLAVE during the rotation ceremony; SignerListSet replaces the old on-chain signer with the new one (`deployment-procedure.md` §11.5) |
+| `vault_state.sealed` | Vault balance sheet + open positions | MRENCLAVE | Reconstructed inside the new enclave during the ceremony via the same export/import-over-local-attestation pattern used for the FROST share; or, in the worst case, rebuilt from chain history |
+| `margin_ledger.sealed` | Per-user margin accounts | MRENCLAVE | Same export/import pathway as vault state — replayed into the new enclave before the old is shredded (§11.5 step 8 "golden rule" soak) |
+| `tx_dedup.sealed` | Processed tx hash table (deposit replay guard) | MRENCLAVE | Same export/import pathway; must be preserved across the ceremony to keep the replay guarantee |
+| `nonce_ctr.sealed` | Monotonic signing counter | MRENCLAVE | Fresh on each binary; old counters are irrelevant to the new key (the new signer starts with sequence 0) |
+
+The export/import pattern (enclave A unseals, ECDH over local attestation to enclave B, B re-seals) is described in Part 6's "Is there any way to make sealed data portable between CPUs?" — here it is used to move state across **MRENCLAVE boundaries on the same CPU**, not across CPUs, but the mechanism is the same.
 
 ### Q: When is the "migration ceremony" pattern warranted for this project?
 
-Three cases:
+**Every enclave binary change.** Because every sealed blob is MRENCLAVE-bound, a new MRENCLAVE cannot unseal old data — there is no "routine re-seal" path for this project. The `deployment-procedure.md` §11.5 ceremony is the only upgrade path for anything that alters the enclave.
 
-1. **Signing-key rotation.** If we ever rotate the enclave's signing key (i.e., the key used to sign the enclave binary itself, which determines MRSIGNER) — ceremony required. No shortcuts.
-2. **Schema change that crosses an invariant.** If a new enclave version wants to interpret old data in a way that requires computing new fields from chain history — build an explicit upgrade path, do not rely on the seal-and-reload round-trip.
-3. **Switching sealing policy itself** (e.g., adding AEAD KDF parameters, changing the SDK major version) — dual-mode transition enclave.
+This is a stricter model than the SGX default (where MRSIGNER sealing permits silent re-use across versions), and it is intentional:
 
-For routine changes — bug fixes, new ecalls, minor logic tweaks — the normal MRSIGNER sealing + schema versioning path is sufficient and no ceremony is needed.
+- The 2-of-3 signing property should propagate to the upgrade path: no single operator can unilaterally change what's running.
+- MRSIGNER would make "compromise the signing key once and read every historical blob forever" a viable attack. MRENCLAVE-only removes that capability.
+- Testnet and mainnet follow the same procedure, so operators do not develop habits that are safe on testnet but catastrophic on mainnet.
+
+The three historical "ceremony warranted" cases (signing-key rotation, invariant-crossing schema change, sealing-policy switch) all still apply — they are just no longer a distinct category, because **every upgrade is a ceremony** in this project.
 
 ---
 

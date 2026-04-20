@@ -316,6 +316,216 @@ Working from "we have a lot of time" — not a hackathon scramble:
 
 At each step, the previous steps are running in the background and getting battle-tested.
 
+## 11. Mainnet hotfix runbook
+
+This section is the concrete step-by-step procedure an on-call operator runs when a new release has been signed 2-of-3 (section 5) and must go live on a cluster that is already holding real user funds on XRPL mainnet. Everything earlier in this document is about *how we decide what to deploy*; this section is about *how we deploy it without losing state or funds*.
+
+### 11.1 Invariant: MRSIGNER sealing is not available
+
+Every sealed blob on every production node (FROST key share, tx dedup table, recovery artefacts) is sealed to the **MRENCLAVE** of the enclave that wrote it. Binding is deliberate: MRSIGNER sealing was evaluated and rejected — see `deployment-dilemma.en.md` §"Strategy 2: MRSIGNER-based Sealing — REJECTED" for the full argument (attestation verifiers check MRENCLAVE not MRSIGNER, one-way door, compromised build pipeline → full key extraction).
+
+The operational consequence of that invariant:
+
+> **Any change that produces a new MRENCLAVE cannot unseal old state.** There is no file-swap upgrade path for the enclave. Every such change is an on-chain key rotation via `SignerListSet`, not a binary swap.
+
+This is the single most important thing to internalise before running this runbook. If you catch yourself thinking "let's just copy the new `.signed.so` in place", stop and re-read this section.
+
+### 11.2 Decision tree: which path am I on?
+
+Before touching anything in production, classify the hotfix:
+
+```
+Did the release change any of:
+  - Enclave/*.cpp, Enclave/*.h, Enclave/*.edl
+  - PerpState.h or any struct persisted inside the enclave
+  - Enclave/Enclave.config.xml (TCS, heap, stack, debug flag)
+  - SGX SDK version or build flags that affect the enclave
+  - The enclave signing key
+?
+
+No  → Path A: orchestrator-only hotfix
+Yes → Path B: enclave change (new MRENCLAVE)
+```
+
+Fast sanity check: `sha256sum enclave.signed.so` on the release artefact vs on the currently running node. If the hashes match it is definitively Path A. If they differ it is Path B, full stop — there is no "tiny enclave change" exception.
+
+### 11.3 Pre-flight (both paths)
+
+Run through this list before touching any production node. If any item is missing, abort and fix it first — there is no "we'll deal with it during the window".
+
+1. **Release manifest has 2-of-3 valid signatures** (section 5). Verify each signature locally against the trust-anchor pubkeys.
+2. **Reproducible build hash matches** — you have independently built from the tagged commit and your `sha256` matches the manifest.
+3. **Previous good manifest identified** — write down its version and commit hash. This is the rollback target; do not hunt for it under pressure.
+4. **Testnet soak completed** — the exact same build has been running on the testnet cluster for ≥24h with healthy FROST rounds.
+5. **Cluster state snapshot taken:**
+   - Current MRENCLAVE on each node (from the local attestation endpoint).
+   - Current XRPL account sequence for the escrow account.
+   - Current signer list on chain (addresses + quorum).
+   - Escrow XRP balance and any open positions.
+   - FROST health: last successful quorum round timestamp.
+6. **No in-flight withdrawals** — check the orchestrator's pending-tx table. If non-empty, either wait for them to confirm or abort.
+7. **No unconfirmed deposits younger than 20 ledgers** — anything mid-validation should settle before you start.
+8. **All three operators reachable** in a shared channel for the duration of the window. A path-B rotation requires live 2-of-3 FROST rounds mid-procedure.
+9. **Rollback release is already built and hash-verified** on each node's disk as `.prev`. The rollback must not depend on a rebuild.
+
+### 11.4 Path A — Orchestrator-only hotfix
+
+Enclave keeps running throughout. Only the orchestrator binary is swapped. Sealed data is untouched. Keys are not rotated. No on-chain action.
+
+Order of nodes: **Hetzner first** (canary — it is the node that feels "most ours"), then Azure node-1, node-2, node-3, with a 5-minute soak between each.
+
+Per-node steps:
+
+1. Confirm `sha256sum enclave.signed.so` on this node matches the production manifest. If not, this is not Path A — stop.
+2. Stop the orchestrator:
+   ```
+   sudo systemctl stop perp-dex-orchestrator-prod
+   ```
+3. Verify the enclave host process on port 9088 is still alive (`pgrep -f enclave_signed`). If the enclave died with the orchestrator, something is wrong — abort before continuing.
+4. Move the new binary into place, keeping the previous one as `.prev`:
+   ```
+   sudo mv /opt/perp-dex/bin/orchestrator /opt/perp-dex/bin/orchestrator.prev
+   sudo install -m 755 /tmp/orchestrator-new /opt/perp-dex/bin/orchestrator
+   ```
+5. Start the orchestrator:
+   ```
+   sudo systemctl start perp-dex-orchestrator-prod
+   ```
+6. Health check must return OK continuously for 60s:
+   ```
+   for i in $(seq 1 60); do curl -fsS http://localhost:3003/v1/health || exit 1; sleep 1; done
+   ```
+7. Run a **dry-run FROST round** against the other two peers (no XRPL submission — the orchestrator has a diagnostic endpoint for this). Round must complete within 10 s.
+8. Soak 5 minutes. Watch `journalctl -u perp-dex-orchestrator-prod -f` for errors.
+9. If clean: move to the next node. If anything flaps: see §11.6 rollback.
+
+Total wall-clock: ~25 minutes for four nodes (5 min per node + 5 min per inter-node soak).
+
+### 11.5 Path B — Enclave change (new MRENCLAVE)
+
+This is the full pre-planned key-rotation ceremony. Do not skip steps. Read `deployment-dilemma.en.md` §"Strategy 4: Pre-planned Key Rotation (recommended)" end-to-end before starting; the attack-surface analysis (vectors 1–6) is the justification for why each step exists.
+
+Order of nodes: **Hetzner first** (canary), then Azure node-1, node-2, node-3. Never more than one node in the rotating state at a time. The cluster must always have ≥2 nodes on a consistent MRENCLAVE to keep signing.
+
+Per-node steps:
+
+1. **Start the new enclave on a staging port** (9089), leaving the old enclave on 9088 running and serving live traffic.
+   ```
+   sudo systemctl start perp-dex-enclave-prod-new
+   ```
+   The new enclave comes up with empty sealed state (no FROST share yet, no tx dedup history).
+
+2. **New enclave generates a fresh keypair internally** and produces a DCAP attestation quote binding `new_MRENCLAVE` to the new XRPL address. Ecall: `ecall_generate_key_with_attestation`.
+
+3. **Peers verify the attestation quote.** The orchestrator on the rotating node sends the quote to the orchestrators of the other two nodes, which forward it to their (old) enclaves. Each peer enclave verifies:
+   - The quote chains to Intel's root.
+   - The MRENCLAVE in the quote matches the `enclave_mrenclave` field in the currently merged release manifest.
+   - The public key in the quote's report data matches what the orchestrator proposed.
+   If any peer rejects, abort — the new enclave is lying about its identity. Stop the new enclave, do not delete old data, escalate.
+
+4. **Co-sign SignerListSet #1 — add new signer, raise quorum to 3.**
+   - Transaction adds the new address to the escrow account's signer list.
+   - Quorum is simultaneously raised from 2 to **3** for the duration of the rotation window (defense against vector 1 from deployment-dilemma §Attack surface analysis).
+   - `LastLedgerSequence` is set to `current_ledger + 20` (~60 s validation window).
+   - 2-of-3 existing (old) enclaves co-sign.
+   - If not confirmed within `LastLedgerSequence`: no key was added, state is unchanged, abort this node's rotation and escalate.
+
+5. **Co-sign SignerListSet #2 — remove old signer, lower quorum to 2.**
+   - Transaction removes the old address, keeping the list at 3 signers (the two unrotated peers + this node's new key).
+   - Quorum returns from 3 to 2.
+   - `Sequence = (tx #1 Sequence) + 1` — XRPL's per-account sequence enforces ordering (vector 4 defense).
+   - Retry with exponential backoff up to 10 minutes total.
+   - **If tx #2 has not confirmed after 10 minutes:** submit emergency SignerListSet #3 which removes the *new* key (returning to the original 3-signer list). Better to abort the upgrade than leave a 4-key window open indefinitely (vector 3 defense).
+
+6. **Verify on-chain state.** Pull the signer list from XRPL and confirm: exactly 3 entries, quorum 2, new key present, old key absent.
+
+7. **Stop the old enclave.**
+   ```
+   sudo systemctl stop perp-dex-enclave-prod-old
+   ```
+   At this point the new enclave on 9089 is the only enclave on this node, but it has not yet been promoted to the production port/service name.
+
+8. **Soak before shredding (golden rule).** Run one real FROST round on mainnet (a no-op such as a trivial escrow memo payment of 1 drop back to the escrow itself, or a ping-style liveness tx agreed in advance). Wait for the tx to confirm on-chain. Confirm the new enclave signed correctly. This is the last safe window — do not skip.
+
+9. **Shred old sealed data.**
+   ```
+   sudo shred -u /var/lib/perp-dex/prod/frost_share.sealed
+   sudo shred -u /var/lib/perp-dex/prod/tx_dedup.sealed
+   sudo shred -u /var/lib/perp-dex/prod/nonce_ctr.sealed
+   sudo rm -f /opt/perp-dex/bin/enclave.signed.so.old
+   ```
+   (Sealed to old MRENCLAVE; unrecoverable even in theory, but shredded anyway to remove the tempting fiction of "we can roll back by restoring the old files".)
+
+10. **Promote the new enclave.** Point the production systemd unit at the new binary and port; restart under the production service name.
+    ```
+    sudo systemctl stop perp-dex-enclave-prod-new
+    sudo mv /opt/perp-dex/bin/enclave.signed.so.new /opt/perp-dex/bin/enclave.signed.so
+    sudo systemctl start perp-dex-enclave-prod
+    ```
+
+11. **Cross-attest with peers.** Each of the other two nodes runs its attestation check against this node and must accept the new MRENCLAVE. If any peer rejects, this node is out of the quorum — see §11.7.
+
+12. **Operational soak — 10 minutes minimum.** Watch for:
+    - Healthy FROST rounds involving this node.
+    - No unexpected errors in `journalctl -u perp-dex-enclave-prod -u perp-dex-orchestrator-prod`.
+    - Attestation status remains "OK" on all three nodes.
+
+13. **Move to next node** only after the soak passes cleanly. Rotate Hetzner → Azure-1 → Azure-2 → Azure-3 sequentially.
+
+End state after all four nodes are rotated: signer list has 3 new addresses (all bound to new MRENCLAVE), quorum 2, same escrow balance, zero XRP moved during the ceremony.
+
+Total wall-clock: ~60–75 minutes for the full cluster, assuming no rollbacks.
+
+### 11.6 Rollback criteria
+
+Listed from least to most drastic. Pick the narrowest one that matches the failure mode.
+
+| Trigger | Scope | Action |
+|---|---|---|
+| Path A health check fails during soak | Single node | Agent auto-reverts to `.prev` binary, restarts, posts rollback receipt. Cluster unaffected. |
+| Path B — add-signer tx not confirmed within `LastLedgerSequence` | Single node | Abort ceremony on this node. No key was added. Old enclave still running. Escalate. |
+| Path B — remove-signer tx not confirmed within 10 min | Single node | Submit emergency SignerListSet #3 removing the *new* key. Return to original 3-signer list. Escalate. |
+| Path B — new enclave fails DCAP attestation by peers | Single node | Stop new enclave. Old enclave still running, old sealed data intact. Investigate MRENCLAVE mismatch (build env drift, wrong manifest) before re-attempting. |
+| Path B — cross-attestation after promotion fails on one peer | Single node | If soak has not yet shredded old data: restart old enclave from its sealed blobs. If shred already done: this node is out of the quorum, follow §11.7. |
+| Operational failure during post-rotation soak (bad FROST rounds, corrupted state) | Cluster | Co-sign a SignerListSet that re-adds the previous node's old key and removes its new key. Cluster returns to pre-hotfix signer set. Quarantine the bad node. |
+| Production bug discovered after full cluster rotation | Cluster | Treat as a new release: sign 2-of-3 a manifest pointing at the previous good version. Run this runbook again in reverse. |
+
+No rollback path involves a single operator overriding the 2-of-3 requirement. If a situation seems to require that, you are either in the "two operators compromised" out-of-scope case or you have misclassified the failure.
+
+### 11.7 Worst case: sealed data lost on one node
+
+If §11.5 step 9 (shred) has completed and the new enclave then fails permanently on that node (hardware fault, MRENCLAVE mismatch that was not caught earlier, unrecoverable data corruption), the node has **no FROST share** — not old, not new.
+
+This node is out of the FROST quorum permanently until a fresh DKG ceremony runs. The cluster continues signing with 2-of-2 of the remaining nodes (the list has 3 signers, quorum 2 — mathematically intact), but the margin of safety is now zero. A second node failing during this window would freeze the escrow.
+
+Recovery procedure (separate from this runbook):
+
+1. Reprovision the affected node from scratch (new VM, wipe and reinstall, or new hardware).
+2. Run a fresh 3-party DKG with the two healthy nodes plus the replacement. This produces a new set of FROST shares bound to the current MRENCLAVE.
+3. Submit a SignerListSet replacing the dead node's address with the replacement's address. Quorum stays at 2.
+4. Resume normal operation.
+
+DKG itself is a separate ceremony and is out of scope of this document. It is documented in `deployment-procedure.md` as a future addition (see section 1 "out of scope").
+
+### 11.8 Golden rule
+
+> **Do not shred old sealed data until the new enclave has signed at least one real FROST round on mainnet.**
+
+Everything before the shred is reversible. The shred is the point of no return for that node. The 10-minute soak at §11.5 step 8 exists specifically so you have a last safe window to abort.
+
+If for any reason you are unsure whether the new enclave is actually producing valid signatures (log noise, attestation flakiness, network oddness during the soak), **do not shred**. Extend the soak, investigate, and only proceed when every signal is clean. An extra hour of soak is always cheaper than a fresh DKG.
+
+### 11.9 Post-hotfix checklist
+
+After the cluster is fully on the new release:
+
+1. All three nodes report the new MRENCLAVE in attestation.
+2. XRPL signer list has exactly 3 entries, quorum 2, all three are the new addresses.
+3. Escrow balance unchanged (modulo the liveness-ping tx from §11.5 step 8).
+4. One successful real user-initiated operation (deposit, withdraw, or position change) signed by the new cluster.
+5. Audit log entry committed to the release repo, signed by the on-call operator, recording: release version, start/end timestamps, node-by-node timing, any deviations from this runbook.
+6. Previous release kept on disk as `.prev` for the standard rollback window (30 days suggested), then pruned.
+
 ---
 
 ## Appendix A — What this does NOT solve
