@@ -189,6 +189,54 @@ These were raised in the earlier review and not yet resolved. Re-listing with st
 
 ---
 
+## Additional questions on `vault-design-spec.md`
+
+### V1 (non-blocking) — Vault type numbering
+
+The spec lists vault types as **1. Market Making**, **2. Delta Neutral**, **4. Delta One**. **There is no Vault Type 3.** Was something intended there (Passive LP? Options-writing?) and dropped, or is it a typo?
+
+### V2 (BLOCKING) — Maker rebate mechanics
+
+The spec says:
+
+> Protocol Vaults are special actors in the ecosystem such that they receive a rebate on orders that are executed against their orders. The rebate is a percentage of the fees that are paid by the taker.
+
+Today our fee model is: taker pays 0.05%, maker pays nothing (all fees go to the protocol / insurance fund). Under the proposed rebate:
+
+- **V2.1** — What's the rebate rate? Half the taker fee (0.025%) or a fixed bps number?
+- **V2.2** — Does the remaining fee still go to the insurance fund, or does it split somewhere else?
+- **V2.3** — Is the rebate paid in RLUSD (settlement asset) or XRP (collateral)? Accrued or paid per-trade?
+- **V2.4** — Which vaults qualify? Only the official vault types from this spec, or any vault registered on the protocol? If the latter, how do we prevent a wash-trading vault (self-sell, self-buy) from farming rebates?
+- **V2.5** — Does the rebate apply to **all maker trades** from a protocol vault, or only to trades where the maker is providing liquidity *within the curve's spread*? (Rationale: without a spread gate, a vault can post at mid-1bp/mid+1bp and collect rebates for near-zero real risk.)
+
+We need answers to V2.1 and V2.5 before we touch the fee-settlement code.
+
+### V3 (non-blocking) — Delta One Vault prerequisites
+
+The spec explicitly notes that the Delta One Vault requires:
+
+1. Spot RLUSD/XRP market on the exchange
+2. Lending protocol integration (borrow USD against XRP collateral)
+
+**Neither exists on XRPL today** (spot XRP/RLUSD is possible via AMM but the vault would need deep liquidity; no native USD-lending protocol against XRP collateral). Clarify:
+
+- **V3.1** — Is Delta One Vault deprioritized until those primitives exist (could be Delta One is a Phase-2 feature), or are we expected to build the lending primitives ourselves?
+- **V3.2** — If deprioritized, should we drop it from the v1 vault spec entirely, or keep it documented as "Phase 2"?
+
+Our default: keep it documented as Phase 2, don't implement in v1.
+
+### V4 (BLOCKING if V3 is not deprioritized) — MM Vault parameters vs vAMM parameters
+
+The MM Vault in `vault-design-spec.md` specifies these tunables:
+
+- Min Spread, Max Spread, Order Size as % of vault, Rebalance Frequency, Max Delta, Min Delta
+
+The vAMM in `post-hackathon-specs.md` replaces all of those with curve parameters (`k`, target delta, collateral utilization cap). Q3.5 asks whether vAMM *is* the MM Vault's new implementation. If yes, **do any of the MM Vault's original parameters survive as operator-tunable knobs**, or are they entirely replaced?
+
+Our default: replace entirely — `k`, target delta, utilization cap, refresh cadence are the full knob set. Min/Max Spread and Min/Max Delta become derived properties of the curve, not inputs.
+
+---
+
 ## Team's proposed order of attack
 
 1. **Ship issue #1** (contract specs) with the defaults above — lightweight, unblocks the `get_markets` consumers. Can land in parallel with answers to blocking questions.
