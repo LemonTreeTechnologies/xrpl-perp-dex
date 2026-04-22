@@ -104,7 +104,10 @@ pub fn decode_xrpl_address(addr: &str) -> Result<[u8; 20]> {
         .into_vec()
         .context("invalid XRPL base58 address")?;
     if decoded.len() != 25 {
-        bail!("decoded XRPL address is {} bytes, expected 25", decoded.len());
+        bail!(
+            "decoded XRPL address is {} bytes, expected 25",
+            decoded.len()
+        );
     }
     let payload = &decoded[..21];
     let checksum = &decoded[21..25];
@@ -207,8 +210,7 @@ mod tests {
         let addr = pubkey_to_xrpl_address(uncompressed_hex).unwrap();
         assert!(
             addr.starts_with('r'),
-            "XRPL address should start with 'r': {}",
-            addr
+            "XRPL address should start with 'r': {addr}"
         );
     }
 }

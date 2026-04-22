@@ -361,28 +361,59 @@ async fn main() -> Result<()> {
             escrow_address,
             disable_master,
         }) => {
-            return cli_tools::escrow_setup(&xrpl_url, &signers_config, &escrow_seed, escrow_address.as_deref(), disable_master).await;
+            return cli_tools::escrow_setup(
+                &xrpl_url,
+                &signers_config,
+                &escrow_seed,
+                escrow_address.as_deref(),
+                disable_master,
+            )
+            .await;
         }
-        Some(Command::SignRequest { seed, method, url, body }) => {
+        Some(Command::SignRequest {
+            seed,
+            method,
+            url,
+            body,
+        }) => {
             return cli_tools::sign_request(&seed, &method, &url, body.as_deref()).await;
         }
-        Some(Command::Withdraw { api, seed, amount, destination, destination_tag }) => {
-            return cli_tools::cli_withdraw(&api, &seed, &amount, &destination, destination_tag).await;
+        Some(Command::Withdraw {
+            api,
+            seed,
+            amount,
+            destination,
+            destination_tag,
+        }) => {
+            return cli_tools::cli_withdraw(&api, &seed, &amount, &destination, destination_tag)
+                .await;
         }
         Some(Command::Balance { api, seed }) => {
             return cli_tools::cli_balance(&api, &seed).await;
         }
-        Some(Command::ConfigInit { entries, escrow_address, quorum, output }) => {
+        Some(Command::ConfigInit {
+            entries,
+            escrow_address,
+            quorum,
+            output,
+        }) => {
             return cli_tools::config_init(&entries, &escrow_address, quorum, &output).await;
         }
-        Some(Command::OperatorAdd { enclave_url, name, config, xrpl_url, escrow_seed }) => {
+        Some(Command::OperatorAdd {
+            enclave_url,
+            name,
+            config,
+            xrpl_url,
+            escrow_seed,
+        }) => {
             return cli_tools::operator_add(
                 &enclave_url,
                 &name,
                 &config,
                 xrpl_url.as_deref(),
                 escrow_seed.as_deref(),
-            ).await;
+            )
+            .await;
         }
         None => {
             // Default: run orchestrator with flattened RunArgs
@@ -482,17 +513,14 @@ async fn main() -> Result<()> {
     };
 
     // Create P2P signing relay channel
-    let (signing_tx, signing_rx) =
-        tokio::sync::mpsc::channel::<p2p::SigningRelay>(32);
+    let (signing_tx, signing_rx) = tokio::sync::mpsc::channel::<p2p::SigningRelay>(32);
 
     let peer_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
-    let maintenance_mode = Arc::new(std::sync::atomic::AtomicBool::new(
-        matches!(
-            std::env::var("PERP_MAINTENANCE").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes")
-        ),
-    ));
+    let maintenance_mode = Arc::new(std::sync::atomic::AtomicBool::new(matches!(
+        std::env::var("PERP_MAINTENANCE").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )));
 
     let app_state = Arc::new(AppState {
         engine,
@@ -505,7 +533,11 @@ async fn main() -> Result<()> {
         xrpl_url: cli.xrpl_url.clone(),
         escrow_address: escrow_address.clone(),
         signers_config: signers_config.clone(),
-        signing_tx: if signers_config.is_some() { Some(signing_tx) } else { None },
+        signing_tx: if signers_config.is_some() {
+            Some(signing_tx)
+        } else {
+            None
+        },
         db: db.clone(),
         shard_router: shard_router.clone(),
         peer_count: peer_count.clone(),
@@ -529,9 +561,15 @@ async fn main() -> Result<()> {
         tokio::sync::mpsc::channel::<election::ElectionMessage>(100);
     let p2p_keypair = p2p::load_or_create_identity(&cli.p2p_key_path)
         .context("failed to load or create libp2p identity")?;
-    let mut p2p_node = p2p::P2PNode::new(&cli.p2p_listen, p2p_keypair, batch_tx, election_inbound_tx, peer_count.clone())
-        .await
-        .context("failed to start P2P node")?;
+    let mut p2p_node = p2p::P2PNode::new(
+        &cli.p2p_listen,
+        p2p_keypair,
+        batch_tx,
+        election_inbound_tx,
+        peer_count.clone(),
+    )
+    .await
+    .context("failed to start P2P node")?;
 
     // Wire P2P publishing channels
     let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<p2p::OrderBatch>(100);
@@ -543,7 +581,8 @@ async fn main() -> Result<()> {
 
     // Wire P2P state events replication
     let (events_pub_tx, events_pub_rx) = tokio::sync::mpsc::channel::<p2p::StateEvent>(256);
-    let (events_inbound_tx, mut events_inbound_rx) = tokio::sync::mpsc::channel::<p2p::StateEvent>(256);
+    let (events_inbound_tx, mut events_inbound_rx) =
+        tokio::sync::mpsc::channel::<p2p::StateEvent>(256);
     p2p_node.set_events_publish_channel(events_pub_rx);
     p2p_node.set_events_inbound_channel(events_inbound_tx);
 
@@ -551,23 +590,48 @@ async fn main() -> Result<()> {
     let validator_events_db = db.clone();
     let _events_handle = tokio::spawn(async move {
         while let Some(event) = events_inbound_rx.recv().await {
-            let Some(ref db) = validator_events_db else { continue };
+            let Some(ref db) = validator_events_db else {
+                continue;
+            };
             match event {
-                p2p::StateEvent::Deposit { ref user_id, ref amount, ref tx_hash, ledger_index } => {
+                p2p::StateEvent::Deposit {
+                    ref user_id,
+                    ref amount,
+                    ref tx_hash,
+                    ledger_index,
+                } => {
                     info!(user = %user_id, amount, "replicated deposit event");
-                    db.insert_deposit(user_id, amount, tx_hash, ledger_index).await;
+                    db.insert_deposit(user_id, amount, tx_hash, ledger_index)
+                        .await;
                 }
-                p2p::StateEvent::Funding { rate_raw, mark_raw, index_raw, timestamp, ref payments } => {
+                p2p::StateEvent::Funding {
+                    rate_raw,
+                    mark_raw,
+                    index_raw,
+                    timestamp,
+                    ref payments,
+                } => {
                     info!(rate = rate_raw, "replicated funding event");
-                    db.insert_funding_event(rate_raw, mark_raw, index_raw, timestamp).await;
+                    db.insert_funding_event(rate_raw, mark_raw, index_raw, timestamp)
+                        .await;
                     for p in payments {
                         db.insert_funding_payment(
-                            &p.user_id, p.position_id, &p.side, p.payment,
-                            rate_raw, mark_raw, timestamp,
-                        ).await;
+                            &p.user_id,
+                            p.position_id,
+                            &p.side,
+                            p.payment,
+                            rate_raw,
+                            mark_raw,
+                            timestamp,
+                        )
+                        .await;
                     }
                 }
-                p2p::StateEvent::Liquidation { position_id, ref user_id, price } => {
+                p2p::StateEvent::Liquidation {
+                    position_id,
+                    ref user_id,
+                    price,
+                } => {
                     info!(pos = position_id, user = %user_id, "replicated liquidation event");
                     db.insert_liquidation(position_id, user_id, price).await;
                 }
@@ -684,7 +748,7 @@ async fn main() -> Result<()> {
     let validator_db = app_state.db.clone();
     let _validator_handle = tokio::spawn(async move {
         let mut last_seq: u64 = 0;
-            let mut known_leader: Option<String> = None;
+        let mut known_leader: Option<String> = None;
         while let Some(batch) = batch_rx.recv().await {
             if is_seq_validator.load(Ordering::Relaxed) {
                 continue; // sequencer doesn't replay its own batches
@@ -974,7 +1038,13 @@ async fn main() -> Result<()> {
                         error!(sender = %deposit.sender, "deposit credit failed: {}", e);
                     } else {
                         if let Some(db) = &app_state.db {
-                            db.insert_deposit(&deposit.sender, &deposit.amount, &deposit.tx_hash, new_ledger).await;
+                            db.insert_deposit(
+                                &deposit.sender,
+                                &deposit.amount,
+                                &deposit.tx_hash,
+                                new_ledger,
+                            )
+                            .await;
                         }
                         let _ = events_pub_tx.try_send(p2p::StateEvent::Deposit {
                             user_id: deposit.sender.clone(),
@@ -994,7 +1064,14 @@ async fn main() -> Result<()> {
 
         // Liquidation scanning
         if last_liquidation_scan.elapsed() >= liquidation_interval && current_price > 0.0 {
-            run_liquidation_scan(&perp, current_price, &app_state.ws_tx, &app_state.db, &events_pub_tx).await;
+            run_liquidation_scan(
+                &perp,
+                current_price,
+                &app_state.ws_tx,
+                &app_state.db,
+                &events_pub_tx,
+            )
+            .await;
             last_liquidation_scan = Instant::now();
         }
 
@@ -1017,20 +1094,22 @@ async fn main() -> Result<()> {
                     app_state.last_funding_time.store(now_ts, Ordering::Relaxed);
                     let mut funding_payments = Vec::new();
                     if let Some(db) = &app_state.db {
-                        db.insert_funding_event(rate_raw, mark_raw, index_raw, now_ts).await;
+                        db.insert_funding_event(rate_raw, mark_raw, index_raw, now_ts)
+                            .await;
                         if let Some(payments) = resp.get("payments").and_then(|v| v.as_array()) {
                             for p in payments {
                                 let user_id = p["user_id"].as_str().unwrap_or("");
                                 let pos_id = p["position_id"].as_i64().unwrap_or(0);
                                 let side = p["side"].as_str().unwrap_or("");
-                                let payment = p["payment"].as_str()
+                                let payment = p["payment"]
+                                    .as_str()
                                     .and_then(|s| s.parse::<crate::types::FP8>().ok())
                                     .map(|fp| fp.raw())
                                     .unwrap_or(0);
                                 db.insert_funding_payment(
-                                    user_id, pos_id, side, payment,
-                                    rate_raw, mark_raw, now_ts,
-                                ).await;
+                                    user_id, pos_id, side, payment, rate_raw, mark_raw, now_ts,
+                                )
+                                .await;
                                 funding_payments.push(p2p::FundingPayment {
                                     user_id: user_id.to_string(),
                                     position_id: pos_id,
@@ -1042,7 +1121,10 @@ async fn main() -> Result<()> {
                         }
                     }
                     let _ = events_pub_tx.try_send(p2p::StateEvent::Funding {
-                        rate_raw, mark_raw, index_raw, timestamp: now_ts,
+                        rate_raw,
+                        mark_raw,
+                        index_raw,
+                        timestamp: now_ts,
                         payments: funding_payments,
                     });
                 }

@@ -76,7 +76,7 @@ pub async fn sign_commitment(
         .build()?;
 
     let resp = client
-        .post(format!("{}/pool/sign", enclave_url))
+        .post(format!("{enclave_url}/pool/sign"))
         .json(&serde_json::json!({
             "from": account_address,
             "hash": hash_hex,
@@ -147,7 +147,7 @@ pub async fn submit_to_sepolia(
         "Commitment published on Sepolia"
     );
 
-    Ok(format!("0x{:x}", tx_hash))
+    Ok(format!("0x{tx_hash:x}"))
 }
 
 /// Query existing commitment from Sepolia.
@@ -174,7 +174,7 @@ pub async fn query_commitment(market_id: [u8; 32]) -> Result<Option<StateCommitm
         r: String::new(),
         s: String::new(),
         market_id: hex::encode(market_id),
-        enclave_address: format!("{:?}", committer),
+        enclave_address: format!("{committer:?}"),
         timestamp: committed_at,
     }))
 }

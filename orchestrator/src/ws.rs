@@ -11,7 +11,7 @@
 //! - `ticker`        — public: mark/index price updates
 //! - `liquidations`  — public: every Liquidation
 //! - `user:rXXX`     — private: per-user Fill, OrderUpdate, PositionChanged,
-//!                     and Liquidation events where `user_id == rXXX`
+//!   and Liquidation events where `user_id == rXXX`
 //!
 //! ## Client protocol
 //!
@@ -121,9 +121,9 @@ impl WsEvent {
             WsEvent::Orderbook { .. } => Some("orderbook"),
             WsEvent::Ticker { .. } => Some("ticker"),
             WsEvent::Liquidation { .. } => Some("liquidations"),
-            WsEvent::Fill { .. } | WsEvent::OrderUpdate { .. } | WsEvent::PositionChanged { .. } => {
-                None
-            }
+            WsEvent::Fill { .. }
+            | WsEvent::OrderUpdate { .. }
+            | WsEvent::PositionChanged { .. } => None,
         }
     }
 
@@ -148,7 +148,7 @@ impl WsEvent {
             }
         }
         if let Some(uid) = self.user_id() {
-            let user_ch = format!("user:{}", uid);
+            let user_ch = format!("user:{uid}");
             if channels.contains(&user_ch) {
                 return true;
             }
@@ -391,7 +391,7 @@ mod tests {
     fn default_channels_include_public_set() {
         let ch = default_channels();
         for c in ["trades", "orderbook", "ticker", "liquidations"] {
-            assert!(ch.contains(c), "missing default channel: {}", c);
+            assert!(ch.contains(c), "missing default channel: {c}");
         }
         assert!(!ch.iter().any(|c| c.starts_with("user:")));
     }
@@ -402,7 +402,10 @@ mod tests {
         let frame: ControlFrame = serde_json::from_str(txt).unwrap();
         match frame {
             ControlFrame::Subscribe { channels } => {
-                assert_eq!(channels, vec!["trades".to_string(), "user:rAlice".to_string()]);
+                assert_eq!(
+                    channels,
+                    vec!["trades".to_string(), "user:rAlice".to_string()]
+                );
             }
             _ => panic!("expected Subscribe"),
         }

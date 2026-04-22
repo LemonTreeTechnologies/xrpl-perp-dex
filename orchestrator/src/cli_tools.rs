@@ -13,8 +13,7 @@ use crate::xrpl_signer;
 
 const HASH_PREFIX_TX_SIGN: [u8; 4] = [0x53, 0x54, 0x58, 0x00]; // "STX\0"
 
-const XRPL_ALPHABET: &[u8; 58] =
-    b"rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
+const XRPL_ALPHABET: &[u8; 58] = b"rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
 
 fn xrpl_alphabet() -> &'static bs58::Alphabet {
     static ALPHA: std::sync::OnceLock<bs58::Alphabet> = std::sync::OnceLock::new();
@@ -60,25 +59,47 @@ struct XrplField {
 
 impl XrplField {
     fn uint16(field_code: u8, val: u16) -> Self {
-        Self { type_code: 1, field_code, data: val.to_be_bytes().to_vec() }
+        Self {
+            type_code: 1,
+            field_code,
+            data: val.to_be_bytes().to_vec(),
+        }
     }
     fn uint32(field_code: u8, val: u32) -> Self {
-        Self { type_code: 2, field_code, data: val.to_be_bytes().to_vec() }
+        Self {
+            type_code: 2,
+            field_code,
+            data: val.to_be_bytes().to_vec(),
+        }
     }
     fn amount_drops(field_code: u8, drops: u64) -> Self {
-        Self { type_code: 6, field_code, data: (0x4000000000000000u64 | drops).to_be_bytes().to_vec() }
+        Self {
+            type_code: 6,
+            field_code,
+            data: (0x4000000000000000u64 | drops).to_be_bytes().to_vec(),
+        }
     }
     fn blob(field_code: u8, bytes: &[u8]) -> Self {
         let mut data = encode_vl_length(bytes.len());
         data.extend_from_slice(bytes);
-        Self { type_code: 7, field_code, data }
+        Self {
+            type_code: 7,
+            field_code,
+            data,
+        }
     }
     fn account_id(field_code: u8, id: &[u8; 20]) -> Self {
         let mut data = vec![20u8];
         data.extend_from_slice(id);
-        Self { type_code: 8, field_code, data }
+        Self {
+            type_code: 8,
+            field_code,
+            data,
+        }
     }
-    fn sort_key(&self) -> (u8, u8) { (self.type_code, self.field_code) }
+    fn sort_key(&self) -> (u8, u8) {
+        (self.type_code, self.field_code)
+    }
     fn serialize(&self) -> Vec<u8> {
         let mut out = encode_field_id(self.type_code, self.field_code);
         out.extend_from_slice(&self.data);
@@ -90,7 +111,7 @@ fn serialize_signer_entries(entries: &[([u8; 20], u16)]) -> Vec<u8> {
     let mut out = encode_field_id(15, 4); // STArray SignerEntries
     for (account_id, weight) in entries {
         out.extend_from_slice(&encode_field_id(14, 11)); // STObject SignerEntry (field 11)
-        // Inner fields sorted: UInt16(1,3) then AccountID(8,1)
+                                                         // Inner fields sorted: UInt16(1,3) then AccountID(8,1)
         out.extend_from_slice(&encode_field_id(1, 3)); // SignerWeight
         out.extend_from_slice(&weight.to_be_bytes());
         out.extend_from_slice(&encode_field_id(8, 1)); // Account
@@ -102,7 +123,7 @@ fn serialize_signer_entries(entries: &[([u8; 20], u16)]) -> Vec<u8> {
     out
 }
 
-fn serialize_fields(fields: &mut Vec<XrplField>, array_suffix: Option<&[u8]>) -> Vec<u8> {
+fn serialize_fields(fields: &mut [XrplField], array_suffix: Option<&[u8]>) -> Vec<u8> {
     fields.sort_by_key(|f| f.sort_key());
     let mut out = Vec::new();
     for f in fields.iter() {
@@ -165,12 +186,14 @@ struct GenerateResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // JSON deserialization target; fields mirror enclave wire format
 struct PoolStatusResponse {
     status: String,
     accounts: Option<Vec<PoolAccount>>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // JSON deserialization target; fields mirror enclave wire format
 struct PoolAccount {
     address: String,
     is_active: bool,
@@ -212,9 +235,7 @@ pub async fn operator_setup(
     }
 
     let eth_address = resp.address.context("missing address in response")?;
-    let uncompressed_pubkey = resp
-        .public_key
-        .context("missing public_key in response")?;
+    let uncompressed_pubkey = resp.public_key.context("missing public_key in response")?;
     let session_key = resp
         .session_key
         .context("missing session_key in response")?;
@@ -263,9 +284,7 @@ pub async fn operator_setup(
     println!("\nNext steps:");
     println!("  1. Add this entry to signers_config.json");
     println!("  2. Run `escrow-setup` to configure XRPL SignerListSet");
-    println!(
-        "  3. Verify on XRPL explorer: https://testnet.xrpl.org/accounts/{xrpl_address}"
-    );
+    println!("  3. Verify on XRPL explorer: https://testnet.xrpl.org/accounts/{xrpl_address}");
 
     Ok(())
 }
@@ -359,18 +378,14 @@ pub async fn escrow_setup(
     let signer_entries_suffix = serialize_signer_entries(&signer_entries_bin);
 
     let mut sls_fields = vec![
-        XrplField::uint16(2, 12),                              // TransactionType = SignerListSet
-        XrplField::uint32(4, sequence as u32),                 // Sequence
-        XrplField::uint32(35, config.quorum),                  // SignerQuorum
-        XrplField::amount_drops(8, 12),                        // Fee = 12 drops
-        XrplField::account_id(1, &account_id),                 // Account
+        XrplField::uint16(2, 12),              // TransactionType = SignerListSet
+        XrplField::uint32(4, sequence as u32), // Sequence
+        XrplField::uint32(35, config.quorum),  // SignerQuorum
+        XrplField::amount_drops(8, 12),        // Fee = 12 drops
+        XrplField::account_id(1, &account_id), // Account
     ];
 
-    let sls_blob = sign_xrpl_tx(
-        &keypair,
-        &mut sls_fields,
-        Some(&signer_entries_suffix),
-    )?;
+    let sls_blob = sign_xrpl_tx(&keypair, &mut sls_fields, Some(&signer_entries_suffix))?;
 
     let sls_result = submit_tx_blob(xrpl_url, &sls_blob).await?;
     let sls_status = sls_result["result"]["engine_result"]
@@ -390,18 +405,14 @@ pub async fn escrow_setup(
     if disable_master {
         println!("\n[4/4] Disabling master key (AccountSet asfDisableMaster)...");
         let mut acset_fields = vec![
-            XrplField::uint16(2, 3),                           // TransactionType = AccountSet
-            XrplField::uint32(4, (sequence + 1) as u32),       // Sequence (next)
-            XrplField::uint32(33, 4),                          // SetFlag = asfDisableMaster
-            XrplField::amount_drops(8, 12),                    // Fee = 12 drops
-            XrplField::account_id(1, &account_id),             // Account
+            XrplField::uint16(2, 3),                     // TransactionType = AccountSet
+            XrplField::uint32(4, (sequence + 1) as u32), // Sequence (next)
+            XrplField::uint32(33, 4),                    // SetFlag = asfDisableMaster
+            XrplField::amount_drops(8, 12),              // Fee = 12 drops
+            XrplField::account_id(1, &account_id),       // Account
         ];
 
-        let acset_blob = sign_xrpl_tx(
-            &keypair,
-            &mut acset_fields,
-            None,
-        )?;
+        let acset_blob = sign_xrpl_tx(&keypair, &mut acset_fields, None)?;
 
         let acset_result = submit_tx_blob(xrpl_url, &acset_blob).await?;
         let acset_status = acset_result["result"]["engine_result"]
@@ -419,9 +430,7 @@ pub async fn escrow_setup(
     // Verify
     println!("\n✓ Escrow setup complete!");
     println!("  Address: {escrow_address}");
-    println!(
-        "  Explorer: https://testnet.xrpl.org/accounts/{escrow_address}"
-    );
+    println!("  Explorer: https://testnet.xrpl.org/accounts/{escrow_address}");
     println!("\nNext: start orchestrators with --escrow-address {escrow_address} --signers-config <path>");
 
     Ok(())
@@ -511,10 +520,8 @@ fn derive_keypair_from_seed(seed: &str) -> Result<XrplKeypair> {
 
     // Ed25519 seeds have 3-byte prefix [0x01, 0xE1, 0x4B], entropy at [3..19]
     // secp256k1 seeds have 1-byte prefix [0x21], entropy at [1..17]
-    let is_ed25519 = decoded.len() >= 23
-        && decoded[0] == 0x01
-        && decoded[1] == 0xE1
-        && decoded[2] == 0x4B;
+    let is_ed25519 =
+        decoded.len() >= 23 && decoded[0] == 0x01 && decoded[1] == 0xE1 && decoded[2] == 0x4B;
 
     if is_ed25519 {
         let entropy = &decoded[3..19];
@@ -569,6 +576,7 @@ fn derive_keypair_from_seed(seed: &str) -> Result<XrplKeypair> {
     })
 }
 
+#[allow(dead_code)] // utility helper kept for CLI debugging scripts
 fn derive_xrpl_address_from_seed(seed: &str) -> Result<String> {
     Ok(derive_keypair_from_seed(seed)?.address)
 }
@@ -601,8 +609,8 @@ pub async fn config_init(
     for path in entry_files {
         let data = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read {}", path.display()))?;
-        let entry: SignerEntry =
-            serde_json::from_str(&data).with_context(|| format!("invalid JSON in {}", path.display()))?;
+        let entry: SignerEntry = serde_json::from_str(&data)
+            .with_context(|| format!("invalid JSON in {}", path.display()))?;
         println!("  + {} → {}", entry.name, entry.xrpl_address);
         signers.push(entry);
     }
@@ -632,10 +640,18 @@ pub async fn config_init(
     std::fs::write(output, &json)
         .with_context(|| format!("failed to write {}", output.display()))?;
 
-    println!("\nCreated {} with {} signers, quorum={}", output.display(), config.signers.len(), quorum);
+    println!(
+        "\nCreated {} with {} signers, quorum={}",
+        output.display(),
+        config.signers.len(),
+        quorum
+    );
     println!("\nNext steps:");
     println!("  1. Add escrow_seed to the config (keep it secret!)");
-    println!("  2. Run `escrow-setup --signers-config {} --escrow-seed <seed>`", output.display());
+    println!(
+        "  2. Run `escrow-setup --signers-config {} --escrow-seed <seed>`",
+        output.display()
+    );
 
     Ok(())
 }
@@ -662,7 +678,7 @@ pub async fn operator_add(
         serde_json::from_str(&config_data).context("invalid signers config JSON")?;
 
     if config.signers.iter().any(|s| s.name == name) {
-        anyhow::bail!("signer '{}' already exists in config", name);
+        anyhow::bail!("signer '{name}' already exists in config");
     }
 
     // Step 1: Generate keypair
@@ -694,7 +710,9 @@ pub async fn operator_add(
     let xrpl_address = xrpl_signer::pubkey_to_xrpl_address(&uncompressed_pubkey)?;
     let compressed_hex = {
         let raw = hex::decode(
-            uncompressed_pubkey.strip_prefix("0x").unwrap_or(&uncompressed_pubkey),
+            uncompressed_pubkey
+                .strip_prefix("0x")
+                .unwrap_or(&uncompressed_pubkey),
         )?;
         hex::encode_upper(&xrpl_signer::compress_pubkey(&raw)?)
     };
@@ -724,7 +742,10 @@ pub async fn operator_add(
 
     // Optional: re-submit SignerListSet if credentials provided
     if let (Some(xrpl_url), Some(seed)) = (xrpl_url, escrow_seed) {
-        println!("\n  Re-submitting SignerListSet with {} signers...", config.signers.len());
+        println!(
+            "\n  Re-submitting SignerListSet with {} signers...",
+            config.signers.len()
+        );
         let escrow_addr = if config.escrow_address.is_empty() {
             None
         } else {
@@ -752,12 +773,7 @@ fn sign_body(keypair: &XrplKeypair, body: &[u8], timestamp: u64) -> Result<Strin
     Ok(hex::encode(&sig_bytes))
 }
 
-pub async fn sign_request(
-    seed: &str,
-    method: &str,
-    url: &str,
-    body: Option<&str>,
-) -> Result<()> {
+pub async fn sign_request(seed: &str, method: &str, url: &str, body: Option<&str>) -> Result<()> {
     let keypair = derive_keypair_from_seed(seed)?;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -894,4 +910,3 @@ pub async fn cli_balance(api_url: &str, seed: &str) -> Result<()> {
 
     Ok(())
 }
-

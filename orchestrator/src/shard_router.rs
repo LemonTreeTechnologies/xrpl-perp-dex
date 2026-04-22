@@ -36,8 +36,7 @@ impl ShardRouter {
     pub async fn from_config(path: &Path) -> Result<Self> {
         let data = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let config: ShardsConfig =
-            toml::from_str(&data).context("invalid shards.toml")?;
+        let config: ShardsConfig = toml::from_str(&data).context("invalid shards.toml")?;
 
         let mut shards = HashMap::new();
         let mut sorted_ids = Vec::new();
@@ -109,7 +108,9 @@ impl ShardRouter {
 
     /// Iterate over all shard clients (for broadcast operations).
     pub fn all_shards(&self) -> impl Iterator<Item = (u32, &PerpClient)> {
-        self.sorted_ids.iter().map(move |id| (*id, &self.shards[id]))
+        self.sorted_ids
+            .iter()
+            .map(move |id| (*id, &self.shards[id]))
     }
 
     /// Number of shards.
@@ -119,8 +120,8 @@ impl ShardRouter {
 
     /// The vault shard (shard 0 by convention).
     pub fn vault_shard(&self) -> &PerpClient {
-        self.shards.get(&0).unwrap_or_else(|| {
-            self.shards.values().next().expect("no shards configured")
-        })
+        self.shards
+            .get(&0)
+            .unwrap_or_else(|| self.shards.values().next().expect("no shards configured"))
     }
 }

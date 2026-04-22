@@ -49,10 +49,10 @@ pub struct WithdrawResult {
 pub struct SignerConfig {
     pub name: String,
     pub enclave_url: String,
-    pub address: String,          // 0x... Ethereum-style for /v1/pool/sign
-    pub session_key: String,      // 0x... per-account auth token
+    pub address: String,           // 0x... Ethereum-style for /v1/pool/sign
+    pub session_key: String,       // 0x... per-account auth token
     pub compressed_pubkey: String, // hex, 33 bytes
-    pub xrpl_address: String,     // r-address
+    pub xrpl_address: String,      // r-address
 }
 
 /// Multi-operator signing configuration.
@@ -137,13 +137,10 @@ async fn sign_via_p2p(
         .await
         .map_err(|_| anyhow::anyhow!("P2P signing channel closed"))?;
 
-    let response = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        resp_rx,
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("P2P signing timeout ({}s)", timeout_secs))?
-    .map_err(|_| anyhow::anyhow!("P2P signing response dropped"))?;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), resp_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("P2P signing timeout ({timeout_secs}s)"))?
+        .map_err(|_| anyhow::anyhow!("P2P signing response dropped"))?;
 
     match response {
         SigningMessage::Response {
@@ -153,7 +150,7 @@ async fn sign_via_p2p(
             ..
         } => Ok((der, pubkey)),
         SigningMessage::Response { error: Some(e), .. } => {
-            anyhow::bail!("remote signer error: {}", e)
+            anyhow::bail!("remote signer error: {e}")
         }
         _ => anyhow::bail!("unexpected signing response"),
     }
@@ -223,7 +220,7 @@ pub async fn process_withdrawal(
                 amount: req.amount.clone(),
                 destination: req.destination.clone(),
                 xrpl_tx_hash: None,
-                message: format!("Enclave error: {}", e),
+                message: format!("Enclave error: {e}"),
             });
         }
     }
@@ -278,8 +275,9 @@ pub async fn process_withdrawal(
             }
         };
 
-        let hash = signing::multi_signing_hash(tx_map, &account_id)
-            .map_err(|e| anyhow::anyhow!("multi_signing_hash for {} failed: {:?}", signer.name, e))?;
+        let hash = signing::multi_signing_hash(tx_map, &account_id).map_err(|e| {
+            anyhow::anyhow!("multi_signing_hash for {} failed: {:?}", signer.name, e)
+        })?;
 
         // Use P2P relay if available, otherwise fall back to direct HTTP
         let sign_result = if let Some(stx) = signing_tx {
@@ -366,8 +364,7 @@ pub async fn process_withdrawal(
                 destination: req.destination.clone(),
                 xrpl_tx_hash: None,
                 message: format!(
-                    "Signatures collected but XRPL submission failed: {}. Balance already deducted.",
-                    e
+                    "Signatures collected but XRPL submission failed: {e}. Balance already deducted."
                 ),
             })
         }

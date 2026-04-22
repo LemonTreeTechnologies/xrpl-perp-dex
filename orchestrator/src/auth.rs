@@ -83,6 +83,7 @@ impl SessionStore {
 /// Global session store — initialized once, shared via Arc in AppState.
 pub static SESSION_STORE: std::sync::OnceLock<Arc<SessionStore>> = std::sync::OnceLock::new();
 
+#[allow(dead_code)] // eager-init alternative to lazy session_store(); kept for main startup
 pub fn init_session_store() -> Arc<SessionStore> {
     let store = Arc::new(SessionStore::new());
     let _ = SESSION_STORE.set(store.clone());
@@ -132,8 +133,7 @@ pub fn verify_request(
         let drift = now.abs_diff(ts);
         if drift > 60 {
             return Err(format!(
-                "request expired: timestamp drift {}s (max 60s)",
-                drift
+                "request expired: timestamp drift {drift}s (max 60s)"
             ));
         }
     }
@@ -175,8 +175,7 @@ pub fn verify_request(
 
     if derived_address != address {
         return Err(format!(
-            "address mismatch: header={}, derived from pubkey={}",
-            address, derived_address
+            "address mismatch: header={address}, derived from pubkey={derived_address}"
         ));
     }
 
@@ -213,9 +212,9 @@ pub fn verify_request(
     //   the wallet internally computes SHA512(hex_bytes)[0..32] and signs that.
     // Try all applicable hash variants × both signing modes
     let hashes_to_try: Vec<&[u8]> = if let Some(ref alt) = alt_hash {
-        vec![hash.as_slice(), alt.as_slice()]
+        vec![&hash[..], &alt[..]]
     } else {
-        vec![hash.as_slice()]
+        vec![&hash[..]]
     };
 
     let mut verified = false;
@@ -228,7 +227,10 @@ pub fn verify_request(
         // Mode 2: SHA-512Half (Crossmark/GemWallet)
         let sha512_full = Sha512::digest(h);
         let sha512_half: [u8; 32] = sha512_full[..32].try_into().unwrap();
-        if verifying_key.verify_prehash(&sha512_half, &signature).is_ok() {
+        if verifying_key
+            .verify_prehash(&sha512_half, &signature)
+            .is_ok()
+        {
             verified = true;
             break;
         }
@@ -236,7 +238,7 @@ pub fn verify_request(
 
     if !verified {
         tracing::debug!(
-            hash_hex = %hex::encode(&hash),
+            hash_hex = %hex::encode(hash),
             sig_hex = %sig_hex,
             pubkey_hex = %pubkey_hex,
             "signature verification failed (tried both direct SHA-256 and XRPL SHA-512Half)"
@@ -254,10 +256,10 @@ pub fn verify_request(
 #[cfg(test)]
 pub fn pubkey_to_xrpl_address(pubkey_bytes: &[u8]) -> String {
     let sha256_hash = Sha256::digest(pubkey_bytes);
-    let ripemd_hash = Ripemd160::digest(&sha256_hash);
+    let ripemd_hash = Ripemd160::digest(sha256_hash);
     let mut payload = vec![0x00u8];
     payload.extend_from_slice(&ripemd_hash);
-    let checksum = Sha256::digest(&Sha256::digest(&payload));
+    let checksum = Sha256::digest(Sha256::digest(&payload));
     payload.extend_from_slice(&checksum[..4]);
     const XRPL_ALPHABET: &str = "rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
     let alpha_bytes: &[u8; 58] = XRPL_ALPHABET.as_bytes().try_into().unwrap();
@@ -309,8 +311,11 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
 
                 // Verify user_id matches token's address (same checks as signature auth)
                 if !body_bytes.is_empty() {
-                    if let Ok(body_json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                        if let Some(body_user_id) = body_json.get("user_id").and_then(|v| v.as_str()) {
+                    if let Ok(body_json) = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                    {
+                        if let Some(body_user_id) =
+                            body_json.get("user_id").and_then(|v| v.as_str())
+                        {
                             if body_user_id != user.xrpl_address {
                                 return (
                                     StatusCode::FORBIDDEN,
@@ -656,7 +661,7 @@ mod tests {
 
     #[test]
     fn xrpl_address_starts_with_r() {
-        let (_, _, pubkey_hex, address) = test_keypair();
+        let (_, _, _pubkey_hex, address) = test_keypair();
         assert!(address.starts_with('r'));
         assert!(address.len() >= 25 && address.len() <= 35);
     }
@@ -676,7 +681,7 @@ mod tests {
         hasher.update(ts.as_bytes());
         let sha256_hash = hasher.finalize();
         // XRPL wallet applies SHA-512Half on top
-        let sha512_full = Sha512::digest(&sha256_hash);
+        let sha512_full = Sha512::digest(sha256_hash);
         let sha512_half: [u8; 32] = sha512_full[..32].try_into().unwrap();
         let (sig, _): (Signature, _) = sk.sign_prehash(&sha512_half).unwrap();
         let sig_der = sig.to_der();
@@ -713,7 +718,7 @@ mod tests {
         hasher.update(uri.as_bytes());
         hasher.update(ts.as_bytes());
         let sha256_hash = hasher.finalize();
-        let sha512_full = Sha512::digest(&sha256_hash);
+        let sha512_full = Sha512::digest(sha256_hash);
         let sha512_half: [u8; 32] = sha512_full[..32].try_into().unwrap();
         let (sig, _): (Signature, _) = sk.sign_prehash(&sha512_half).unwrap();
         let sig_der = sig.to_der();

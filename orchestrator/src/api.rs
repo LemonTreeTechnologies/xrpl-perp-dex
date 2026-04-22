@@ -57,6 +57,7 @@ pub struct AppState {
     /// PostgreSQL for history (optional — trading works without it)
     pub db: Option<crate::db::Db>,
     /// Shard router — routes user_id → shard → enclave. Phase 1: single shard.
+    #[allow(dead_code)] // held for Phase 2 routing; shard_id=0 path doesn't read it yet
     pub shard_router: Arc<crate::shard_router::ShardRouter>,
     /// Connected P2P peers (updated by P2P node).
     pub peer_count: Arc<std::sync::atomic::AtomicU32>,
@@ -147,7 +148,7 @@ fn parse_side(s: &str) -> Result<Side, String> {
     match s.to_lowercase().as_str() {
         "buy" | "long" => Ok(Side::Long),
         "sell" | "short" => Ok(Side::Short),
-        _ => Err(format!("invalid side: {}", s)),
+        _ => Err(format!("invalid side: {s}")),
     }
 }
 
@@ -155,7 +156,7 @@ fn parse_order_type(s: &str) -> Result<OrderType, String> {
     match s.to_lowercase().as_str() {
         "limit" => Ok(OrderType::Limit),
         "market" => Ok(OrderType::Market),
-        _ => Err(format!("invalid order type: {}", s)),
+        _ => Err(format!("invalid order type: {s}")),
     }
 }
 
@@ -164,14 +165,17 @@ fn parse_tif(s: &str) -> Result<TimeInForce, String> {
         "gtc" => Ok(TimeInForce::Gtc),
         "ioc" => Ok(TimeInForce::Ioc),
         "fok" => Ok(TimeInForce::Fok),
-        _ => Err(format!("invalid time_in_force: {}", s)),
+        _ => Err(format!("invalid time_in_force: {s}")),
     }
 }
 
 // ── Health ──────────────────────────────────────────────────────
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let role = if state.is_sequencer.load(std::sync::atomic::Ordering::Relaxed) {
+    let role = if state
+        .is_sequencer
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         "sequencer"
     } else {
         "validator"
@@ -186,7 +190,11 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     {
         Ok(c) => {
             let url = format!("{}/pool/status", state.perp.base_url());
-            c.get(&url).send().await.map(|r| r.status().is_success()).unwrap_or(false)
+            c.get(&url)
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
         }
         Err(_) => false,
     };
@@ -590,12 +598,18 @@ async fn submit_order(
             if let Some(db) = &state.db {
                 for t in &result.trades {
                     db.insert_trade(
-                        t.trade_id, "XRP-USD-PERP",
-                        t.maker_order_id, t.taker_order_id,
-                        &t.maker_user_id, &t.taker_user_id,
-                        t.price, t.size,
-                        &format!("{}", t.taker_side), t.timestamp_ms,
-                    ).await;
+                        t.trade_id,
+                        "XRP-USD-PERP",
+                        t.maker_order_id,
+                        t.taker_order_id,
+                        &t.maker_user_id,
+                        &t.taker_user_id,
+                        t.price,
+                        t.size,
+                        &format!("{}", t.taker_side),
+                        t.timestamp_ms,
+                    )
+                    .await;
                 }
             }
 
@@ -849,20 +863,17 @@ async fn close_position(
         Err(e) => {
             return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("failed to query balance: {}", e),
+                &format!("failed to query balance: {e}"),
             )
             .into_response();
         }
     };
 
     // Find the position and extract side + size for the opposite-side close order.
-    let position = balance["data"]["positions"]
-        .as_array()
-        .and_then(|arr| {
-            arr.iter().find(|p| {
-                p.get("position_id").and_then(|v| v.as_u64()) == Some(position_id)
-            })
-        });
+    let position = balance["data"]["positions"].as_array().and_then(|arr| {
+        arr.iter()
+            .find(|p| p.get("position_id").and_then(|v| v.as_u64()) == Some(position_id))
+    });
     let position = match position {
         Some(p) => p,
         None => {
@@ -911,12 +922,18 @@ async fn close_position(
             if let Some(db) = &state.db {
                 for t in &result.trades {
                     db.insert_trade(
-                        t.trade_id, "XRP-USD-PERP",
-                        t.maker_order_id, t.taker_order_id,
-                        &t.maker_user_id, &t.taker_user_id,
-                        t.price, t.size,
-                        &format!("{}", t.taker_side), t.timestamp_ms,
-                    ).await;
+                        t.trade_id,
+                        "XRP-USD-PERP",
+                        t.maker_order_id,
+                        t.taker_order_id,
+                        &t.maker_user_id,
+                        &t.taker_user_id,
+                        t.price,
+                        t.size,
+                        &format!("{}", t.taker_side),
+                        t.timestamp_ms,
+                    )
+                    .await;
                 }
             }
 
@@ -984,16 +1001,20 @@ async fn get_balance(
         Ok(val) => (StatusCode::OK, Json(val)).into_response(),
         Err(_) => {
             // Enclave returns 500 for unknown users — return zero balance instead
-            (StatusCode::OK, Json(serde_json::json!({
-                "status": "success",
-                "data": {
-                    "margin_balance": "0.00000000",
-                    "available_margin": "0.00000000",
-                    "used_margin": "0.00000000",
-                    "unrealized_pnl": "0.00000000",
-                    "positions": []
-                }
-            }))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "success",
+                    "data": {
+                        "margin_balance": "0.00000000",
+                        "available_margin": "0.00000000",
+                        "used_margin": "0.00000000",
+                        "unrealized_pnl": "0.00000000",
+                        "positions": []
+                    }
+                })),
+            )
+                .into_response()
         }
     }
 }
@@ -1013,7 +1034,11 @@ async fn get_user_trade_history(
             let trades = db.get_user_trades(&user_id, 100).await;
             ok(serde_json::json!({ "trades": trades })).into_response()
         }
-        None => err(StatusCode::SERVICE_UNAVAILABLE, "trade history not available (no database)").into_response(),
+        None => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "trade history not available (no database)",
+        )
+        .into_response(),
     }
 }
 
@@ -1032,7 +1057,11 @@ async fn get_user_funding_history(
             let payments = db.get_user_funding(&user_id, 100).await;
             ok(serde_json::json!({ "payments": payments })).into_response()
         }
-        None => err(StatusCode::SERVICE_UNAVAILABLE, "funding history not available (no database)").into_response(),
+        None => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "funding history not available (no database)",
+        )
+        .into_response(),
     }
 }
 
@@ -1157,28 +1186,34 @@ async fn withdraw(
 
 /// POST /v1/auth/login — sign once, get a session token valid for 30 minutes.
 /// Requires the same 4 XRPL auth headers. Returns a Bearer token for subsequent requests.
-async fn auth_login(
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
+async fn auth_login(headers: axum::http::HeaderMap) -> impl IntoResponse {
     // The login endpoint is exempt from the middleware, so we verify manually here.
     let body_bytes = b"";
     let uri = "/v1/auth/login";
     match auth::verify_request(&headers, body_bytes, uri) {
         Ok(user) => {
-            let token = auth::session_store().create(user.xrpl_address.clone()).await;
-            (StatusCode::OK, Json(serde_json::json!({
-                "status": "success",
-                "token": token,
-                "expires_in": 1800,
-                "address": user.xrpl_address,
-            }))).into_response()
+            let token = auth::session_store()
+                .create(user.xrpl_address.clone())
+                .await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "success",
+                    "token": token,
+                    "expires_in": 1800,
+                    "address": user.xrpl_address,
+                })),
+            )
+                .into_response()
         }
-        Err(msg) => {
-            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+        Err(msg) => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
                 "status": "error",
                 "message": msg,
-            }))).into_response()
-        }
+            })),
+        )
+            .into_response(),
     }
 }
 

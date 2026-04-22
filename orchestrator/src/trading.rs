@@ -78,9 +78,18 @@ impl TradingEngine {
         client_order_id: Option<String>,
     ) -> Result<OrderResult> {
         self.submit_order_inner(
-            user_id, side, order_type, price, size, leverage,
-            time_in_force, reduce_only, client_order_id, None,
-        ).await
+            user_id,
+            side,
+            order_type,
+            price,
+            size,
+            leverage,
+            time_in_force,
+            reduce_only,
+            client_order_id,
+            None,
+        )
+        .await
     }
 
     /// Submit a close order that routes through the CLOB.
@@ -95,9 +104,18 @@ impl TradingEngine {
         close_position_id: u32,
     ) -> Result<OrderResult> {
         self.submit_order_inner(
-            user_id, close_side, OrderType::Market, FP8::ZERO, size, leverage,
-            TimeInForce::Ioc, true, None, Some(close_position_id),
-        ).await
+            user_id,
+            close_side,
+            OrderType::Market,
+            FP8::ZERO,
+            size,
+            leverage,
+            TimeInForce::Ioc,
+            true,
+            None,
+            Some(close_position_id),
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -129,9 +147,7 @@ impl TradingEngine {
                         let est_margin = FP8(notional.raw() / leverage as i64);
                         if avail.raw() < est_margin.raw() {
                             anyhow::bail!(
-                                "insufficient margin: available={}, required~={}",
-                                avail,
-                                est_margin
+                                "insufficient margin: available={avail}, required~={est_margin}"
                             );
                         }
                     }
@@ -197,12 +213,12 @@ impl TradingEngine {
                             );
                             None
                         } else {
-                            let msg = format!("enclave close returned: {}", v);
+                            let msg = format!("enclave close returned: {v}");
                             warn!(trade_id = trade.trade_id, "close_position failed: {}", msg);
                             Some(msg)
                         }
                     }
-                    Err(e) => Some(format!("{}", e)),
+                    Err(e) => Some(format!("{e}")),
                 }
             } else {
                 let result = self
@@ -229,12 +245,12 @@ impl TradingEngine {
                             );
                             None
                         } else {
-                            let msg = format!("enclave returned: {}", v);
+                            let msg = format!("enclave returned: {v}");
                             warn!(trade_id = trade.trade_id, user = %trade.taker_user_id, "taker position failed: {}", msg);
                             Some(msg)
                         }
                     }
-                    Err(e) => Some(format!("{}", e)),
+                    Err(e) => Some(format!("{e}")),
                 }
             };
 
@@ -264,13 +280,13 @@ impl TradingEngine {
                         );
                         None
                     } else {
-                        let msg = format!("enclave returned: {}", v);
+                        let msg = format!("enclave returned: {v}");
                         warn!(trade_id = trade.trade_id, user = %trade.maker_user_id, "maker position failed: {}", msg);
                         Some(msg)
                     }
                 }
                 Err(e) => {
-                    let msg = format!("{}", e);
+                    let msg = format!("{e}");
                     error!(trade_id = trade.trade_id, user = %trade.maker_user_id, "maker position error: {}", msg);
                     Some(msg)
                 }

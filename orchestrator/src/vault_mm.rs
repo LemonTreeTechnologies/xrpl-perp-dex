@@ -18,11 +18,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::api::AppState;
 use crate::orderbook::OrderType;
-use crate::types::{FP8, Side};
+use crate::types::{Side, FP8};
 
 /// Vault strategy type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -66,14 +66,30 @@ pub struct VaultMmConfig {
     pub max_delta: f64,
 }
 
-fn default_vault_user_id() -> String { "vault:mm".into() }
-fn default_half_spread() -> f64 { 0.0025 }
-fn default_order_size() -> String { "100.00000000".into() }
-fn default_interval() -> u64 { 5 }
-fn default_initial_deposit() -> String { "10000.00000000".into() }
-fn default_levels() -> usize { 3 }
-fn default_strategy() -> VaultStrategy { VaultStrategy::MarketMaking }
-fn default_max_delta() -> f64 { 500.0 }
+fn default_vault_user_id() -> String {
+    "vault:mm".into()
+}
+fn default_half_spread() -> f64 {
+    0.0025
+}
+fn default_order_size() -> String {
+    "100.00000000".into()
+}
+fn default_interval() -> u64 {
+    5
+}
+fn default_initial_deposit() -> String {
+    "10000.00000000".into()
+}
+fn default_levels() -> usize {
+    3
+}
+fn default_strategy() -> VaultStrategy {
+    VaultStrategy::MarketMaking
+}
+fn default_max_delta() -> f64 {
+    500.0
+}
 
 impl Default for VaultMmConfig {
     fn default() -> Self {
@@ -91,10 +107,7 @@ impl Default for VaultMmConfig {
 }
 
 /// Seed the vault user with initial margin in the enclave.
-pub async fn seed_vault_deposit(
-    perp: &crate::perp_client::PerpClient,
-    config: &VaultMmConfig,
-) {
+pub async fn seed_vault_deposit(perp: &crate::perp_client::PerpClient, config: &VaultMmConfig) {
     let tx_hash = format!(
         "{:064x}",
         std::time::SystemTime::now()
@@ -156,9 +169,7 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
         // Query vault's available margin from enclave to size orders as %
         let order_size = match state.perp.get_balance(&config.user_id).await {
             Ok(bal) => {
-                let avail_str = bal["data"]["available_margin"]
-                    .as_str()
-                    .unwrap_or("0");
+                let avail_str = bal["data"]["available_margin"].as_str().unwrap_or("0");
                 let avail: f64 = avail_str.parse().unwrap_or(0.0);
                 if avail <= 0.0 {
                     debug!(user = %config.user_id, "vault MM: no available margin");
@@ -167,7 +178,11 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
                 // 1% of available margin / number of levels = per-level size
                 let per_level = avail * size_pct / config.levels as f64;
                 let sized = FP8::from_f64(per_level);
-                if sized.raw() <= 0 { fallback_size } else { sized }
+                if sized.raw() <= 0 {
+                    fallback_size
+                } else {
+                    sized
+                }
             }
             Err(_) => fallback_size,
         };
@@ -177,11 +192,19 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
             let net_delta = compute_net_delta(&state.perp, &config.user_id).await;
             if net_delta > config.max_delta {
                 // Too long → only sell (asks) to reduce
-                debug!(net_delta, max = config.max_delta, "vault DN: over max delta, asks only");
+                debug!(
+                    net_delta,
+                    max = config.max_delta,
+                    "vault DN: over max delta, asks only"
+                );
                 (false, true)
             } else if net_delta < -config.max_delta {
                 // Too short → only buy (bids) to reduce
-                debug!(net_delta, max = config.max_delta, "vault DN: under -max delta, bids only");
+                debug!(
+                    net_delta,
+                    max = config.max_delta,
+                    "vault DN: under -max delta, bids only"
+                );
                 (true, false)
             } else {
                 (true, true)
@@ -230,7 +253,7 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
                         1, // leverage
                         crate::orderbook::TimeInForce::Gtc,
                         false,
-                        Some(format!("vault-bid-{}", level)),
+                        Some(format!("vault-bid-{level}")),
                     )
                     .await
                 {
@@ -251,7 +274,7 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
                         1,
                         crate::orderbook::TimeInForce::Gtc,
                         false,
-                        Some(format!("vault-ask-{}", level)),
+                        Some(format!("vault-ask-{level}")),
                     )
                     .await
                 {
@@ -272,10 +295,7 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
 
 /// Compute the vault's net delta (sum of long sizes - sum of short sizes).
 /// Returns 0.0 if the query fails or the vault has no positions.
-async fn compute_net_delta(
-    perp: &crate::perp_client::PerpClient,
-    user_id: &str,
-) -> f64 {
+async fn compute_net_delta(perp: &crate::perp_client::PerpClient, user_id: &str) -> f64 {
     let bal = match perp.get_balance(user_id).await {
         Ok(b) => b,
         Err(_) => return 0.0,

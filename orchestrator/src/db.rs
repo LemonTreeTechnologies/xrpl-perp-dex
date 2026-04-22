@@ -157,6 +157,7 @@ impl Db {
     // ── Funding events ────────────────────────────────────────────
 
     /// Record per-position funding payment (called once per open position per funding tick).
+    #[allow(clippy::too_many_arguments)] // mirrors the funding_payments table schema
     pub async fn insert_funding_payment(
         &self,
         user_id: &str,
@@ -259,39 +260,49 @@ impl Db {
         .unwrap_or_default();
 
         rows.into_iter()
-            .filter_map(|(id, user_id, market, side, price, size, filled, leverage, reduce_only, ts, coid)| {
-                let side = match side.as_str() {
-                    "long" | "buy" => crate::types::Side::Long,
-                    _ => crate::types::Side::Short,
-                };
-                Some(crate::orderbook::Order {
-                    id: id as u64,
+            .map(
+                |(
+                    id,
                     user_id,
                     market,
                     side,
-                    order_type: crate::orderbook::OrderType::Limit,
-                    price: FP8(price),
-                    size: FP8(size),
-                    filled: FP8(filled),
-                    leverage: leverage as u32,
-                    status: crate::orderbook::OrderStatus::Open,
-                    time_in_force: crate::orderbook::TimeInForce::Gtc,
+                    price,
+                    size,
+                    filled,
+                    leverage,
                     reduce_only,
-                    timestamp_ms: ts as u64,
-                    client_order_id: coid,
-                    close_position_id: None,
-                })
-            })
+                    ts,
+                    coid,
+                )| {
+                    let side = match side.as_str() {
+                        "long" | "buy" => crate::types::Side::Long,
+                        _ => crate::types::Side::Short,
+                    };
+                    crate::orderbook::Order {
+                        id: id as u64,
+                        user_id,
+                        market,
+                        side,
+                        order_type: crate::orderbook::OrderType::Limit,
+                        price: FP8(price),
+                        size: FP8(size),
+                        filled: FP8(filled),
+                        leverage: leverage as u32,
+                        status: crate::orderbook::OrderStatus::Open,
+                        time_in_force: crate::orderbook::TimeInForce::Gtc,
+                        reduce_only,
+                        timestamp_ms: ts as u64,
+                        client_order_id: coid,
+                        close_position_id: None,
+                    }
+                },
+            )
             .collect()
     }
 
     /// Query trade history for a user.
-    pub async fn get_user_trades(
-        &self,
-        user_id: &str,
-        limit: i64,
-    ) -> Vec<serde_json::Value> {
-        let rows = sqlx::query_as::<_, (i64, String, i64, i64, String, i64,)>(
+    pub async fn get_user_trades(&self, user_id: &str, limit: i64) -> Vec<serde_json::Value> {
+        let rows = sqlx::query_as::<_, (i64, String, i64, i64, String, i64)>(
             "SELECT trade_id, taker_side, price, size, market, timestamp_ms \
              FROM trades WHERE maker_user_id = $1 OR taker_user_id = $1 \
              ORDER BY timestamp_ms DESC LIMIT $2",
@@ -317,12 +328,8 @@ impl Db {
     }
 
     /// Query funding payment history for a user.
-    pub async fn get_user_funding(
-        &self,
-        user_id: &str,
-        limit: i64,
-    ) -> Vec<serde_json::Value> {
-        let rows = sqlx::query_as::<_, (i64, i64, String, i64,)>(
+    pub async fn get_user_funding(&self, user_id: &str, limit: i64) -> Vec<serde_json::Value> {
+        let rows = sqlx::query_as::<_, (i64, i64, String, i64)>(
             "SELECT payment, position_id, side, timestamp_epoch \
              FROM funding_payments WHERE user_id = $1 \
              ORDER BY timestamp_epoch DESC LIMIT $2",

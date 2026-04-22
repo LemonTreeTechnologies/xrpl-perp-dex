@@ -91,8 +91,7 @@ impl PerpClient {
 
     /// Query user margin, positions, unrealized PnL.
     pub async fn get_balance(&self, user_id: &str) -> Result<Value> {
-        self.get(&format!("/perp/balance?user_id={}", user_id))
-            .await
+        self.get(&format!("/perp/balance?user_id={user_id}")).await
     }
 
     // ── Position management ─────────────────────────────────────

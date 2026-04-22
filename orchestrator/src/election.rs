@@ -240,10 +240,7 @@ impl ElectionState {
                 "validator heartbeat tick"
             );
             if elapsed > self.config.heartbeat_timeout {
-                warn!(
-                    ?elapsed,
-                    "leader heartbeat timeout — attempting takeover"
-                );
+                warn!(?elapsed, "leader heartbeat timeout — attempting takeover");
                 self.promote();
             }
         }
@@ -430,7 +427,7 @@ mod tests {
     async fn timeout_promotes_to_sequencer() {
         let (out_tx, mut out_rx) = mpsc::channel(10);
         let (_in_tx, in_rx) = mpsc::channel(10);
-        let (role_tx, mut role_rx) = watch::channel(Role::Validator);
+        let (role_tx, _role_rx) = watch::channel(Role::Validator);
 
         let config = ElectionConfig {
             our_peer_id: "B".into(),
@@ -460,7 +457,7 @@ mod tests {
     async fn role_change_sent_via_watch() {
         let (out_tx, _out_rx) = mpsc::channel(10);
         let (_in_tx, in_rx) = mpsc::channel(10);
-        let (role_tx, mut role_rx) = watch::channel(Role::Sequencer);
+        let (role_tx, role_rx) = watch::channel(Role::Sequencer);
 
         let config = ElectionConfig {
             our_peer_id: "B".into(),

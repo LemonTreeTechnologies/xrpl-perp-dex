@@ -8,7 +8,6 @@
 //! Adapted from Phoenix PM's singleton.rs.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -17,6 +16,7 @@ use tracing::{info, warn};
 use crate::election::Role;
 
 pub struct SingletonHandle {
+    #[allow(dead_code)] // kept for debug logs if Drop ever needs to identify the handle
     name: &'static str,
     monitor: JoinHandle<()>,
 }
@@ -82,6 +82,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn starts_on_promote_stops_on_demote() {

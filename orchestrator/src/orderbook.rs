@@ -179,7 +179,7 @@ impl OrderBook {
     /// Fills are produced immediately if the order crosses the book.
     /// `stp_cancelled` lists any of the user's resting orders that were
     /// cancelled by self-trade prevention to make way for this new order.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn submit_order(
         &mut self,
         user_id: String,
@@ -320,7 +320,7 @@ impl OrderBook {
                 return Ok(order);
             }
         }
-        bail!("order {} not found", order_id)
+        bail!("order {order_id} not found")
     }
 
     /// Cancel all orders for a user.

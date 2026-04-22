@@ -16,7 +16,9 @@ pub struct DepositEvent {
     pub amount: String,
     /// XRPL transaction hash (lowercase hex)
     pub tx_hash: String,
-    /// XRPL DestinationTag (u32) — identifies the user within the escrow account
+    /// XRPL DestinationTag (u32) — identifies the user within the escrow account.
+    /// Currently parsed but not consumed downstream (see DestinationTag scanner bug).
+    #[allow(dead_code)]
     pub destination_tag: Option<u32>,
 }
 
@@ -129,11 +131,11 @@ impl XrplMonitor {
                     Err(_) => continue,
                 };
                 let xrp = drops as f64 / 1_000_000.0;
-                format!("{:.8}", xrp)
+                format!("{xrp:.8}")
             } else if let Some(drops_num) = amount.as_u64() {
                 // Native XRP: amount in drops as number
                 let xrp = drops_num as f64 / 1_000_000.0;
-                format!("{:.8}", xrp)
+                format!("{xrp:.8}")
             } else {
                 continue;
             };
@@ -146,7 +148,7 @@ impl XrplMonitor {
                 let frac = if parts.len() > 1 { parts[1] } else { "" };
                 // Pad or truncate fraction to 8 digits
                 let frac_padded = format!("{:0<8}", &frac[..frac.len().min(8)]);
-                format!("{}.{}", integer, frac_padded)
+                format!("{integer}.{frac_padded}")
             };
 
             // Validate it's a positive amount

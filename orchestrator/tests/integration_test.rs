@@ -7,12 +7,10 @@
 //! Tests the complete flow: submit order → match → fill → orderbook/ticker.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use axum::{
     extract::Query,
-    http::{HeaderMap, HeaderValue, Method, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -108,21 +106,6 @@ async fn mock_attestation() -> impl IntoResponse {
     )
 }
 
-/// Build the orchestrator API server using mock enclave URL.
-async fn start_orchestrator(enclave_url: &str) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    // We can't easily import the binary's internals from integration tests.
-    // Instead, test via the actual binary spawned as a subprocess,
-    // or build the router manually. Let's use subprocess approach.
-    //
-    // For now, we test the mock enclave + HTTP client flow.
-    // The real integration test will be the Python e2e.
-
-    // Minimal test: just verify the mock enclave works
-    let addr = "127.0.0.1:0".parse().unwrap();
-    let handle = tokio::spawn(async {});
-    (addr, handle)
-}
-
 // ── Tests ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -131,7 +114,7 @@ async fn mock_enclave_deposit_works() {
     let client = reqwest::Client::new();
 
     let resp: Value = client
-        .post(format!("http://{}/v1/perp/deposit", addr))
+        .post(format!("http://{addr}/v1/perp/deposit"))
         .json(&json!({
             "user_id": "rAlice",
             "amount": "100.00000000",
@@ -154,7 +137,7 @@ async fn mock_enclave_balance_works() {
     let client = reqwest::Client::new();
 
     let resp: Value = client
-        .get(format!("http://{}/v1/perp/balance?user_id=rAlice", addr))
+        .get(format!("http://{addr}/v1/perp/balance?user_id=rAlice"))
         .send()
         .await
         .unwrap()
@@ -173,7 +156,7 @@ async fn mock_enclave_open_position_works() {
     let client = reqwest::Client::new();
 
     let resp: Value = client
-        .post(format!("http://{}/v1/perp/position/open", addr))
+        .post(format!("http://{addr}/v1/perp/position/open"))
         .json(&json!({
             "user_id": "rBob",
             "side": "long",
@@ -199,7 +182,7 @@ async fn mock_enclave_no_liquidations() {
     let client = reqwest::Client::new();
 
     let resp: Value = client
-        .get(format!("http://{}/v1/perp/liquidations/check", addr))
+        .get(format!("http://{addr}/v1/perp/liquidations/check"))
         .send()
         .await
         .unwrap()
@@ -216,7 +199,7 @@ async fn mock_enclave_state_save_load() {
     let client = reqwest::Client::new();
 
     let save: Value = client
-        .post(format!("http://{}/v1/perp/state/save", addr))
+        .post(format!("http://{addr}/v1/perp/state/save"))
         .json(&json!({}))
         .send()
         .await
@@ -227,7 +210,7 @@ async fn mock_enclave_state_save_load() {
     assert_eq!(save["status"], "success");
 
     let load: Value = client
-        .post(format!("http://{}/v1/perp/state/load", addr))
+        .post(format!("http://{addr}/v1/perp/state/load"))
         .json(&json!({}))
         .send()
         .await
@@ -250,7 +233,7 @@ async fn perp_client_against_mock() {
 
     // Deposit
     let resp: Value = client
-        .post(format!("http://{}/v1/perp/deposit", addr))
+        .post(format!("http://{addr}/v1/perp/deposit"))
         .json(&json!({"user_id": "rTest", "amount": "500.00000000", "xrpl_tx_hash": "hash1"}))
         .send()
         .await
@@ -262,7 +245,7 @@ async fn perp_client_against_mock() {
 
     // Update price
     let resp: Value = client
-        .post(format!("http://{}/v1/perp/price", addr))
+        .post(format!("http://{addr}/v1/perp/price"))
         .json(&json!({"mark_price": "0.55000000", "index_price": "0.55000000", "timestamp": 1000}))
         .send()
         .await
@@ -274,14 +257,14 @@ async fn perp_client_against_mock() {
 
     // Open position
     let resp: Value = client
-        .post(format!("http://{}/v1/perp/position/open", addr))
+        .post(format!("http://{addr}/v1/perp/position/open"))
         .json(&json!({"user_id": "rTest", "side": "long", "size": "100.00000000", "price": "0.55000000", "leverage": 5}))
         .send().await.unwrap().json().await.unwrap();
     assert_eq!(resp["status"], "success");
 
     // Get balance
     let resp: Value = client
-        .get(format!("http://{}/v1/perp/balance?user_id=rTest", addr))
+        .get(format!("http://{addr}/v1/perp/balance?user_id=rTest"))
         .send()
         .await
         .unwrap()
@@ -292,7 +275,7 @@ async fn perp_client_against_mock() {
 
     // Apply funding
     let resp: Value = client
-        .post(format!("http://{}/v1/perp/funding/apply", addr))
+        .post(format!("http://{addr}/v1/perp/funding/apply"))
         .json(&json!({"funding_rate": "0.00050000", "timestamp": 2000}))
         .send()
         .await

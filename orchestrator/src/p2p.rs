@@ -387,7 +387,7 @@ impl P2PNode {
             .behaviour_mut()
             .gossipsub
             .publish(self.orders_topic.clone(), data)
-            .map_err(|e| anyhow::anyhow!("publish failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("publish failed: {e}"))?;
         Ok(())
     }
 
@@ -397,7 +397,7 @@ impl P2PNode {
             .behaviour_mut()
             .gossipsub
             .publish(self.election_topic.clone(), data)
-            .map_err(|e| anyhow::anyhow!("election publish failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("election publish failed: {e}"))?;
         Ok(())
     }
 
@@ -407,7 +407,7 @@ impl P2PNode {
             .behaviour_mut()
             .gossipsub
             .publish(self.signing_topic.clone(), data)
-            .map_err(|e| anyhow::anyhow!("signing publish failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("signing publish failed: {e}"))?;
         Ok(())
     }
 

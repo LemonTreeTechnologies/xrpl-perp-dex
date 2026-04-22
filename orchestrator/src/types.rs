@@ -51,7 +51,7 @@ impl fmt::Display for FP8 {
         let abs = self.0.unsigned_abs();
         let whole = abs / FP8_SCALE as u64;
         let frac = abs % FP8_SCALE as u64;
-        write!(f, "{}{}.{:08}", sign, whole, frac)
+        write!(f, "{sign}{whole}.{frac:08}")
     }
 }
 
@@ -75,7 +75,7 @@ impl FromStr for FP8 {
         };
 
         // Pad or truncate fractional part to exactly 8 digits
-        let frac_padded = format!("{:0<8}", frac_str);
+        let frac_padded = format!("{frac_str:0<8}");
         let frac: i64 = frac_padded[..8].parse()?;
 
         let mut val = whole * FP8_SCALE + frac;
@@ -163,7 +163,7 @@ impl FromStr for Side {
         match s.to_lowercase().as_str() {
             "long" => Ok(Side::Long),
             "short" => Ok(Side::Short),
-            _ => anyhow::bail!("invalid side: {}", s),
+            _ => anyhow::bail!("invalid side: {s}"),
         }
     }
 }
