@@ -215,11 +215,8 @@ fn infer_network(xrpl_url: &str) -> &'static str {
 }
 
 async fn system_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let (quorum, signer_count) = state
-        .signers_config
-        .as_ref()
-        .map(|c| (c.quorum, c.signers.len()))
-        .unwrap_or((0, 0));
+    let quorum = state.signers_config.as_ref().map(|c| c.quorum);
+    let signer_count = state.signers_config.as_ref().map(|c| c.signers.len());
 
     Json(serde_json::json!({
         "network": infer_network(&state.xrpl_url),

@@ -22,7 +22,7 @@ curl https://api-dev.xperp.fi/v1/system/status
 ```json
 {
   "network": "testnet",
-  "deposit_address": "rJGcnNyxEx3q4w4zAFL51unZwmwZDBWaAz",
+  "deposit_address": "rhfcqLFTi3UFfpAwjqSKoYs3UjK99Kth6K",
   "is_in_maintenance": false,
   "market": "XRP-USD-PERP",
   "escrow_quorum": 2,
@@ -401,7 +401,7 @@ Returns the current network, deposit address, and maintenance flag. Call this at
 ```json
 {
     "network": "testnet",
-    "deposit_address": "rJGcnNyxEx3q4w4zAFL51unZwmwZDBWaAz",
+    "deposit_address": "rhfcqLFTi3UFfpAwjqSKoYs3UjK99Kth6K",
     "is_in_maintenance": false,
     "market": "XRP-USD-PERP",
     "escrow_quorum": 2,
@@ -418,8 +418,8 @@ Returns the current network, deposit address, and maintenance flag. Call this at
 | `deposit_address` | string | Current escrow r-address; show this to users for deposits |
 | `is_in_maintenance` | boolean | When `true`, the frontend should display a maintenance banner and block new order/deposit CTAs |
 | `market` | string | Trading pair (currently `"XRP-USD-PERP"` only) |
-| `escrow_quorum` | integer | Multisig signatures required (e.g. `2`) |
-| `escrow_signer_count` | integer | Total SGX signers in the multisig (e.g. `3`) |
+| `escrow_quorum` | integer\|null | Multisig signatures required (e.g. `2`); `null` if the orchestrator was started without a signers-config (single-operator fallback) |
+| `escrow_signer_count` | integer\|null | Total SGX signers in the multisig (e.g. `3`); `null` under the same condition as `escrow_quorum` |
 | `version` | string | Orchestrator build version |
 
 ### Submit Order
