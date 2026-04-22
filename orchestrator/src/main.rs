@@ -487,6 +487,13 @@ async fn main() -> Result<()> {
 
     let peer_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
+    let maintenance_mode = Arc::new(std::sync::atomic::AtomicBool::new(
+        matches!(
+            std::env::var("PERP_MAINTENANCE").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        ),
+    ));
+
     let app_state = Arc::new(AppState {
         engine,
         perp: PerpClient::new(&cli.enclave_url)?,
@@ -503,6 +510,7 @@ async fn main() -> Result<()> {
         shard_router: shard_router.clone(),
         peer_count: peer_count.clone(),
         start_time: Instant::now(),
+        maintenance_mode: maintenance_mode.clone(),
     });
 
     // Start API server

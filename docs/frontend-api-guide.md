@@ -1,16 +1,43 @@
 # Frontend Developer API Guide
 
-**Base URL:** `https://api-perp.ph18.io` (production) or `http://localhost:3000` (dev)
+**Base URL (dev/testnet):** `https://api-dev.xperp.fi`
+**Base URL (prod):** `https://api.xperp.fi` — currently also points at the testnet dev instance while mainnet escrow is being re-provisioned (see `/v1/system/status` for the live `network` value).
 **Market:** `XRP-USD-PERP`
-**OpenAPI Spec:** `https://api-perp.ph18.io/v1/openapi.json`
+**OpenAPI Spec:** `https://api-dev.xperp.fi/v1/openapi.json`
+
+> **Status (2026-04-22):** The previous mainnet escrow `r4rwwSM9PUu7VcvPRWdu9pmZpmhCZS9mmc` was closed via `AccountDelete` on 2026-04-18. Do not send XRP to that address — it no longer exists. Only testnet deposits are accepted until mainnet is re-enabled.
 
 ---
 
-## Getting Started: XRPL Mainnet Wallet & Deposit
+## Getting Started: Discovering Network & Deposit Address
 
-To trade on the perp DEX, you need an XRPL keypair (secp256k1). You can sign once to get a session token (recommended for browsers), or sign every request individually.
+**Do not hardcode the deposit address.** It is returned by the server and may change (testnet ↔ mainnet, address rotation). Always read it from `GET /v1/system/status` at app startup.
 
-### 1. Choose a Wallet
+### 1. Query system status (no auth)
+
+```bash
+curl https://api-dev.xperp.fi/v1/system/status
+```
+
+```json
+{
+  "network": "testnet",
+  "deposit_address": "rJGcnNyxEx3q4w4zAFL51unZwmwZDBWaAz",
+  "is_in_maintenance": false,
+  "market": "XRP-USD-PERP",
+  "escrow_quorum": 2,
+  "escrow_signer_count": 3,
+  "version": "0.1.0"
+}
+```
+
+Frontend contract:
+- **`is_in_maintenance: true`** — show a maintenance banner and disable order submission / deposit CTAs.
+- **`network`** — one of `"testnet"`, `"mainnet"`, `"devnet"`. Use this to pick the right wallet network mode and XRPL explorer (`testnet.xrpl.org` vs `livenet.xrpl.org`).
+- **`deposit_address`** — the live escrow account. Show this to users for deposits. Re-fetch on every app load; do not cache across sessions.
+- **`escrow_quorum` / `escrow_signer_count`** — optional trust UI (e.g. "Funds protected by 2-of-3 SGX multisig").
+
+### 2. Choose a Wallet
 
 | Wallet | Platform | Recommended for |
 |--------|----------|-----------------|
@@ -20,48 +47,41 @@ To trade on the perp DEX, you need an XRPL keypair (secp256k1). You can sign onc
 | **xrpl.js (code)** | Node.js / Browser | Automated testing, bots |
 | **`tools/xrpl_auth.py`** | CLI (Python) | Quick testing from terminal |
 
-### 2. Setup Crossmark
+> **Network selector:** set your wallet to the network returned by `/v1/system/status`. For the current dev instance that is **XRPL Testnet**. When connecting to `api.xperp.fi` post-mainnet-relaunch, switch wallets back to Mainnet.
 
-1. Install Crossmark extension from [Chrome Web Store](https://chromewebstore.google.com/detail/crossmark/oiobfgfhicfobpfiihoofajlkbgemdal)
-2. Create or import a wallet
-3. Ensure **Mainnet** is selected (top-left network selector)
+### 3. Fund your wallet (testnet)
 
-### 3. Setup GemWallet
+Use the XRPL Testnet Faucet: <https://xrpl.org/xrp-testnet-faucet.html> — it returns a funded r-address + seed you can import into Crossmark/Xaman/xrpl.js.
 
-1. Install GemWallet from [Chrome Web Store](https://chromewebstore.google.com/detail/gemwallet/egebedonbdapoieeigaobedekpfoelld)
-2. Create a wallet
-3. Ensure Settings → Network is set to **Mainnet**
+### 4. Deposit XRP to Trade
 
-### 4. Setup Xaman (XUMM)
+The escrow is protected by a **2-of-3 SGX multisig** (`SignerListSet`) — no single operator can move funds.
 
-1. Install Xaman from App Store / Google Play
-2. Default network is Mainnet — no changes needed
-3. Create or import an account
-4. Copy your r-address from the main screen
+Fetch the current escrow address from `/v1/system/status`, then send a standard XRPL `Payment` to it. The orchestrator monitors the ledger and credits your margin automatically — no API call needed from your side.
 
-### 5. Deposit XRP to Trade
-
-Before trading, deposit XRP to the DEX escrow account. The escrow is protected by a **2-of-3 SGX multisig** (`SignerListSet`) — no single operator can move funds.
-
-**Escrow address (XRPL Mainnet):**
-```
-r4rwwSM9PUu7VcvPRWdu9pmZpmhCZS9mmc
-```
-
-Send a standard XRPL Payment (native XRP) to this address. The orchestrator monitors the ledger and credits your margin automatically — no API call needed from your side.
-
-**Via Crossmark/GemWallet/Xaman:** Send a payment to `r4rwwSM9PUu7VcvPRWdu9pmZpmhCZS9mmc` from your wallet UI.
-
-**Via xrpl.js:**
+**Via xrpl.js (testnet):**
 ```javascript
-import { Client, Wallet, Payment } from 'xrpl';
-const client = new Client('wss://xrplcluster.com');
+import { Client, Wallet } from 'xrpl';
+
+// 1. Discover the deposit address
+const status = await fetch('https://api-dev.xperp.fi/v1/system/status').then(r => r.json());
+if (status.is_in_maintenance) {
+  throw new Error('DEX is in maintenance');
+}
+
+// 2. Connect to the right XRPL network
+const rpc = status.network === 'mainnet'
+  ? 'wss://xrplcluster.com'
+  : 'wss://s.altnet.rippletest.net:51233';
+const client = new Client(rpc);
 await client.connect();
+
+// 3. Send deposit
 const wallet = Wallet.fromSeed('sYOUR_SECRET');
 const tx = await client.submitAndWait({
   TransactionType: 'Payment',
   Account: wallet.address,
-  Destination: 'r4rwwSM9PUu7VcvPRWdu9pmZpmhCZS9mmc',
+  Destination: status.deposit_address,
   Amount: '100000000', // 100 XRP in drops
 }, { wallet });
 console.log('Deposited:', tx.result.hash);
@@ -70,27 +90,25 @@ console.log('Deposited:', tx.result.hash);
 After deposit, check your balance:
 ```bash
 python3 tools/xrpl_auth.py --secret spXXX... \
-  --request GET "https://api-perp.ph18.io/v1/account/balance?user_id=rYOUR_ADDRESS"
+  --request GET "https://api-dev.xperp.fi/v1/account/balance?user_id=rYOUR_ADDRESS"
 ```
 
-### 6. Verify Your Setup
+### 5. Verify Your Setup
 
-Check your balance on the XRPL Mainnet explorer:
+For testnet, use the Testnet explorer:
 ```
-https://livenet.xrpl.org/accounts/rYOUR_ADDRESS_HERE
+https://testnet.xrpl.org/accounts/rYOUR_ADDRESS_HERE
+https://testnet.xrpl.org/accounts/{deposit_address from /v1/system/status}
 ```
 
-Verify the escrow multisig:
-```
-https://livenet.xrpl.org/accounts/r4rwwSM9PUu7VcvPRWdu9pmZpmhCZS9mmc
-```
+For mainnet, use `https://livenet.xrpl.org/` with the same paths.
 
 ### Important Notes
 
-- **Real XRP** — this is XRPL Mainnet. Deposits use real XRP. Start with small amounts.
-- **Reserve requirement** — each XRPL account needs minimum 10 XRP base reserve.
+- **Testnet XRP has no real value** — the current dev instance accepts testnet deposits only.
+- **Reserve requirement** — each XRPL account needs minimum 10 XRP base reserve (both networks).
 - **Auto-detection** — deposits are detected automatically (1s scan interval). No manual API call needed.
-- **XRPL Explorer** — view any transaction at `https://livenet.xrpl.org/`
+- **No DestinationTag support (yet)** — do not deposit from a shared/exchange wallet (Binance, Kraken, etc.). Use a personal wallet only; exchange deposits with `DestinationTag` are not routed correctly in the current build.
 - **Signing** — the DEX uses secp256k1 ECDSA signatures (same curve as XRPL). All wallets above support this natively.
 
 ---
@@ -101,24 +119,24 @@ https://livenet.xrpl.org/accounts/r4rwwSM9PUu7VcvPRWdu9pmZpmhCZS9mmc
 
 ```bash
 # DCAP Remote Attestation (verify enclave integrity)
-curl -X POST http://YOUR_SERVER:3000/v1/attestation/quote \
+curl -X POST https://api-dev.xperp.fi/v1/attestation/quote \
   -H "Content-Type: application/json" \
   -d '{"user_data": "0xdeadbeef"}'
 
 # Order book
-curl http://YOUR_SERVER:3000/v1/markets/XRP-USD-PERP/orderbook
+curl https://api-dev.xperp.fi/v1/markets/XRP-USD-PERP/orderbook
 
 # Ticker (best bid/ask)
-curl http://YOUR_SERVER:3000/v1/markets/XRP-USD-PERP/ticker
+curl https://api-dev.xperp.fi/v1/markets/XRP-USD-PERP/ticker
 
 # Recent trades
-curl http://YOUR_SERVER:3000/v1/markets/XRP-USD-PERP/trades
+curl https://api-dev.xperp.fi/v1/markets/XRP-USD-PERP/trades
 ```
 
 ### 1b. WebSocket (real-time feed, no authentication)
 
 ```javascript
-const ws = new WebSocket('wss://api-perp.ph18.io/ws');
+const ws = new WebSocket('wss://api-dev.xperp.fi/ws');
 ws.onmessage = (e) => console.log(JSON.parse(e.data));
 
 // Default: trades, orderbook, ticker, liquidations (market-wide).
@@ -143,7 +161,7 @@ python3 tools/xrpl_auth.py --generate
 
 # Submit an order
 python3 tools/xrpl_auth.py --secret spXXX... \
-  --request POST http://YOUR_SERVER:3000/v1/orders \
+  --request POST https://api-dev.xperp.fi/v1/orders \
   '{"user_id":"X","side":"buy","type":"limit","price":"0.55000000","size":"100.00000000","leverage":5}'
 ```
 
@@ -284,7 +302,7 @@ body = json.dumps({
 })
 
 resp = requests.post(
-    "http://YOUR_SERVER:3000/v1/orders",
+    "https://api-dev.xperp.fi/v1/orders",
     headers=sign_request(body),
     data=body,
 )
@@ -331,7 +349,7 @@ const body = JSON.stringify({
     leverage: 5,
 });
 
-fetch('http://YOUR_SERVER:3000/v1/orders', {
+fetch('https://api-dev.xperp.fi/v1/orders', {
     method: 'POST',
     headers: signRequest(body),
     body: body,
@@ -369,6 +387,40 @@ function signRequest(bodyStr) {
 ---
 
 ## API Reference
+
+### System Status
+
+```
+GET /v1/system/status
+Auth: None
+```
+
+Returns the current network, deposit address, and maintenance flag. Call this at app startup to configure the client; do not hardcode the deposit address or network.
+
+**Response:**
+```json
+{
+    "network": "testnet",
+    "deposit_address": "rJGcnNyxEx3q4w4zAFL51unZwmwZDBWaAz",
+    "is_in_maintenance": false,
+    "market": "XRP-USD-PERP",
+    "escrow_quorum": 2,
+    "escrow_signer_count": 3,
+    "version": "0.1.0"
+}
+```
+
+**Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `network` | string | `"testnet"`, `"mainnet"`, or `"devnet"` — matches the XRPL network the orchestrator is connected to |
+| `deposit_address` | string | Current escrow r-address; show this to users for deposits |
+| `is_in_maintenance` | boolean | When `true`, the frontend should display a maintenance banner and block new order/deposit CTAs |
+| `market` | string | Trading pair (currently `"XRP-USD-PERP"` only) |
+| `escrow_quorum` | integer | Multisig signatures required (e.g. `2`) |
+| `escrow_signer_count` | integer | Total SGX signers in the multisig (e.g. `3`) |
+| `version` | string | Orchestrator build version |
 
 ### Submit Order
 
@@ -737,7 +789,7 @@ HTTP status: 503
 
 **Verification:** Use `dcap_verifier.py` from the enclave repo to independently verify the quote:
 ```bash
-python3 dcap_verifier.py --url http://YOUR_SERVER:3000/v1 --expected-mrenclave <HASH>
+python3 dcap_verifier.py --url https://api-dev.xperp.fi/v1 --expected-mrenclave <HASH>
 ```
 
 ### Building the "Verify Enclave" Page
@@ -758,7 +810,7 @@ const nonce = '0x' + crypto.getRandomValues(new Uint8Array(32))
   .reduce((s, b) => s + b.toString(16).padStart(2, '0'), '');
 
 // 2. Fetch attestation quote from live enclave
-const res = await fetch('https://api-perp.ph18.io/v1/attestation/quote', {
+const res = await fetch('https://api-dev.xperp.fi/v1/attestation/quote', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ user_data: nonce }),
@@ -818,8 +870,8 @@ attestation. Anyone can verify, no trust required.
 ## WebSocket (Real-Time Feed)
 
 ```
-ws://YOUR_SERVER:3000/ws
-wss://api-perp.ph18.io/ws   (production, via nginx)
+wss://api-dev.xperp.fi/ws   (dev, testnet)
+wss://api.xperp.fi/ws       (prod, currently aliased to dev until mainnet relaunch)
 Auth: Not required
 ```
 
@@ -958,7 +1010,7 @@ owner's `user:rXXX`:
 ### JavaScript example
 
 ```javascript
-const ws = new WebSocket('wss://api-perp.ph18.io/ws');
+const ws = new WebSocket('wss://api-dev.xperp.fi/ws');
 const myAddress = 'rBobXRPLAddress...';
 
 ws.onopen = () => {
@@ -1013,7 +1065,7 @@ import websockets
 MY_ADDR = "rBobXRPLAddress..."
 
 async def listen():
-    async with websockets.connect("wss://api-perp.ph18.io/ws") as ws:
+    async with websockets.connect("wss://api-dev.xperp.fi/ws") as ws:
         await ws.send(json.dumps({
             "action": "subscribe",
             "channels": [f"user:{MY_ADDR}"],
@@ -1076,15 +1128,15 @@ export SECRET="spXXX..."
 
 # Place a limit buy
 python3 tools/xrpl_auth.py --secret $SECRET \
-  --request POST http://YOUR_SERVER:3000/v1/orders \
+  --request POST https://api-dev.xperp.fi/v1/orders \
   '{"user_id":"X","side":"buy","type":"limit","price":"0.55","size":"100","leverage":5}'
 
 # Check orderbook (no auth needed)
-curl http://YOUR_SERVER:3000/v1/markets/XRP-USD-PERP/orderbook
+curl https://api-dev.xperp.fi/v1/markets/XRP-USD-PERP/orderbook
 
 # Get your orders
 python3 tools/xrpl_auth.py --secret $SECRET \
-  --request GET "http://YOUR_SERVER:3000/v1/orders?user_id=YOUR_ADDRESS"
+  --request GET "https://api-dev.xperp.fi/v1/orders?user_id=YOUR_ADDRESS"
 ```
 
 Note: For `--request GET`, the tool signs the URI path. For `--request POST`, it signs the body.

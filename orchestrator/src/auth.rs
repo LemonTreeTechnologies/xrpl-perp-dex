@@ -273,6 +273,7 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
 
     // Public endpoints — no auth required
     if uri == "/v1/health"
+        || uri == "/v1/system/status"
         || uri == "/v1/openapi.json"
         || uri == "/v1/pool/status"
         || uri == "/v1/auth/login"

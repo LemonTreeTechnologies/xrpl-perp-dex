@@ -62,6 +62,9 @@ pub struct AppState {
     pub peer_count: Arc<std::sync::atomic::AtomicU32>,
     /// Start time for uptime reporting.
     pub start_time: std::time::Instant,
+    /// Maintenance flag surfaced by `/v1/system/status` so frontends can show a banner
+    /// without needing a redeploy. Toggled via `PERP_MAINTENANCE` env at startup.
+    pub maintenance_mode: Arc<AtomicBool>,
 }
 
 // ── Request/Response types ──────────────────────────────────────
@@ -198,6 +201,37 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }))
 }
 
+// ── System status (frontend-facing config) ──────────────────────
+
+fn infer_network(xrpl_url: &str) -> &'static str {
+    let u = xrpl_url.to_lowercase();
+    if u.contains("altnet") || u.contains("testnet") {
+        "testnet"
+    } else if u.contains("devnet") {
+        "devnet"
+    } else {
+        "mainnet"
+    }
+}
+
+async fn system_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let (quorum, signer_count) = state
+        .signers_config
+        .as_ref()
+        .map(|c| (c.quorum, c.signers.len()))
+        .unwrap_or((0, 0));
+
+    Json(serde_json::json!({
+        "network": infer_network(&state.xrpl_url),
+        "deposit_address": state.escrow_address,
+        "is_in_maintenance": state.maintenance_mode.load(Ordering::Relaxed),
+        "market": "XRP-USD-PERP",
+        "escrow_quorum": quorum,
+        "escrow_signer_count": signer_count,
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
 // ── Router ──────────────────────────────────────────────────────
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -226,6 +260,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/attestation/commitment", get(attestation_commitment))
         .route("/v1/auth/login", post(auth_login))
         .route("/v1/health", get(health))
+        .route("/v1/system/status", get(system_status))
         .layer(axum::middleware::from_fn(auth::auth_middleware))
         .route("/ws", get(ws::ws_handler))
         .layer(cors)
