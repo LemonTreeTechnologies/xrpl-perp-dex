@@ -252,41 +252,39 @@ What's **still missing**:
 
 We rejected `asfRequireDest` on the escrow itself (`a017de0`) — personal-wallet users must still be able to deposit without a tag. So the model is **hybrid**: tag present → credit by tag, tag absent → credit by sender.
 
-### Q5.1 (BLOCKING) — How does a user get their DestinationTag?
+### Decision (team, not a question for 8Baller) — Tag issuance model
 
-Three candidate models:
+Our plan: **enclave-issued, on-demand**. New authenticated endpoint `POST /v1/account/deposit-tag` — on first call the enclave allocates a sequential u32, persists the `tag ↔ user_id` pair in sealed state, and returns `{ deposit_tag, deposit_address }`. Idempotent — second call returns the existing tag. Frontend shows this alongside `deposit_address` from `/v1/system/status` whenever a user wants to deposit from an exchange.
 
-- **A. Deterministic derivation** — `tag = hash(xrpl_address) % 2^32` or similar. No registration step, frontend can compute it client-side. Collision risk ~1-in-4B; mitigated by the enclave rejecting deposits whose tag doesn't match any known user (funds would sit uncredited until operator intervention).
-- **B. Enclave-issued, on-demand** — `POST /v1/account/deposit-tag` (auth required) → enclave allocates a sequential u32, persists the mapping in sealed state, returns it. Clean but adds an enclave write on first use.
-- **C. Tag = first 4 bytes of user_id hash, checked on deposit** — hybrid: derived client-side, but enclave validates by iterating current users (feasible at N<10k users). Avoids persistent mapping but O(N) scan per deposit.
+Why this over deterministic derivation (`hash(address) % 2^32`): single source of truth, no 1-in-4B collision space to reason about, fits the existing user-registration flow, and credits deposits with O(1) lookup rather than O(N) scan.
 
-We lean toward **B** (enclave-issued): single source of truth, no collision space to audit, fits the existing user-registration flow. But want 8Baller's input since it shapes what the frontend has to show at onboarding.
+Implementation scope:
+1. Enclave: new ecall `ecall_perp_allocate_deposit_tag(user_id) → u32` + sealed state entry `(user_id, tag)` with next-tag counter.
+2. Orchestrator: `POST /v1/account/deposit-tag` routes to ecall.
+3. `xrpl_monitor.rs` / deposit consumer: if `destination_tag` present → credit user by tag lookup (enclave-side); else fall back to sender-address model.
+4. `/v1/system/status` unchanged — tag is per-user, not global.
 
-### Q5.2 (non-blocking) — Withdrawal UX
+### Q5.1 (non-blocking, frontend UX) — Withdrawal modal
 
 Users withdrawing to an exchange **must** supply a DestinationTag (lose funds otherwise). Two options:
 
-- **A.** Frontend always surfaces a DestinationTag input on the withdraw modal, labeled "required for exchange withdrawals".
-- **B.** Frontend detects the destination is an exchange (via an address whitelist or a heuristic) and conditionally shows the field.
+- **A.** Always surface a DestinationTag input on the withdraw modal, labeled "required for exchange withdrawals, leave empty for personal wallets".
+- **B.** Detect the destination is an exchange (via an address whitelist or a heuristic) and conditionally show the field.
 
-We lean toward **A** — simpler, no list to maintain, no silent mislabeling.
-
-### Q5.3 (non-blocking) — Testnet readiness
-
-The dev instance (`api-dev.xperp.fi`) will need the routing fix too, since Tom's frontend will be hitting it with real users once onboarding flows are in. We can ship Q5.1's implementation directly to testnet first.
+We lean toward **A** — no list to maintain, no silent mislabeling when a new exchange appears. Tom: your call since it's a frontend decision.
 
 ---
 
 ## Team's proposed order of attack
 
 1. **Ship issue #1** (contract specs) with the defaults above — lightweight, unblocks the `get_markets` consumers. Can land in parallel with answers to blocking questions.
-2. **Ship issue #5** (DestinationTag routing) — required before Tom's frontend can onboard exchange users. Small scope once Q5.1 is answered; pre-mainnet blocker.
-3. **Resolve Q2.1–Q2.3, Q3.1–Q3.5, Q4.1, Q5.1, A1, A2, A3.1–A3.3** — this is the design-decision bucket. Once these are answered we can implement issues #2 (cross-margin) and #3 (vAMM).
+2. **Ship issue #5** (DestinationTag routing) — required before Tom's frontend can onboard exchange users. Pre-mainnet blocker; implementation scope in the Issue #5 decision block above.
+3. **Resolve Q2.1–Q2.3, Q3.1–Q3.5, Q4.1, A1, A2, A3.1–A3.3** — this is the design-decision bucket. Once these are answered we can implement issues #2 (cross-margin) and #3 (vAMM).
 4. **Implement cross-margin (#2)** — bigger enclave change than #3, but #3 depends on cross-margin semantics for the vault's own portfolio accounting. So cross-margin first.
 5. **Implement vAMM (#3) + risk limits (#4)** as a single vault module.
 6. **Ship vault API (`vault-requirements.md`)** last, once all the above is proven.
 
-Cross-margin (#2) is where we'll spend most of the effort. We'd like 8Baller's input on Q2.1–Q2.3 (and Q5.1) before we start drafting the enclave changes.
+Cross-margin (#2) is where we'll spend most of the effort. We'd like 8Baller's input on Q2.1–Q2.3 before we start drafting the enclave changes.
 
 ---
 
