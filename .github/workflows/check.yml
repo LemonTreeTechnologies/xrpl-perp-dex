@@ -26,9 +26,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Must match rust-toolchain.toml so rustfmt/clippy components land
+        # on the same toolchain cargo will auto-select when building.
+        uses: dtolnay/rust-toolchain@1.88.0
         with:
-          # rust-toolchain.toml pins 1.88.0 — honored automatically
           components: rustfmt, clippy
 
       - name: Cache cargo registry + target
