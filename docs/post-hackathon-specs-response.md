@@ -264,14 +264,14 @@ Implementation scope:
 3. `xrpl_monitor.rs` / deposit consumer: if `destination_tag` present → credit user by tag lookup (enclave-side); else fall back to sender-address model.
 4. `/v1/system/status` unchanged — tag is per-user, not global.
 
-### Q5.1 (non-blocking, frontend UX) — Withdrawal modal
+### Q5.1 (ANSWERED by 8Baller 2026-04-22) — Withdrawal modal
 
 Users withdrawing to an exchange **must** supply a DestinationTag (lose funds otherwise). Two options:
 
 - **A.** Always surface a DestinationTag input on the withdraw modal, labeled "required for exchange withdrawals, leave empty for personal wallets".
 - **B.** Detect the destination is an exchange (via an address whitelist or a heuristic) and conditionally show the field.
 
-We lean toward **A** — no list to maintain, no silent mislabeling when a new exchange appears. Tom: your call since it's a frontend decision.
+**Answer (Tom, 2026-04-22):** Option A — "I think we always show a Destination tag for withdrawals." Frontend will always show the field.
 
 ---
 
