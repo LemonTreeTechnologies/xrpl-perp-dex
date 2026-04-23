@@ -87,6 +87,28 @@ impl PoolPathAClient {
             .to_string())
     }
 
+    // ── DCAP quote (bound to user-supplied report_data) ─────────
+
+    /// `POST /v1/pool/attestation-quote` with `{user_data}` — returns the
+    /// full DCAP quote bytes (lowercase hex, no `0x`) with `user_data`
+    /// placed in the 64-byte `report_data` field. For Path A, callers pass
+    /// the 64-byte output of `ecdh_report_data(shard_id, group_id)` as
+    /// `user_data_hex`; the receiver's `verify_peer_quote` recomputes the
+    /// same `report_data` formula and binds.
+    pub async fn attestation_quote(&self, user_data_hex: &str) -> Result<String> {
+        let v = self
+            .post(
+                "/pool/attestation-quote",
+                serde_json::json!({ "user_data": user_data_hex }),
+            )
+            .await?;
+        Ok(v["quote_hex"]
+            .as_str()
+            .context("pool/attestation-quote: missing quote_hex field")?
+            .trim_start_matches("0x")
+            .to_lowercase())
+    }
+
     // ── Peer attestation ────────────────────────────────────────
 
     /// `POST /v1/pool/attest/verify-peer-quote` — verifies `quote` binds to

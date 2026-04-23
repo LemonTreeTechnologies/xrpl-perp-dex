@@ -1,12 +1,18 @@
 # Shard configuration — one entry per shard.
 # Phase 1: single shard. Growth: add entries and restart.
 # Shard 0 is the vault shard by convention.
+#
+# Optional `frost_group_id` (32-byte hex, no 0x): when set, the orchestrator
+# spawns a Path A peer-quote announcer for that shard. Set it AFTER DKG
+# finalize. Pre-DKG leave it unset — the announcer stays dormant.
 
 [[shards]]
 shard_id = 0
 enclave_url = "https://localhost:9088/v1"
+# frost_group_id = "<32B hex, post-DKG>"
 
 # Example: adding a second shard
 # [[shards]]
 # shard_id = 1
 # enclave_url = "https://shard1.example.com:9088/v1"
+# frost_group_id = "<32B hex, post-DKG>"

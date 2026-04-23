@@ -23,12 +23,27 @@ pub struct ShardsConfig {
 pub struct ShardEntry {
     pub shard_id: u32,
     pub enclave_url: String,
+    /// Path A: 32-byte FROST group_id (hex, no 0x). Set after DKG finalize.
+    /// When present → Path A announcer broadcasts a DCAP quote bound to
+    /// `(ecdh_pubkey, shard_id, group_id)` every ~4 min. When absent →
+    /// announcer is dormant for this shard (pre-DKG PoC state).
+    #[serde(default)]
+    pub frost_group_id: Option<String>,
+}
+
+/// A shard configured with a FROST group_id — ready for Path A announcements.
+#[derive(Debug, Clone)]
+pub struct PathAGroup {
+    pub shard_id: u32,
+    pub group_id_hex: String,
+    pub enclave_url: String,
 }
 
 pub struct ShardRouter {
     shards: HashMap<u32, PerpClient>,
     shard_count: u32,
     sorted_ids: Vec<u32>,
+    path_a_groups: Vec<PathAGroup>,
 }
 
 impl ShardRouter {
@@ -40,6 +55,7 @@ impl ShardRouter {
 
         let mut shards = HashMap::new();
         let mut sorted_ids = Vec::new();
+        let mut path_a_groups = Vec::new();
         for entry in &config.shards {
             let client = PerpClient::new(&entry.enclave_url)?;
             match client.set_shard_id(entry.shard_id).await {
@@ -50,6 +66,14 @@ impl ShardRouter {
                 }
             }
             info!(shard_id = entry.shard_id, url = %entry.enclave_url, "shard registered");
+            if let Some(gid) = &entry.frost_group_id {
+                info!(shard_id = entry.shard_id, group_id = %gid, "Path A announcer armed");
+                path_a_groups.push(PathAGroup {
+                    shard_id: entry.shard_id,
+                    group_id_hex: gid.to_lowercase(),
+                    enclave_url: entry.enclave_url.clone(),
+                });
+            }
             shards.insert(entry.shard_id, client);
             sorted_ids.push(entry.shard_id);
         }
@@ -60,6 +84,7 @@ impl ShardRouter {
             shards,
             shard_count,
             sorted_ids,
+            path_a_groups,
         })
     }
 
@@ -81,7 +106,14 @@ impl ShardRouter {
             shards,
             shard_count: 1,
             sorted_ids: vec![shard_id],
+            path_a_groups: Vec::new(),
         })
+    }
+
+    /// Shards that have a `frost_group_id` configured — Path A announcer runs
+    /// once per entry. Empty on the `single()` CLI path or pre-DKG.
+    pub fn path_a_groups(&self) -> &[PathAGroup] {
+        &self.path_a_groups
     }
 
     /// Route a user_id to its shard's PerpClient.

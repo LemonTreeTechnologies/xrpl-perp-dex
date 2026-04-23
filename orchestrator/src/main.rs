@@ -686,9 +686,67 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Keep publish senders alive until main exits; drivers land in Phase 6.
-    let _peer_quote_pub_tx = peer_quote_pub_tx;
+    // Path A peer-quote announcer — one per shard with a configured FROST
+    // group_id in shards.toml. Loops every PEER_QUOTE_INTERVAL_SECS, fetches
+    // ECDH pubkey + report_data + DCAP quote, sends Announce. Attest-cache
+    // TTL is 5 min, so the interval is set a minute under that.
+    const PEER_QUOTE_INTERVAL_SECS: u64 = 240;
+    for group in shard_router.path_a_groups() {
+        let announcer_client = pool_path_a_client::PoolPathAClient::new(&group.enclave_url)?;
+        let pub_tx = peer_quote_pub_tx.clone();
+        let shard_id = group.shard_id;
+        let group_id = group.group_id_hex.clone();
+        let _announcer = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(PEER_QUOTE_INTERVAL_SECS));
+            loop {
+                tick.tick().await;
+                let now_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let my_pk = match announcer_client.ecdh_pubkey().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(shard_id, "announcer ecdh_pubkey failed: {}", e);
+                        continue;
+                    }
+                };
+                let rd = match announcer_client.ecdh_report_data(shard_id, &group_id).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(shard_id, "announcer ecdh_report_data failed: {}", e);
+                        continue;
+                    }
+                };
+                let quote = match announcer_client.attestation_quote(&rd).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(shard_id, "announcer attestation_quote failed: {}", e);
+                        continue;
+                    }
+                };
+                let msg = p2p::PeerQuoteMessage::Announce {
+                    peer_pubkey: my_pk,
+                    shard_id,
+                    group_id: group_id.clone(),
+                    quote,
+                    timestamp: now_ts,
+                };
+                if pub_tx.send(msg).await.is_err() {
+                    warn!(shard_id, "announcer channel closed — exiting");
+                    break;
+                }
+                info!(shard_id, group_id = %group_id, "queued peer-quote announce");
+            }
+        });
+    }
+
+    // Keep the share-v2 publish sender alive until main exits; the
+    // re-DKG export driver that drains it lands in Phase 6b.
     let _share_v2_pub_tx = share_v2_pub_tx;
+    // Drop the peer-quote publish sender handle here: any configured
+    // announcer holds its own clone, and unconfigured shards never needed it.
+    drop(peer_quote_pub_tx);
 
     // Validator: apply inbound state events to local PG
     let validator_events_db = db.clone();
