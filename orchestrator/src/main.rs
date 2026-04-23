@@ -887,6 +887,10 @@ async fn main() -> Result<()> {
     } else {
         election::Role::Validator
     });
+    // O-H3: leader-tracking watch channel, consumed by the validator
+    // replay task to gate `batch.sequencer_id` against the currently
+    // elected leader (replaces trust-on-first-use).
+    let (leader_tx, leader_rx) = tokio::sync::watch::channel::<Option<String>>(None);
     let election_config = election::ElectionConfig {
         our_peer_id: p2p_node.peer_id.to_string(),
         our_priority: cli.priority,
@@ -898,6 +902,7 @@ async fn main() -> Result<()> {
         election_outbound_tx,
         election_inbound_rx,
         role_tx,
+        leader_tx,
     );
     let _election_handle = tokio::spawn(async move {
         election_state.run().await;
@@ -934,9 +939,9 @@ async fn main() -> Result<()> {
     let is_seq_validator = is_sequencer.clone();
     let validator_perp = PerpClient::new(&cli.enclave_url)?;
     let validator_db = app_state.db.clone();
+    let validator_leader_rx = leader_rx.clone();
     let _validator_handle = tokio::spawn(async move {
         let mut last_seq: u64 = 0;
-        let mut known_leader: Option<String> = None;
         // O-H2: per-sequencer mismatch counter. Exposed via tracing events
         // tagged `metric = "state_hash_mismatches_total"` so log scrapers
         // can alert on a compromised or buggy sequencer.
@@ -949,21 +954,32 @@ async fn main() -> Result<()> {
 
             let total_fills: usize = batch.orders.iter().map(|o| o.fills.len()).sum();
 
-            // Verify batch source consistency — if we've seen batches from a sequencer,
-            // reject batches from a different sequencer (potential rogue node)
-            if !batch.sequencer_id.is_empty() {
-                if let Some(ref known) = known_leader {
-                    if *known != batch.sequencer_id {
-                        warn!(
-                            known = %known,
-                            got = %batch.sequencer_id,
-                            "batch from unexpected sequencer — ignoring"
-                        );
-                        continue;
-                    }
-                } else {
-                    info!(sequencer = %batch.sequencer_id, "accepted sequencer identity");
-                    known_leader = Some(batch.sequencer_id.clone());
+            // O-H3: gate the batch source on the *elected* leader from the
+            // election state machine — no TOFU on first-observed peer.
+            // A rogue peer cannot lock itself in as sequencer by beating
+            // the real leader to the first publish; the election channel
+            // is the source of truth.
+            let elected = validator_leader_rx.borrow().clone();
+            match elected {
+                Some(ref elected_id) if *elected_id == batch.sequencer_id => {
+                    // elected leader matches sender → proceed
+                }
+                Some(ref elected_id) => {
+                    warn!(
+                        elected = %elected_id,
+                        got = %batch.sequencer_id,
+                        seq = batch.seq_num,
+                        "batch from non-elected sequencer — ignoring"
+                    );
+                    continue;
+                }
+                None => {
+                    warn!(
+                        got = %batch.sequencer_id,
+                        seq = batch.seq_num,
+                        "no elected leader yet — ignoring batch"
+                    );
+                    continue;
                 }
             }
 

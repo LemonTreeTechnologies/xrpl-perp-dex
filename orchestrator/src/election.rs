@@ -54,6 +54,10 @@ pub struct ElectionState {
     outbound_tx: mpsc::Sender<ElectionMessage>,
     inbound_rx: mpsc::Receiver<ElectionMessage>,
     role_tx: watch::Sender<Role>,
+    // O-H3: publishes the currently-elected leader's peer_id so the
+    // validator replay task can gate `batch.sequencer_id` against it
+    // instead of trust-on-first-use on the first batch it observes.
+    leader_tx: watch::Sender<Option<String>>,
 }
 
 impl ElectionState {
@@ -62,6 +66,7 @@ impl ElectionState {
         outbound_tx: mpsc::Sender<ElectionMessage>,
         inbound_rx: mpsc::Receiver<ElectionMessage>,
         role_tx: watch::Sender<Role>,
+        leader_tx: watch::Sender<Option<String>>,
     ) -> Self {
         // Priority 0 starts as sequencer, others as validator
         let role = if config.our_priority == 0 {
@@ -71,12 +76,14 @@ impl ElectionState {
         };
 
         let now = Instant::now();
+        let leader = if role == Role::Sequencer {
+            Some((config.our_peer_id.clone(), config.our_priority))
+        } else {
+            None
+        };
+        let _ = leader_tx.send(leader.as_ref().map(|(id, _)| id.clone()));
         ElectionState {
-            leader: if role == Role::Sequencer {
-                Some((config.our_peer_id.clone(), config.our_priority))
-            } else {
-                None
-            },
+            leader,
             config,
             role,
             last_heartbeat: now,
@@ -86,7 +93,14 @@ impl ElectionState {
             outbound_tx,
             inbound_rx,
             role_tx,
+            leader_tx,
         }
+    }
+
+    fn set_leader(&mut self, leader: Option<(String, u8)>) {
+        let id = leader.as_ref().map(|(id, _)| id.clone());
+        self.leader = leader;
+        let _ = self.leader_tx.send(id);
     }
 
     pub async fn run(&mut self) {
@@ -152,7 +166,7 @@ impl ElectionState {
                 // a leader means we should stay validator
                 if self.startup_grace {
                     self.startup_grace = false;
-                    self.leader = Some((peer_id.clone(), priority));
+                    self.set_leader(Some((peer_id.clone(), priority)));
                     self.last_heartbeat = Instant::now();
                     if self.role == Role::Sequencer && priority < self.config.our_priority {
                         // Higher priority node is already leader
@@ -171,7 +185,7 @@ impl ElectionState {
                 // Accept higher-priority node as leader
                 if let Some((_, leader_prio)) = self.leader {
                     if priority < leader_prio {
-                        self.leader = Some((peer_id.clone(), priority));
+                        self.set_leader(Some((peer_id.clone(), priority)));
                         self.last_heartbeat = Instant::now();
                         if self.role == Role::Sequencer && priority < self.config.our_priority {
                             self.switch_role(Role::Validator);
@@ -179,7 +193,7 @@ impl ElectionState {
                     }
                 } else {
                     // No known leader — accept this one
-                    self.leader = Some((peer_id.clone(), priority));
+                    self.set_leader(Some((peer_id.clone(), priority)));
                     self.last_heartbeat = Instant::now();
                 }
             }
@@ -198,7 +212,7 @@ impl ElectionState {
                         priority,
                         "accepting higher-priority leader"
                     );
-                    self.leader = Some((peer_id.clone(), priority));
+                    self.set_leader(Some((peer_id.clone(), priority)));
                     self.last_heartbeat = Instant::now();
                     if self.role == Role::Sequencer {
                         self.switch_role(Role::Validator);
@@ -206,7 +220,7 @@ impl ElectionState {
                 } else if priority == self.config.our_priority {
                     // Tie — lower peer_id string wins
                     if *peer_id < self.config.our_peer_id {
-                        self.leader = Some((peer_id.clone(), priority));
+                        self.set_leader(Some((peer_id.clone(), priority)));
                         self.last_heartbeat = Instant::now();
                         if self.role == Role::Sequencer {
                             self.switch_role(Role::Validator);
@@ -251,7 +265,10 @@ impl ElectionState {
             priority = self.config.our_priority,
             "promoting self to sequencer"
         );
-        self.leader = Some((self.config.our_peer_id.clone(), self.config.our_priority));
+        self.set_leader(Some((
+            self.config.our_peer_id.clone(),
+            self.config.our_priority,
+        )));
         self.switch_role(Role::Sequencer);
 
         // Announce leadership (fire-and-forget)
@@ -291,7 +308,8 @@ mod tests {
             heartbeat_timeout: Duration::from_secs(15),
         };
 
-        let state = ElectionState::new(config, out_tx, in_rx, role_tx);
+        let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
+        let state = ElectionState::new(config, out_tx, in_rx, role_tx, leader_tx);
         assert_eq!(state.role, Role::Sequencer);
         drop(in_tx); // suppress warning
         drop(role_rx);
@@ -310,7 +328,8 @@ mod tests {
             heartbeat_timeout: Duration::from_secs(15),
         };
 
-        let state = ElectionState::new(config, out_tx, in_rx, role_tx);
+        let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
+        let state = ElectionState::new(config, out_tx, in_rx, role_tx, leader_tx);
         assert_eq!(state.role, Role::Validator);
     }
 
@@ -327,7 +346,8 @@ mod tests {
             heartbeat_timeout: Duration::from_secs(15),
         };
 
-        let mut state = ElectionState::new(config, out_tx, in_rx, role_tx);
+        let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
+        let mut state = ElectionState::new(config, out_tx, in_rx, role_tx, leader_tx);
         state.role = Role::Sequencer;
         state.startup_grace = false;
 
@@ -352,7 +372,8 @@ mod tests {
             heartbeat_timeout: Duration::from_secs(15),
         };
 
-        let mut state = ElectionState::new(config, out_tx, in_rx, role_tx);
+        let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
+        let mut state = ElectionState::new(config, out_tx, in_rx, role_tx, leader_tx);
         state.startup_grace = false;
 
         // Lower priority (higher number) tries to claim leadership
@@ -378,7 +399,8 @@ mod tests {
             heartbeat_timeout: Duration::from_secs(15),
         };
 
-        let mut state = ElectionState::new(config, out_tx, in_rx, role_tx);
+        let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
+        let mut state = ElectionState::new(config, out_tx, in_rx, role_tx, leader_tx);
         state.startup_grace = false;
 
         // Own heartbeat should be ignored
@@ -405,7 +427,8 @@ mod tests {
             heartbeat_timeout: Duration::from_secs(15),
         };
 
-        let mut state = ElectionState::new(config, out_tx, in_rx, role_tx);
+        let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
+        let mut state = ElectionState::new(config, out_tx, in_rx, role_tx, leader_tx);
         state.startup_grace = false;
         state.leader = Some(("A".into(), 0));
         // Simulate old heartbeat
@@ -436,7 +459,8 @@ mod tests {
             heartbeat_timeout: Duration::from_millis(50), // short for test
         };
 
-        let mut state = ElectionState::new(config, out_tx, in_rx, role_tx);
+        let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
+        let mut state = ElectionState::new(config, out_tx, in_rx, role_tx, leader_tx);
         state.startup_grace = false;
         state.leader = Some(("A".into(), 0));
         // Set last heartbeat to long ago
@@ -466,7 +490,8 @@ mod tests {
             heartbeat_timeout: Duration::from_secs(15),
         };
 
-        let mut state = ElectionState::new(config, out_tx, in_rx, role_tx);
+        let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
+        let mut state = ElectionState::new(config, out_tx, in_rx, role_tx, leader_tx);
         state.role = Role::Sequencer;
         state.startup_grace = false;
 
@@ -492,7 +517,8 @@ mod tests {
             heartbeat_timeout: Duration::from_secs(15),
         };
 
-        let mut state = ElectionState::new(config, out_tx, in_rx, role_tx);
+        let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
+        let mut state = ElectionState::new(config, out_tx, in_rx, role_tx, leader_tx);
         state.role = Role::Sequencer;
         state.startup_grace = false;
 
@@ -504,6 +530,39 @@ mod tests {
 
         assert_eq!(state.role, Role::Validator);
         assert_eq!(state.leader.as_ref().unwrap().0, "A_low_peer_id");
+    }
+
+    #[tokio::test]
+    async fn leader_channel_publishes_on_election_change() {
+        // O-H3: the watch channel must reflect the currently-elected
+        // leader so the validator replay loop can gate batch sources.
+        let (out_tx, _out_rx) = mpsc::channel(10);
+        let (_in_tx, in_rx) = mpsc::channel(10);
+        let (role_tx, _role_rx) = watch::channel(Role::Validator);
+        let (leader_tx, leader_rx) = watch::channel::<Option<String>>(None);
+
+        let config = ElectionConfig {
+            our_peer_id: "B".into(),
+            our_priority: 1,
+            heartbeat_interval: Duration::from_secs(5),
+            heartbeat_timeout: Duration::from_secs(15),
+        };
+
+        let mut state = ElectionState::new(config, out_tx, in_rx, role_tx, leader_tx);
+        // Priority-1 validator starts with no leader.
+        assert_eq!(*leader_rx.borrow(), None);
+
+        // A heartbeat from a higher-priority node establishes leadership.
+        state.handle_message(ElectionMessage::Heartbeat {
+            peer_id: "A".into(),
+            priority: 0,
+            seq_num: 1,
+        });
+        assert_eq!(leader_rx.borrow().as_deref(), Some("A"));
+
+        // Self-promotion (e.g. on leader timeout) publishes our own id.
+        state.promote();
+        assert_eq!(leader_rx.borrow().as_deref(), Some("B"));
     }
 
     #[test]
