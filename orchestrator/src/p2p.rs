@@ -189,12 +189,41 @@ pub struct LocalSigner {
     pub xrpl_address: String,
 }
 
+// ── Path A: peer DCAP quote exchange ────────────────────────────
+
+/// Path A peer-quote announcement. Published by each operator on ECDH
+/// identity load/rotation and re-broadcast periodically (attest cache TTL
+/// is 5 min → re-announce every ~4 min). Receivers pass `quote_hex` +
+/// `peer_pubkey_hex` to `/v1/pool/attest/verify-peer-quote`; success
+/// populates the local enclave's attest cache so subsequent v2 share
+/// export/import requests for this peer succeed.
+///
+/// All hex is lowercase with no `0x` prefix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PeerQuoteMessage {
+    Announce {
+        /// 33-byte compressed secp256k1 ECDH identity pubkey.
+        peer_pubkey: String,
+        /// Shard identity this quote binds to.
+        shard_id: u32,
+        /// 32-byte FROST group_id this quote binds to.
+        group_id: String,
+        /// Raw DCAP quote bytes.
+        quote: String,
+        /// Announcement wall-clock (sender side). Used only for staleness
+        /// log filtering; the enclave uses its own `now_ts` on verify.
+        timestamp: u64,
+    },
+}
+
 // ── Network behaviour ───────────────────────────────────────────
 
 const ORDERS_TOPIC: &str = "perp-dex/orders";
 const ELECTION_TOPIC: &str = "perp-dex/election";
 const SIGNING_TOPIC: &str = "perp-dex/signing";
 const EVENTS_TOPIC: &str = "perp-dex/events";
+const PEER_QUOTE_TOPIC: &str = "perp-dex/path-a/peer-quote";
 
 #[derive(NetworkBehaviour)]
 struct PerpBehaviour {
@@ -210,6 +239,7 @@ pub struct P2PNode {
     election_topic: gossipsub::IdentTopic,
     signing_topic: gossipsub::IdentTopic,
     events_topic: gossipsub::IdentTopic,
+    peer_quote_topic: gossipsub::IdentTopic,
     /// Channel to send received batches to the orchestrator (validator).
     batch_tx: mpsc::Sender<OrderBatch>,
     /// Channel to receive batches to publish (sequencer).
@@ -226,6 +256,10 @@ pub struct P2PNode {
     events_publish_rx: Option<mpsc::Receiver<StateEvent>>,
     /// Channel for received state events (validator consumes).
     events_inbound_tx: Option<mpsc::Sender<StateEvent>>,
+    /// Path A: outbound peer-quote announcements (published by local periodic task).
+    peer_quote_publish_rx: Option<mpsc::Receiver<PeerQuoteMessage>>,
+    /// Path A: received peer-quote announcements forwarded to verifier task.
+    peer_quote_inbound_tx: Option<mpsc::Sender<PeerQuoteMessage>>,
     /// Local signer credentials for handling incoming signing requests.
     local_signer: Option<LocalSigner>,
     /// Our peer ID.
@@ -292,6 +326,7 @@ impl P2PNode {
         let election_topic = gossipsub::IdentTopic::new(ELECTION_TOPIC);
         let signing_topic = gossipsub::IdentTopic::new(SIGNING_TOPIC);
         let events_topic = gossipsub::IdentTopic::new(EVENTS_TOPIC);
+        let peer_quote_topic = gossipsub::IdentTopic::new(PEER_QUOTE_TOPIC);
 
         let mut node = P2PNode {
             swarm,
@@ -299,6 +334,7 @@ impl P2PNode {
             election_topic,
             signing_topic,
             events_topic,
+            peer_quote_topic,
             batch_tx,
             publish_rx: None,
             election_inbound_tx,
@@ -307,6 +343,8 @@ impl P2PNode {
             pending_signing: HashMap::new(),
             events_publish_rx: None,
             events_inbound_tx: None,
+            peer_quote_publish_rx: None,
+            peer_quote_inbound_tx: None,
             local_signer: None,
             peer_id,
             peer_count,
@@ -333,6 +371,11 @@ impl P2PNode {
             .gossipsub
             .subscribe(&node.events_topic)
             .context("failed to subscribe to events topic")?;
+        node.swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&node.peer_quote_topic)
+            .context("failed to subscribe to peer-quote topic")?;
 
         // Listen
         let addr: Multiaddr = listen_addr.parse().context("invalid listen address")?;
@@ -365,6 +408,20 @@ impl P2PNode {
     /// Set events inbound channel (validator receives events to apply).
     pub fn set_events_inbound_channel(&mut self, tx: mpsc::Sender<StateEvent>) {
         self.events_inbound_tx = Some(tx);
+    }
+
+    /// Path A: set the channel a local periodic task uses to publish own
+    /// peer-quote announcements onto gossipsub.
+    #[allow(dead_code)]
+    pub fn set_peer_quote_publish_channel(&mut self, rx: mpsc::Receiver<PeerQuoteMessage>) {
+        self.peer_quote_publish_rx = Some(rx);
+    }
+
+    /// Path A: set the channel received peer-quote announcements are
+    /// forwarded to (consumer calls `/v1/pool/attest/verify-peer-quote`).
+    #[allow(dead_code)]
+    pub fn set_peer_quote_inbound_channel(&mut self, tx: mpsc::Sender<PeerQuoteMessage>) {
+        self.peer_quote_inbound_tx = Some(tx);
     }
 
     /// Set local signer credentials for handling incoming signing requests.
@@ -503,11 +560,13 @@ impl P2PNode {
         let mut election_rx = self.election_outbound_rx.take();
         let mut signing_rx = self.signing_request_rx.take();
         let mut events_rx = self.events_publish_rx.take();
+        let mut peer_quote_rx = self.peer_quote_publish_rx.take();
 
         let orders_topic_hash = self.orders_topic.hash();
         let election_topic_hash = self.election_topic.hash();
         let signing_topic_hash = self.signing_topic.hash();
         let events_topic_hash = self.events_topic.hash();
+        let peer_quote_topic_hash = self.peer_quote_topic.hash();
 
         let mut signing_cleanup = tokio::time::interval(Duration::from_secs(5));
 
@@ -599,6 +658,29 @@ impl P2PNode {
                         if let Err(e) = self.swarm.behaviour_mut().gossipsub
                             .publish(self.events_topic.clone(), data) {
                             warn!("events publish failed: {}", e);
+                        }
+                    }
+                }
+
+                // Path A: publish own peer-quote announcement
+                Some(msg) = async {
+                    match &mut peer_quote_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<PeerQuoteMessage>>().await,
+                    }
+                } => {
+                    if let Ok(data) = serde_json::to_vec(&msg) {
+                        match self.swarm.behaviour_mut().gossipsub
+                            .publish(self.peer_quote_topic.clone(), data) {
+                            Ok(_) => {
+                                let PeerQuoteMessage::Announce { ref peer_pubkey, shard_id, .. } = msg;
+                                info!(
+                                    peer_pubkey = %peer_pubkey,
+                                    shard_id = shard_id,
+                                    "published peer-quote announcement"
+                                );
+                            }
+                            Err(e) => warn!("peer-quote publish failed: {}", e),
                         }
                     }
                 }
@@ -701,6 +783,19 @@ impl P2PNode {
                             }
                             Err(e) => {
                                 warn!("invalid state event from {}: {}", propagation_source, e);
+                            }
+                        }
+                    } else if message.topic == peer_quote_topic_hash {
+                        match serde_json::from_slice::<PeerQuoteMessage>(&message.data) {
+                            Ok(msg) => {
+                                if let Some(ref tx) = self.peer_quote_inbound_tx {
+                                    if let Err(e) = tx.send(msg).await {
+                                        error!("failed to forward peer-quote: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("invalid peer-quote from {}: {}", propagation_source, e);
                             }
                         }
                     }
