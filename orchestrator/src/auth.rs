@@ -153,15 +153,14 @@ impl SessionStore {
     }
 }
 
-/// Global session store — initialized once, shared via Arc in AppState.
-pub static SESSION_STORE: std::sync::OnceLock<Arc<SessionStore>> = std::sync::OnceLock::new();
-
-#[allow(dead_code)] // eager-init alternative to lazy session_store(); kept for main startup
-pub fn init_session_store() -> Arc<SessionStore> {
-    let store = Arc::new(SessionStore::new());
-    let _ = SESSION_STORE.set(store.clone());
-    store
-}
+/// Global session store — initialized lazily on first access via
+/// `get_or_init`. O-M1: we deliberately do NOT expose an eager
+/// `init_session_store()` setter. `OnceLock::set()` silently fails if
+/// another thread already initialized through `get_or_init`, which
+/// meant the previous eager/lazy pair could race-land two different
+/// stores (one eager, one lazy) depending on call order. Relying on a
+/// single `get_or_init` path eliminates the race by construction.
+static SESSION_STORE: std::sync::OnceLock<Arc<SessionStore>> = std::sync::OnceLock::new();
 
 pub fn session_store() -> &'static Arc<SessionStore> {
     SESSION_STORE.get_or_init(|| Arc::new(SessionStore::new()))
