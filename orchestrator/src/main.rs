@@ -250,6 +250,12 @@ struct RunArgs {
     #[arg(long, default_value_t = 3)]
     vault_mm_levels: usize,
 
+    /// O-M5: cap on aggregate vault inventory (XRP). Pauses quoting
+    /// when gross inventory (MM) or |net delta| (DN) would exceed this.
+    /// Guards against unbounded pyramiding on a one-sided sweep.
+    #[arg(long, default_value_t = 50.0)]
+    vault_mm_max_inventory: f64,
+
     /// Enable Delta Neutral vault (quotes both sides, biases to reduce net delta).
     #[arg(long)]
     vault_dn: bool,
@@ -1160,6 +1166,7 @@ async fn main() -> Result<()> {
             order_size: cli.vault_mm_size.clone(),
             levels: cli.vault_mm_levels,
             strategy: vault_mm::VaultStrategy::MarketMaking,
+            max_inventory: cli.vault_mm_max_inventory,
             ..Default::default()
         };
         vault_mm::seed_vault_deposit(&perp, &vault_config).await;
@@ -1182,6 +1189,7 @@ async fn main() -> Result<()> {
             levels: cli.vault_mm_levels,
             strategy: vault_mm::VaultStrategy::DeltaNeutral,
             max_delta: 500.0,
+            max_inventory: cli.vault_mm_max_inventory,
             ..Default::default()
         };
         vault_mm::seed_vault_deposit(&perp, &vault_config).await;

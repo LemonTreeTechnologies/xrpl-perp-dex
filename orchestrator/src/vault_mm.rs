@@ -64,6 +64,14 @@ pub struct VaultMmConfig {
     /// quotes one-sided to reduce exposure. Only used for delta_neutral.
     #[serde(default = "default_max_delta")]
     pub max_delta: f64,
+    /// O-M5: kill-switch cap on aggregate vault inventory (in XRP).
+    /// A one-sided sweep would otherwise pyramid the vault's position
+    /// without bound; this cap pauses placement on levels whose fill
+    /// would push the inventory metric over the limit. For MarketMaking
+    /// the metric is gross inventory (sum of |position sizes|); for
+    /// DeltaNeutral it is |net delta|, since the hedge cancels.
+    #[serde(default = "default_max_inventory")]
+    pub max_inventory: f64,
 }
 
 fn default_vault_user_id() -> String {
@@ -90,6 +98,9 @@ fn default_strategy() -> VaultStrategy {
 fn default_max_delta() -> f64 {
     500.0
 }
+fn default_max_inventory() -> f64 {
+    50.0
+}
 
 impl Default for VaultMmConfig {
     fn default() -> Self {
@@ -102,8 +113,20 @@ impl Default for VaultMmConfig {
             levels: default_levels(),
             strategy: default_strategy(),
             max_delta: default_max_delta(),
+            max_inventory: default_max_inventory(),
         }
     }
+}
+
+/// O-M5: return the index set of levels that can be placed without
+/// exceeding `max_inventory`. Each entry is `true` if the level is
+/// safe to place. If every entry is `false`, the caller should pause
+/// quoting until inventory drains.
+fn levels_to_place(inventory_metric: f64, max_inventory: f64, level_sizes: &[FP8]) -> Vec<bool> {
+    level_sizes
+        .iter()
+        .map(|s| inventory_metric + s.to_f64() <= max_inventory)
+        .collect()
 }
 
 /// Seed the vault user with initial margin in the enclave.
@@ -224,8 +247,51 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
         // Reduced 10x for mainnet safety (limits max position size)
         let fixed_sizes: [f64; 3] = [1.9, 3.8, 7.6];
 
+        // O-M5: compute the inventory metric before quoting. A one-sided
+        // sweep would otherwise pyramid without bound; the cap below
+        // pauses placement on levels whose size would push us over.
+        let inventory_metric = match config.strategy {
+            VaultStrategy::MarketMaking => {
+                compute_gross_inventory(&state.perp, &config.user_id).await
+            }
+            VaultStrategy::DeltaNeutral => {
+                compute_net_delta(&state.perp, &config.user_id).await.abs()
+            }
+        };
+
+        // Precompute level sizes so we can query the cap per level.
+        let level_sizes: Vec<FP8> = (0..config.levels)
+            .map(|level| {
+                if level < fixed_sizes.len() {
+                    FP8::from_f64(fixed_sizes[level])
+                } else {
+                    order_size
+                }
+            })
+            .collect();
+        let place_mask = levels_to_place(inventory_metric, config.max_inventory, &level_sizes);
+        if place_mask.iter().all(|b| !*b) {
+            warn!(
+                user = %config.user_id,
+                inventory = inventory_metric,
+                cap = config.max_inventory,
+                "vault: inventory cap reached, pausing quoting until it drains"
+            );
+            continue;
+        }
+
         // Place levels on each side
         for level in 0..config.levels {
+            if !place_mask[level] {
+                debug!(
+                    level,
+                    inventory = inventory_metric,
+                    cap = config.max_inventory,
+                    "vault: level skipped to stay under inventory cap"
+                );
+                continue;
+            }
+
             let spread_mult = config.half_spread * (1.0 + level as f64 * 0.5);
             let bid_price = FP8::from_f64(mark_f * (1.0 - spread_mult));
             let ask_price = FP8::from_f64(mark_f * (1.0 + spread_mult));
@@ -234,11 +300,7 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
                 continue;
             }
 
-            let level_size = if level < fixed_sizes.len() {
-                FP8::from_f64(fixed_sizes[level])
-            } else {
-                order_size
-            };
+            let level_size = level_sizes[level];
 
             // Place bid (skipped if delta neutral says "asks only")
             if quote_bids {
@@ -318,4 +380,89 @@ async fn compute_net_delta(perp: &crate::perp_client::PerpClient, user_id: &str)
         }
     }
     net
+}
+
+/// Compute gross vault inventory: sum of |position sizes| across all
+/// open positions. Used by the MM-mode inventory cap (O-M5) — a
+/// one-sided sweep shows up as growing gross inventory regardless of
+/// which side accumulated.
+async fn compute_gross_inventory(perp: &crate::perp_client::PerpClient, user_id: &str) -> f64 {
+    let bal = match perp.get_balance(user_id).await {
+        Ok(b) => b,
+        Err(_) => return 0.0,
+    };
+    let positions = match bal["data"]["positions"].as_array() {
+        Some(arr) => arr,
+        None => return 0.0,
+    };
+    let mut gross: f64 = 0.0;
+    for pos in positions {
+        let size: f64 = pos["size"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        gross += size.abs();
+    }
+    gross
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn levels_to_place_empty_inventory_allows_all() {
+        let sizes = vec![FP8::from_f64(1.9), FP8::from_f64(3.8), FP8::from_f64(7.6)];
+        let mask = levels_to_place(0.0, 50.0, &sizes);
+        assert_eq!(mask, vec![true, true, true]);
+    }
+
+    #[test]
+    fn levels_to_place_caps_largest_first() {
+        let sizes = vec![FP8::from_f64(1.9), FP8::from_f64(3.8), FP8::from_f64(7.6)];
+        // 45 + 1.9=46.9, 45+3.8=48.8, 45+7.6=52.6 → only the last is capped
+        let mask = levels_to_place(45.0, 50.0, &sizes);
+        assert_eq!(mask, vec![true, true, false]);
+    }
+
+    #[test]
+    fn levels_to_place_one_sided_sweep_eventually_pauses_quoting() {
+        // Simulate a one-sided sweep: inventory ratchets up by the
+        // pyramid sum each rebalance. Assert that the cap bites before
+        // it runs away (the "cap holds" property the audit asks for).
+        let sizes = vec![FP8::from_f64(1.9), FP8::from_f64(3.8), FP8::from_f64(7.6)];
+        let cap = 50.0;
+        let mut inventory = 0.0;
+        let mut rebalances = 0;
+        loop {
+            let mask = levels_to_place(inventory, cap, &sizes);
+            if mask.iter().all(|b| !*b) {
+                break;
+            }
+            for (i, placed) in mask.iter().enumerate() {
+                if *placed {
+                    inventory += sizes[i].to_f64();
+                }
+            }
+            rebalances += 1;
+            assert!(
+                rebalances < 20,
+                "cap should bite within a finite number of rebalances"
+            );
+        }
+        // Once we pause, inventory must be bounded above by cap plus one
+        // level size (the last placement can straddle the cap by less
+        // than the largest level size).
+        assert!(
+            inventory <= cap + sizes.iter().map(|s| s.to_f64()).fold(0.0, f64::max),
+            "inventory exceeded cap by more than one level size: {inventory}"
+        );
+    }
+
+    #[test]
+    fn levels_to_place_cap_exactly_equal_is_allowed() {
+        let sizes = vec![FP8::from_f64(5.0)];
+        let mask = levels_to_place(45.0, 50.0, &sizes); // 45 + 5 == 50
+        assert_eq!(mask, vec![true]);
+    }
 }
