@@ -461,28 +461,24 @@ impl P2PNode {
 
     /// Path A: set the channel a local periodic task uses to publish own
     /// peer-quote announcements onto gossipsub.
-    #[allow(dead_code)]
     pub fn set_peer_quote_publish_channel(&mut self, rx: mpsc::Receiver<PeerQuoteMessage>) {
         self.peer_quote_publish_rx = Some(rx);
     }
 
     /// Path A: set the channel received peer-quote announcements are
     /// forwarded to (consumer calls `/v1/pool/attest/verify-peer-quote`).
-    #[allow(dead_code)]
     pub fn set_peer_quote_inbound_channel(&mut self, tx: mpsc::Sender<PeerQuoteMessage>) {
         self.peer_quote_inbound_tx = Some(tx);
     }
 
     /// Path A: set the channel a local export task uses to publish v2 share
     /// envelopes destined for a specific recipient peer.
-    #[allow(dead_code)]
     pub fn set_share_v2_publish_channel(&mut self, rx: mpsc::Receiver<ShareEnvelopeV2Message>) {
         self.share_v2_publish_rx = Some(rx);
     }
 
     /// Path A: set the channel received share envelopes addressed to us are
     /// forwarded to (consumer calls `/v1/pool/frost/share-import-v2`).
-    #[allow(dead_code)]
     pub fn set_share_v2_inbound_channel(&mut self, tx: mpsc::Sender<ShareEnvelopeV2Message>) {
         self.share_v2_inbound_tx = Some(tx);
     }
@@ -490,7 +486,6 @@ impl P2PNode {
     /// Path A: set our local ECDH pubkey (33-byte compressed, lowercase hex).
     /// Used as the recipient filter on the v2 share topic — messages whose
     /// `recipient_pubkey` doesn't match are dropped before forwarding.
-    #[allow(dead_code)]
     pub fn set_local_ecdh_pubkey(&mut self, pk_hex: String) {
         info!(ecdh_pubkey = %pk_hex, "P2P: local ECDH pubkey configured");
         self.local_ecdh_pubkey = Some(pk_hex.to_lowercase());

@@ -587,6 +587,109 @@ async fn main() -> Result<()> {
     p2p_node.set_events_publish_channel(events_pub_rx);
     p2p_node.set_events_inbound_channel(events_inbound_tx);
 
+    // Wire Path A (peer DCAP attestation + v2 FROST share transport).
+    // Publish senders are held for future drivers (periodic announce,
+    // re-DKG share export); inbound receivers drive the verify / import
+    // tasks below.
+    let (peer_quote_pub_tx, peer_quote_pub_rx) =
+        tokio::sync::mpsc::channel::<p2p::PeerQuoteMessage>(32);
+    let (peer_quote_in_tx, mut peer_quote_in_rx) =
+        tokio::sync::mpsc::channel::<p2p::PeerQuoteMessage>(32);
+    p2p_node.set_peer_quote_publish_channel(peer_quote_pub_rx);
+    p2p_node.set_peer_quote_inbound_channel(peer_quote_in_tx);
+
+    let (share_v2_pub_tx, share_v2_pub_rx) =
+        tokio::sync::mpsc::channel::<p2p::ShareEnvelopeV2Message>(32);
+    let (share_v2_in_tx, mut share_v2_in_rx) =
+        tokio::sync::mpsc::channel::<p2p::ShareEnvelopeV2Message>(32);
+    p2p_node.set_share_v2_publish_channel(share_v2_pub_rx);
+    p2p_node.set_share_v2_inbound_channel(share_v2_in_tx);
+
+    // Best-effort: fetch local ECDH identity pubkey to drive the share-v2
+    // recipient filter. Non-fatal — older enclaves or SGX-less dev boxes
+    // will simply have Path A unreachable.
+    let ecdh_bootstrap = pool_path_a_client::PoolPathAClient::new(&cli.enclave_url)?;
+    match ecdh_bootstrap.ecdh_pubkey().await {
+        Ok(pk) => {
+            info!(ecdh_pubkey = %pk, "fetched local ECDH identity for Path A");
+            p2p_node.set_local_ecdh_pubkey(pk);
+        }
+        Err(e) => {
+            warn!(
+                "Path A: failed to fetch local ECDH pubkey ({}) — \
+                 recipient filter disabled, share-v2 import will still \
+                 be enforced by the enclave attest cache",
+                e
+            );
+        }
+    }
+
+    // Spawn Path A peer-quote verifier — received announcements are
+    // passed to /v1/pool/attest/verify-peer-quote to populate the
+    // enclave's attest cache.
+    let verifier_client = pool_path_a_client::PoolPathAClient::new(&cli.enclave_url)?;
+    let _peer_quote_verifier = tokio::spawn(async move {
+        while let Some(p2p::PeerQuoteMessage::Announce {
+            peer_pubkey,
+            shard_id,
+            group_id,
+            quote,
+            timestamp: _,
+        }) = peer_quote_in_rx.recv().await
+        {
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            match verifier_client
+                .attest_verify_peer_quote(&quote, &peer_pubkey, shard_id, &group_id, now_ts)
+                .await
+            {
+                Ok(Some(mre)) => {
+                    info!(peer_pubkey = %peer_pubkey, mrenclave = %mre, "verified peer quote")
+                }
+                Ok(None) => {
+                    warn!(peer_pubkey = %peer_pubkey, "peer quote verification refused (403)")
+                }
+                Err(e) => {
+                    warn!(peer_pubkey = %peer_pubkey, "peer quote verify error: {}", e)
+                }
+            }
+        }
+    });
+
+    // Spawn Path A share-v2 importer — envelopes addressed to us (the
+    // recipient filter already dropped the rest in p2p.rs) are passed to
+    // /v1/pool/frost/share-import-v2.
+    let importer_client = pool_path_a_client::PoolPathAClient::new(&cli.enclave_url)?;
+    let _share_v2_importer = tokio::spawn(async move {
+        while let Some(p2p::ShareEnvelopeV2Message::Deliver {
+            recipient_pubkey: _,
+            shard_id,
+            group_id,
+            signer_id,
+            envelope,
+        }) = share_v2_in_rx.recv().await
+        {
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            match importer_client
+                .frost_share_import_v2(&envelope, shard_id, &group_id, signer_id, now_ts)
+                .await
+            {
+                Ok(true) => info!(signer_id, shard_id, "imported v2 FROST share"),
+                Ok(false) => warn!(signer_id, "v2 share import refused (403)"),
+                Err(e) => warn!(signer_id, "v2 share import error: {}", e),
+            }
+        }
+    });
+
+    // Keep publish senders alive until main exits; drivers land in Phase 6.
+    let _peer_quote_pub_tx = peer_quote_pub_tx;
+    let _share_v2_pub_tx = share_v2_pub_tx;
+
     // Validator: apply inbound state events to local PG
     let validator_events_db = db.clone();
     let _events_handle = tokio::spawn(async move {
