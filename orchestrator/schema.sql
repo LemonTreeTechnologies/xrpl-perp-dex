@@ -90,6 +90,9 @@ CREATE INDEX IF NOT EXISTS idx_funding_events_ts ON funding_events(timestamp_epo
 
 -- Resting limit orders currently on the in-memory CLOB. Persisted so that
 -- a new sequencer can rebuild the book from PG on failover (C5.1).
+-- O-H4: every row carries the submitter's XRPL signature binding so the
+-- post-failover reload can re-verify authenticity before replaying into
+-- the in-memory CLOB. See migrations/002_resting_order_signatures.sql.
 CREATE TABLE IF NOT EXISTS resting_orders (
     order_id BIGINT PRIMARY KEY,
     user_id VARCHAR(36) NOT NULL,
@@ -102,6 +105,11 @@ CREATE TABLE IF NOT EXISTS resting_orders (
     reduce_only BOOLEAN NOT NULL DEFAULT FALSE,
     timestamp_ms BIGINT NOT NULL,
     client_order_id VARCHAR(64),
+    signed_body_hex TEXT NOT NULL,
+    signature_hex TEXT NOT NULL,
+    signer_timestamp TEXT NOT NULL,
+    signer_address VARCHAR(36) NOT NULL,
+    signer_pubkey_hex VARCHAR(66) NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 

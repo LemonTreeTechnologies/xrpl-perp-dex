@@ -23,7 +23,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
-use tracing::error;
+use tracing::{error, warn};
 
 use tokio::sync::broadcast;
 
@@ -532,8 +532,10 @@ async fn openapi_spec() -> impl IntoResponse {
 
 async fn submit_order(
     State(state): State<Arc<AppState>>,
+    binding_ext: Option<axum::extract::Extension<crate::auth::OrderSignatureBinding>>,
     Json(req): Json<SubmitOrderRequest>,
 ) -> impl IntoResponse {
+    let signature_binding = binding_ext.map(|e| e.0);
     if !state.is_sequencer.load(Ordering::Relaxed) {
         return err(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -703,26 +705,38 @@ async fn submit_order(
             }
 
             // C5.1: persist resting-order changes to PG for failover recovery.
-            // Taker rested?
+            // O-H4: the first insert requires a signature binding so the
+            // row can be re-verified on failover reload. Fill updates for
+            // already-persisted makers only touch `filled` — they never
+            // overwrite the original binding, so they don't need one.
             if let Some(db) = &state.db {
                 if result.order.status == crate::orderbook::OrderStatus::Open
                     && result.order.remaining().raw() > 0
                 {
-                    db.upsert_resting_order(&result.order).await;
+                    match &signature_binding {
+                        Some(b) => db.insert_resting_order(&result.order, b).await,
+                        None => {
+                            warn!(
+                                order_id = result.order.id,
+                                user = %result.order.user_id,
+                                "resting order not persisted: no signature binding (session-token submission); order works in memory but is lost on failover"
+                            );
+                        }
+                    }
                 }
                 // Maker orders that were fully filled get removed from book.
                 for t in &result.trades {
                     match state.engine.get_order(t.maker_order_id).await {
-                        Some(maker) => db.upsert_resting_order(&maker).await, // partial fill
-                        None => db.delete_resting_order(t.maker_order_id).await, // fully filled
+                        Some(maker) => db.update_resting_order_filled(maker.id, maker.filled).await,
+                        None => db.delete_resting_order(t.maker_order_id).await,
                     }
                 }
-                // STP-cancelled maker orders: delete (fully cancelled) or upsert (partial).
+                // STP-cancelled maker orders: delete (fully cancelled) or update filled (partial).
                 for (maker, _cross) in &result.stp_cancelled {
                     if maker.status == crate::orderbook::OrderStatus::Cancelled {
                         db.delete_resting_order(maker.id).await;
                     } else {
-                        db.upsert_resting_order(maker).await;
+                        db.update_resting_order_filled(maker.id, maker.filled).await;
                     }
                 }
             }

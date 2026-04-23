@@ -35,6 +35,79 @@ pub struct AuthenticatedUser {
     pub xrpl_address: String,
 }
 
+/// O-H4: signature-bound identity of a submission, stashed by the auth
+/// middleware so the handler can persist it alongside the resting order
+/// and the post-failover reload can re-verify before replaying the row
+/// into the in-memory CLOB. The reload path calls
+/// [`verify_signature_only`] — it skips the timestamp-drift check because
+/// persisted rows are arbitrarily old by definition, but it re-runs the
+/// full ECDSA verification and address/pubkey self-consistency check,
+/// which is what binds the row to a real user.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct OrderSignatureBinding {
+    /// Raw JSON body the client signed (hex-encoded for PG TEXT transport).
+    pub signed_body_hex: String,
+    pub signature_hex: String,
+    pub timestamp: String,
+    pub signer_address: String,
+    pub signer_pubkey_hex: String,
+}
+
+/// O-H4: re-verify a persisted signature binding without the timestamp
+/// drift check. Used on validator failover when rebuilding the CLOB from
+/// PG. Returns Ok iff:
+///   1. The stored pubkey round-trips to the stored address.
+///   2. The signature is valid over `SHA-256(body || timestamp)`
+///      (either directly or via the XRPL SHA-512Half wrap).
+pub fn verify_signature_only(binding: &OrderSignatureBinding) -> Result<(), String> {
+    let pubkey_bytes = hex::decode(&binding.signer_pubkey_hex).map_err(|_| "invalid pubkey hex")?;
+    let verifying_key =
+        VerifyingKey::from_sec1_bytes(&pubkey_bytes).map_err(|_| "invalid secp256k1 public key")?;
+
+    let sha256_hash = Sha256::digest(&pubkey_bytes);
+    let ripemd_hash = Ripemd160::digest(sha256_hash);
+    let mut payload = vec![0x00u8];
+    payload.extend_from_slice(&ripemd_hash);
+    let checksum = Sha256::digest(Sha256::digest(&payload));
+    payload.extend_from_slice(&checksum[..4]);
+    const XRPL_ALPHABET: &str = "rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
+    let alpha_bytes: &[u8; 58] = XRPL_ALPHABET
+        .as_bytes()
+        .try_into()
+        .expect("XRPL alphabet is 58 chars");
+    let alpha = bs58::Alphabet::new(alpha_bytes).expect("valid alphabet");
+    let derived = bs58::encode(&payload).with_alphabet(&alpha).into_string();
+    if derived != binding.signer_address {
+        return Err(format!(
+            "address mismatch: stored={}, derived from pubkey={}",
+            binding.signer_address, derived
+        ));
+    }
+
+    let body_bytes = hex::decode(&binding.signed_body_hex).map_err(|_| "invalid body hex")?;
+    if body_bytes.is_empty() {
+        return Err("stored signed body is empty — rebind rejected".into());
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(&body_bytes);
+    hasher.update(binding.timestamp.as_bytes());
+    let hash = hasher.finalize();
+
+    let sig_bytes = hex::decode(&binding.signature_hex).map_err(|_| "invalid signature hex")?;
+    let signature = Signature::from_der(&sig_bytes).map_err(|_| "invalid DER signature")?;
+
+    if verifying_key.verify_prehash(&hash, &signature).is_ok() {
+        return Ok(());
+    }
+    let sha512_full = Sha512::digest(hash);
+    let sha512_half: [u8; 32] = sha512_full[..32].try_into().unwrap();
+    verifying_key
+        .verify_prehash(&sha512_half, &signature)
+        .map_err(|_| "signature verification failed".to_string())?;
+    Ok(())
+}
+
 // ── Session token store ──────────────────────────────────────────
 
 const SESSION_TTL: Duration = Duration::from_secs(30 * 60); // 30 minutes
@@ -384,6 +457,35 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
 
     match verify_request(&headers, method.as_str(), &body_bytes, &uri_string) {
         Ok(user) => {
+            // O-H4: build a binding we can persist with resting orders so
+            // the row can be re-verified on failover reload.
+            let binding: Option<OrderSignatureBinding> =
+                if !body_bytes.is_empty() && method != "GET" {
+                    let sig_hex = headers
+                        .get("x-xrpl-signature")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let ts = headers
+                        .get("x-xrpl-timestamp")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let pk = headers
+                        .get("x-xrpl-publickey")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    Some(OrderSignatureBinding {
+                        signed_body_hex: hex::encode(&body_bytes),
+                        signature_hex: sig_hex,
+                        timestamp: ts,
+                        signer_address: user.xrpl_address.clone(),
+                        signer_pubkey_hex: pk,
+                    })
+                } else {
+                    None
+                };
             // For POST/DELETE with body: verify user_id matches authenticated address
             if !body_bytes.is_empty() {
                 match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
@@ -439,6 +541,9 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
 
             // Inject authenticated user into request extensions
             parts.extensions.insert(user);
+            if let Some(b) = binding {
+                parts.extensions.insert(b);
+            }
             let request = Request::from_parts(parts, Body::from(body_bytes));
             next.run(request).await
         }
@@ -874,5 +979,68 @@ mod tests {
 
         let result = verify_request(&headers, "POST", &[], uri);
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    // ── O-H4 regression tests ──────────────────────────────────────
+
+    fn make_binding(
+        sk: &SigningKey,
+        pubkey_hex: &str,
+        address: &str,
+        body: &[u8],
+    ) -> OrderSignatureBinding {
+        let ts = current_ts();
+        let mut hasher = Sha256::new();
+        hasher.update(body);
+        hasher.update(ts.as_bytes());
+        let hash = hasher.finalize();
+        let (sig, _): (Signature, _) = sk.sign_prehash(&hash).unwrap();
+        OrderSignatureBinding {
+            signed_body_hex: hex::encode(body),
+            signature_hex: hex::encode(sig.to_der().as_bytes()),
+            timestamp: ts,
+            signer_address: address.to_string(),
+            signer_pubkey_hex: pubkey_hex.to_string(),
+        }
+    }
+
+    #[test]
+    fn verify_signature_only_accepts_valid_binding() {
+        let (sk, _, pubkey_hex, address) = test_keypair();
+        let body = br#"{"user_id":"rEXAMPLE","side":"long","size":"1"}"#;
+        let binding = make_binding(&sk, &pubkey_hex, &address, body);
+        assert!(verify_signature_only(&binding).is_ok());
+    }
+
+    #[test]
+    fn verify_signature_only_rejects_tampered_body() {
+        let (sk, _, pubkey_hex, address) = test_keypair();
+        let body = br#"{"user_id":"rEXAMPLE","side":"long","size":"1"}"#;
+        let mut binding = make_binding(&sk, &pubkey_hex, &address, body);
+        // Flip one byte in the signed body — hash changes, signature invalid.
+        binding.signed_body_hex =
+            hex::encode(br#"{"user_id":"rEXAMPLE","side":"long","size":"9"}"#);
+        let r = verify_signature_only(&binding);
+        assert!(r.is_err(), "tampered body must be rejected: {r:?}");
+    }
+
+    #[test]
+    fn verify_signature_only_rejects_swapped_address() {
+        let (sk, _, pubkey_hex, address) = test_keypair();
+        let (_, _, _, other_address) = test_keypair();
+        let body = br#"{"user_id":"rEXAMPLE"}"#;
+        let mut binding = make_binding(&sk, &pubkey_hex, &address, body);
+        // Attacker stored a different address alongside the valid pubkey.
+        binding.signer_address = other_address;
+        let r = verify_signature_only(&binding);
+        assert!(r.is_err(), "address mismatch must be rejected: {r:?}");
+    }
+
+    #[test]
+    fn verify_signature_only_rejects_empty_body() {
+        let (sk, _, pubkey_hex, address) = test_keypair();
+        let binding = make_binding(&sk, &pubkey_hex, &address, b"");
+        let r = verify_signature_only(&binding);
+        assert!(r.is_err(), "empty body must be rejected: {r:?}");
     }
 }

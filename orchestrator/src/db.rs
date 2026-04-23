@@ -6,7 +6,7 @@
 //! All writes are fire-and-forget — pg failure does not block trading.
 
 use sqlx::postgres::PgPool;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::types::FP8;
 
@@ -212,12 +212,21 @@ impl Db {
 
     // ── Resting orders (C5.1 orderbook persistence for failover) ──
 
-    /// Upsert a resting order (insert or update filled amount).
-    pub async fn upsert_resting_order(&self, o: &crate::orderbook::Order) {
+    /// O-H4: insert a fresh resting order, carrying the user's XRPL
+    /// signature binding so the row can be re-verified on failover reload.
+    /// Idempotent on (order_id): if the row already exists we assume it
+    /// was inserted by the sequencer and just touch `filled` — signature
+    /// columns are never overwritten, preserving the original binding.
+    pub async fn insert_resting_order(
+        &self,
+        o: &crate::orderbook::Order,
+        binding: &crate::auth::OrderSignatureBinding,
+    ) {
         let r = sqlx::query(
             "INSERT INTO resting_orders \
-             (order_id, user_id, market, side, price, size, filled, leverage, reduce_only, timestamp_ms, client_order_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             (order_id, user_id, market, side, price, size, filled, leverage, reduce_only, timestamp_ms, client_order_id, \
+              signed_body_hex, signature_hex, signer_timestamp, signer_address, signer_pubkey_hex) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
              ON CONFLICT (order_id) DO UPDATE SET filled = $7",
         )
         .bind(o.id as i64)
@@ -231,10 +240,29 @@ impl Db {
         .bind(o.reduce_only)
         .bind(o.timestamp_ms as i64)
         .bind(&o.client_order_id)
+        .bind(&binding.signed_body_hex)
+        .bind(&binding.signature_hex)
+        .bind(&binding.timestamp)
+        .bind(&binding.signer_address)
+        .bind(&binding.signer_pubkey_hex)
         .execute(&self.pool)
         .await;
         if let Err(e) = r {
-            error!("pg upsert_resting_order failed: {}", e);
+            error!("pg insert_resting_order failed: {}", e);
+        }
+    }
+
+    /// Update only the `filled` column on an existing resting order.
+    /// Used for subsequent partial-fill updates where the original binding
+    /// is not available in memory (the engine doesn't carry it).
+    pub async fn update_resting_order_filled(&self, order_id: u64, filled: FP8) {
+        let r = sqlx::query("UPDATE resting_orders SET filled = $2 WHERE order_id = $1")
+            .bind(order_id as i64)
+            .bind(filled.raw())
+            .execute(&self.pool)
+            .await;
+        if let Err(e) = r {
+            error!("pg update_resting_order_filled failed: {}", e);
         }
     }
 
@@ -249,55 +277,115 @@ impl Db {
         }
     }
 
-    /// Load all resting orders from PG (for book rebuild on failover).
+    /// O-H4: load all resting orders from PG, re-verifying each row's
+    /// signature binding before returning it. Rows whose signature doesn't
+    /// validate, or whose `user_id` doesn't match the signer's address, are
+    /// dropped and logged — a compromised PG cannot poison the reloaded
+    /// book with forged orders.
     pub async fn load_resting_orders(&self) -> Vec<crate::orderbook::Order> {
-        let rows = sqlx::query_as::<_, (i64, String, String, String, i64, i64, i64, i32, bool, i64, Option<String>)>(
-            "SELECT order_id, user_id, market, side, price, size, filled, leverage, reduce_only, timestamp_ms, client_order_id \
+        #[allow(clippy::type_complexity)]
+        let rows = sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                String,
+                String,
+                i64,
+                i64,
+                i64,
+                i32,
+                bool,
+                i64,
+                Option<String>,
+                String,
+                String,
+                String,
+                String,
+                String,
+            ),
+        >(
+            "SELECT order_id, user_id, market, side, price, size, filled, leverage, reduce_only, timestamp_ms, client_order_id, \
+                    signed_body_hex, signature_hex, signer_timestamp, signer_address, signer_pubkey_hex \
              FROM resting_orders ORDER BY order_id",
         )
         .fetch_all(&self.pool)
         .await
         .unwrap_or_default();
 
-        rows.into_iter()
-            .map(
-                |(
-                    id,
-                    user_id,
-                    market,
-                    side,
-                    price,
-                    size,
-                    filled,
-                    leverage,
-                    reduce_only,
-                    ts,
-                    coid,
-                )| {
-                    let side = match side.as_str() {
-                        "long" | "buy" => crate::types::Side::Long,
-                        _ => crate::types::Side::Short,
-                    };
-                    crate::orderbook::Order {
-                        id: id as u64,
-                        user_id,
-                        market,
-                        side,
-                        order_type: crate::orderbook::OrderType::Limit,
-                        price: FP8(price),
-                        size: FP8(size),
-                        filled: FP8(filled),
-                        leverage: leverage as u32,
-                        status: crate::orderbook::OrderStatus::Open,
-                        time_in_force: crate::orderbook::TimeInForce::Gtc,
-                        reduce_only,
-                        timestamp_ms: ts as u64,
-                        client_order_id: coid,
-                        close_position_id: None,
-                    }
-                },
-            )
-            .collect()
+        let mut out = Vec::with_capacity(rows.len());
+        let mut rejected = 0usize;
+        for (
+            id,
+            user_id,
+            market,
+            side,
+            price,
+            size,
+            filled,
+            leverage,
+            reduce_only,
+            ts,
+            coid,
+            signed_body_hex,
+            signature_hex,
+            signer_timestamp,
+            signer_address,
+            signer_pubkey_hex,
+        ) in rows
+        {
+            let binding = crate::auth::OrderSignatureBinding {
+                signed_body_hex,
+                signature_hex,
+                timestamp: signer_timestamp,
+                signer_address: signer_address.clone(),
+                signer_pubkey_hex,
+            };
+            if let Err(e) = crate::auth::verify_signature_only(&binding) {
+                warn!(order_id = id, %user_id, "resting order rejected on reload: {}", e);
+                rejected += 1;
+                continue;
+            }
+            if signer_address != user_id {
+                warn!(
+                    order_id = id,
+                    %user_id,
+                    stored_signer = %signer_address,
+                    "resting order rejected on reload: signer_address != user_id"
+                );
+                rejected += 1;
+                continue;
+            }
+            let side_enum = match side.as_str() {
+                "long" | "buy" => crate::types::Side::Long,
+                _ => crate::types::Side::Short,
+            };
+            out.push(crate::orderbook::Order {
+                id: id as u64,
+                user_id,
+                market,
+                side: side_enum,
+                order_type: crate::orderbook::OrderType::Limit,
+                price: FP8(price),
+                size: FP8(size),
+                filled: FP8(filled),
+                leverage: leverage as u32,
+                status: crate::orderbook::OrderStatus::Open,
+                time_in_force: crate::orderbook::TimeInForce::Gtc,
+                reduce_only,
+                timestamp_ms: ts as u64,
+                client_order_id: coid,
+                close_position_id: None,
+            });
+        }
+        if rejected > 0 {
+            warn!(
+                rejected,
+                accepted = out.len(),
+                "load_resting_orders: some rows failed signature re-verification"
+            );
+        }
+        out
     }
 
     /// Query trade history for a user.
