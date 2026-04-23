@@ -883,6 +883,14 @@ async fn main() -> Result<()> {
                 xrpl_address: first.xrpl_address.clone(),
             });
         }
+        // X-C1: the escrow address in signers-config tells the P2P node
+        // which Account a signing request is allowed to draw from. Without
+        // it every incoming request would fail the policy check.
+        if !cfg.escrow_address.is_empty() {
+            p2p_node.set_escrow_address(cfg.escrow_address.clone());
+        } else {
+            warn!("X-C1: signers-config has no escrow_address — all incoming P2P signing requests will be rejected");
+        }
     }
 
     // Forward trade batches to P2P — only when sequencer

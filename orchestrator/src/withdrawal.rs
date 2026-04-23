@@ -118,10 +118,17 @@ async fn sign_with_enclave(
 }
 
 /// Collect a signature from a remote signer via P2P relay.
+///
+/// X-C1: we publish the full unsigned tx plus the signer's account_id
+/// so receivers can re-derive the multi_signing_hash themselves. The
+/// caller-computed hash is no longer sent on the wire — it would be
+/// trusted blindly by the receiver enclave and let any gossipsub peer
+/// demand signatures on arbitrary hashes.
 async fn sign_via_p2p(
     signing_tx: &mpsc::Sender<SigningRelay>,
     signer: &SignerConfig,
-    hash: &[u8; 32],
+    unsigned_tx: &serde_json::Value,
+    account_id: &[u8; 20],
     timeout_secs: u64,
 ) -> Result<(String, String)> {
     let request_id = format!("{:016x}", rand::random::<u64>());
@@ -130,7 +137,8 @@ async fn sign_via_p2p(
     signing_tx
         .send(SigningRelay {
             request_id: request_id.clone(),
-            hash_hex: format!("0x{}", hex::encode(hash)),
+            unsigned_tx: unsigned_tx.clone(),
+            signer_account_id_hex: hex::encode(account_id),
             signer_xrpl_address: signer.xrpl_address.clone(),
             response_tx: resp_tx,
         })
@@ -283,14 +291,16 @@ pub async fn process_withdrawal(
             }
         };
 
-        let hash = signing::multi_signing_hash(tx_map, &account_id).map_err(|e| {
-            anyhow::anyhow!("multi_signing_hash for {} failed: {:?}", signer.name, e)
-        })?;
-
-        // Use P2P relay if available, otherwise fall back to direct HTTP
+        // Use P2P relay if available, otherwise fall back to direct HTTP.
+        // P2P path sends the full tx and lets the receiver derive the hash
+        // (see X-C1 comment on `sign_via_p2p`). HTTP fallback still needs
+        // the hash locally because it POSTs directly to `/pool/sign`.
         let sign_result = if let Some(stx) = signing_tx {
-            sign_via_p2p(stx, signer, &hash, 30).await
+            sign_via_p2p(stx, signer, &tx_json, &account_id, 30).await
         } else {
+            let hash = signing::multi_signing_hash(tx_map, &account_id).map_err(|e| {
+                anyhow::anyhow!("multi_signing_hash for {} failed: {:?}", signer.name, e)
+            })?;
             sign_with_enclave(&http, signer, &hash).await
         };
 
