@@ -171,7 +171,19 @@ fn parse_tif(s: &str) -> Result<TimeInForce, String> {
 
 // ── Health ──────────────────────────────────────────────────────
 
+// O-L5: `/v1/health` is the public liveness probe — minimal, unauth.
+// The operational details (role, peer count, enclave status, uptime)
+// moved to `/v1/status` behind auth, so a scanner can no longer
+// fingerprint the mesh topology from an unauthenticated request.
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "network": infer_network(&state.xrpl_url),
+    }))
+}
+
+async fn detailed_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let role = if state
         .is_sequencer
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -265,6 +277,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/attestation/commitment", get(attestation_commitment))
         .route("/v1/auth/login", post(auth_login))
         .route("/v1/health", get(health))
+        .route("/v1/status", get(detailed_status))
         .route("/v1/system/status", get(system_status))
         .layer(axum::middleware::from_fn(auth::auth_middleware))
         .route("/ws", get(ws::ws_handler))
@@ -305,11 +318,8 @@ async fn attestation_quote(
             .replace("/perp", "")
     );
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .unwrap();
+    let client =
+        crate::http_helpers::loopback_http_client(std::time::Duration::from_secs(60)).unwrap();
 
     match client
         .post(format!(
