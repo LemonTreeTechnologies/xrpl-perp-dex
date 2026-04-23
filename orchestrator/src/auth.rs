@@ -95,8 +95,17 @@ pub fn session_store() -> &'static Arc<SessionStore> {
 }
 
 /// Extract and verify XRPL signature from request headers.
+///
+/// `method` is the HTTP method (uppercase). It is used to disambiguate
+/// two cases that both present with an empty body at this level:
+///   * `GET` — the client signs the URI path (+ query) as the body.
+///   * `POST`/`DELETE` with empty body (e.g. `/v1/auth/login`) — the
+///     client signs the domain-separated canonical to defeat the
+///     proof-of-life / foreign-oracle attack flagged in
+///     SECURITY-REAUDIT-4 O-H1.
 pub fn verify_request(
     headers: &HeaderMap,
+    method: &str,
     body_bytes: &[u8],
     uri_path: &str,
 ) -> Result<AuthenticatedUser, String> {
@@ -179,26 +188,32 @@ pub fn verify_request(
         ));
     }
 
-    // Compute hash of body (or URI for GET) + timestamp (always included)
-    // For POST with empty body (e.g. /v1/auth/login): try both URI-based and empty-body hashes
+    // Compute canonical hash to verify against.
+    //
+    //   GET              → SHA-256(uri_path || timestamp)
+    //   non-empty body   → SHA-256(body || timestamp)
+    //   empty-body POST  → SHA-256("xperp/v1/login|" || uri_path || "|" || timestamp)
+    //
+    // The empty-body POST path is domain-separated to defeat the
+    // "foreign oracle" attack flagged in SECURITY-REAUDIT-4 O-H1: any
+    // external signer that produced `SHA-256(timestamp)` (proof-of-life,
+    // telemetry, unrelated XRPL contexts) previously doubled as a valid
+    // login credential. The domain prefix pins the signature to this
+    // server's login flow.
+    let is_get = method.eq_ignore_ascii_case("GET");
     let hash = {
         let mut hasher = Sha256::new();
-        if body_bytes.is_empty() {
+        if is_get {
             hasher.update(uri_path.as_bytes());
+        } else if body_bytes.is_empty() {
+            hasher.update(b"xperp/v1/login|");
+            hasher.update(uri_path.as_bytes());
+            hasher.update(b"|");
         } else {
             hasher.update(body_bytes);
         }
         hasher.update(timestamp_str.as_bytes());
         hasher.finalize()
-    };
-    // Alternative hash for POST with empty body: hash("" + timestamp)
-    let alt_hash = if body_bytes.is_empty() {
-        let mut hasher = Sha256::new();
-        // empty body + timestamp
-        hasher.update(timestamp_str.as_bytes());
-        Some(hasher.finalize())
-    } else {
-        None
     };
 
     // Decode and verify signature
@@ -206,35 +221,25 @@ pub fn verify_request(
     let signature = Signature::from_der(&sig_bytes).map_err(|_| "invalid DER signature")?;
 
     // Verify ECDSA signature over pre-hashed data.
-    // Mode 1 (default): client signs SHA-256(body+timestamp) directly (Python, Node.js, raw secp256k1).
-    // Mode 2 (XRPL wallets): Crossmark/GemWallet use ripple-keypairs which applies
-    //   SHA-512Half(message) before ECDSA. The client passes SHA-256(body+timestamp) as hex,
-    //   the wallet internally computes SHA512(hex_bytes)[0..32] and signs that.
-    // Try all applicable hash variants × both signing modes
-    let hashes_to_try: Vec<&[u8]> = if let Some(ref alt) = alt_hash {
-        vec![&hash[..], &alt[..]]
-    } else {
-        vec![&hash[..]]
+    // Mode 1 (default): client signs the canonical hash directly (Python,
+    //   Node.js, raw secp256k1).
+    // Mode 2 (XRPL wallets): Crossmark/GemWallet use ripple-keypairs which
+    //   applies SHA-512Half(message) before ECDSA. The client passes the
+    //   hex of the canonical hash as message; the wallet internally signs
+    //   SHA512(hex_bytes)[0..32].
+    let verified = {
+        // Mode 1: direct canonical hash.
+        if verifying_key.verify_prehash(&hash, &signature).is_ok() {
+            true
+        } else {
+            // Mode 2: SHA-512Half wrap.
+            let sha512_full = Sha512::digest(hash);
+            let sha512_half: [u8; 32] = sha512_full[..32].try_into().unwrap();
+            verifying_key
+                .verify_prehash(&sha512_half, &signature)
+                .is_ok()
+        }
     };
-
-    let mut verified = false;
-    for h in &hashes_to_try {
-        // Mode 1: direct SHA-256
-        if verifying_key.verify_prehash(h, &signature).is_ok() {
-            verified = true;
-            break;
-        }
-        // Mode 2: SHA-512Half (Crossmark/GemWallet)
-        let sha512_full = Sha512::digest(h);
-        let sha512_half: [u8; 32] = sha512_full[..32].try_into().unwrap();
-        if verifying_key
-            .verify_prehash(&sha512_half, &signature)
-            .is_ok()
-        {
-            verified = true;
-            break;
-        }
-    }
 
     if !verified {
         tracing::debug!(
@@ -377,7 +382,7 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
         }
     };
 
-    match verify_request(&headers, &body_bytes, &uri_string) {
+    match verify_request(&headers, method.as_str(), &body_bytes, &uri_string) {
         Ok(user) => {
             // For POST/DELETE with body: verify user_id matches authenticated address
             if !body_bytes.is_empty() {
@@ -499,12 +504,42 @@ mod tests {
         sign_body(sk, pubkey_hex, address, uri.as_bytes())
     }
 
+    /// Helper: sign the domain-separated empty-body POST canonical
+    /// hash — `SHA-256("xperp/v1/login|" || uri_path || "|" || ts)`.
+    /// Mirrors the server-side canonical introduced by O-H1.
+    fn sign_empty_body_post(
+        sk: &SigningKey,
+        pubkey_hex: &str,
+        address: &str,
+        uri_path: &str,
+    ) -> HeaderMap {
+        let ts = current_ts();
+        let mut hasher = Sha256::new();
+        hasher.update(b"xperp/v1/login|");
+        hasher.update(uri_path.as_bytes());
+        hasher.update(b"|");
+        hasher.update(ts.as_bytes());
+        let hash = hasher.finalize();
+        let (sig, _): (Signature, _) = sk.sign_prehash(&hash).unwrap();
+        let sig_der = sig.to_der();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-xrpl-address", address.parse().unwrap());
+        headers.insert("x-xrpl-publickey", pubkey_hex.parse().unwrap());
+        headers.insert(
+            "x-xrpl-signature",
+            hex::encode(sig_der.as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-xrpl-timestamp", ts.parse().unwrap());
+        headers
+    }
+
     #[test]
     fn valid_post_signature_passes() {
         let (sk, _, pubkey_hex, address) = test_keypair();
         let body = b"{\"user_id\":\"test\",\"side\":\"buy\"}";
         let headers = sign_body(&sk, &pubkey_hex, &address, body);
-        let result = verify_request(&headers, body, "/v1/orders");
+        let result = verify_request(&headers, "POST", body, "/v1/orders");
         assert!(result.is_ok());
         assert_eq!(result.unwrap().xrpl_address, address);
     }
@@ -515,7 +550,7 @@ mod tests {
         let uri = "/v1/orders?user_id=rTest123";
         // GET: empty body, signs URI
         let headers = sign_uri(&sk, &pubkey_hex, &address, uri);
-        let result = verify_request(&headers, &[], uri);
+        let result = verify_request(&headers, "GET", &[], uri);
         assert!(result.is_ok());
     }
 
@@ -524,7 +559,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-xrpl-publickey", "aa".repeat(33).parse().unwrap());
         headers.insert("x-xrpl-signature", "deadbeef".parse().unwrap());
-        let result = verify_request(&headers, b"body", "/");
+        let result = verify_request(&headers, "POST", b"body", "/");
         assert_eq!(result.unwrap_err(), "missing X-XRPL-Address header");
     }
 
@@ -536,7 +571,7 @@ mod tests {
             "rTest12345678901234567890".parse().unwrap(),
         );
         headers.insert("x-xrpl-signature", "deadbeef".parse().unwrap());
-        let result = verify_request(&headers, b"body", "/");
+        let result = verify_request(&headers, "POST", b"body", "/");
         assert_eq!(result.unwrap_err(), "missing X-XRPL-PublicKey header");
     }
 
@@ -548,7 +583,7 @@ mod tests {
             "rTest12345678901234567890".parse().unwrap(),
         );
         headers.insert("x-xrpl-publickey", "aa".repeat(33).parse().unwrap());
-        let result = verify_request(&headers, b"body", "/");
+        let result = verify_request(&headers, "POST", b"body", "/");
         assert_eq!(result.unwrap_err(), "missing X-XRPL-Signature header");
     }
 
@@ -557,7 +592,7 @@ mod tests {
         let (sk, _, pubkey_hex, _) = test_keypair();
         let body = b"test";
         let headers = sign_body(&sk, &pubkey_hex, "xNotAnAddress", body);
-        let result = verify_request(&headers, body, "/");
+        let result = verify_request(&headers, "POST", body, "/");
         assert_eq!(result.unwrap_err(), "invalid XRPL address format");
     }
 
@@ -565,7 +600,7 @@ mod tests {
     fn address_too_short_rejected() {
         let (sk, _, pubkey_hex, _) = test_keypair();
         let headers = sign_body(&sk, &pubkey_hex, "rShort", b"test");
-        let result = verify_request(&headers, b"test", "/");
+        let result = verify_request(&headers, "POST", b"test", "/");
         assert_eq!(result.unwrap_err(), "invalid XRPL address format");
     }
 
@@ -579,7 +614,7 @@ mod tests {
         headers.insert("x-xrpl-publickey", "aabb".parse().unwrap()); // too short
         headers.insert("x-xrpl-signature", "deadbeef".parse().unwrap());
         headers.insert("x-xrpl-timestamp", current_ts().parse().unwrap());
-        let result = verify_request(&headers, b"body", "/");
+        let result = verify_request(&headers, "POST", b"body", "/");
         assert_eq!(
             result.unwrap_err(),
             "invalid public key length (expected 66 hex chars)"
@@ -593,7 +628,7 @@ mod tests {
         // Use a different (but valid-format) address
         let fake_address = "rFakeAddress1234567890123";
         let headers = sign_body(&sk, &pubkey_hex, fake_address, body);
-        let result = verify_request(&headers, body, "/");
+        let result = verify_request(&headers, "POST", body, "/");
         assert!(result.unwrap_err().starts_with("address mismatch"));
     }
 
@@ -603,7 +638,7 @@ mod tests {
         let body = b"correct body";
         let headers = sign_body(&sk, &pubkey_hex, &address, b"different body");
         // Verify with correct body but signature was for different body
-        let result = verify_request(&headers, body, "/");
+        let result = verify_request(&headers, "POST", body, "/");
         assert_eq!(result.unwrap_err(), "signature verification failed");
     }
 
@@ -615,7 +650,7 @@ mod tests {
         headers.insert("x-xrpl-publickey", pubkey_hex.parse().unwrap());
         headers.insert("x-xrpl-signature", "not_hex!!".parse().unwrap());
         headers.insert("x-xrpl-timestamp", current_ts().parse().unwrap());
-        let result = verify_request(&headers, b"body", "/");
+        let result = verify_request(&headers, "POST", b"body", "/");
         assert_eq!(result.unwrap_err(), "invalid signature hex");
     }
 
@@ -627,7 +662,7 @@ mod tests {
         headers.insert("x-xrpl-publickey", pubkey_hex.parse().unwrap());
         headers.insert("x-xrpl-signature", "deadbeef".parse().unwrap());
         headers.insert("x-xrpl-timestamp", current_ts().parse().unwrap());
-        let result = verify_request(&headers, b"body", "/");
+        let result = verify_request(&headers, "POST", b"body", "/");
         assert_eq!(result.unwrap_err(), "invalid DER signature");
     }
 
@@ -645,7 +680,7 @@ mod tests {
             hex::encode(sig.to_der().as_bytes()).parse().unwrap(),
         );
         // NO timestamp header
-        let result = verify_request(&headers, body, "/");
+        let result = verify_request(&headers, "POST", body, "/");
         assert!(result.unwrap_err().contains("X-XRPL-Timestamp"));
     }
 
@@ -702,7 +737,7 @@ mod tests {
         let (sk, _, pubkey_hex, address) = test_keypair();
         let body = b"{\"user_id\":\"test\",\"side\":\"buy\"}";
         let headers = sign_body_xrpl_wallet(&sk, &pubkey_hex, &address, body);
-        let result = verify_request(&headers, body, "/v1/orders");
+        let result = verify_request(&headers, "POST", body, "/v1/orders");
         assert!(result.is_ok(), "SHA-512Half wallet signature should pass");
         assert_eq!(result.unwrap().xrpl_address, address);
     }
@@ -731,7 +766,7 @@ mod tests {
             hex::encode(sig_der.as_bytes()).parse().unwrap(),
         );
         headers.insert("x-xrpl-timestamp", ts.parse().unwrap());
-        let result = verify_request(&headers, &[], uri);
+        let result = verify_request(&headers, "GET", &[], uri);
         assert!(result.is_ok(), "SHA-512Half GET signature should pass");
     }
 
@@ -740,5 +775,104 @@ mod tests {
         let (_, _, _, addr1) = test_keypair();
         let (_, _, _, addr2) = test_keypair();
         assert_ne!(addr1, addr2);
+    }
+
+    // ── O-H1 regression tests (SECURITY-REAUDIT-4) ──────────────────
+
+    #[test]
+    fn login_domain_separated_hash_passes() {
+        let (sk, _, pubkey_hex, address) = test_keypair();
+        let uri = "/v1/auth/login";
+        let headers = sign_empty_body_post(&sk, &pubkey_hex, &address, uri);
+        let result = verify_request(&headers, "POST", &[], uri);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(result.unwrap().xrpl_address, address);
+    }
+
+    /// The audit-flagged vulnerable path: any signature produced for an
+    /// unrelated purpose over just a unix timestamp (e.g. a
+    /// proof-of-life probe) must NOT authenticate a login. Before the
+    /// O-H1 fix, `SHA-256(timestamp)` was an accepted alternate hash.
+    #[test]
+    fn login_timestamp_only_hash_rejected() {
+        let (sk, _, pubkey_hex, address) = test_keypair();
+        let uri = "/v1/auth/login";
+        let ts = current_ts();
+        // Produce a signature over SHA-256(timestamp) — what the old
+        // alt_hash branch accepted.
+        let mut hasher = Sha256::new();
+        hasher.update(ts.as_bytes());
+        let hash = hasher.finalize();
+        let (sig, _): (Signature, _) = sk.sign_prehash(&hash).unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-xrpl-address", address.parse().unwrap());
+        headers.insert("x-xrpl-publickey", pubkey_hex.parse().unwrap());
+        headers.insert(
+            "x-xrpl-signature",
+            hex::encode(sig.to_der().as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-xrpl-timestamp", ts.parse().unwrap());
+
+        let result = verify_request(&headers, "POST", &[], uri);
+        assert_eq!(result.unwrap_err(), "signature verification failed");
+    }
+
+    /// The pre-audit non-domain-separated empty-body canonical
+    /// `SHA-256(uri || ts)` must also fail — a signature produced
+    /// against it was not an oracle risk, but accepting it after the
+    /// fix would keep a second verify path open and mask client bugs.
+    #[test]
+    fn login_non_domain_separated_hash_rejected() {
+        let (sk, _, pubkey_hex, address) = test_keypair();
+        let uri = "/v1/auth/login";
+        let ts = current_ts();
+        let mut hasher = Sha256::new();
+        hasher.update(uri.as_bytes());
+        hasher.update(ts.as_bytes());
+        let hash = hasher.finalize();
+        let (sig, _): (Signature, _) = sk.sign_prehash(&hash).unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-xrpl-address", address.parse().unwrap());
+        headers.insert("x-xrpl-publickey", pubkey_hex.parse().unwrap());
+        headers.insert(
+            "x-xrpl-signature",
+            hex::encode(sig.to_der().as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-xrpl-timestamp", ts.parse().unwrap());
+
+        let result = verify_request(&headers, "POST", &[], uri);
+        assert_eq!(result.unwrap_err(), "signature verification failed");
+    }
+
+    /// SHA-512Half wrapping (Crossmark / GemWallet) must still compose
+    /// with the domain-separated empty-body canonical.
+    #[test]
+    fn login_sha512half_domain_separated_passes() {
+        let (sk, _, pubkey_hex, address) = test_keypair();
+        let uri = "/v1/auth/login";
+        let ts = current_ts();
+        let mut hasher = Sha256::new();
+        hasher.update(b"xperp/v1/login|");
+        hasher.update(uri.as_bytes());
+        hasher.update(b"|");
+        hasher.update(ts.as_bytes());
+        let canonical = hasher.finalize();
+        let sha512_full = Sha512::digest(canonical);
+        let sha512_half: [u8; 32] = sha512_full[..32].try_into().unwrap();
+        let (sig, _): (Signature, _) = sk.sign_prehash(&sha512_half).unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-xrpl-address", address.parse().unwrap());
+        headers.insert("x-xrpl-publickey", pubkey_hex.parse().unwrap());
+        headers.insert(
+            "x-xrpl-signature",
+            hex::encode(sig.to_der().as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-xrpl-timestamp", ts.parse().unwrap());
+
+        let result = verify_request(&headers, "POST", &[], uri);
+        assert!(result.is_ok(), "{result:?}");
     }
 }

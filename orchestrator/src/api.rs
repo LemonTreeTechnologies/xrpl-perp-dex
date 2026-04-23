@@ -1190,7 +1190,7 @@ async fn auth_login(headers: axum::http::HeaderMap) -> impl IntoResponse {
     // The login endpoint is exempt from the middleware, so we verify manually here.
     let body_bytes = b"";
     let uri = "/v1/auth/login";
-    match auth::verify_request(&headers, body_bytes, uri) {
+    match auth::verify_request(&headers, "POST", body_bytes, uri) {
         Ok(user) => {
             let token = auth::session_store()
                 .create(user.xrpl_address.clone())

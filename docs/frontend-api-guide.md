@@ -229,6 +229,18 @@ Then use `Authorization: Bearer <token>` on all subsequent requests. No more sig
 5. Same headers (including X-XRPL-Timestamp)
 ```
 
+**For POST with empty body (e.g. `/v1/auth/login`):**
+
+```
+1. timestamp = current Unix epoch seconds
+2. path = URI path, e.g. "/v1/auth/login"
+3. hash = SHA-256("xperp/v1/login|" + path_bytes + "|" + timestamp_bytes)
+4. signature = ECDSA_sign(hash, private_key)
+5. Same headers (including X-XRPL-Timestamp)
+```
+
+The `"xperp/v1/login|...|..."` prefix is a **mandatory domain separator** (SECURITY-REAUDIT-4 O-H1). Without it the server rejects the login. Older clients that signed `SHA-256(timestamp)` or `SHA-256(uri || timestamp)` for empty-body POST need to migrate.
+
 **Browser wallet note:** Crossmark and GemWallet apply SHA-512Half (first 32 bytes of SHA-512) before ECDSA internally. The server accepts both direct SHA-256 and SHA-512Half-wrapped signatures automatically.
 
 **Important:** Timestamp must be within 60 seconds of server time. Requests with missing or expired timestamps are rejected.
