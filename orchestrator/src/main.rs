@@ -12,6 +12,7 @@ mod db;
 mod election;
 mod orderbook;
 mod p2p;
+mod path_a_redkg;
 mod perp_client;
 mod pool_path_a_client;
 mod price_feed;
@@ -257,6 +258,13 @@ struct RunArgs {
     /// created from --enclave-url with shard_id=0.
     #[arg(long)]
     shards_config: Option<PathBuf>,
+
+    /// Local-only admin HTTP listener for the Path A re-DKG share-v2
+    /// export driver. Accepts `POST /admin/path-a/share-export`. Must
+    /// bind to a loopback address; remote bind is rejected at startup.
+    /// Defaults to off — the admin surface only exists when set.
+    #[arg(long)]
+    admin_listen: Option<String>,
 }
 
 // ── Funding rate ────────────────────────────────────────────────
@@ -741,8 +749,26 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Keep the share-v2 publish sender alive until main exits; the
-    // re-DKG export driver that drains it lands in Phase 6b.
+    // Path A re-DKG share-v2 export driver — spawned only when the
+    // operator opts in via --admin-listen. Binds loopback-only; the
+    // export function it fronts is also callable as a library from any
+    // future in-process driver (e.g., automated re-DKG orchestration).
+    if let Some(admin_listen) = cli.admin_listen.clone() {
+        let admin_state = Arc::new(path_a_redkg::AdminState {
+            client: pool_path_a_client::PoolPathAClient::new(&cli.enclave_url)?,
+            share_v2_pub_tx: share_v2_pub_tx.clone(),
+            groups: shard_router.path_a_groups().to_vec(),
+        });
+        let _admin_handle = tokio::spawn(async move {
+            if let Err(e) = path_a_redkg::spawn_admin_listener(admin_listen, admin_state).await {
+                error!("Path A admin listener exited: {}", e);
+            }
+        });
+    }
+    // Keep the share-v2 publish sender alive even when the admin
+    // listener is disabled — future in-process drivers (automated
+    // re-DKG) will clone it. Dropping it would close the outbound
+    // gossipsub arm in p2p.rs.
     let _share_v2_pub_tx = share_v2_pub_tx;
     // Drop the peer-quote publish sender handle here: any configured
     // announcer holds its own clone, and unconfigured shards never needed it.
