@@ -13,6 +13,7 @@ mod election;
 mod orderbook;
 mod p2p;
 mod perp_client;
+mod pool_path_a_client;
 mod price_feed;
 pub mod shard_router;
 mod singleton;
