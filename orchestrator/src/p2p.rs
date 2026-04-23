@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::election::ElectionMessage;
+use crate::pool_path_a_client::ShareEnvelopeV2;
 
 /// Load a libp2p Ed25519 identity from `path` if it exists, otherwise
 /// generate a fresh one and persist it.
@@ -217,6 +218,34 @@ pub enum PeerQuoteMessage {
     },
 }
 
+// ── Path A: v2 FROST share transport ────────────────────────────
+
+/// Path A targeted delivery of an ECDH+AES-GCM-sealed FROST share envelope.
+/// The ciphertext is already AEAD-bound to `recipient_pubkey`; peers whose
+/// local ECDH pubkey does not match drop the message silently, and matching
+/// peers forward to the local enclave via
+/// `POST /v1/pool/frost/share-import-v2`.
+///
+/// `recipient_pubkey` is a broadcast-filter hint only — security comes
+/// from the AEAD + sender attest-cache check the enclave performs on import.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ShareEnvelopeV2Message {
+    Deliver {
+        /// 33-byte compressed ECDH pubkey of the intended recipient.
+        recipient_pubkey: String,
+        /// Shard this share belongs to.
+        shard_id: u32,
+        /// 32-byte FROST group_id.
+        group_id: String,
+        /// FROST signer_id the share corresponds to.
+        signer_id: u32,
+        /// Sealed envelope as returned by
+        /// `POST /v1/pool/frost/share-export-v2`.
+        envelope: ShareEnvelopeV2,
+    },
+}
+
 // ── Network behaviour ───────────────────────────────────────────
 
 const ORDERS_TOPIC: &str = "perp-dex/orders";
@@ -224,6 +253,7 @@ const ELECTION_TOPIC: &str = "perp-dex/election";
 const SIGNING_TOPIC: &str = "perp-dex/signing";
 const EVENTS_TOPIC: &str = "perp-dex/events";
 const PEER_QUOTE_TOPIC: &str = "perp-dex/path-a/peer-quote";
+const SHARE_V2_TOPIC: &str = "perp-dex/path-a/share-v2";
 
 #[derive(NetworkBehaviour)]
 struct PerpBehaviour {
@@ -240,6 +270,7 @@ pub struct P2PNode {
     signing_topic: gossipsub::IdentTopic,
     events_topic: gossipsub::IdentTopic,
     peer_quote_topic: gossipsub::IdentTopic,
+    share_v2_topic: gossipsub::IdentTopic,
     /// Channel to send received batches to the orchestrator (validator).
     batch_tx: mpsc::Sender<OrderBatch>,
     /// Channel to receive batches to publish (sequencer).
@@ -260,6 +291,14 @@ pub struct P2PNode {
     peer_quote_publish_rx: Option<mpsc::Receiver<PeerQuoteMessage>>,
     /// Path A: received peer-quote announcements forwarded to verifier task.
     peer_quote_inbound_tx: Option<mpsc::Sender<PeerQuoteMessage>>,
+    /// Path A: outbound v2 share envelopes (published by share-export task).
+    share_v2_publish_rx: Option<mpsc::Receiver<ShareEnvelopeV2Message>>,
+    /// Path A: received share envelopes forwarded to import task
+    /// (only messages matching `local_ecdh_pubkey` are delivered — hint-only).
+    share_v2_inbound_tx: Option<mpsc::Sender<ShareEnvelopeV2Message>>,
+    /// Path A: local ECDH pubkey hex (33B lowercase) used as the recipient
+    /// filter on the v2 share topic. `None` = forward every received message.
+    local_ecdh_pubkey: Option<String>,
     /// Local signer credentials for handling incoming signing requests.
     local_signer: Option<LocalSigner>,
     /// Our peer ID.
@@ -327,6 +366,7 @@ impl P2PNode {
         let signing_topic = gossipsub::IdentTopic::new(SIGNING_TOPIC);
         let events_topic = gossipsub::IdentTopic::new(EVENTS_TOPIC);
         let peer_quote_topic = gossipsub::IdentTopic::new(PEER_QUOTE_TOPIC);
+        let share_v2_topic = gossipsub::IdentTopic::new(SHARE_V2_TOPIC);
 
         let mut node = P2PNode {
             swarm,
@@ -335,6 +375,7 @@ impl P2PNode {
             signing_topic,
             events_topic,
             peer_quote_topic,
+            share_v2_topic,
             batch_tx,
             publish_rx: None,
             election_inbound_tx,
@@ -345,6 +386,9 @@ impl P2PNode {
             events_inbound_tx: None,
             peer_quote_publish_rx: None,
             peer_quote_inbound_tx: None,
+            share_v2_publish_rx: None,
+            share_v2_inbound_tx: None,
+            local_ecdh_pubkey: None,
             local_signer: None,
             peer_id,
             peer_count,
@@ -376,6 +420,11 @@ impl P2PNode {
             .gossipsub
             .subscribe(&node.peer_quote_topic)
             .context("failed to subscribe to peer-quote topic")?;
+        node.swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&node.share_v2_topic)
+            .context("failed to subscribe to share-v2 topic")?;
 
         // Listen
         let addr: Multiaddr = listen_addr.parse().context("invalid listen address")?;
@@ -422,6 +471,29 @@ impl P2PNode {
     #[allow(dead_code)]
     pub fn set_peer_quote_inbound_channel(&mut self, tx: mpsc::Sender<PeerQuoteMessage>) {
         self.peer_quote_inbound_tx = Some(tx);
+    }
+
+    /// Path A: set the channel a local export task uses to publish v2 share
+    /// envelopes destined for a specific recipient peer.
+    #[allow(dead_code)]
+    pub fn set_share_v2_publish_channel(&mut self, rx: mpsc::Receiver<ShareEnvelopeV2Message>) {
+        self.share_v2_publish_rx = Some(rx);
+    }
+
+    /// Path A: set the channel received share envelopes addressed to us are
+    /// forwarded to (consumer calls `/v1/pool/frost/share-import-v2`).
+    #[allow(dead_code)]
+    pub fn set_share_v2_inbound_channel(&mut self, tx: mpsc::Sender<ShareEnvelopeV2Message>) {
+        self.share_v2_inbound_tx = Some(tx);
+    }
+
+    /// Path A: set our local ECDH pubkey (33-byte compressed, lowercase hex).
+    /// Used as the recipient filter on the v2 share topic — messages whose
+    /// `recipient_pubkey` doesn't match are dropped before forwarding.
+    #[allow(dead_code)]
+    pub fn set_local_ecdh_pubkey(&mut self, pk_hex: String) {
+        info!(ecdh_pubkey = %pk_hex, "P2P: local ECDH pubkey configured");
+        self.local_ecdh_pubkey = Some(pk_hex.to_lowercase());
     }
 
     /// Set local signer credentials for handling incoming signing requests.
@@ -561,12 +633,14 @@ impl P2PNode {
         let mut signing_rx = self.signing_request_rx.take();
         let mut events_rx = self.events_publish_rx.take();
         let mut peer_quote_rx = self.peer_quote_publish_rx.take();
+        let mut share_v2_rx = self.share_v2_publish_rx.take();
 
         let orders_topic_hash = self.orders_topic.hash();
         let election_topic_hash = self.election_topic.hash();
         let signing_topic_hash = self.signing_topic.hash();
         let events_topic_hash = self.events_topic.hash();
         let peer_quote_topic_hash = self.peer_quote_topic.hash();
+        let share_v2_topic_hash = self.share_v2_topic.hash();
 
         let mut signing_cleanup = tokio::time::interval(Duration::from_secs(5));
 
@@ -685,6 +759,32 @@ impl P2PNode {
                     }
                 }
 
+                // Path A: publish v2 share envelope to targeted recipient
+                Some(msg) = async {
+                    match &mut share_v2_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<ShareEnvelopeV2Message>>().await,
+                    }
+                } => {
+                    if let Ok(data) = serde_json::to_vec(&msg) {
+                        match self.swarm.behaviour_mut().gossipsub
+                            .publish(self.share_v2_topic.clone(), data) {
+                            Ok(_) => {
+                                let ShareEnvelopeV2Message::Deliver {
+                                    ref recipient_pubkey, shard_id, signer_id, ..
+                                } = msg;
+                                info!(
+                                    recipient_pubkey = %recipient_pubkey,
+                                    shard_id = shard_id,
+                                    signer_id = signer_id,
+                                    "published v2 share envelope"
+                                );
+                            }
+                            Err(e) => warn!("share-v2 publish failed: {}", e),
+                        }
+                    }
+                }
+
                 // Cleanup timed-out signing requests
                 _ = signing_cleanup.tick() => {
                     // oneshot senders that are closed (receiver dropped) get cleaned up
@@ -796,6 +896,29 @@ impl P2PNode {
                             }
                             Err(e) => {
                                 warn!("invalid peer-quote from {}: {}", propagation_source, e);
+                            }
+                        }
+                    } else if message.topic == share_v2_topic_hash {
+                        match serde_json::from_slice::<ShareEnvelopeV2Message>(&message.data) {
+                            Ok(msg) => {
+                                // Recipient filter: if we know our ECDH pubkey,
+                                // silently drop envelopes addressed to others.
+                                let ShareEnvelopeV2Message::Deliver {
+                                    ref recipient_pubkey, ..
+                                } = msg;
+                                if let Some(ref local_pk) = self.local_ecdh_pubkey {
+                                    if recipient_pubkey.to_lowercase() != *local_pk {
+                                        continue;
+                                    }
+                                }
+                                if let Some(ref tx) = self.share_v2_inbound_tx {
+                                    if let Err(e) = tx.send(msg).await {
+                                        error!("failed to forward share-v2: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("invalid share-v2 from {}: {}", propagation_source, e);
                             }
                         }
                     }
