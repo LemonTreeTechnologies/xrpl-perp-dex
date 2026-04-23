@@ -59,3 +59,7 @@ toml = "0.8"
 
 # Error handling
 anyhow = "1"
+
+[dev-dependencies]
+# Test fixtures (O-L3: escrow-seed file resolver)
+tempfile = "3"

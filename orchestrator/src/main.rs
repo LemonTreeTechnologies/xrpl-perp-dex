@@ -78,9 +78,15 @@ enum Command {
         /// Path to signers config JSON (must have "signers" array with xrpl_address)
         #[arg(long)]
         signers_config: PathBuf,
-        /// XRPL escrow account seed (secret)
+        /// XRPL escrow account seed (secret). Deprecated — prefer
+        /// --escrow-seed-file because argv is visible to every user
+        /// on the host via `ps`. O-L3.
+        #[arg(long, conflicts_with = "escrow_seed_file")]
+        escrow_seed: Option<String>,
+        /// Path to a 0600-mode file containing the escrow seed on its
+        /// first line. Preferred over --escrow-seed. O-L3.
         #[arg(long)]
-        escrow_seed: String,
+        escrow_seed_file: Option<PathBuf>,
         /// Escrow r-address (optional — skips derivation from seed, needed for Ed25519 sEd seeds)
         #[arg(long)]
         escrow_address: Option<String>,
@@ -164,9 +170,14 @@ enum Command {
         /// XRPL JSON-RPC URL (if set, re-submits SignerListSet)
         #[arg(long)]
         xrpl_url: Option<String>,
-        /// Escrow seed (required if --xrpl-url is set, to re-submit SignerListSet)
-        #[arg(long)]
+        /// Escrow seed (deprecated — use --escrow-seed-file). Required
+        /// if --xrpl-url is set, to re-submit SignerListSet. O-L3.
+        #[arg(long, conflicts_with = "escrow_seed_file")]
         escrow_seed: Option<String>,
+        /// Path to a 0600-mode file containing the escrow seed on its
+        /// first line. Preferred over --escrow-seed. O-L3.
+        #[arg(long)]
+        escrow_seed_file: Option<PathBuf>,
     },
 }
 
@@ -374,13 +385,18 @@ async fn main() -> Result<()> {
             xrpl_url,
             signers_config,
             escrow_seed,
+            escrow_seed_file,
             escrow_address,
             disable_master,
         }) => {
+            let seed = cli_tools::resolve_escrow_seed(
+                escrow_seed.as_deref(),
+                escrow_seed_file.as_deref(),
+            )?;
             return cli_tools::escrow_setup(
                 &xrpl_url,
                 &signers_config,
-                &escrow_seed,
+                &seed,
                 escrow_address.as_deref(),
                 disable_master,
             )
@@ -421,13 +437,26 @@ async fn main() -> Result<()> {
             config,
             xrpl_url,
             escrow_seed,
+            escrow_seed_file,
         }) => {
+            // O-L3: resolve seed from --escrow-seed-file when provided.
+            // Both flags are optional for operator_add (xrpl_url may be
+            // unset, in which case no seed is needed); only validate
+            // when at least one was given.
+            let seed = if escrow_seed.is_some() || escrow_seed_file.is_some() {
+                Some(cli_tools::resolve_escrow_seed(
+                    escrow_seed.as_deref(),
+                    escrow_seed_file.as_deref(),
+                )?)
+            } else {
+                None
+            };
             return cli_tools::operator_add(
                 &enclave_url,
                 &name,
                 &config,
                 xrpl_url.as_deref(),
-                escrow_seed.as_deref(),
+                seed.as_deref(),
             )
             .await;
         }

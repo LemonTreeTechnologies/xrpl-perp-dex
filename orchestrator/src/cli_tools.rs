@@ -1,10 +1,65 @@
 //! CLI subcommands for operator onboarding and escrow setup.
 
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::xrpl_signer;
+
+/// O-L3: resolve an escrow seed from either an inline CLI arg
+/// (deprecated — visible to `ps`) or a file. The file mode is
+/// checked on unix: if anything outside the owner has access we
+/// warn loudly so operators notice during the ceremony.
+///
+/// Exactly one of `seed` / `seed_file` must be set; clap already
+/// enforces the conflicts-with rule at parse time, but we re-check
+/// here for defence in depth.
+pub fn resolve_escrow_seed(seed: Option<&str>, seed_file: Option<&Path>) -> Result<String> {
+    match (seed, seed_file) {
+        (Some(s), None) => {
+            warn!(
+                "escrow seed passed via --escrow-seed (argv); it is visible to every local \
+                user via `ps`. Use --escrow-seed-file for future ceremonies."
+            );
+            Ok(s.trim().to_string())
+        }
+        (None, Some(path)) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let meta = std::fs::metadata(path)
+                    .with_context(|| format!("cannot stat {}", path.display()))?;
+                let mode = meta.mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    warn!(
+                        path = %path.display(),
+                        mode = format!("{mode:o}"),
+                        "escrow seed file is not 0600. `chmod 0600` before the next ceremony."
+                    );
+                }
+            }
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("cannot read {}", path.display()))?;
+            let first = content
+                .lines()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("escrow seed file is empty: {}", path.display()))?
+                .trim();
+            if first.is_empty() {
+                anyhow::bail!("escrow seed file first line is empty: {}", path.display());
+            }
+            Ok(first.to_string())
+        }
+        (Some(_), Some(_)) => {
+            anyhow::bail!("--escrow-seed and --escrow-seed-file are mutually exclusive");
+        }
+        (None, None) => {
+            anyhow::bail!("one of --escrow-seed or --escrow-seed-file is required");
+        }
+    }
+}
 
 // ── XRPL binary serialization ──────────────────────────────────
 //
@@ -912,4 +967,50 @@ pub async fn cli_balance(api_url: &str, seed: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_escrow_seed_prefers_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seed");
+        std::fs::write(&path, "shSeedValueOnFirstLine\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let got = resolve_escrow_seed(None, Some(&path)).unwrap();
+        assert_eq!(got, "shSeedValueOnFirstLine");
+    }
+
+    #[test]
+    fn resolve_escrow_seed_accepts_argv_with_warning() {
+        let got = resolve_escrow_seed(Some("shArgvSeed"), None).unwrap();
+        assert_eq!(got, "shArgvSeed");
+    }
+
+    #[test]
+    fn resolve_escrow_seed_rejects_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seed");
+        std::fs::write(&path, "sh\n").unwrap();
+        assert!(resolve_escrow_seed(Some("s"), Some(&path)).is_err());
+    }
+
+    #[test]
+    fn resolve_escrow_seed_rejects_neither() {
+        assert!(resolve_escrow_seed(None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_escrow_seed_rejects_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seed");
+        std::fs::write(&path, "\n").unwrap();
+        assert!(resolve_escrow_seed(None, Some(&path)).is_err());
+    }
 }
