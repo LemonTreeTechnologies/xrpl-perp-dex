@@ -899,6 +899,22 @@ async fn close_position(
         }
     };
 
+    // O-M3: explicit ownership assertion as defense-in-depth against an
+    // enclave bug that leaks another user's position into this caller's
+    // balance response. The query is already keyed on `caller`, so this
+    // should never trip — it becomes a 403 tripwire on the day it does.
+    if let Some(pos_user) = position.get("user_id").and_then(|v| v.as_str()) {
+        if pos_user != caller {
+            error!(
+                caller = %caller,
+                position_user = %pos_user,
+                position_id,
+                "O-M3 tripwire: enclave returned position owned by a different user"
+            );
+            return err(StatusCode::FORBIDDEN, "position ownership mismatch").into_response();
+        }
+    }
+
     let pos_side = position["side"].as_str().unwrap_or("long");
     let pos_size_str = position["size"].as_str().unwrap_or("0");
     let pos_size = match pos_size_str.parse::<FP8>() {
