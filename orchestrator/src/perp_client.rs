@@ -13,12 +13,13 @@ pub struct PerpClient {
 }
 
 impl PerpClient {
-    /// Create a new client. TLS verification is disabled (self-signed cert).
+    /// Create a new client. TLS verification is relaxed because the
+    /// enclave serves a self-signed cert; `ensure_loopback_url` gates
+    /// that relaxation on the URL actually being loopback (O-L4).
     pub fn new(base_url: &str) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
+        crate::http_helpers::ensure_loopback_url(base_url)
+            .context("PerpClient requires a loopback enclave URL (O-L4)")?;
+        let client = crate::http_helpers::loopback_http_client(std::time::Duration::from_secs(30))
             .context("failed to build reqwest client")?;
 
         Ok(Self {

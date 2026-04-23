@@ -10,6 +10,7 @@ mod cli_tools;
 mod commitment;
 mod db;
 mod election;
+mod http_helpers;
 mod orderbook;
 mod p2p;
 mod path_a_redkg;

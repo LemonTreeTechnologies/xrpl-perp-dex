@@ -255,7 +255,15 @@ pub async fn process_withdrawal(
         "built unsigned multisig Payment tx"
     );
 
-    // Step 4: Collect signatures from quorum signers
+    // Step 4: Collect signatures from quorum signers.
+    //
+    // O-L4 known gap: each `signer.enclave_url` points at a cross-VM
+    // peer enclave that currently serves a self-signed cert, so we
+    // must still accept-invalid-certs here. Replacing this with
+    // default TLS verification is gated on enclave-side E-M2
+    // (CA-signed certs or pinned-pubkey verification). Until then
+    // this is the only non-loopback client in the orchestrator that
+    // trusts the wire via the broken SGX cert chain rather than TLS.
     let http = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()

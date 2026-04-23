@@ -541,11 +541,11 @@ impl P2PNode {
         request_id: &str,
         hash_hex: &str,
     ) -> SigningMessage {
-        let http = match reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .timeout(Duration::from_secs(15))
-            .build()
-        {
+        // O-L4: `local_signer.enclave_url` is loopback (the current
+        // node's own enclave). The shared factory carries the self-
+        // signed-cert relaxation so every loopback-client site reads
+        // the same way.
+        let http = match crate::http_helpers::loopback_http_client(Duration::from_secs(15)) {
             Ok(c) => c,
             Err(e) => {
                 return SigningMessage::Response {

@@ -204,10 +204,12 @@ pub async fn operator_setup(
     name: &str,
     output: Option<&std::path::Path>,
 ) -> Result<()> {
-    let http = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    // O-L4: operator tooling talks to the local enclave — enforce
+    // loopback and reuse the shared factory so that remains
+    // true if someone repoints `--enclave-url` at an attacker host.
+    crate::http_helpers::ensure_loopback_url(enclave_url)
+        .context("operator_setup requires a loopback enclave URL (O-L4)")?;
+    let http = crate::http_helpers::loopback_http_client(std::time::Duration::from_secs(30))?;
 
     println!("Operator Setup");
     println!("==============");
@@ -682,10 +684,11 @@ pub async fn operator_add(
     }
 
     // Step 1: Generate keypair
-    let http = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    // O-L4: operator_add targets the local enclave — enforce loopback
+    // and reuse the shared factory.
+    crate::http_helpers::ensure_loopback_url(enclave_url)
+        .context("operator_add requires a loopback enclave URL (O-L4)")?;
+    let http = crate::http_helpers::loopback_http_client(std::time::Duration::from_secs(30))?;
 
     println!("[1/3] Generating keypair in enclave...");
     let resp: GenerateResponse = http

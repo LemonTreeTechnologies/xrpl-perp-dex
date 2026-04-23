@@ -70,10 +70,10 @@ pub async fn sign_commitment(
     let digest = hasher.finalize();
     let hash_hex = format!("0x{}", hex::encode(digest));
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    // O-L4: the enclave URL is loopback by construction (derived from
+    // `--enclave-url` which must pass `ensure_loopback_url`). Use the
+    // shared factory so that invariant travels with the call site.
+    let client = crate::http_helpers::loopback_http_client(std::time::Duration::from_secs(30))?;
 
     let resp = client
         .post(format!("{enclave_url}/pool/sign"))
