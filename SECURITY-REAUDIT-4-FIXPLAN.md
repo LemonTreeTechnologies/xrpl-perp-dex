@@ -262,20 +262,21 @@ orchestrator from seed: rpY3wEh813BHmzKMisx1yLUNjQREt1ULzJ   ← what auth signs
 
 ## APP-PATHA-1 — `dcap_verify.cpp` strict QV-result policy is not configurable
 
-**Severity:** Medium (mainnet safety regression risk).
+**Severity:** Medium.
+**Status (split):**
+- **Policy content** (which verdicts to accept on Azure DCsv3): **Accepted-risk** — see [`docs/accepted-platform-risks.md`](docs/accepted-platform-risks.md) entry P-1. Decision: `{OK, SW_HARDENING_NEEDED}` is the correct policy for any Azure DCsv3 deployment given INTEL-SA-00615's nature (MMIO Stale Data, mitigation requires OS-level VERW which Azure applies but cannot prove via DCAP). This is no longer "open until tightened" — it is the documented intentional choice.
+- **Implementation form** (hardcoded vs config-driven): **Open** — must be fixed before any deploy beyond the current Azure DCsv3 testnet. Hardcoded allowlists obscure the policy from operators and break audit-traceability.
 **File:** `EthSignerEnclave/Enclave/dcap_verify.cpp` (commit `8934f63` — landed 2026-04-26).
 
-**Issue:** during this session we **relaxed** the strict `SGX_QL_QV_RESULT_OK`-only policy to also accept `SGX_QL_QV_RESULT_SW_HARDENING_NEEDED`, because Azure DCsv3 currently reports the latter (INTEL-SA-00615). The relaxation is **hardcoded** in the enclave. There is no config flag.
+**Background.** This session relaxed the strict `SGX_QL_QV_RESULT_OK`-only check to also accept `SGX_QL_QV_RESULT_SW_HARDENING_NEEDED`, because Azure DCsv3 currently reports the latter. The relaxation is hardcoded in the enclave. The *content* of the relaxation is correct (operator @77ph reviewed the underlying advisory INTEL-SA-00615 and accepted P-1 in `accepted-platform-risks.md` on 2026-04-26). The *form* (hardcode rather than config) still needs to ship.
 
-**Risk:** if mainnet hardware reports the same verdict (or worse), the enclave will accept it without operator awareness. The original audit logic ("strict OK only on mainnet") is now silently weakened.
-
-**Fix:** turn the verdict allowlist into an `ecall_verify_peer_dcap_quote` parameter (or a sealed config value set at first run). Host reads `PERP_DCAP_ACCEPTED_QV_RESULTS` env var (e.g. `OK,SW_HARDENING_NEEDED` for testnet, `OK` for mainnet) and passes it to the ecall. Encode as bitmask of known qv_result values.
+**What needs to ship.** Turn the verdict allowlist into an `ecall_verify_peer_dcap_quote` parameter (or a sealed config value set at first run). Host reads `PERP_DCAP_ACCEPTED_QV_RESULTS` env var, defaults to `OK,SW_HARDENING_NEEDED` (matching P-1), passes the bitmask to the ecall. The deploy procedure documents which environments use which value (right now: Azure DCsv3 testnet AND any future Azure DCsv3 mainnet → `OK,SW_HARDENING_NEEDED`; non-Azure SGX hardware that legitimately attests OK → `OK` only).
 
 **Effort:** ~1 day (enclave EDL change → libapp wrapper → host plumbing → docs); requires another enclave bump cycle.
 
-**Until then:** mainnet deploy MUST verify the policy is OK-only by inspecting the running binary's allowlist before promotion. Concretely: do not deploy commit `8934f63` (or anything descending from it) to mainnet without first re-tightening or making it config-driven.
+**Until the config-driven version ships:** the running binary IS already on the policy P-1 documents. There is no behavioural change required pre-mainnet; the gap is documentation/auditability of the policy, not the policy itself. Treat as "ship a refactor, not a security fix."
 
-**Architectural context.** This finding sits inside a broader question — the orchestrator+enclave use DCAP-based peer cross-attestation as the cluster-trust model, while the sibling project Phoenix PM (`77ph/SGX_project`) uses an operator-signed roster instead. The divergence is intentional in each project (each followed its own audit's prescription), but raises a question the next audit should address explicitly. Full reasoning, comparison, and the question for the auditor are in [`docs/cluster-trust-model-decision.md`](docs/cluster-trust-model-decision.md). Anyone touching `dcap_verify.cpp`, the verdict policy, or Path A peer-attest should read that ADR first.
+**Architectural context.** This finding sits inside a broader question — the orchestrator+enclave use DCAP-based peer cross-attestation as the cluster-trust model, while the sibling project Phoenix PM (`77ph/SGX_project`) uses an operator-signed roster instead. The divergence is intentional in each project (each followed its own audit's prescription), but raises a question the next audit should address explicitly. Full reasoning, comparison, and the question for the auditor are in [`docs/cluster-trust-model-decision.md`](docs/cluster-trust-model-decision.md). Anyone touching `dcap_verify.cpp`, the verdict policy, or Path A peer-attest should read that ADR first, then `docs/accepted-platform-risks.md` P-1 for the verdict-policy reasoning.
 
 ## APP-WIRE-1 — Path A `import-v2` wire mismatch (export returns nested envelope, import expects top-level fields)
 
