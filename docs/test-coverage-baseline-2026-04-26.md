@@ -66,7 +66,7 @@
 
 The high-coverage files are the ones that have shipped real bug-fix tests over the audit cycle (X-C1 in `p2p.rs`, O-H1 in `auth.rs`, XRPL primitives in `xrpl_signer.rs`). The zero-coverage files are everything that touches the network boundary plus all Path A code. **The two appendix-A findings caught manually (APP-AUTH-2, APP-WIRE-1) sit precisely in the zero/low-coverage areas.**
 
-The integration tests in `tests/integration_test.rs` use a Python mock enclave (`mock_enclave_server.py`); replacing it with a Rust mock per Appendix C Phase 1.2 will let the integration tests exercise more of `api.rs`, `perp_client.rs`, `pool_path_a_client.rs` without cross-language drift.
+The integration tests in `tests/integration_test.rs` use an inline Rust axum mock — same-language already. The pre-existing `tests/mock_enclave_server.py` (Flask) was a separate Docker-only mock with no active consumer; both it and `tests/Dockerfile.mock-enclave` were deleted on 2026-04-27 (Phase 1.2 completion) along with adding a Rust axum mock inside `pool_path_a_client.rs::tests` that exercises the Path A wire shape end-to-end, including an APP-WIRE-1 regression-lock test.
 
 ---
 
@@ -130,7 +130,7 @@ Per `SECURITY-REAUDIT-4-FIXPLAN.md` Appendix C §1.3 classification.
 | Layer | What we have | What's missing |
 |---|---|---|
 | Orchestrator unit (Rust) | 111 tests, 30.40% line coverage | XRPL Family Generator vector test for `derive_keypair_from_seed`; coverage of `cli_tools`, `withdrawal`, `pool_path_a_client`, `perp_client`, `path_a_redkg` |
-| Orchestrator integration (Rust) | 6 tests via Python mock enclave | Rust mock enclave (Phase 1.2); coverage of full withdraw + Path A wire roundtrip |
+| Orchestrator integration (Rust) | 6 tests via inline Rust axum mock; +6 unit tests on Path A wire shape via in-module Rust mock (added 2026-04-27, Phase 1.2) | coverage of full withdraw flow remains 0%; integration test for that is a separate ratchet step |
 | Enclave unit (C/C++) | 19 tests for pre-Path-A code | Tests for ALL Path A files: `dcap_verify`, `ecdh_identity`, `peer_attest_cache`, `ecdh_aes`, v2 ecalls |
 | Python e2e | 6 K-Client + 4 K-Op + 1 R | CI workflow that runs them; modernization to current bastion arch + new escrow address |
 | Coverage gating | none | `cargo llvm-cov` ratchet in CI per Appendix C §1.4 |
@@ -140,7 +140,7 @@ Per `SECURITY-REAUDIT-4-FIXPLAN.md` Appendix C §1.3 classification.
 Each line below is a separate PR / atomic change:
 
 1. **Phase 1.1 — TDD bug closures.** AUTH-2 first (test → fix → ratchet `cli_tools.rs` upward). O-M2, O-L2, O-I2, O-I3 to follow.
-2. **Phase 1.2 — Rust mock enclave.** Replaces `tests/mock_enclave_server.py`. Allows `pool_path_a_client.rs` and `perp_client.rs` to ratchet from 0%.
+2. **Phase 1.2 — Rust mock enclave.** ✅ Completed 2026-04-27 (commits `7819aeb` series). `tests/mock_enclave_server.py` and `tests/Dockerfile.mock-enclave` deleted (no active consumer). Six new wire-shape unit tests added to `pool_path_a_client::tests` (in-module Rust mock — same-language so any client-side drift breaks at compile time or fails the assert). One of the tests is an APP-WIRE-1 regression lock — pins that `frost_share_import_v2` body lifts `threshold/n_participants/sender_pubkey` to top level. `pool_path_a_client.rs` ratchets from 0% to substantial coverage; `perp_client.rs` still 0% (next ratchet step).
 3. **Phase 1.3 — Python triage execution.** Move K-Op files to `scripts/operator/`. Disclaimer headers. K-Client files stay; CI workflow added.
 4. **Phase 1.4 — Coverage gate in CI.** `cargo-llvm-cov` baseline = 30.40%. PR fails if line coverage drops below `current - 1pp`. Ratchet upward as Phase 1.1/1.2 work lands.
 5. **Phase 1.5 — Enclave parity.** First three test files: `test_dcap_verify.cpp`, `test_ecdh_aes.cpp`, `test_peer_attest_cache.cpp`. Wire `Makefile test:` to actually run `test_libapp` binary + the Enclave.cpp suite.

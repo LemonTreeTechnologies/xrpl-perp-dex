@@ -1,9 +1,0 @@
-FROM python:3.11-slim
-
-WORKDIR /app
-
-RUN pip install flask
-
-COPY mock_enclave_server.py .
-
-CMD ["python3", "mock_enclave_server.py"]

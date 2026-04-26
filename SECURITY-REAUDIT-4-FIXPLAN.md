@@ -351,7 +351,7 @@ These are **not** suggestions. They are project-level invariants for any code th
    - `tests/test_xrpl_withdrawal.py` — observes XRPL ledger, asserts state. Black-box.
    - `scripts/setup_testnet_escrow.py` — operator harness, drives faucet + signs txs externally.
 
-4. **Python is NOT allowed when it plays the role of an internal component.** A test where Rust production code calls *into* a Python process — the production-side caller and the Python-side callee can drift in their type contracts, and CI cannot detect drift across the language boundary. Today `tests/integration_test.rs` (Rust) calls `tests/mock_enclave_server.py` (Python) standing in for the real enclave. That's the anti-pattern. The fake enclave must move to Rust (axum, same `tests/` dir) so its route signatures share types with `pool_path_a_client.rs` / `perp_client.rs` and the compiler catches drift.
+4. **Python is NOT allowed when it plays the role of an internal component.** A test where Rust production code calls *into* a Python process — the production-side caller and the Python-side callee can drift in their type contracts, and CI cannot detect drift across the language boundary. The historical `tests/mock_enclave_server.py` (Flask) and its `Dockerfile.mock-enclave` were a Docker-only stand-in for the real enclave with no active consumer; deleted 2026-04-27 (Phase 1.2). Same-language Rust mocks now live inline in `tests/integration_test.rs` (full API exercised) and inside `src/pool_path_a_client.rs::tests` (Path A wire-shape locked in unit tests). Any future addition of a cross-language internal mock is forbidden by this rule.
 
 5. **The deploy parallel.** Manual `ssh + scp + systemctl restart` chains are the operational analogue of cross-language mocks: they "work" until the deploy goes wrong, and then nobody can tell whether the procedure or the tooling failed. Same rule: deployment logic that touches our binaries lives as a Rust subcommand of the orchestrator binary, or as bash with explicit per-step assertions checked in to the repo. Not as a notebook of one-off SSH calls.
 
@@ -360,7 +360,7 @@ These are **not** suggestions. They are project-level invariants for any code th
 | Layer | Tests today | Notes |
 |---|---|---|
 | Orchestrator unit (Rust) | 109 `#[test]` fns across 12 modules | covers auth, p2p, election, orderbook, vault_mm, ws, xrpl_signer, etc. |
-| Orchestrator integration (Rust) | 6 tests in `tests/integration_test.rs` (~287 LoC) | uses Python mock enclave — API drift risk (see C.1 §4) |
+| Orchestrator integration (Rust) | 6 tests in `tests/integration_test.rs` (~287 LoC) | uses inline Rust axum mock — same-language, no drift risk |
 | Orchestrator e2e | none in Rust | 11 Python files in `tests/` (last touched 2026-04-02 to 2026-04-17) — pre-X-C1, pre-Path A; classification pending in Phase 1.3 |
 | Enclave unit (C/C++) | not measured yet | needs grep in `EthSignerEnclave/` repo as Phase 1.0 |
 | Coverage measurement | none | no `cargo llvm-cov` / `grcov` in CI |
@@ -387,12 +387,13 @@ For each open finding, **the test is written first** (and fails). Then the fix l
 | O-L2 | Rust unit test: zero-balance fallback no longer fires for unknown user (returns 404 instead). | Drop fallback. |
 | O-I2 | Rust unit test on passive-replication path. | Replace `ON CONFLICT DO NOTHING` with stricter handling. |
 
-### Phase 1.2 — replace Python mock enclave with Rust mock (1 day)
+### Phase 1.2 — Python internal mock removal (✅ completed 2026-04-27)
 
-- Port `tests/mock_enclave_server.py` to a Rust axum binary in `tests/mock_enclave/`.
-- The mock binary's route signatures share types with `pool_path_a_client.rs` and `perp_client.rs` — so any production-side signature change breaks the mock at compile time.
-- Update `tests/integration_test.rs` to spawn the Rust mock instead of the Python one.
-- Delete `tests/mock_enclave_server.py` and `tests/Dockerfile.mock-enclave`.
+The original plan was "port `mock_enclave_server.py` to Rust". On inspection it turned out the existing `tests/integration_test.rs` already used an inline Rust axum mock; the Python file was a separate Docker-only stand-in with no active consumer. Actual deliverable shipped:
+
+- Deleted `tests/mock_enclave_server.py` and `tests/Dockerfile.mock-enclave`.
+- Added six wire-shape unit tests inside `src/pool_path_a_client.rs::tests` using a same-language inline axum mock. The mock asserts on body shape inline (`for f in [...] { assert!(body.get(f).is_some()) }`), so any drift between client and the enclave-server's actual route contract fails the test at CI time. One test is explicitly an APP-WIRE-1 regression lock.
+- `pool_path_a_client.rs` ratchets from 0% to substantial coverage. `perp_client.rs` and `withdrawal.rs` remain at 0% — next ratchet step.
 
 ### Phase 1.3 — triage Python e2e files (½ day)
 
