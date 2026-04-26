@@ -58,12 +58,21 @@ impl ShardRouter {
         let mut path_a_groups = Vec::new();
         for entry in &config.shards {
             let client = PerpClient::new(&entry.enclave_url)?;
-            match client.set_shard_id(entry.shard_id).await {
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(shard_id = entry.shard_id, url = %entry.enclave_url,
-                        "set_shard_id not supported by enclave: {}", e);
-                }
+            // O-I3 (audit): if `set_shard_id` is not understood by the
+            // remote enclave, the orchestrator continues but the enclave
+            // is effectively running with `shard_id = 0` regardless of
+            // config. Operators must alert on `audit.shard_id_unsupported
+            // = true` in journalctl for multi-shard deployments. Single-
+            // shard deploys are unaffected.
+            if let Err(e) = client.set_shard_id(entry.shard_id).await {
+                tracing::warn!(
+                    target: "audit",
+                    shard_id_unsupported = true,
+                    shard_id = entry.shard_id,
+                    url = %entry.enclave_url,
+                    "set_shard_id not supported by enclave (running as shard 0): {}",
+                    e
+                );
             }
             info!(shard_id = entry.shard_id, url = %entry.enclave_url, "shard registered");
             if let Some(gid) = &entry.frost_group_id {
@@ -91,11 +100,21 @@ impl ShardRouter {
     /// Build a single-shard router (no config file needed).
     pub async fn single(enclave_url: &str, shard_id: u32) -> Result<Self> {
         let client = PerpClient::new(enclave_url)?;
+        // See `from_config` — same O-I3 audit comment applies. For a
+        // single-shard deploy the warning is informational (an older
+        // enclave silently runs as shard 0 anyway, which is the correct
+        // value for a 1-shard cluster).
         match client.set_shard_id(shard_id).await {
             Ok(_) => info!(shard_id, url = %enclave_url, "single-shard router"),
             Err(e) => {
-                tracing::warn!(shard_id, url = %enclave_url,
-                    "set_shard_id not supported by enclave (old binary?): {}", e);
+                tracing::warn!(
+                    target: "audit",
+                    shard_id_unsupported = true,
+                    shard_id,
+                    url = %enclave_url,
+                    "set_shard_id not supported by enclave (running as shard 0): {}",
+                    e
+                );
             }
         }
 
