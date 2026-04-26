@@ -17,6 +17,7 @@ mod path_a_redkg;
 mod perp_client;
 mod pool_path_a_client;
 mod price_feed;
+mod rate_limit;
 pub mod shard_router;
 mod singleton;
 mod trading;

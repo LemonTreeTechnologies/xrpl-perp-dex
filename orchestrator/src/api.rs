@@ -28,6 +28,16 @@ use tracing::{error, warn};
 use tokio::sync::broadcast;
 
 use crate::auth;
+use crate::rate_limit::RateLimiter;
+
+/// O-L2: per-authenticated-address rate limiter for the balance
+/// endpoint. 30 admits per 60-second sliding window matches the
+/// X-C1 P2P signing limiter. Lazy-init via OnceLock to keep the
+/// constructor `const`-friendly.
+fn balance_rate_limiter() -> &'static RateLimiter {
+    static RL: std::sync::OnceLock<RateLimiter> = std::sync::OnceLock::new();
+    RL.get_or_init(|| RateLimiter::new(std::time::Duration::from_secs(60), 30))
+}
 use crate::orderbook::{OrderType, TimeInForce};
 use crate::perp_client::PerpClient;
 use crate::trading::TradingEngine;
@@ -1029,6 +1039,7 @@ async fn get_orders(
 
 async fn get_balance(
     State(state): State<Arc<AppState>>,
+    axum::Extension(caller): axum::Extension<crate::auth::AuthenticatedUser>,
     Query(params): Query<UserIdQuery>,
 ) -> impl IntoResponse {
     let user_id = match params.user_id {
@@ -1037,6 +1048,19 @@ async fn get_balance(
             return err(StatusCode::BAD_REQUEST, "user_id query param required").into_response()
         }
     };
+    // O-L2: cap probes-per-caller to bound the timing channel left
+    // by the zero-balance fallback. The fallback is intentional
+    // (see SECURITY-REAUDIT-4 O-L2 — privacy-preserving), but a
+    // brute-force probe at thousands of qps could still drain the
+    // channel given enough time. Rate-limit per authenticated
+    // address: same shape as the X-C1 P2P rate limit.
+    if !balance_rate_limiter().check_and_record(&caller.xrpl_address) {
+        return err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "balance probe rate exceeded — try again in a few seconds",
+        )
+        .into_response();
+    }
     match state.perp.get_balance(&user_id).await {
         Ok(val) => (StatusCode::OK, Json(val)).into_response(),
         Err(_) => {
