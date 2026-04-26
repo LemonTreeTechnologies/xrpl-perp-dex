@@ -10,19 +10,13 @@
 
 2. **Therefore every enclave bump = key rotation.** All XRPL multisig keys are regenerated. The on-chain SignerList becomes invalid the moment we swap binaries, so a SignerListSet is mandatory and non-conditional.
 
-3. **Testnet vs mainnet.** Testnet (escrow `rUjznEhZBujfE1Fz6TxEDyi4rrARvkBwd2`) tolerates a single-wave rip-and-replace because no XRP is at risk. Mainnet requires the staged Path B ceremony from `deployment-procedure.md §11.5` (staging port, peer DCAP verify, two-step SignerListSet with quorum→3 buffer, soak, shred, promote). Do **not** export testnet shortcuts to mainnet.
+3. **Testnet vs mainnet.** Testnet tolerates a single-wave rip-and-replace because no XRP is at risk. The testnet escrow is **also rotated** each bump — a fresh faucet-funded escrow + fresh SignerListSet, not a re-keying of an existing one. The previous escrow is left orphaned. Mainnet behaves differently: same escrow address forever, key rotation only via `deployment-procedure.md §11.5` Path B (staging port, peer DCAP verify, two-step SignerListSet with quorum→3 buffer, soak, shred, promote). Do **not** export testnet shortcuts to mainnet.
 
 4. **Out-of-cluster services on Hetzner.** The Hetzner dev enclave on `:9089` and dev orchestrator on `:3003` (units `perp-dex-enclave-dev.service` and `perp-dex-orchestrator-dev.service`) are NOT part of the testnet cluster — different escrow, different p2p port. The retired mainnet enclave on `:9088` (PID from last boot, no orchestrator attached) is also outside scope. **Leave all three alone.** Stop/start commands in this procedure target only the 3 Azure VMs.
 
 ## 1. Pre-flight
 
-**Out-of-infra prerequisite.** The secret seed of testnet escrow `rUjznEhZBujfE1Fz6TxEDyi4rrARvkBwd2` is **not** stored on Hetzner or Azure. Locate it in your personal secret store (password manager) and stage it on Hetzner as a 0600-mode file before step 7. Without it step 7 cannot run.
-
-```bash
-# Stage the seed (single line, no trailing newline). Delete the file after step 7.
-ssh andrey@94.130.18.162 'umask 077 && cat > /tmp/testnet-escrow-seed && chmod 600 /tmp/testnet-escrow-seed'
-# Paste the seed, press Ctrl+D.
-```
+**Self-contained prerequisites.** This procedure does not require any operator-held secrets. The testnet escrow seed lives at the canonical path `~/.secrets/perp-dex-xrpl/escrow-testnet.json` on Hetzner (mode 0600). If that file is missing or stale, step 7 creates a fresh testnet escrow via faucet and writes the new seed there — no human-memory dependency. See `feedback_secrets_canonical_files.md` for the rule.
 
 Run from your local laptop. All of these are read-only.
 
@@ -199,56 +193,91 @@ ssh andrey@94.130.18.162 "
 
 Each `/tmp/node-N.json` contains the new XRPL address, compressed pubkey, session key. The enclave seals the corresponding private key locally.
 
-## 7. Build unified signers config + submit SignerListSet
+## 7. Create fresh testnet escrow + register signers (one shot)
 
-Run on Hetzner, where `~/phase7-entries/` now has all three entries:
+On testnet we do **not** preserve the escrow across enclave bumps. The seed for the previous escrow is rarely captured (the original `setup_testnet_escrow.py` printed it to stdout only, see `feedback_secrets_canonical_files.md`), and faucet escrows are free anyway. Each bump = fresh testnet escrow with a fresh seed file.
+
+The patched `setup_testnet_escrow.py` does both in one shot: faucet-fund a new escrow, submit SignerListSet for the 3 new node addresses, disable master key, write seed to `~/.secrets/perp-dex-xrpl/escrow-testnet.json` (0600).
+
+```bash
+ssh andrey@94.130.18.162 "
+  cd ~/llm-perp-xrpl
+
+  # Move aside any prior testnet seed file (from a previous bump)
+  if [ -f ~/.secrets/perp-dex-xrpl/escrow-testnet.json ]; then
+    mv ~/.secrets/perp-dex-xrpl/escrow-testnet.json \\
+       ~/.secrets/perp-dex-xrpl/escrow-testnet.json.prev-\$(date +%Y%m%d-%H%M%S)
+  fi
+
+  # Pull the 3 new xrpl_addresses from the operator-setup outputs
+  N1=\$(jq -r .xrpl_address ~/phase7-entries/node-1.json)
+  N2=\$(jq -r .xrpl_address ~/phase7-entries/node-2.json)
+  N3=\$(jq -r .xrpl_address ~/phase7-entries/node-3.json)
+
+  python3 orchestrator/scripts/setup_testnet_escrow.py \\
+    --signer node-1=\$N1 \\
+    --signer node-2=\$N2 \\
+    --signer node-3=\$N3 \\
+    --quorum 2
+"
+```
+
+Output prints `ESCROW_ADDRESS=r…` and `SEED_FILE=…`. Verify on https://testnet.xrpl.org that the new address has quorum 2 with the three node addresses, and master key disabled.
+
+Save the new escrow address as a shell variable for step 8:
+
+```bash
+ESCROW_ADDR=$(ssh andrey@94.130.18.162 "jq -r .escrow_address ~/.secrets/perp-dex-xrpl/escrow-testnet.json")
+echo "$ESCROW_ADDR"
+```
+
+The unified `signers_config.json` for the cluster is built using the **new** escrow address:
 
 ```bash
 ssh andrey@94.130.18.162 "
   cd ~/llm-perp-xrpl/orchestrator
+  ESCROW_ADDR=\$(jq -r .escrow_address ~/.secrets/perp-dex-xrpl/escrow-testnet.json)
   ./target/release/perp-dex-orchestrator config-init \\
     --entries ~/phase7-entries/node-1.json \\
               ~/phase7-entries/node-2.json \\
               ~/phase7-entries/node-3.json \\
-    --escrow-address rUjznEhZBujfE1Fz6TxEDyi4rrARvkBwd2 \\
+    --escrow-address \$ESCROW_ADDR \\
     --quorum 2 \\
     --output ~/phase7-entries/signers_config.json
 "
 ```
 
-Submit SignerListSet using the testnet escrow seed (must already be funded; this re-does what was done at first cluster bring-up):
-
-```bash
-# The seed file is 0600-mode and lives somewhere off the host.
-# Replace TESTNET_SEED_FILE with the actual path.
-ssh andrey@94.130.18.162 "
-  cd ~/llm-perp-xrpl/orchestrator
-  ./target/release/perp-dex-orchestrator escrow-setup \\
-    --xrpl-url https://s.altnet.rippletest.net:51234 \\
-    --signers-config ~/phase7-entries/signers_config.json \\
-    --escrow-seed-file <TESTNET_SEED_FILE>
-"
-```
-
-The output prints the on-chain `SignerListSet` tx hash. Verify on https://testnet.xrpl.org that the escrow's signer list now contains the three new addresses with quorum 2.
-
 ## 8. Distribute config + start orchestrators
 
-Each node needs a copy of `signers_config.json` with its own `local_signer` field set. The shape is documented in `cli_tools.rs` (`FullSignersConfig`). For each node, copy the unified config and edit `local_signer` to that node's own entry:
+Each node needs:
+- A copy of `signers_config.json` with its own `local_signer` field set (shape: `FullSignersConfig` in `cli_tools.rs`).
+- An updated `start_orchestrator.sh` (or systemd unit ExecStart) pointing `--escrow-address` at the **new** escrow created in step 7.
 
 ```bash
 ssh andrey@94.130.18.162 "
   cd ~/phase7-entries
+  ESCROW_ADDR=\$(jq -r .escrow_address ~/.secrets/perp-dex-xrpl/escrow-testnet.json)
+
   for i in 1 2 3; do
     case \$i in
       1) ip=20.71.184.176 ;;
       2) ip=20.224.243.60 ;;
       3) ip=52.236.130.102 ;;
     esac
+
+    # Build per-node signers_config with the right local_signer pointer
     jq --argjson local \"\$(cat node-\$i.json)\" '. + {local_signer: \$local}' \\
       signers_config.json > /tmp/signers_config_node-\$i.json
     scp /tmp/signers_config_node-\$i.json azureuser@\$ip:/home/azureuser/perp/signers_config.json
-    ssh azureuser@\$ip 'sudo systemctl start perp-dex-orchestrator'
+
+    # Update start_orchestrator.sh: replace the old --escrow-address rUjzn... with new one.
+    # Use sed against the regex 'r[1-9A-HJ-NP-Za-km-z]{24,34}' (XRPL r-address shape).
+    ssh azureuser@\$ip \"
+      cp -a ~/perp/start_orchestrator.sh ~/perp/start_orchestrator.sh.prev-\$(date +%Y%m%d-%H%M%S)
+      sed -i -E 's|--escrow-address +r[1-9A-HJ-NP-Za-km-z]{24,34}|--escrow-address \$ESCROW_ADDR|' ~/perp/start_orchestrator.sh
+      grep -- '--escrow-address' ~/perp/start_orchestrator.sh
+      sudo systemctl start perp-dex-orchestrator
+    \"
   done
 "
 ```
@@ -396,10 +425,11 @@ If anything fails between steps 5 and 12 and the cluster is unrecoverable:
 2. Restore the `*.prev-<timestamp>` artefacts saved aside earlier:
    - binaries from step 4 (`enclave.signed.so.prev-…`, `perp-dex-server.prev-…`, `perp-dex-orchestrator.prev-…`)
    - sealed state from step 4 (`accounts.prev-<TS>` → `accounts/`)
-   - `signers_config.json.prev-<TS>` saved in step 3 (only matters if step 8 already overwrote the live file)
+   - `signers_config.json.prev-<TS>` saved in step 3
+   - `start_orchestrator.sh.prev-<TS>` saved in step 8 (restores the old `--escrow-address`)
 3. If §11 was reached, drop any admin-listen override: `sudo systemctl revert perp-dex-orchestrator` on the sender node.
-4. Restart enclaves + orchestrators. The previous SignerList on the testnet escrow is still valid because we only do the SignerListSet *after* the new keys are generated — if step 7 hasn't run yet, the old keys still match.
-5. **If SignerListSet (step 7) already submitted:** rollback requires a second SignerListSet from the testnet escrow seed, restoring the old three addresses. Submit it manually with the same `escrow-setup` flow but pointing `--signers-config` at the saved `signers_config.json.prev-<TS>` from step 3.
+4. Restart enclaves + orchestrators. The previous testnet escrow (from before this bump) is still on chain with its old SignerList — restored binaries + restored config will work against it as before.
+5. **If §7 already created a new escrow:** no on-chain rollback is needed for the new escrow — it's faucet-funded testnet, abandon it. The seed file `~/.secrets/perp-dex-xrpl/escrow-testnet.json` should be moved aside (it was already moved before §7 started, see `escrow-testnet.json.prev-<TS>` in `~/.secrets/perp-dex-xrpl/`).
 
 Document the failure mode in this file under a new section. Future-you will thank you.
 
