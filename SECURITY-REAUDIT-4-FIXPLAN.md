@@ -275,6 +275,8 @@ orchestrator from seed: rpY3wEh813BHmzKMisx1yLUNjQREt1ULzJ   ← what auth signs
 
 **Until then:** mainnet deploy MUST verify the policy is OK-only by inspecting the running binary's allowlist before promotion. Concretely: do not deploy commit `8934f63` (or anything descending from it) to mainnet without first re-tightening or making it config-driven.
 
+**Architectural context.** This finding sits inside a broader question — the orchestrator+enclave use DCAP-based peer cross-attestation as the cluster-trust model, while the sibling project Phoenix PM (`77ph/SGX_project`) uses an operator-signed roster instead. The divergence is intentional in each project (each followed its own audit's prescription), but raises a question the next audit should address explicitly. Full reasoning, comparison, and the question for the auditor are in [`docs/cluster-trust-model-decision.md`](docs/cluster-trust-model-decision.md). Anyone touching `dcap_verify.cpp`, the verdict policy, or Path A peer-attest should read that ADR first.
+
 ## APP-WIRE-1 — Path A `import-v2` wire mismatch (export returns nested envelope, import expects top-level fields)
 
 **Severity:** Medium (Path A v2 wire flow non-functional until fixed).
