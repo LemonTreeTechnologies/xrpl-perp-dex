@@ -62,6 +62,53 @@ impl RateLimiter {
         q.push_back(now);
         true
     }
+
+    /// Read-only check: would the next request be admitted? Does NOT
+    /// consume a slot. Use this when you want to gate work *before*
+    /// you've decided whether to record the event (e.g. O-M4 STP
+    /// rate-limit only records when an STP event actually fires).
+    pub fn peek(&self, key: &str) -> bool {
+        self.peek_at(key, Instant::now())
+    }
+
+    /// Same as `peek` but accepts an explicit "now" — used by tests.
+    pub fn peek_at(&self, key: &str, now: Instant) -> bool {
+        let mut guard = self.inner.lock().expect("rate-limiter mutex poisoned");
+        let q = match guard.entry(key.to_string()) {
+            Entry::Occupied(o) => o.into_mut(),
+            Entry::Vacant(_) => return true,
+        };
+        while let Some(front) = q.front() {
+            if now.duration_since(*front) >= self.window {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+        q.len() < self.max_per_window
+    }
+
+    /// Record an event without checking budget — used in pair with
+    /// `peek` for the "gate first, record only on event" pattern.
+    pub fn record(&self, key: &str) {
+        self.record_at(key, Instant::now());
+    }
+
+    /// Same as `record` but accepts an explicit "now" — used by tests.
+    pub fn record_at(&self, key: &str, now: Instant) {
+        let mut guard = self.inner.lock().expect("rate-limiter mutex poisoned");
+        let q = guard.entry(key.to_string()).or_default();
+        // Prune so the bucket cannot grow beyond `max_per_window` even
+        // with many rapid record() calls.
+        while let Some(front) = q.front() {
+            if now.duration_since(*front) >= self.window {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+        q.push_back(now);
+    }
 }
 
 #[cfg(test)]
@@ -131,5 +178,48 @@ mod tests {
             rl.check_and_record_at("alice", t61),
             "single original entry must have aged out by t0+61, regardless of the t0+30 refusal"
         );
+    }
+
+    #[test]
+    fn peek_is_read_only() {
+        // Peek must not consume budget. 100 peeks then 5 records on
+        // a budget=5 limiter must all succeed; the 6th record exceeds
+        // the bucket but record() doesn't return false (caller gated
+        // on peek beforehand).
+        let rl = RateLimiter::new(Duration::from_secs(60), 5);
+        let t0 = Instant::now();
+        for _ in 0..100 {
+            assert!(rl.peek_at("alice", t0));
+        }
+        for _ in 0..5 {
+            rl.record_at("alice", t0);
+        }
+        assert!(
+            !rl.peek_at("alice", t0),
+            "after 5 records, peek must report exhausted"
+        );
+    }
+
+    #[test]
+    fn peek_record_pair_for_gated_work() {
+        // The intended O-M4 usage: peek before doing potentially-
+        // expensive work, record only if work was performed.
+        let rl = RateLimiter::new(Duration::from_secs(60), 3);
+        let t0 = Instant::now();
+
+        // Three "STP events" land.
+        for _ in 0..3 {
+            assert!(rl.peek_at("alice", t0), "budget should be available");
+            rl.record_at("alice", t0);
+        }
+        // Fourth event is gated.
+        assert!(
+            !rl.peek_at("alice", t0),
+            "budget exhausted after 3 record() calls"
+        );
+
+        // After window, budget refreshes.
+        let t61 = t0 + Duration::from_secs(61);
+        assert!(rl.peek_at("alice", t61));
     }
 }

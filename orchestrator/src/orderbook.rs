@@ -133,6 +133,15 @@ pub struct OrderBook {
     /// Recent trades (last N)
     pub recent_trades: Vec<Trade>,
     max_recent_trades: usize,
+
+    /// O-M4: per-user rate limit on Self-Trade-Prevention events.
+    /// STP is "decrement-and-cancel" — cheap per-event but a grief
+    /// attacker bouncing self-crosses through their own resting
+    /// liquidity (e.g. through the vault MM) amplifies cancel-and-
+    /// replace pressure on PG and gossipsub. Cap STP triggers at
+    /// 30/min/user. Records ONLY when an STP event actually fires;
+    /// non-self-crossing orders are not counted.
+    stp_rate: crate::rate_limit::RateLimiter,
 }
 
 impl OrderBook {
@@ -145,6 +154,7 @@ impl OrderBook {
             next_trade_id: 1,
             recent_trades: Vec::new(),
             max_recent_trades: 1000,
+            stp_rate: crate::rate_limit::RateLimiter::new(std::time::Duration::from_secs(60), 30),
         }
     }
 
@@ -198,6 +208,13 @@ impl OrderBook {
         if order_type == OrderType::Limit && price.0 <= 0 {
             bail!("limit order price must be positive");
         }
+        // O-M4: gate before matching. If the user has already triggered
+        // 30 STP events in the trailing minute, refuse the new order
+        // entirely — the next match would either fill normally or
+        // trigger another STP, but we want to bound the latter.
+        if !self.stp_rate.peek(&user_id) {
+            bail!("self-trade rate exceeded: too many self-crossing orders in the last minute");
+        }
 
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -236,6 +253,15 @@ impl OrderBook {
 
         // Match against resting orders
         let (trades, stp_cancelled) = self.match_order(&mut order);
+
+        // O-M4: record an STP event if any self-crosses fired. We
+        // record AFTER the match so non-crossing orders never consume
+        // budget — only repeated bouncing through own resting orders
+        // does. This keeps the cap functional for grief patterns
+        // without penalising legit traffic.
+        if !stp_cancelled.is_empty() {
+            self.stp_rate.record(&order.user_id);
+        }
 
         // If STP shrank the taker size to zero, the order is fully self-cancelled.
         if order.size.0 == 0 {
@@ -1197,5 +1223,89 @@ mod tests {
             )
             .unwrap();
         assert!(o2.id > o1.id, "order IDs should increment");
+    }
+
+    // ── O-M4 STP rate-limit ───────────────────────────────────
+
+    /// Helper: submit a limit order, ignoring all return fields.
+    #[allow(clippy::type_complexity)]
+    fn place(
+        ob: &mut OrderBook,
+        user: &str,
+        side: Side,
+        price: f64,
+        size: f64,
+    ) -> Result<(Order, Vec<Trade>, Vec<(Order, i64)>)> {
+        ob.submit_order(
+            user.into(),
+            side,
+            OrderType::Limit,
+            FP8::from_f64(price),
+            FP8::from_f64(size),
+            1,
+            TimeInForce::Gtc,
+            false,
+            None,
+        )
+    }
+
+    #[test]
+    fn stp_event_records_against_user_budget() {
+        // Alice places resting bid → resting ask of her own at a price
+        // that crosses the bid → STP fires once.
+        let mut ob = book();
+        place(&mut ob, "alice", Side::Long, 1.00, 10.0).unwrap();
+        let (_, _, stp) = place(&mut ob, "alice", Side::Short, 1.00, 5.0).unwrap();
+        assert_eq!(stp.len(), 1, "exactly one self-cross expected");
+        // Budget is 30/min — 1 used, plenty of room.
+        assert!(ob.stp_rate.peek("alice"));
+    }
+
+    #[test]
+    fn stp_rate_limit_rejects_31st_self_crossing_order() {
+        // Drive 30 self-crosses; the 31st must be rejected at the gate
+        // before match_order is called (i.e. submit_order returns Err).
+        let mut ob = book();
+        // Place a single resting buy big enough to be hit 30 times.
+        place(&mut ob, "alice", Side::Long, 1.00, 1000.0).unwrap();
+        for i in 0..30 {
+            let r = place(&mut ob, "alice", Side::Short, 1.00, 1.0);
+            assert!(r.is_ok(), "self-cross #{i} should be admitted");
+        }
+        let r = place(&mut ob, "alice", Side::Short, 1.00, 1.0);
+        assert!(r.is_err(), "31st order should be rejected");
+        let msg = format!("{}", r.err().unwrap());
+        assert!(msg.contains("self-trade rate exceeded"), "wrong msg: {msg}");
+    }
+
+    #[test]
+    fn non_self_crossing_orders_do_not_consume_stp_budget() {
+        // Alice's orders never cross her own → budget untouched even
+        // after many submissions. This pins that we record only on
+        // STP fire, not on every order.
+        let mut ob = book();
+        place(&mut ob, "bob", Side::Long, 0.99, 100.0).unwrap();
+        for _ in 0..100 {
+            // Alice places a resting ask above the bid → never crosses bob.
+            place(&mut ob, "alice", Side::Short, 1.10, 1.0).unwrap();
+        }
+        // Alice's STP budget is fully intact.
+        assert!(ob.stp_rate.peek("alice"));
+    }
+
+    #[test]
+    fn stp_rate_limit_is_per_user() {
+        // Alice exhausts her budget → Bob is unaffected.
+        let mut ob = book();
+        place(&mut ob, "alice", Side::Long, 1.00, 1000.0).unwrap();
+        for _ in 0..30 {
+            place(&mut ob, "alice", Side::Short, 1.00, 1.0).unwrap();
+        }
+        assert!(place(&mut ob, "alice", Side::Short, 1.00, 1.0).is_err());
+
+        // Bob can still submit even when crossing alice's resting bid
+        // (cross-user fill, no STP).
+        let r = place(&mut ob, "bob", Side::Short, 1.00, 1.0);
+        assert!(r.is_ok(), "bob's order must not be rate-limited");
     }
 }
