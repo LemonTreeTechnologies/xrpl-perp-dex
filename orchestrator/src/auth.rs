@@ -108,6 +108,17 @@ pub fn verify_signature_only(binding: &OrderSignatureBinding) -> Result<(), Stri
     Ok(())
 }
 
+// ── Replay-protection drift window ──────────────────────────────
+//
+// O-M2: requests must carry a fresh-ish X-XRPL-Timestamp. The
+// window is symmetric (signed `abs_diff`), so the effective replay
+// resistance is `MAX_TIMESTAMP_DRIFT_SECS` * 2. Was 60 in earlier
+// commits; narrowed to 30 to halve replay surface without
+// pushing legit clients over the edge — frontends generate the
+// timestamp at signing-time, and 30 s covers normal network +
+// frontend-clock skew.
+pub(crate) const MAX_TIMESTAMP_DRIFT_SECS: u64 = 30;
+
 // ── Session token store ──────────────────────────────────────────
 
 const SESSION_TTL: Duration = Duration::from_secs(30 * 60); // 30 minutes
@@ -212,9 +223,9 @@ pub fn verify_request(
             .unwrap()
             .as_secs();
         let drift = now.abs_diff(ts);
-        if drift > 60 {
+        if drift > MAX_TIMESTAMP_DRIFT_SECS {
             return Err(format!(
-                "request expired: timestamp drift {drift}s (max 60s)"
+                "request expired: timestamp drift {drift}s (max {MAX_TIMESTAMP_DRIFT_SECS}s)"
             ));
         }
     }
@@ -1040,5 +1051,83 @@ mod tests {
         let binding = make_binding(&sk, &pubkey_hex, &address, b"");
         let r = verify_signature_only(&binding);
         assert!(r.is_err(), "empty body must be rejected: {r:?}");
+    }
+
+    // ── O-M2 timestamp-drift window ────────────────────────────
+
+    /// Sign with an explicit (faked) timestamp instead of `now`. Used
+    /// to test the drift window edges without sleeping in tests.
+    fn sign_body_with_ts(
+        sk: &SigningKey,
+        pubkey_hex: &str,
+        address: &str,
+        body: &[u8],
+        ts: u64,
+    ) -> HeaderMap {
+        let ts_str = ts.to_string();
+        let mut hasher = Sha256::new();
+        hasher.update(body);
+        hasher.update(ts_str.as_bytes());
+        let hash = hasher.finalize();
+        let (sig, _): (Signature, _) = sk.sign_prehash(&hash).unwrap();
+        let sig_der = sig.to_der();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-xrpl-address", address.parse().unwrap());
+        headers.insert("x-xrpl-publickey", pubkey_hex.parse().unwrap());
+        headers.insert(
+            "x-xrpl-signature",
+            hex::encode(sig_der.as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-xrpl-timestamp", ts_str.parse().unwrap());
+        headers
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn drift_within_window_accepted() {
+        let (sk, _, pubkey_hex, address) = test_keypair();
+        let body = br#"{}"#;
+        // 25 s old — well inside MAX_TIMESTAMP_DRIFT_SECS (30 s).
+        let ts = now_secs() - 25;
+        let headers = sign_body_with_ts(&sk, &pubkey_hex, &address, body, ts);
+        let r = verify_request(&headers, "POST", body, "/v1/test");
+        assert!(r.is_ok(), "25s drift must pass; got {r:?}");
+    }
+
+    #[test]
+    fn drift_past_window_rejected() {
+        let (sk, _, pubkey_hex, address) = test_keypair();
+        let body = br#"{}"#;
+        // 35 s old — over MAX_TIMESTAMP_DRIFT_SECS (30 s).
+        let ts = now_secs() - 35;
+        let headers = sign_body_with_ts(&sk, &pubkey_hex, &address, body, ts);
+        let r = verify_request(&headers, "POST", body, "/v1/test");
+        let e = r.expect_err("35 s drift must be rejected");
+        assert!(e.contains("timestamp drift"), "wrong rejection: {e}");
+    }
+
+    #[test]
+    fn drift_future_window_rejected() {
+        let (sk, _, pubkey_hex, address) = test_keypair();
+        let body = br#"{}"#;
+        // 35 s in the future — symmetric `abs_diff`, must also reject.
+        let ts = now_secs() + 35;
+        let headers = sign_body_with_ts(&sk, &pubkey_hex, &address, body, ts);
+        let r = verify_request(&headers, "POST", body, "/v1/test");
+        let e = r.expect_err("future-drift 35 s must be rejected");
+        assert!(e.contains("timestamp drift"), "wrong rejection: {e}");
+    }
+
+    #[test]
+    fn drift_constant_pinned_at_30_for_audit_traceability() {
+        // O-M2 fix: was 60, narrowed to 30. Test pins the value so a
+        // future loosening cannot land silently.
+        assert_eq!(MAX_TIMESTAMP_DRIFT_SECS, 30);
     }
 }
