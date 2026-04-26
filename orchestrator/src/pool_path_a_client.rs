@@ -210,12 +210,26 @@ impl PoolPathAClient {
         signer_id: u32,
         now_ts: u64,
     ) -> Result<bool> {
+        // The enclave's import-v2 REST handler expects threshold,
+        // n_participants, and sender_pubkey at the **top level** (it does
+        // not look inside `envelope` for them). Lift them out so the
+        // body matches the handler contract — see
+        // server/api/v1/pool_handler.cpp::handleFrostShareImportV2.
         let body = serde_json::json!({
-            "envelope": envelope,
+            "envelope": {
+                "ceremony_nonce": envelope.ceremony_nonce,
+                "iv": envelope.iv,
+                "ct": envelope.ct,
+                "tag": envelope.tag,
+                "keygen_cache": envelope.keygen_cache,
+            },
             "shard_id": shard_id,
             "group_id": group_id_hex,
             "signer_id": signer_id,
             "now_ts": now_ts,
+            "threshold": envelope.threshold,
+            "n_participants": envelope.n_participants,
+            "sender_pubkey": envelope.sender_pubkey,
         });
         let url = format!("{}{}", self.base_url, "/pool/frost/share-import-v2");
         let resp = self.client.post(&url).json(&body).send().await?;
