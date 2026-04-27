@@ -1,0 +1,64 @@
+name: coverage
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: cargo llvm-cov + ratchet check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # Must match rust-toolchain.toml so llvm-cov instruments against the
+        # same toolchain cargo will auto-select for the build.
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: orchestrator
+          # Coverage-instrumented builds have different keys from check.yml's
+          # plain builds — namespace separately so they don't fight for cache.
+          key: coverage
+
+      - name: Install cargo-llvm-cov
+        # Pinned to avoid silent percentage drift across versions.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.8.5
+
+      - name: Generate lcov report
+        working-directory: orchestrator
+        run: cargo llvm-cov --lcov --output-path lcov.info --locked
+
+      - name: Ratchet check vs coverage-baseline.json
+        # Tolerance 1.0pp matches Phase 1.4 spec in SECURITY-REAUDIT-4-FIXPLAN.md.
+        # Bump the baseline manually on master via:
+        #   python3 scripts/check-coverage.py --mode update --lcov orchestrator/lcov.info
+        run: python3 scripts/check-coverage.py --mode check --lcov orchestrator/lcov.info --baseline coverage-baseline.json --tolerance-pct 1.0
+
+      - name: Upload lcov artifact
+        # Keep the raw lcov around for forensics on regression PRs.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov-${{ github.sha }}
+          path: orchestrator/lcov.info
+          retention-days: 14
