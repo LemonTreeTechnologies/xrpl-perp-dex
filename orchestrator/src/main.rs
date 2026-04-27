@@ -7,6 +7,7 @@
 mod api;
 mod auth;
 mod cli_tools;
+mod cluster_deploy;
 mod commitment;
 mod db;
 mod dkg_bootstrap;
@@ -193,6 +194,25 @@ enum Command {
         /// optional bastion, list of {pid,label,ssh,enclave_url}).
         #[arg(long)]
         topology: PathBuf,
+    },
+
+    /// Stop services, swap binaries, restart enclaves only (Phase 2.1b).
+    /// Replaces §3-§5 of docs/testnet-enclave-bump-procedure.md. Per
+    /// node: stage artefacts to /tmp via scp, verify SHAs, stop both
+    /// services, backup prior artefacts with timestamp suffix, install
+    /// new binaries, restart enclave only. Orchestrators stay STOPPED
+    /// — Phase 2.1c (operator-setup + escrow) is the natural next step.
+    ClusterDeploy {
+        /// Path to dkg-topology.toml (shared with `dkg-bootstrap`).
+        #[arg(long)]
+        topology: PathBuf,
+        /// Path to the freshly-built perp-dex-orchestrator binary.
+        #[arg(long)]
+        orchestrator: PathBuf,
+        /// Path to the freshly-built `dist-azure/` directory containing
+        /// enclave.signed.so + perp-dex-server + build-manifest.txt.
+        #[arg(long)]
+        enclave_dist: PathBuf,
     },
 }
 
@@ -451,6 +471,29 @@ async fn main() -> Result<()> {
             println!("group_pubkey = 0x{}", result.group_pubkey);
             for (label, pk) in &result.per_node {
                 println!("  {label}: 0x{pk}");
+            }
+            return Ok(());
+        }
+        Some(Command::ClusterDeploy {
+            topology,
+            orchestrator,
+            enclave_dist,
+        }) => {
+            let raw = std::fs::read_to_string(&topology)
+                .with_context(|| format!("read topology {topology:?}"))?;
+            let topo: dkg_bootstrap::DkgTopology =
+                toml::from_str(&raw).context("parse topology TOML")?;
+            let manifest = enclave_dist.join("build-manifest.txt");
+            let artefacts = cluster_deploy::ArtefactSet {
+                orchestrator,
+                enclave_signed_so: enclave_dist.join("enclave.signed.so"),
+                perp_dex_server: enclave_dist.join("perp-dex-server"),
+                build_manifest: manifest.exists().then_some(manifest),
+            };
+            let results = cluster_deploy::deploy(&topo, &artefacts).await?;
+            println!("Cluster deploy complete:");
+            for r in &results {
+                println!("  {}: mrenclave={}", r.label, r.mrenclave);
             }
             return Ok(());
         }
