@@ -23,8 +23,7 @@ use serde::Deserialize;
 use tokio::process::Command;
 use tracing::{info, warn};
 
-const GROUP_ID_ZEROS: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
+const GROUP_ID_ZEROS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// `dkg-topology.toml` shape. Operator builds this once per cluster.
 #[derive(Debug, Deserialize)]
@@ -95,7 +94,10 @@ fn validate_topology(topo: &DkgTopology) -> Result<()> {
     pids.sort();
     for (i, pid) in pids.iter().enumerate() {
         if *pid != i as u32 {
-            bail!("nodes must have pid 0..{} (contiguous, distinct); got {pids:?}", n - 1);
+            bail!(
+                "nodes must have pid 0..{} (contiguous, distinct); got {pids:?}",
+                n - 1
+            );
         }
     }
     if topo.threshold < 2 || topo.threshold > n {
@@ -135,14 +137,23 @@ async fn run_ssh(target: &str, bastion: Option<&str>, remote_cmd: &str) -> Resul
     Ok(output.stdout)
 }
 
-async fn ssh_get_json(node: &NodeConfig, bastion: Option<&str>, path_after_base: &str) -> Result<serde_json::Value> {
+async fn ssh_get_json(
+    node: &NodeConfig,
+    bastion: Option<&str>,
+    path_after_base: &str,
+) -> Result<serde_json::Value> {
     let url = format!("{}{}", node.enclave_url, path_after_base);
     let cmd = format!("curl -k -s {url}");
     let out = run_ssh(&node.ssh, bastion, &cmd).await?;
     parse_json(&out, &url)
 }
 
-async fn ssh_post_json(node: &NodeConfig, bastion: Option<&str>, path_after_base: &str, body: &str) -> Result<serde_json::Value> {
+async fn ssh_post_json(
+    node: &NodeConfig,
+    bastion: Option<&str>,
+    path_after_base: &str,
+    body: &str,
+) -> Result<serde_json::Value> {
     let body_uuid = uuid::Uuid::new_v4().simple().to_string();
     let local_tmp = std::env::temp_dir().join(format!("dkg-{body_uuid}.json"));
     let remote_path = format!("/tmp/dkg-{body_uuid}.json");
@@ -159,7 +170,11 @@ async fn ssh_post_json(node: &NodeConfig, bastion: Option<&str>, path_after_base
     let scp_status = scp.status().await.context("spawn scp")?;
     let _ = std::fs::remove_file(&local_tmp);
     if !scp_status.success() {
-        bail!("scp to {} failed (status {:?})", node.ssh, scp_status.code());
+        bail!(
+            "scp to {} failed (status {:?})",
+            node.ssh,
+            scp_status.code()
+        );
     }
 
     let url = format!("{}{}", node.enclave_url, path_after_base);
@@ -184,9 +199,11 @@ async fn collect_ecdh_pubkeys(topo: &DkgTopology) -> Result<Vec<String>> {
     let bastion = topo.bastion.as_deref();
     let mut pks = vec![String::new(); topo.nodes.len()];
     for n in &topo.nodes {
-        let json = ssh_get_json(n, bastion, "/pool/ecdh/pubkey").await
+        let json = ssh_get_json(n, bastion, "/pool/ecdh/pubkey")
+            .await
             .with_context(|| format!("ecdh/pubkey on {}", n.label))?;
-        let pk = json["pubkey"].as_str()
+        let pk = json["pubkey"]
+            .as_str()
             .with_context(|| format!("missing pubkey field on {}", n.label))?;
         let pk = strip_0x(pk).to_string();
         info!(pid = n.pid, label = %n.label, pk_short = %&pk[..16], "ECDH pubkey");
@@ -200,7 +217,10 @@ async fn collect_ecdh_pubkeys(topo: &DkgTopology) -> Result<Vec<String>> {
 /// Each node's DCAP quote hex (no `0x` prefix), ~9.5 KB. Indexed by pid.
 type AttestationQuotes = Vec<String>;
 
-async fn collect_attestations(topo: &DkgTopology, _pubkeys: &[String]) -> Result<AttestationQuotes> {
+async fn collect_attestations(
+    topo: &DkgTopology,
+    _pubkeys: &[String],
+) -> Result<AttestationQuotes> {
     info!("Stage 2/7: collecting DCAP report_data + quote per node");
     let bastion = topo.bastion.as_deref();
     let mut out: AttestationQuotes = vec![String::new(); topo.nodes.len()];
@@ -209,19 +229,28 @@ async fn collect_attestations(topo: &DkgTopology, _pubkeys: &[String]) -> Result
         let body = serde_json::json!({
             "shard_id": 0,
             "group_id": GROUP_ID_ZEROS,
-        }).to_string();
-        let rd_json = ssh_post_json(n, bastion, "/pool/ecdh/report-data", &body).await
+        })
+        .to_string();
+        let rd_json = ssh_post_json(n, bastion, "/pool/ecdh/report-data", &body)
+            .await
             .with_context(|| format!("ecdh/report-data on {}", n.label))?;
-        let rd = strip_0x(rd_json["report_data"].as_str()
-            .with_context(|| format!("missing report_data field on {}", n.label))?
-        ).to_string();
+        let rd = strip_0x(
+            rd_json["report_data"]
+                .as_str()
+                .with_context(|| format!("missing report_data field on {}", n.label))?,
+        )
+        .to_string();
 
         let body = serde_json::json!({ "user_data": rd }).to_string();
-        let q_json = ssh_post_json(n, bastion, "/pool/attestation-quote", &body).await
+        let q_json = ssh_post_json(n, bastion, "/pool/attestation-quote", &body)
+            .await
             .with_context(|| format!("attestation-quote on {}", n.label))?;
-        let quote = strip_0x(q_json["quote_hex"].as_str()
-            .with_context(|| format!("missing quote_hex field on {}", n.label))?
-        ).to_lowercase();
+        let quote = strip_0x(
+            q_json["quote_hex"]
+                .as_str()
+                .with_context(|| format!("missing quote_hex field on {}", n.label))?,
+        )
+        .to_lowercase();
 
         info!(
             pid = n.pid,
@@ -257,19 +286,15 @@ async fn cross_verify(
                 "shard_id": 0,
                 "group_id": GROUP_ID_ZEROS,
                 "now_ts": now,
-            }).to_string();
+            })
+            .to_string();
 
-            let resp = ssh_post_json(tgt, bastion, "/pool/attest/verify-peer-quote", &body).await
-                .with_context(|| format!(
-                    "verify-peer-quote on {} for {}",
-                    tgt.label, src.label
-                ))?;
+            let resp = ssh_post_json(tgt, bastion, "/pool/attest/verify-peer-quote", &body)
+                .await
+                .with_context(|| format!("verify-peer-quote on {} for {}", tgt.label, src.label))?;
             let status = resp["status"].as_str().unwrap_or("?");
             if status != "success" {
-                bail!(
-                    "{} → {} verify rejected: {resp}",
-                    tgt.label, src.label
-                );
+                bail!("{} → {} verify rejected: {resp}", tgt.label, src.label);
             }
             info!(tgt = %tgt.label, src = %src.label, "verify-peer-quote OK");
         }
@@ -290,21 +315,30 @@ async fn round1_generate(topo: &DkgTopology) -> Result<Vec<Round1Output>> {
     let bastion = topo.bastion.as_deref();
     let n = topo.nodes.len() as u32;
     let mut out: Vec<Round1Output> = Vec::with_capacity(topo.nodes.len());
-    out.resize_with(topo.nodes.len(), || Round1Output { vss_commitment: String::new() });
+    out.resize_with(topo.nodes.len(), || Round1Output {
+        vss_commitment: String::new(),
+    });
 
     for node in &topo.nodes {
         let body = serde_json::json!({
             "my_participant_id": node.pid,
             "threshold": topo.threshold,
             "n_participants": n,
-        }).to_string();
-        let resp = ssh_post_json(node, bastion, "/pool/dkg/round1-generate", &body).await
+        })
+        .to_string();
+        let resp = ssh_post_json(node, bastion, "/pool/dkg/round1-generate", &body)
+            .await
             .with_context(|| format!("round1-generate on {}", node.label))?;
-        let vss = strip_0x(resp["vss_commitment"].as_str()
-            .with_context(|| format!("missing vss_commitment on {}", node.label))?
-        ).to_string();
+        let vss = strip_0x(
+            resp["vss_commitment"]
+                .as_str()
+                .with_context(|| format!("missing vss_commitment on {}", node.label))?,
+        )
+        .to_string();
         info!(pid = node.pid, label = %node.label, vss_len = vss.len(), "round1 done");
-        out[node.pid as usize] = Round1Output { vss_commitment: vss };
+        out[node.pid as usize] = Round1Output {
+            vss_commitment: vss,
+        };
     }
     Ok(out)
 }
@@ -338,10 +372,19 @@ async fn round1_export(topo: &DkgTopology, _pubkeys: &[String]) -> Result<Envelo
                 "shard_id": 0,
                 "group_id": GROUP_ID_ZEROS,
                 "now_ts": now,
-            }).to_string();
-            let resp = ssh_post_json(src, bastion, "/pool/dkg/round1-export-share-v2", &body).await
-                .with_context(|| format!("round1-export-share-v2 on {} (target {})", src.label, tgt.label))?;
-            let env = resp.get("envelope").cloned()
+            })
+            .to_string();
+            let resp = ssh_post_json(src, bastion, "/pool/dkg/round1-export-share-v2", &body)
+                .await
+                .with_context(|| {
+                    format!(
+                        "round1-export-share-v2 on {} (target {})",
+                        src.label, tgt.label
+                    )
+                })?;
+            let env = resp
+                .get("envelope")
+                .cloned()
                 .with_context(|| format!("missing envelope in response on {}", src.label))?;
             envs[src.pid as usize][tgt.pid as usize] = Some(ShareEnvelope { json: env });
             info!(src = %src.label, tgt = %tgt.label, "share exported");
@@ -367,7 +410,8 @@ async fn round2_import(
             if src.pid == tgt.pid {
                 continue;
             }
-            let env = envelopes[src.pid as usize][tgt.pid as usize].as_ref()
+            let env = envelopes[src.pid as usize][tgt.pid as usize]
+                .as_ref()
                 .with_context(|| format!("missing envelope src={} tgt={}", src.label, tgt.label))?;
             let body = serde_json::json!({
                 "from_participant_id": src.pid,
@@ -377,15 +421,19 @@ async fn round2_import(
                 "now_ts": now,
                 "envelope": env.json,
                 "vss_commitment": vss[src.pid as usize].vss_commitment,
-            }).to_string();
-            let resp = ssh_post_json(tgt, bastion, "/pool/dkg/round2-import-share-v2", &body).await
-                .with_context(|| format!("round2-import-share-v2 on {} (from {})", tgt.label, src.label))?;
+            })
+            .to_string();
+            let resp = ssh_post_json(tgt, bastion, "/pool/dkg/round2-import-share-v2", &body)
+                .await
+                .with_context(|| {
+                    format!(
+                        "round2-import-share-v2 on {} (from {})",
+                        tgt.label, src.label
+                    )
+                })?;
             let status = resp["status"].as_str().unwrap_or("?");
             if status != "success" {
-                bail!(
-                    "{} import from {} rejected: {}",
-                    tgt.label, src.label, resp
-                );
+                bail!("{} import from {} rejected: {}", tgt.label, src.label, resp);
             }
             info!(tgt = %tgt.label, src = %src.label, "share imported + verified");
         }
@@ -402,11 +450,15 @@ async fn finalize_all(topo: &DkgTopology) -> Result<BootstrapResult> {
 
     for node in &topo.nodes {
         // Empty body — finalize takes no args.
-        let resp = ssh_post_json(node, bastion, "/pool/dkg/finalize", "{}").await
+        let resp = ssh_post_json(node, bastion, "/pool/dkg/finalize", "{}")
+            .await
             .with_context(|| format!("finalize on {}", node.label))?;
-        let group_pk = strip_0x(resp["group_pubkey"].as_str()
-            .with_context(|| format!("missing group_pubkey on {}", node.label))?
-        ).to_string();
+        let group_pk = strip_0x(
+            resp["group_pubkey"]
+                .as_str()
+                .with_context(|| format!("missing group_pubkey on {}", node.label))?,
+        )
+        .to_string();
         info!(pid = node.pid, label = %node.label, group_pk_short = %&group_pk[..16], "finalize done");
         per_node.push((node.label.clone(), group_pk));
     }
@@ -419,12 +471,18 @@ async fn finalize_all(topo: &DkgTopology) -> Result<BootstrapResult> {
                 "DIVERGENT group_pubkey");
             bail!(
                 "DKG transcript inconsistent: {} produced {}, expected {} (matches {}). Abort.",
-                label, pk, canonical, per_node[0].0
+                label,
+                pk,
+                canonical,
+                per_node[0].0
             );
         }
     }
 
-    Ok(BootstrapResult { group_pubkey: canonical, per_node })
+    Ok(BootstrapResult {
+        group_pubkey: canonical,
+        per_node,
+    })
 }
 
 #[cfg(test)]
