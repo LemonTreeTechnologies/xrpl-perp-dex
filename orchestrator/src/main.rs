@@ -12,6 +12,7 @@ mod db;
 mod election;
 mod http_helpers;
 mod orderbook;
+mod dkg_bootstrap;
 mod p2p;
 mod path_a_redkg;
 mod perp_client;
@@ -179,6 +180,19 @@ enum Command {
         /// first line. Preferred over --escrow-seed. O-L3.
         #[arg(long)]
         escrow_seed_file: Option<PathBuf>,
+    },
+
+    /// Drive a fresh FROST DKG ceremony across the cluster (Phase 2.1a).
+    /// Replaces the manual SSH+curl chain in §9 of
+    /// docs/testnet-enclave-bump-procedure.md. Reads node topology from a
+    /// TOML file; runs pre-DKG attestation (group_id=zeros sentinel) →
+    /// round 1 → round 1.5 export-v2 → round 2 import-v2 → finalize, and
+    /// asserts byte-identical group_pubkey across all nodes.
+    DkgBootstrap {
+        /// Path to dkg-topology.toml describing the cluster (threshold,
+        /// optional bastion, list of {pid,label,ssh,enclave_url}).
+        #[arg(long)]
+        topology: PathBuf,
     },
 }
 
@@ -431,6 +445,14 @@ async fn main() -> Result<()> {
             output,
         }) => {
             return cli_tools::config_init(&entries, &escrow_address, quorum, &output).await;
+        }
+        Some(Command::DkgBootstrap { topology }) => {
+            let result = dkg_bootstrap::run(&topology).await?;
+            println!("group_pubkey = 0x{}", result.group_pubkey);
+            for (label, pk) in &result.per_node {
+                println!("  {label}: 0x{pk}");
+            }
+            return Ok(());
         }
         Some(Command::OperatorAdd {
             enclave_url,
