@@ -86,16 +86,22 @@ EOF
 "
 ```
 
-**Verify Path A endpoints are present** (catches BuildKit cache lies):
+**Verify Path A + DKG v2 endpoints are present** (catches BuildKit cache lies):
 
 ```bash
 ssh andrey@94.130.18.162 "
   strings ~/xrpl-perp-dex-enclave/EthSignerEnclave/dist-azure/perp-dex-server \
-    | grep -E '/v1/pool/(ecdh|attest|frost)' | sort -u
+    | grep -E '/v1/pool/(ecdh|attest|frost|dkg)' | sort -u
 "
 ```
 
-You must see all 16 endpoints, including `/v1/pool/ecdh/pubkey`, `/v1/pool/attest/verify-peer-quote`, `/v1/pool/frost/share-export-v2`, `/v1/pool/frost/share-import-v2`. If any are missing, the build is stale — delete the dist dir and rebuild with `--no-cache` again.
+You must see at minimum these v2 endpoints, all required by §9:
+- `/v1/pool/ecdh/pubkey`, `/v1/pool/ecdh/report-data`
+- `/v1/pool/attestation-quote`, `/v1/pool/attest/verify-peer-quote`
+- `/v1/pool/dkg/round1-generate`, `/v1/pool/dkg/round1-export-share-v2`, `/v1/pool/dkg/round2-import-share-v2`, `/v1/pool/dkg/finalize`
+- `/v1/pool/frost/share-export-v2`, `/v1/pool/frost/share-import-v2`
+
+If any are missing, the build is stale — delete the dist dir and rebuild with `--no-cache` again. The legacy `/v1/pool/dkg/round1-export-share` and `/v1/pool/dkg/round2-import-share` (without `-v2`) are still in the binary for backwards compat but **must not be used cross-machine** — they fail with `SGX_ERROR_MAC_MISMATCH`. See `feedback_dkg_cross_machine_bug.md`.
 
 ## 3. Stop the cluster (one wave)
 
@@ -293,58 +299,141 @@ ssh andrey@94.130.18.162 "
 "
 ```
 
-## 9. DKG ceremony (4-stage Pedersen)
+## 9. DKG ceremony (Pedersen, v2 ECDH-over-DCAP transport)
 
-The orchestrator has no DKG driver — it's operator-driven curl. The 4 stages run on each Azure node against its local enclave on `:9088`. Participant IDs are 1–3, threshold 2, n 3.
+The legacy `/v1/pool/dkg/round1-export-share` endpoint uses `sgx_seal_data` for the share blob, which binds the seal key to the local CPU's TCB — cross-machine `unseal` always returns `SGX_ERROR_MAC_MISMATCH (12289)`. We confirmed this empirically on 2026-04-26 (see `feedback_dkg_cross_machine_bug.md`). The cluster therefore uses the **v2** endpoints — `/v1/pool/dkg/round1-export-share-v2` + `round2-import-share-v2` — which mirror the Path A v2 wire format (ECDH-over-DCAP key agreement + AES-128-GCM, AAD binds `mrenclave_self || group_id || shard_id || ceremony_nonce || sender_pk || recipient_pk`). Since this is the bootstrap, no FROST `group_id` exists yet, so we use `group_id = 32 zero bytes` as the bootstrap sentinel; after §10 the periodic announcer takes over with the real key.
 
-**Round 1 — VSS commitment.** Each node generates its commitment polynomial; this is public.
+**Participant IDs are 0-indexed**: node-1 → pid 0, node-2 → pid 1, node-3 → pid 2. The enclave validates `my_participant_id < n_participants`; passing pid=3 with n=3 fails. The original `setup_testnet_escrow.py` writes `signers_config.json` with three signers `node-1/2/3`, but those names are labels — the FROST pid mapping is positional in 0-based order.
 
-```bash
-# Run on each Azure node, substituting MY_ID = 1, 2, 3
-curl -k -s -X POST https://localhost:9088/v1/pool/dkg/round1-generate \
-  -H 'Content-Type: application/json' \
-  -d '{"my_participant_id": MY_ID, "threshold": 2, "n_participants": 3}' \
-  > /tmp/round1-MY_ID.json
-```
-
-The response has `vss_commitment` (hex). It is non-secret and must be broadcast to the other two nodes.
-
-**Round 1.5 — pairwise sealed share export.** Each node generates one sealed share per peer.
+The orchestrator has no DKG driver yet (Phase 2.1 will codify §9–§10 as a Rust subcommand). For now this is operator-driven curl. **Open ONE interactive bash session on Hetzner and run all §9 blocks in it** — they share state via `IPS`, `PK`, `QUOTE`, `GROUP_ZEROS` arrays:
 
 ```bash
-# On node MY_ID, for each peer TARGET_ID ∈ {1,2,3} \ {MY_ID}:
-curl -k -s -X POST https://localhost:9088/v1/pool/dkg/round1-export-share \
-  -H 'Content-Type: application/json' \
-  -d '{"target_participant_id": TARGET_ID}' \
-  > /tmp/share-from-MY_ID-to-TARGET_ID.json
+ssh andrey@94.130.18.162   # leave this shell open; all §9 blocks run inside it
+
+GROUP_ZEROS='0000000000000000000000000000000000000000000000000000000000000000'
+declare -A IPS=([0]=20.71.184.176 [1]=20.224.243.60 [2]=52.236.130.102)
+declare -A PK QUOTE
+mkdir -p ~/dkg-shares
 ```
 
-Now the operator manually shuffles `(sealed_share, vss_commitment)` pairs between Azure VMs via the Hetzner bastion (Azure-to-Azure SSH is closed to Hetzner-key only). The sealed share is encrypted to the target enclave's identity; the vss_commitment is public.
+**Round 0 — pre-DKG attestation round (group_id = zeros).** v2 export/import refuses unless the peer is in the local `peer_attest_cache` for the requested `(shard_id, group_id, peer_pk)` tuple. Pre-DKG no `frost_group_id` is configured, so the periodic announcer is dormant. We drive a one-shot attestation round manually with the bootstrap sentinel.
 
-**Round 2 — import + verify.** Each node imports the two shares it received from peers; the enclave verifies each share against the matching VSS commitment.
+For each node: collect ECDH pubkey + DCAP report_data (bound to `(shard=0, group=zeros)`) + DCAP quote. Then for each (sender, receiver) pair the receiver verifies the sender's quote, populating its cache.
 
 ```bash
-# On node TARGET_ID, for each FROM_ID ∈ {1,2,3} \ {TARGET_ID}:
-curl -k -s -X POST https://localhost:9088/v1/pool/dkg/round2-import-share \
-  -H 'Content-Type: application/json' \
-  -d "{
-    \"from_participant_id\": FROM_ID,
-    \"sealed_share\":      \"$(jq -r .sealed_share share-from-FROM_ID-to-TARGET_ID.json)\",
-    \"vss_commitment\":    \"$(jq -r .vss_commitment round1-FROM_ID.json)\"
-  }"
+for pid in 0 1 2 ; do
+  ip=${IPS[$pid]}
+  PK[$pid]=$(ssh azureuser@$ip 'curl -k -s https://localhost:9088/v1/pool/ecdh/pubkey' \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin)["pubkey"].removeprefix("0x"))')
+  rd=$(ssh azureuser@$ip "curl -k -s -X POST -H 'Content-Type: application/json' \
+    -d '{\"shard_id\":0,\"group_id\":\"$GROUP_ZEROS\"}' \
+    https://localhost:9088/v1/pool/ecdh/report-data" \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin)["report_data"].removeprefix("0x"))')
+  QUOTE[$pid]=$(ssh azureuser@$ip "curl -k -s -X POST -H 'Content-Type: application/json' \
+    -d '{\"user_data\":\"$rd\"}' \
+    https://localhost:9088/v1/pool/attestation-quote" \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin)["quote_hex"].removeprefix("0x").lower())')
+done
+
+NOW=$(date +%s)
+for tgt in 0 1 2 ; do
+  ip=${IPS[$tgt]}
+  for src in 0 1 2 ; do
+    [ $src -eq $tgt ] && continue
+    python3 -c "import json; open('/tmp/v_${tgt}_${src}.json','w').write(json.dumps({
+      'quote':'${QUOTE[$src]}','peer_pubkey':'${PK[$src]}',
+      'shard_id':0,'group_id':'$GROUP_ZEROS','now_ts':$NOW}))"
+    scp /tmp/v_${tgt}_${src}.json azureuser@$ip:/tmp/vbody.json >/dev/null
+    rc=$(ssh azureuser@$ip 'curl -k -s -o /dev/null -w %{http_code} -X POST \
+      -H "Content-Type: application/json" --data-binary @/tmp/vbody.json \
+      https://localhost:9088/v1/pool/attest/verify-peer-quote')
+    echo "pid=$tgt verifies pid=$src → HTTP $rc"
+  done
+done
 ```
 
-A 500 here means VSS verification failed — the peer either misbehaved or the share was corrupted in transit. **Abort and restart from Round 1**. Do not silently retry; investigate first.
+You must see all 6 verifications return `HTTP 200`. A `400 quote must be non-empty hex` is the lstrip foot-gun (see Appendix A); a `403` means DCAP collateral is stale or the quote is malformed.
 
-**Finalize.** Each node finalizes; all three must produce the same `group_pubkey` (32-byte BIP340 x-only).
+**Round 1 — VSS commitment.** Each node generates its commitment polynomial; the result is public.
 
 ```bash
-curl -k -s -X POST https://localhost:9088/v1/pool/dkg/finalize > /tmp/finalize.json
-GROUP_ID_HEX=$(jq -r .group_pubkey /tmp/finalize.json)
-echo "$GROUP_ID_HEX"  # 64 hex chars
+for pid in 0 1 2 ; do
+  ip=${IPS[$pid]}
+  ssh azureuser@$ip "curl -k -s -X POST -H 'Content-Type: application/json' \
+    -d '{\"my_participant_id\":$pid,\"threshold\":2,\"n_participants\":3}' \
+    https://localhost:9088/v1/pool/dkg/round1-generate" > /tmp/r1_$pid.json
+done
 ```
 
-Cross-check: the `group_pubkey` value must be byte-identical on all three nodes. If they diverge, the DKG transcript was tampered with — abort.
+Each `vss_commitment` is `threshold × 33 bytes` of compressed-pubkey hex (132 chars + `0x`). It is non-secret and must travel to every other node so they can verify the share you'll send next.
+
+**Round 1.5 — share export (v2).** Each node exports one ECDH-wrapped envelope per peer.
+
+```bash
+NOW=$(date +%s)
+for src in 0 1 2 ; do
+  ip=${IPS[$src]}
+  for tgt in 0 1 2 ; do
+    [ $src -eq $tgt ] && continue
+    python3 -c "import json; open('/tmp/exp_${src}_${tgt}.json','w').write(json.dumps({
+      'target_participant_id': $tgt, 'peer_pubkey': '${PK[$tgt]}',
+      'shard_id': 0, 'group_id': '$GROUP_ZEROS', 'now_ts': $NOW
+    }))"
+    scp /tmp/exp_${src}_${tgt}.json azureuser@$ip:/tmp/expbody.json >/dev/null
+    ssh azureuser@$ip 'curl -k -s -X POST -H "Content-Type: application/json" \
+      --data-binary @/tmp/expbody.json \
+      https://localhost:9088/v1/pool/dkg/round1-export-share-v2' > ~/dkg-shares/exp_${src}_to_${tgt}.json
+  done
+done
+```
+
+Each response carries `{status, target_participant_id, my_participant_id, envelope: {ceremony_nonce, iv, ct, tag, sender_pubkey}}`. The envelope is intelligible only to the target enclave (its ECDH identity is in the AAD).
+
+**Round 2 — import + verify (v2).** Each node imports the two envelopes destined for it, attaching the sender's public `vss_commitment` so the enclave can verify the share.
+
+```bash
+NOW=$(date +%s)
+for tgt in 0 1 2 ; do
+  ip=${IPS[$tgt]}
+  for src in 0 1 2 ; do
+    [ $src -eq $tgt ] && continue
+    python3 - <<PYEOF > /tmp/imp_body.json
+import json
+exp = json.load(open('$HOME/dkg-shares/exp_${src}_to_${tgt}.json'))
+r1  = json.load(open('/tmp/r1_${src}.json'))
+print(json.dumps({
+    'from_participant_id': $src,
+    'sender_pubkey': '${PK[$src]}',
+    'shard_id': 0,
+    'group_id': '$GROUP_ZEROS',
+    'now_ts': $NOW,
+    'envelope': exp['envelope'],
+    'vss_commitment': r1['vss_commitment'].removeprefix('0x'),
+}))
+PYEOF
+    scp /tmp/imp_body.json azureuser@$ip:/tmp/impbody.json >/dev/null
+    rc=$(ssh azureuser@$ip 'curl -k -s -o /dev/null -w %{http_code} -X POST \
+      -H "Content-Type: application/json" --data-binary @/tmp/impbody.json \
+      https://localhost:9088/v1/pool/dkg/round2-import-share-v2')
+    echo "tgt=$tgt imports from src=$src → HTTP $rc"
+  done
+done
+```
+
+All 6 imports must return `HTTP 200`. A `403 sender not attested` means §9.0 didn't populate the attest cache for that pair (or the cache TTL of 5 min has elapsed — re-run §9.0). A `403 AEAD failed` means the envelope was tampered with in transit; abort, do not retry. A `403 VSS verification failed` means the peer constructed a share inconsistent with their commitment — that is the malicious-peer signal, abort and investigate.
+
+**Finalize.** Each node aggregates the shares it received and emits the group pubkey.
+
+```bash
+for pid in 0 1 2 ; do
+  out=$(ssh azureuser@${IPS[$pid]} 'curl -k -s -X POST https://localhost:9088/v1/pool/dkg/finalize')
+  echo "pid=$pid → $out"
+done
+```
+
+All three must report the **byte-identical** `group_pubkey` (32-byte BIP340 x-only, 64 hex chars + `0x`). If they diverge, the DKG transcript was tampered with — abort.
+
+Reference run (2026-04-27): `group_pubkey = 0x847151fe514df4c5e43914bbc0fcc560c70e91c2550198b1a97aa13a368a2293` on all three nodes.
 
 ## 10. Configure Path A group + restart orchestrators
 
@@ -359,63 +448,73 @@ frost_group_id = "<GROUP_ID_HEX from step 9>"
 
 Restart each orchestrator. The Path A peer-quote announcer will wake up (it stays dormant when `frost_group_id` is unset; see `path_a_redkg.rs`).
 
-## 11. Path A wire test
+## 11. Path A wire test (optional regression handle)
 
-Pick one node as ceremony sender — say node-1. Restart its orchestrator with `--admin-listen 127.0.0.1:9099`. The other two stay unchanged. Per the security design, admin-listen is off by default and binds loopback-only.
+§9 already exercises the full ECDH-over-DCAP transport: the v2 export/import code path is **the same** for DKG-bootstrap and post-DKG share rotation, only the source data differs (`dkg_session.my_shares[]` vs `frost_group.shares[signer_id]`). If §9 finalized cleanly, the wire format is verified.
 
-Add the flag via a systemd drop-in. First inspect the current ExecStart on node-1 so you know what to replicate:
-
-```bash
-ssh andrey@94.130.18.162 "ssh azureuser@20.71.184.176 'systemctl cat perp-dex-orchestrator | grep ExecStart'"
-```
-
-Create a drop-in that overrides ExecStart to the existing line + the new flag:
-
-```bash
-ssh andrey@94.130.18.162 'ssh azureuser@20.71.184.176 "sudo systemctl edit perp-dex-orchestrator"'
-# In the editor, paste:
-#   [Service]
-#   ExecStart=
-#   ExecStart=<paste current ExecStart verbatim, append> --admin-listen 127.0.0.1:9099
-# Save, exit. Then:
-ssh andrey@94.130.18.162 "ssh azureuser@20.71.184.176 'sudo systemctl daemon-reload && sudo systemctl restart perp-dex-orchestrator'"
-```
-
-The empty `ExecStart=` line is required: it clears the inherited value before you set the new one.
-
-Wait ~5 minutes for the periodic peer-quote announcer (240 s interval) to make all three peers visible in each other's attest cache. Verify via `/v1/pool/attest/peer-lookup` if needed.
-
-Then trigger share-export on node-1:
-
-```bash
-ssh azureuser@20.71.184.176 "
-  curl -s -X POST http://127.0.0.1:9099/admin/path-a/share-export \\
-    -H 'Content-Type: application/json' \\
-    -d '{
-      \"shard_id\": 0,
-      \"group_id\": \"$GROUP_ID_HEX\",
-      \"signer_id\": 1,
-      \"targets\": [
-        \"<node-2 ECDH pubkey from /v1/pool/ecdh/pubkey>\",
-        \"<node-3 ECDH pubkey from /v1/pool/ecdh/pubkey>\"
-      ]
-    }'
-"
-```
-
-On nodes 2 and 3, watch the orchestrator logs for `verified peer quote` followed by `imported v2 FROST share`. On node-1, the response body has `published: 2, refused: 0, errored: 0`.
-
-After the test, drop the override and restart so admin-listen goes back to off:
-
-```bash
-ssh andrey@94.130.18.162 "ssh azureuser@20.71.184.176 'sudo systemctl revert perp-dex-orchestrator && sudo systemctl daemon-reload && sudo systemctl restart perp-dex-orchestrator'"
-```
-
-`systemctl revert` removes all drop-ins and returns to the base unit. The admin surface should not stay live.
+Skip this section unless you want a dedicated regression handle for the post-DKG share-rotation flow specifically (e.g., when adding a fourth operator or doing a share refresh without an MRENCLAVE bump). The post-DKG path uses `/v1/pool/frost/share-export-v2` + `/v1/pool/frost/share-import-v2` (note: `/frost/`, not `/dkg/`) and is driven by the orchestrator's loopback admin route at `/admin/path-a/share-export`. The drop-in pattern for `--admin-listen 127.0.0.1:9099` and the `systemctl revert` to remove it after the test are documented in `path_a_redkg.rs` and the original Phase 6b commit message.
 
 ## 12. Multisig signing smoke test
 
-End-to-end check that the new SignerList works. Submit any small testnet withdrawal through the orchestrator's API; it triggers the multisig flow that hits `/pool/sign` on each enclave and submits via `submit_multisigned`. A signed-and-confirmed tx hash is the success signal.
+End-to-end check that the new escrow + new SignerList + new operator keys all work together. Faucet a fresh secp256k1 user wallet, deposit a few XRP into the new escrow, then withdraw 1 XRP back. The orchestrator collects 2-of-3 multisig signatures via `/v1/pool/sign` on each operator's enclave and submits via `submit_multisigned`. The success signal is a `tesSUCCESS` validated tx on testnet.
+
+**Step A — deposit 5 XRP from a fresh secp256k1 wallet.** Run on Hetzner:
+
+```bash
+ssh andrey@94.130.18.162 "
+ESCROW_ADDR=\$(jq -r .escrow_address ~/.secrets/perp-dex-xrpl/escrow-testnet.json)
+python3 - <<PYEOF
+import json, time
+from xrpl.clients import JsonRpcClient
+from xrpl.wallet import Wallet, generate_faucet_wallet
+from xrpl.constants import CryptoAlgorithm
+from xrpl.models.transactions import Payment
+from xrpl.transaction import submit_and_wait
+from xrpl.utils import xrp_to_drops
+
+client = JsonRpcClient('https://s.altnet.rippletest.net:51234')
+fresh = Wallet.create(algorithm=CryptoAlgorithm.SECP256K1)
+funded = generate_faucet_wallet(client, wallet=fresh, debug=False)
+print('user_id =', funded.classic_address)
+pay = Payment(account=funded.classic_address, destination='\$ESCROW_ADDR', amount=xrp_to_drops(5))
+resp = submit_and_wait(pay, client, funded)
+print('deposit_tx_hash =', resp.result.get('hash'))
+print('seed =', funded.seed)
+time.sleep(20)  # let the deposit scanner credit the user
+PYEOF
+"
+```
+
+xrpl-py defaults to `ED25519` for `Wallet.create()` — you **must** pass `algorithm=CryptoAlgorithm.SECP256K1` or the orchestrator's auth path (which expects a secp256k1 family generator) will fail to verify. See Appendix A.
+
+**Step B — withdraw 1 XRP via the orchestrator CLI on node-1.**
+
+```bash
+ssh andrey@94.130.18.162 "
+  ssh azureuser@20.71.184.176 \
+    \"~/perp/perp-dex-orchestrator withdraw \
+      --api http://localhost:3000 \
+      --seed '<seed from step A>' \
+      --amount 1.00000000 \
+      --destination '<user_id from step A>'\"
+"
+```
+
+The success response carries `xrpl_tx_hash`. Verify on chain:
+
+```python
+from xrpl.clients import JsonRpcClient
+from xrpl.models.requests import Tx
+client = JsonRpcClient('https://s.altnet.rippletest.net:51234')
+r = client.request(Tx(transaction='<xrpl_tx_hash>')).result
+assert r['meta']['TransactionResult'] == 'tesSUCCESS'
+assert r['validated'] is True
+assert len(r['tx_json']['Signers']) >= 2  # quorum=2 reached
+```
+
+The `Signers[]` array should contain **2 of the 3** operator addresses — the orchestrator stops collecting sigs once quorum is met (the unused operator's signer slot is omitted, not zero-padded).
+
+Reference run (2026-04-27): user `rJWZfQuNvAqLDBBFR5eNGrdztbXSqpbipU`, withdrawal `0AD9913799EC94078CC36463B491B0CF1A7FD4AC8D951246958B6226289A856F` (`tesSUCCESS`, validated, 2 signers — node-1 + node-2; node-3 not needed).
 
 ## 13. Rollback
 
@@ -438,3 +537,19 @@ Document the failure mode in this file under a new section. Future-you will than
 - **Mainnet** updates — see `deployment-procedure.md §11.5 — Path B`.
 - **DKG without enclave bump** (e.g., adding a fourth operator to an existing group) — that's a follow-up doc; this one assumes a full reset.
 - **Recovery from lost shares** — the recovery flow (`ecall_generate_account_with_recovery`) is out of scope.
+
+## Appendix A — common foot-guns
+
+These are the specific traps we hit while running this procedure on 2026-04-26/27. None of them are "bugs in the procedure" — they're places where Python/JS string semantics or XRPL defaults silently produce wrong values that look right.
+
+**`str.lstrip("0x")` is NOT `str.removeprefix("0x")`.** `lstrip` takes a *set* of chars and strips any combination from the left. On `"0x030002…"` it strips `0x03` (matching the chars `{0, x, 0, 3?}` — actually `{0, x}` repeated) leaving `"3002…"`, which is both wrong content and odd-length (so subsequent `hex_to_bytes` fails with "non-empty hex" or similar misleading errors). Always use `removeprefix("0x")`. We were bitten by this in the §9.0 attestation round; symptom is `HTTP 400 quote must be non-empty hex` despite the quote string clearly being non-empty.
+
+**FROST participant_id is 0-indexed.** The enclave validates `my_participant_id < n_participants`. With `n_participants=3` only pids `{0, 1, 2}` are valid; `pid=3` returns `HTTP 500 DKG round1 generate failed`. Earlier versions of this doc said "Participant IDs are 1–3" which was wrong — the convention got cleaned up after §9.0 of the 2026-04-27 bump exposed it.
+
+**`Wallet.create()` and `Wallet.from_seed()` default to ED25519 even for secp256k1 seeds.** xrpl-py's API silently picks ed25519 unless you pass `algorithm=CryptoAlgorithm.SECP256K1`. The orchestrator's auth flow uses an XRPL secp256k1 family generator (`derive_keypair_from_seed`); ed25519 keys won't decode. Symptom is `HTTP 401` from `/v1/withdraw` even though the seed/address pair looks valid. Same trap exists in `generate_faucet_wallet(client, wallet=…)` — pass an explicitly-secp256k1 `wallet` argument; do NOT call `generate_faucet_wallet(client)` with no `wallet` and expect to swap algorithms later.
+
+**`peer_attest_cache` TTL is 5 minutes.** v2 export/import refuses if the peer's verified DCAP quote has aged out. If §9.4 finalize fails with `403 sender not attested` on a re-run, the cause is usually that §9.0 ran more than 5 minutes ago — re-run it.
+
+**SSH-shell-quoting clobbers large hex strings.** Passing a 9.5 KB DCAP quote through three levels of shell escaping (laptop → bash → ssh → bash → curl `-d`) loses bytes silently — the receiving side sees a JSON body where the `quote` field is truncated or empty. Always write request bodies to a file with Python's `json.dumps`, `scp` the file, then `curl --data-binary @/tmp/body.json`. Patterns in §9 use this.
+
+**`unix2dos -q` files where the original was CRLF.** Some files in the enclave repo (`server/server.cpp`, `server/api/v1/pool_handler.hpp`) are committed with CRLF line endings. Any tool that rewrites them with LF (Python's `Path.write_text`, etc.) makes `git diff --stat` show every line as changed, drowning the actual edit. Restore CRLF with `unix2dos -q <file>` after edit; the diff collapses back to just your real change.
