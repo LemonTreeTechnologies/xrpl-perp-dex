@@ -202,6 +202,47 @@ fn backup_existing(ts: &str) -> Result<()> {
     }
     std::fs::create_dir_all(format!("{DEPLOY_DIR}/accounts"))
         .context("recreate empty accounts/")?;
+
+    // Ownership invariant: `accounts/` must match the parent
+    // (DEPLOY_DIR) so the unprivileged daemon-running user can write
+    // sealed account files to it. If the operator (or their AI
+    // assistant) accidentally invoked `node-deploy` via outer sudo, the
+    // freshly-created dir would be `root:root` and the enclave would
+    // fail `/pool/generate` with "Failed to generate account". Match
+    // ownership to the parent dir's, which is the deploy account.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let parent_meta =
+            std::fs::metadata(DEPLOY_DIR).with_context(|| format!("stat {DEPLOY_DIR}"))?;
+        let target = format!("{DEPLOY_DIR}/accounts");
+        // Only attempt chown if we'd actually change ownership; chown
+        // requires CAP_CHOWN if mismatched, which we'll have if running
+        // via outer sudo and skip silently if not.
+        let curr_meta = std::fs::metadata(&target)?;
+        if curr_meta.uid() != parent_meta.uid() || curr_meta.gid() != parent_meta.gid() {
+            // Best effort — `chown` shells out so we don't pull in
+            // libc bindings just for this. Failure is logged but not
+            // fatal; the operator will see /pool/generate 500 and can
+            // chown manually.
+            let status = std::process::Command::new("chown")
+                .arg(format!("{}:{}", parent_meta.uid(), parent_meta.gid()))
+                .arg(&target)
+                .status();
+            match status {
+                Ok(s) if s.success() => {
+                    info!(target = %target, uid = parent_meta.uid(), "chown'd accounts/ to deploy-dir owner");
+                }
+                Ok(s) => {
+                    tracing::warn!(target = %target, status = ?s.code(), "chown accounts/ failed; daemon may not be able to write to it");
+                }
+                Err(e) => {
+                    tracing::warn!(target = %target, "chown accounts/ failed: {e}");
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

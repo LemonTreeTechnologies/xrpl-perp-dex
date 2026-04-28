@@ -439,23 +439,45 @@ pub async fn handle_start_dkg(
         "leader: initiating DKG ceremony"
     );
 
-    state
-        .dkg_step_pub
-        .send(DkgStepMessage::Round1Start {
-            ceremony_id: ceremony_id.clone(),
-            threshold: req.threshold,
-            n_participants: n,
-            pid_assignment,
-        })
+    let round1_start = DkgStepMessage::Round1Start {
+        ceremony_id: ceremony_id.clone(),
+        threshold: req.threshold,
+        n_participants: n,
+        pid_assignment,
+    };
+    publish_and_self_handle(&state, round1_start)
         .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("publish Round1Start failed: {e}"),
+                format!("publish/self-handle Round1Start failed: {e}"),
             )
         })?;
 
     drive_ceremony(&state, &ceremony_id, n).await
+}
+
+/// Helper for leader-side `*Start` emissions. Gossipsub in Strict
+/// validation mode does NOT echo own publications back to the local
+/// inbound channel — peers receive the message but the publisher does
+/// not. Without this helper the leader's own follower would never run
+/// the local enclave step (round1-generate, share-export-v2, finalize)
+/// and the ceremony would stall.
+///
+/// Order matters: `handle_message` runs FIRST (which initialises
+/// `state.active` for Round1Start, exports envelopes for Round15Start,
+/// finalises locally for FinalizeStart), THEN `publish` puts the
+/// message on gossipsub. This avoids a race where a peer receives the
+/// `*Start`, runs its step, publishes its `*Done`, and the leader's
+/// inbound handler drops the `*Done` because the leader's own
+/// `state.active` hasn't been populated yet.
+async fn publish_and_self_handle(state: &Arc<CoordinatorState>, msg: DkgStepMessage) -> Result<()> {
+    handle_message(state, msg.clone()).await?;
+    state
+        .dkg_step_pub
+        .send(msg)
+        .await
+        .map_err(|e| anyhow::anyhow!("publish failed: {e}"))
 }
 
 async fn drive_ceremony(
@@ -527,30 +549,33 @@ async fn drive_ceremony(
 
         if r1 == n && !sent_round15 {
             sent_round15 = true;
-            let _ = state
-                .dkg_step_pub
-                .send(DkgStepMessage::Round15Start {
+            let _ = publish_and_self_handle(
+                state,
+                DkgStepMessage::Round15Start {
                     ceremony_id: ceremony_id.to_string(),
-                })
-                .await;
+                },
+            )
+            .await;
         } else if r15 == n && !sent_round2 {
             sent_round2 = true;
             let vss_pairs: Vec<(u32, String)> = vss.into_iter().collect();
-            let _ = state
-                .dkg_step_pub
-                .send(DkgStepMessage::Round2Start {
+            let _ = publish_and_self_handle(
+                state,
+                DkgStepMessage::Round2Start {
                     ceremony_id: ceremony_id.to_string(),
                     vss_commitments: vss_pairs,
-                })
-                .await;
+                },
+            )
+            .await;
         } else if r2 == n && !sent_finalize {
             sent_finalize = true;
-            let _ = state
-                .dkg_step_pub
-                .send(DkgStepMessage::FinalizeStart {
+            let _ = publish_and_self_handle(
+                state,
+                DkgStepMessage::FinalizeStart {
                     ceremony_id: ceremony_id.to_string(),
-                })
-                .await;
+                },
+            )
+            .await;
         }
     }
 }
