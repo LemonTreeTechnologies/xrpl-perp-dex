@@ -1,11 +1,11 @@
 {
   "files": {
     "orchestrator/src/auth.rs": 73.13,
-    "orchestrator/src/cli_tools.rs": 20.51,
+    "orchestrator/src/cli_tools.rs": 20.38,
     "orchestrator/src/orderbook.rs": 89.46,
     "orchestrator/src/pool_path_a_client.rs": 89.36,
     "orchestrator/src/rate_limit.rs": 91.67,
     "orchestrator/src/shard_router.rs": 0.0
   },
-  "overall": 36.67
+  "overall": 35.48
 }

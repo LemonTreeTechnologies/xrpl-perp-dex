@@ -366,7 +366,8 @@ pub async fn node_bootstrap(
         if let Some(f) = faucet_url {
             faucet_fund(f, &xrpl_address).await?;
         }
-        let signing_pubkey = hex::decode(&compressed_hex).context("invalid compressed_pubkey hex")?;
+        let signing_pubkey =
+            hex::decode(&compressed_hex).context("invalid compressed_pubkey hex")?;
         let tx_hash = submit_domain_account_set(
             xrpl_url,
             enclave_url,
@@ -492,7 +493,7 @@ async fn submit_domain_account_set(
         );
     }
 
-    let domain_value = format!("xperp-ecdh-v1:{}", ecdh_pubkey_hex.to_lowercase());
+    let domain_value = encode_domain_v1(ecdh_pubkey_hex);
     let domain_bytes = domain_value.as_bytes();
     if domain_bytes.len() > 256 {
         anyhow::bail!("Domain payload exceeds XRPL's 256-byte limit");
@@ -554,6 +555,38 @@ async fn submit_domain_account_set(
         .unwrap_or("unknown")
         .to_string();
     Ok(hash)
+}
+
+/// Encodes the Domain field per `docs/multi-operator-architecture.md`
+/// §3.3: ASCII `xperp-ecdh-v1:` + lowercase hex of the 33-byte ECDH
+/// public key. The result is intended to be stored as raw bytes in the
+/// XRPL `Domain` field (which the ledger treats as opaque hex of up to
+/// 256 bytes). The format is the runtime discovery contract — peers
+/// query each operator's `AccountInfo`, parse `Domain`, strip the
+/// prefix, and hex-decode 33 bytes.
+fn encode_domain_v1(ecdh_pubkey_hex: &str) -> String {
+    format!("xperp-ecdh-v1:{}", ecdh_pubkey_hex.to_lowercase())
+}
+
+/// Reverse of `encode_domain_v1`. Used by `node-config-apply` (Phase
+/// 2.1c-C) and any other consumer that learns peer ECDH pubkeys via
+/// XRPL `AccountInfo`. Bails on prefix mismatch or wrong-length hex.
+#[allow(dead_code)]
+pub fn decode_domain_v1(domain_bytes: &[u8]) -> Result<[u8; 33]> {
+    let s = std::str::from_utf8(domain_bytes).context("Domain is not UTF-8")?;
+    let hex_part = s
+        .strip_prefix("xperp-ecdh-v1:")
+        .context("Domain missing 'xperp-ecdh-v1:' prefix")?;
+    let bytes = hex::decode(hex_part).context("Domain hex part failed to decode")?;
+    if bytes.len() != 33 {
+        anyhow::bail!(
+            "Domain ECDH pubkey has wrong length: got {} bytes, expected 33",
+            bytes.len()
+        );
+    }
+    let mut out = [0u8; 33];
+    out.copy_from_slice(&bytes);
+    Ok(out)
 }
 
 /// Asks the operator's enclave to ECDSA-sign a 32-byte hash with the
@@ -1340,6 +1373,67 @@ mod tests {
         let path = dir.path().join("seed");
         std::fs::write(&path, "\n").unwrap();
         assert!(resolve_escrow_seed(None, Some(&path)).is_err());
+    }
+
+    // ── Phase 2.1c-A Domain-field encoding (multi-operator §3.3) ─
+
+    #[test]
+    fn encode_domain_v1_format_lowercases_and_prefixes() {
+        let pk_upper = "03D3869DF7C134DA8066006A6304C3F3AFB9357BABE6326F5D8655A3DD2DE0CF57";
+        let got = encode_domain_v1(pk_upper);
+        assert_eq!(
+            got,
+            "xperp-ecdh-v1:03d3869df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57"
+        );
+        // 14 prefix chars + 66 hex chars = 80 bytes — well within
+        // XRPL's 256-byte Domain limit.
+        assert_eq!(got.len(), 80);
+    }
+
+    #[test]
+    fn encode_domain_v1_idempotent_on_lowercase() {
+        let pk_lower = "03d3869df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57";
+        assert_eq!(encode_domain_v1(pk_lower).len(), 80);
+    }
+
+    #[test]
+    fn decode_domain_v1_round_trips_with_encode() {
+        let pk_hex = "03D3869DF7C134DA8066006A6304C3F3AFB9357BABE6326F5D8655A3DD2DE0CF57";
+        let encoded = encode_domain_v1(pk_hex);
+        let decoded = decode_domain_v1(encoded.as_bytes()).unwrap();
+        assert_eq!(hex::encode(decoded).to_uppercase(), pk_hex);
+    }
+
+    #[test]
+    fn decode_domain_v1_rejects_missing_prefix() {
+        let raw = "03d3869df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57";
+        let err = decode_domain_v1(raw.as_bytes()).unwrap_err();
+        assert!(
+            err.to_string().contains("xperp-ecdh-v1"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_domain_v1_rejects_wrong_length_pubkey() {
+        // 32 bytes of hex (64 chars), not 33 — well-formed hex but
+        // wrong length → length-check failure, not codec failure.
+        let bad = "xperp-ecdh-v1:03d3869df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0c1";
+        // Make sure we built an even-length hex (33 - 1 = 32 bytes = 64 chars).
+        assert_eq!(
+            bad.strip_prefix("xperp-ecdh-v1:").unwrap().len(),
+            64,
+            "fixture must be even-length hex"
+        );
+        let err = decode_domain_v1(bad.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("wrong length"), "got: {err}");
+    }
+
+    #[test]
+    fn decode_domain_v1_rejects_non_utf8() {
+        let bad: [u8; 4] = [0xff, 0xfe, 0xfd, 0xfc];
+        let err = decode_domain_v1(&bad).unwrap_err();
+        assert!(err.to_string().contains("UTF-8"), "got: {err}");
     }
 
     // ── XRPL key derivation conformance (APP-AUTH-2) ───────────
