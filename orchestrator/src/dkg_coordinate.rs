@@ -1,8 +1,8 @@
 //! Phase 2.1c-D — DKG ceremony coordination over libp2p.
 //!
-//! Replaces the SSH-driven `dkg_bootstrap.rs` with a leader+followers
-//! protocol that runs entirely over the existing libp2p mesh, per
-//! `docs/multi-operator-architecture.md` §3.1 and §6.8. Each operator's
+//! A leader+followers protocol that runs entirely over the existing
+//! libp2p mesh, per `docs/multi-operator-architecture.md` §3.1 and
+//! §6.8. Each operator's
 //! orchestrator daemon runs a follower handler (`run_follower`) that
 //! reads inbound `DkgStepMessage` from gossipsub topic
 //! `perp-dex/cluster/dkg-step` and drives the local enclave through

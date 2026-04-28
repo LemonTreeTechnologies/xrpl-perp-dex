@@ -7,10 +7,8 @@
 mod api;
 mod auth;
 mod cli_tools;
-mod cluster_deploy;
 mod commitment;
 mod db;
-mod dkg_bootstrap;
 mod dkg_coordinate;
 mod election;
 mod http_helpers;
@@ -202,19 +200,6 @@ enum Command {
         escrow_seed_file: Option<PathBuf>,
     },
 
-    /// Drive a fresh FROST DKG ceremony across the cluster (Phase 2.1a).
-    /// Replaces the manual SSH+curl chain in §9 of
-    /// docs/testnet-enclave-bump-procedure.md. Reads node topology from a
-    /// TOML file; runs pre-DKG attestation (group_id=zeros sentinel) →
-    /// round 1 → round 1.5 export-v2 → round 2 import-v2 → finalize, and
-    /// asserts byte-identical group_pubkey across all nodes.
-    DkgBootstrap {
-        /// Path to dkg-topology.toml describing the cluster (threshold,
-        /// optional bastion, list of {pid,label,ssh,enclave_url}).
-        #[arg(long)]
-        topology: PathBuf,
-    },
-
     /// Phase 2.1c-C — discover the cluster roster from the on-chain
     /// SignerList plus each signer's `Domain` field (the ECDH pubkey),
     /// then build a local `signers_config.json` with `local_signer`
@@ -279,25 +264,6 @@ enum Command {
         orchestrator: PathBuf,
         /// Path to the freshly-built `dist-azure/` directory containing
         /// enclave.signed.so + perp-dex-server + (optional) build-manifest.txt.
-        #[arg(long)]
-        enclave_dist: PathBuf,
-    },
-
-    /// Stop services, swap binaries, restart enclaves only (Phase 2.1b).
-    /// Replaces §3-§5 of docs/testnet-enclave-bump-procedure.md. Per
-    /// node: stage artefacts to /tmp via scp, verify SHAs, stop both
-    /// services, backup prior artefacts with timestamp suffix, install
-    /// new binaries, restart enclave only. Orchestrators stay STOPPED
-    /// — Phase 2.1c (node-bootstrap + escrow-init) is the natural next step.
-    ClusterDeploy {
-        /// Path to dkg-topology.toml (shared with `dkg-bootstrap`).
-        #[arg(long)]
-        topology: PathBuf,
-        /// Path to the freshly-built perp-dex-orchestrator binary.
-        #[arg(long)]
-        orchestrator: PathBuf,
-        /// Path to the freshly-built `dist-azure/` directory containing
-        /// enclave.signed.so + perp-dex-server + build-manifest.txt.
         #[arg(long)]
         enclave_dist: PathBuf,
     },
@@ -571,14 +537,6 @@ async fn main() -> Result<()> {
         }) => {
             return cli_tools::config_init(&entries, &escrow_address, quorum, &output).await;
         }
-        Some(Command::DkgBootstrap { topology }) => {
-            let result = dkg_bootstrap::run(&topology).await?;
-            println!("group_pubkey = 0x{}", result.group_pubkey);
-            for (label, pk) in &result.per_node {
-                println!("  {label}: 0x{pk}");
-            }
-            return Ok(());
-        }
         Some(Command::NodeConfigApply {
             xrpl_url,
             escrow_address,
@@ -638,29 +596,6 @@ async fn main() -> Result<()> {
             println!("Node deploy complete:");
             println!("  mrenclave:     {}", result.mrenclave);
             println!("  backup_suffix: {}", result.backup_suffix);
-            return Ok(());
-        }
-        Some(Command::ClusterDeploy {
-            topology,
-            orchestrator,
-            enclave_dist,
-        }) => {
-            let raw = std::fs::read_to_string(&topology)
-                .with_context(|| format!("read topology {topology:?}"))?;
-            let topo: dkg_bootstrap::DkgTopology =
-                toml::from_str(&raw).context("parse topology TOML")?;
-            let manifest = enclave_dist.join("build-manifest.txt");
-            let artefacts = cluster_deploy::ArtefactSet {
-                orchestrator,
-                enclave_signed_so: enclave_dist.join("enclave.signed.so"),
-                perp_dex_server: enclave_dist.join("perp-dex-server"),
-                build_manifest: manifest.exists().then_some(manifest),
-            };
-            let results = cluster_deploy::deploy(&topo, &artefacts).await?;
-            println!("Cluster deploy complete:");
-            for r in &results {
-                println!("  {}: mrenclave={}", r.label, r.mrenclave);
-            }
             return Ok(());
         }
         Some(Command::OperatorAdd {

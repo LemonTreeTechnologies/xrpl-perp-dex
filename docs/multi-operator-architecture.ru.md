@@ -317,27 +317,25 @@ Cluster-coordinated subcommand бежит на одной ноде и drives clu
 - `orchestrator/src/withdrawal.rs`: multisig withdrawal flow через XRPL `submit_multisigned`. Enclave каждого оператора подписывает своим собственным ключом; aggregation on-chain.
 - `orchestrator/src/cli_tools.rs::operator_setup`: node-local. Генерирует keypair оператора через локальный enclave, эмитит `node-<i>.json`. Будет promoted до `node-bootstrap` и расширен чтобы также публиковать `Domain`.
 
-### 11.2 Помечено как debt — должно быть заменено
+### 11.2 Уволенный SSH-driven debt
 
-Следующее присутствует в репозитории но нарушает модель. Они помечены `[DEPRECATED — нарушает multi-operator architecture; replace per Phase 2.1c]` doc-комментариями в верху модулей. Они хранятся временно потому что нам нужны testnet operations во время transition'а; они НЕ предназначены для use на любом non-throwaway state'е.
+Следующие SSH-driven модули существовали в течение Phase 2.1c transition'а. Они нарушали multi-operator модель (каждый встраивал cross-operator SSH допущение которое production не может выполнить). Они уволены.
 
-- `orchestrator/src/dkg_bootstrap.rs` (commit `5fe5aa1`+`78710a9`): SSH-driven DKG ceremony. Замена: `dkg-coordinate` (cluster-coordinated, libp2p-driven).
-- `orchestrator/src/cluster_deploy.rs` (commit `fefd3c9`): SSH-driven multi-node binary swap + service lifecycle. Замена: `node-deploy` (node-local). Coordinated MRENCLAVE bumps — governance, не одна команда.
+- ~~`orchestrator/src/dkg_bootstrap.rs`~~ (commits `5fe5aa1`+`78710a9` + retired в 2.1c-F): SSH-driven DKG ceremony. Заменён на `dkg-coordinate` (cluster-coordinated, libp2p-driven).
+- ~~`orchestrator/src/cluster_deploy.rs`~~ (commit `fefd3c9` + retired в 2.1c-F): SSH-driven multi-node binary swap + service lifecycle. Заменён на `node-deploy` (node-local). Coordinated MRENCLAVE bumps — governance, не одна команда.
 
-### 11.3 Replacement plan (Phase 2.1c continuation)
+### 11.3 Replacement plan — выполнен
 
-Replacement работа происходит в этом порядке:
-
-| Phase | Subcommand | Класс | Заменяет | Время |
+| Phase | Subcommand | Класс | Заменяет | Status |
 |---|---|---|---|---|
-| 2.1c-A | `node-bootstrap` | node-local | `operator-setup` (rename + extend with Domain publish) | ~1 день |
-| 2.1c-B | `escrow-init` | XRPL-only | `setup_testnet_escrow.py` | ~½ дня |
-| 2.1c-C | `node-config-apply` | node-local | новый (нет current equivalent'а) | ~½ дня |
-| 2.1c-D | `dkg-coordinate` | cluster-coordinated | `dkg-bootstrap` (SSH) | ~2 дня |
-| 2.1c-E | `node-deploy` | node-local | `cluster-deploy` (SSH) | ~½ дня |
-| 2.1c-F | retire `dkg_bootstrap.rs` + `cluster_deploy.rs` | (delete) | (retiring debt) | ~½ дня |
+| 2.1c-A | `node-bootstrap` | node-local | `operator-setup` (rename + extend with Domain publish) | ✅ landed `b068ecb`+`cc4e25f`+`e95ebcc` |
+| 2.1c-B | `escrow-init` | XRPL-only | `setup_testnet_escrow.py` | ✅ landed `d64ce67`+`dc2bcd0` |
+| 2.1c-C | `node-config-apply` | node-local | новый | ✅ landed `0e41678` |
+| 2.1c-D | `dkg-coordinate` | cluster-coordinated (libp2p) | `dkg-bootstrap` (SSH) | ✅ code-complete `dc54fa4` |
+| 2.1c-E | `node-deploy` | node-local | `cluster-deploy` (SSH) | ✅ code-complete `9130033` |
+| 2.1c-F | retire `dkg_bootstrap.rs` + `cluster_deploy.rs` | (delete) | (retiring debt) | ✅ этот commit |
 
-Total: ~5 дней. В течение этого времени testnet оперирует на deprecated SSH-driven path'е; mainnet'а ещё нет. Deprecated-path operations во время transition'а explicitly понимаются как testnet-developer-convenience, не system-code, и никогда не информируют mainnet design.
+Phase 2.1c полностью выполнен. Репозиторий больше не содержит SSH-driven cross-operator кодовых путей. Live testnet validation flow'а 2.1c-D + 2.1c-E — естественный следующий operational шаг; он не требует никакой дальнейшей работы по коду.
 
 ## 12. Глоссарий
 

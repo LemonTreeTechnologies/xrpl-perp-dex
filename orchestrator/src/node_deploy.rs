@@ -3,9 +3,8 @@
 //! binaries with a timestamp suffix, installs the new orchestrator +
 //! enclave artefacts, restarts the enclave service.
 //!
-//! Replaces the SSH-driven `cluster_deploy` for the multi-operator
-//! model: each operator deploys their own node from their own machine,
-//! no central coordinator host. Per
+//! Each operator deploys their own node from their own machine — no
+//! cross-operator SSH, no central coordinator host. Per
 //! `docs/multi-operator-architecture.md` §7.2: "each operator
 //! independently deploys" — this subcommand is the codification of
 //! that step.
@@ -27,9 +26,8 @@ use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tracing::info;
 
-/// Artefact set the operator points at. Same shape as
-/// `cluster_deploy::ArtefactSet` but consumed directly on the local
-/// node — no scp, no remote staging.
+/// Artefact set the operator points at. Consumed directly on the
+/// local node — no scp, no remote staging.
 #[derive(Debug)]
 pub struct LocalArtefactSet {
     pub orchestrator: PathBuf,
@@ -238,8 +236,7 @@ async fn sudo_systemctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-// ── SHA + manifest helpers (mirrored from cluster_deploy.rs; will be
-// consolidated when 2.1c-F retires that module). ────────────────────
+// ── SHA + manifest helpers ────────────────────────────────────────
 
 fn compute_sha256(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("read {path:?}"))?;

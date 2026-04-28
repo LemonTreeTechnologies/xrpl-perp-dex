@@ -267,8 +267,8 @@ pub enum ShareEnvelopeV2Message {
 
 /// DKG ceremony coordination messages, published on
 /// `perp-dex/cluster/dkg-step` per `docs/multi-operator-architecture.md`
-/// §3.1. Per Phase 2.1c-D — replaces the SSH-driven dkg_bootstrap with
-/// a leader-followers protocol that runs entirely over libp2p.
+/// §3.1. Per Phase 2.1c-D — a leader-followers protocol that runs
+/// entirely over libp2p.
 ///
 /// Wire flow (happy path, 3 nodes, leader = node-0):
 ///   1. Leader publishes `Round1Start { ceremony_id, threshold, n,
