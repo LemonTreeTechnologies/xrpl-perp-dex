@@ -839,21 +839,7 @@ pub async fn escrow_init(
             seed_file.display()
         );
     }
-    if signers.len() < 2 || signers.len() > 32 {
-        anyhow::bail!(
-            "need 2..=32 signers, got {} (XRPL SignerList limit)",
-            signers.len()
-        );
-    }
-    if quorum < 1 || quorum as usize > signers.len() {
-        anyhow::bail!("quorum must be in 1..={}, got {}", signers.len(), quorum);
-    }
-    // Validate signer addresses parse as XRPL r-addresses up-front so
-    // we don't burn the faucet entry on a typo'd config.
-    for (name, addr) in signers {
-        decode_xrpl_address(addr)
-            .with_context(|| format!("signer {name} has invalid XRPL address {addr:?}"))?;
-    }
+    validate_escrow_init_args(signers, quorum)?;
 
     println!("Escrow Init");
     println!("===========");
@@ -994,6 +980,27 @@ pub async fn escrow_init(
         signers.len()
     );
 
+    Ok(())
+}
+
+/// Pure-logic argument validation for `escrow_init`. Extracted so the
+/// failure modes (too-few/too-many signers, bad quorum, malformed
+/// XRPL address) are unit-testable without touching the network. Real
+/// network errors during the ceremony are reported separately.
+fn validate_escrow_init_args(signers: &[(String, String)], quorum: u32) -> Result<()> {
+    if signers.len() < 2 || signers.len() > 32 {
+        anyhow::bail!(
+            "need 2..=32 signers, got {} (XRPL SignerList limit)",
+            signers.len()
+        );
+    }
+    if quorum < 1 || quorum as usize > signers.len() {
+        anyhow::bail!("quorum must be in 1..={}, got {}", signers.len(), quorum);
+    }
+    for (name, addr) in signers {
+        decode_xrpl_address(addr)
+            .with_context(|| format!("signer {name} has invalid XRPL address {addr:?}"))?;
+    }
     Ok(())
 }
 
@@ -1645,6 +1652,106 @@ mod tests {
         let bad: [u8; 4] = [0xff, 0xfe, 0xfd, 0xfc];
         let err = decode_domain_v1(&bad).unwrap_err();
         assert!(err.to_string().contains("UTF-8"), "got: {err}");
+    }
+
+    // ── Phase 2.1c-B escrow-init helpers ───────────────────────────
+
+    fn three_valid_signers() -> Vec<(String, String)> {
+        vec![
+            ("node-1".into(), "rKe1hu3iRvyRnJB4xHBMXvzEwsnXTHMxnJ".into()),
+            ("node-2".into(), "rL3LYCP6gkduRoiD9pB6KDEUyNVPXeDo2j".into()),
+            ("node-3".into(), "rwoAC7KZD3UYtzpWSB4jQUt1qvQjhqXTUn".into()),
+        ]
+    }
+
+    #[test]
+    fn validate_escrow_init_accepts_2_of_3() {
+        validate_escrow_init_args(&three_valid_signers(), 2).unwrap();
+    }
+
+    #[test]
+    fn validate_escrow_init_rejects_one_signer() {
+        let one = three_valid_signers()
+            .into_iter()
+            .take(1)
+            .collect::<Vec<_>>();
+        let err = validate_escrow_init_args(&one, 1).unwrap_err();
+        assert!(err.to_string().contains("need 2..=32"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_escrow_init_rejects_quorum_zero() {
+        let err = validate_escrow_init_args(&three_valid_signers(), 0).unwrap_err();
+        assert!(err.to_string().contains("quorum must be"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_escrow_init_rejects_quorum_above_n() {
+        let err = validate_escrow_init_args(&three_valid_signers(), 4).unwrap_err();
+        assert!(err.to_string().contains("quorum must be"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_escrow_init_rejects_invalid_signer_address() {
+        let mut bad = three_valid_signers();
+        bad[1].1 = "rThisIsNotAValidAddress".into();
+        let err = validate_escrow_init_args(&bad, 2).unwrap_err();
+        // The bs58 decoder calls a malformed XRPL address an "invalid
+        // encoding"; surface that distinct from quorum errors.
+        assert!(
+            err.to_string().contains("invalid XRPL address") || err.to_string().contains("invalid"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn family_seed_starts_with_s_and_decodes_back() {
+        let seed = generate_secp256k1_family_seed();
+        // XRPL secp256k1 family seeds always start with 's' and are
+        // typically 29 chars long (1-byte prefix + 16 entropy +
+        // 4 checksum, base58-encoded).
+        assert!(seed.starts_with('s'), "got: {seed}");
+        assert!(
+            seed.len() == 29 || seed.len() == 28,
+            "unexpected length {} for seed {seed}",
+            seed.len()
+        );
+        // Decoding via the same path as `derive_keypair_from_seed`
+        // round-trips: produces the right entropy length.
+        let decoded = bs58::decode(&seed)
+            .with_alphabet(xrpl_alphabet())
+            .into_vec()
+            .expect("seed must decode");
+        assert_eq!(
+            decoded.len(),
+            21,
+            "expected 1+16+4 bytes, got {}",
+            decoded.len()
+        );
+        assert_eq!(
+            decoded[0], 0x21,
+            "expected secp256k1 family-seed prefix 0x21"
+        );
+    }
+
+    #[test]
+    fn family_seed_derives_to_a_valid_xrpl_keypair() {
+        // The derived keypair must have a valid r-address (round-trip
+        // through `decode_xrpl_address`) — proves the seed is usable
+        // immediately by the rest of the XRPL flow.
+        let seed = generate_secp256k1_family_seed();
+        let kp = derive_keypair_from_seed(&seed).expect("freshly-generated seed must derive");
+        decode_xrpl_address(&kp.address).expect("derived address must be valid XRPL r-address");
+    }
+
+    #[test]
+    fn family_seed_two_calls_produce_different_seeds() {
+        // Cheap entropy sanity check: two consecutive calls must NOT
+        // produce the same seed. Probability of collision is 2^-128
+        // when entropy is sound.
+        let a = generate_secp256k1_family_seed();
+        let b = generate_secp256k1_family_seed();
+        assert_ne!(a, b, "two consecutive calls produced the same seed");
     }
 
     // ── XRPL key derivation conformance (APP-AUTH-2) ───────────
