@@ -60,9 +60,13 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Generate a new signer identity from an SGX enclave.
-    OperatorSetup {
-        /// Enclave REST API base URL
+    /// Phase 2.1c-A — generate a new signer identity from this node's
+    /// local SGX enclave, fetch the enclave's ECDH identity public
+    /// key, and optionally publish the ECDH pubkey on chain via
+    /// `AccountSet.Domain` per `docs/multi-operator-architecture.md`
+    /// §6.2. Replaces the older `operator-setup` subcommand.
+    NodeBootstrap {
+        /// Enclave REST API base URL (must be loopback per O-L4)
         #[arg(long, default_value = "https://localhost:9088/v1")]
         enclave_url: String,
         /// Operator name (label for config files)
@@ -71,6 +75,19 @@ enum Command {
         /// Write signer entry JSON to this file
         #[arg(long)]
         output: Option<PathBuf>,
+        /// If set, publish the ECDH pubkey on chain via AccountSet.Domain.
+        /// Requires --xrpl-url and a funded operator account.
+        #[arg(long)]
+        publish_domain: bool,
+        /// XRPL JSON-RPC URL (required when --publish-domain).
+        #[arg(long)]
+        xrpl_url: Option<String>,
+        /// Optional faucet URL. When set, the operator's account is
+        /// faucet-funded before AccountSet.Domain submission. Use on
+        /// testnet/devnet; mainnet has no faucet — operators fund their
+        /// own accounts and skip this flag.
+        #[arg(long)]
+        faucet_url: Option<String>,
     },
 
     /// Configure an XRPL escrow account with a 2-of-N SignerListSet.
@@ -145,7 +162,7 @@ enum Command {
 
     /// Create a signers_config.json from multiple operator entry files.
     ConfigInit {
-        /// Operator entry JSON files (from operator-setup --output)
+        /// Operator entry JSON files (from node-bootstrap --output)
         #[arg(long, required = true, num_args = 1..)]
         entries: Vec<PathBuf>,
         /// XRPL escrow account r-address
@@ -201,7 +218,7 @@ enum Command {
     /// node: stage artefacts to /tmp via scp, verify SHAs, stop both
     /// services, backup prior artefacts with timestamp suffix, install
     /// new binaries, restart enclave only. Orchestrators stay STOPPED
-    /// — Phase 2.1c (operator-setup + escrow) is the natural next step.
+    /// — Phase 2.1c (node-bootstrap + escrow-init) is the natural next step.
     ClusterDeploy {
         /// Path to dkg-topology.toml (shared with `dkg-bootstrap`).
         #[arg(long)]
@@ -409,12 +426,23 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::OperatorSetup {
+        Some(Command::NodeBootstrap {
             enclave_url,
             name,
             output,
+            publish_domain,
+            xrpl_url,
+            faucet_url,
         }) => {
-            return cli_tools::operator_setup(&enclave_url, &name, output.as_deref()).await;
+            return cli_tools::node_bootstrap(
+                &enclave_url,
+                &name,
+                output.as_deref(),
+                publish_domain,
+                xrpl_url.as_deref(),
+                faucet_url.as_deref(),
+            )
+            .await;
         }
         Some(Command::EscrowSetup {
             xrpl_url,

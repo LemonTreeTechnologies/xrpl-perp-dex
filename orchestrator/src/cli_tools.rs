@@ -219,7 +219,7 @@ fn sign_xrpl_tx(
     Ok(serialize_fields(fields, array_suffix))
 }
 
-// ── operator-setup ───────────────────────────────────────────────
+// ── node-bootstrap ───────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SignerEntry {
@@ -229,6 +229,15 @@ struct SignerEntry {
     session_key: String,
     compressed_pubkey: String,
     xrpl_address: String,
+    /// 33-byte ECDH identity public key, hex-encoded uppercase, no `0x`
+    /// prefix. Populated by `node-bootstrap`. Mirrors what the operator
+    /// publishes on chain via `AccountSet.Domain` per
+    /// `docs/multi-operator-architecture.md` §6.2.
+    /// Optional for backward-compatibility with pre-Phase-2.1c entry
+    /// files that lacked the field; consumers that need the ECDH pubkey
+    /// must fall back to a live `AccountInfo` query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ecdh_pubkey: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -254,26 +263,54 @@ struct PoolAccount {
     is_active: bool,
 }
 
-pub async fn operator_setup(
+/// Phase 2.1c-A — `node-bootstrap` subcommand. Runs locally on a single
+/// node by its operator. Generates a fresh XRPL keypair inside the
+/// enclave, fetches the enclave's ECDH identity public key, and
+/// optionally publishes the ECDH pubkey on chain via `AccountSet.Domain`
+/// per `docs/multi-operator-architecture.md` §6.2.
+///
+/// Single-mode: the same code path runs on testnet (typically with
+/// `--faucet-url` to auto-fund the new account) and mainnet (operator
+/// pre-funds their account from their own XRP holdings). Domain
+/// publication is opt-in via `--publish-domain` so the keypair-only
+/// flow remains usable for the orchestrator's own startup needs.
+///
+/// Replaces the older `operator-setup` subcommand. Output entry JSON
+/// gains an `ecdh_pubkey` field; existing consumers (`config_init`,
+/// `operator_add`) treat it as optional for backward compatibility.
+pub async fn node_bootstrap(
     enclave_url: &str,
     name: &str,
     output: Option<&std::path::Path>,
+    publish_domain: bool,
+    xrpl_url: Option<&str>,
+    faucet_url: Option<&str>,
 ) -> Result<()> {
     // O-L4: operator tooling talks to the local enclave — enforce
     // loopback and reuse the shared factory so that remains
     // true if someone repoints `--enclave-url` at an attacker host.
     crate::http_helpers::ensure_loopback_url(enclave_url)
-        .context("operator_setup requires a loopback enclave URL (O-L4)")?;
+        .context("node_bootstrap requires a loopback enclave URL (O-L4)")?;
     let http = crate::http_helpers::loopback_http_client(std::time::Duration::from_secs(30))?;
 
-    println!("Operator Setup");
+    if publish_domain && xrpl_url.is_none() {
+        anyhow::bail!("--publish-domain requires --xrpl-url");
+    }
+
+    println!("Node Bootstrap");
     println!("==============");
     println!("Enclave: {enclave_url}");
     println!("Name:    {name}");
+    if publish_domain {
+        println!("XRPL:    {} (publishing Domain)", xrpl_url.unwrap());
+        if let Some(f) = faucet_url {
+            println!("Faucet:  {f}");
+        }
+    }
     println!();
 
     // Step 1: Generate a new keypair in the enclave
-    println!("[1/3] Generating keypair in enclave...");
+    println!("[1/4] Generating keypair in enclave...");
     let resp: GenerateResponse = http
         .post(format!("{enclave_url}/pool/generate"))
         .json(&serde_json::json!({}))
@@ -301,7 +338,7 @@ pub async fn operator_setup(
     println!("  Session key:      {session_key}");
 
     // Step 2: Derive XRPL address from uncompressed pubkey
-    println!("\n[2/3] Deriving XRPL address...");
+    println!("\n[2/4] Deriving XRPL address...");
     let xrpl_address = xrpl_signer::pubkey_to_xrpl_address(&uncompressed_pubkey)?;
 
     let compressed_hex = {
@@ -317,7 +354,35 @@ pub async fn operator_setup(
     println!("  XRPL address:     {xrpl_address}");
     println!("  Compressed pubkey: {compressed_hex}");
 
-    // Step 3: Output signer entry
+    // Step 3: Fetch ECDH identity pubkey from the same enclave.
+    println!("\n[3/4] Fetching ECDH identity pubkey...");
+    let ecdh_pubkey = fetch_ecdh_pubkey(&http, enclave_url).await?;
+    println!("  ECDH pubkey:      {ecdh_pubkey}");
+
+    // Step 4 (optional): publish Domain on chain.
+    if publish_domain {
+        println!("\n[4/4] Publishing AccountSet.Domain on XRPL...");
+        let xrpl_url = xrpl_url.unwrap();
+        if let Some(f) = faucet_url {
+            faucet_fund(f, &xrpl_address).await?;
+        }
+        let signing_pubkey = hex::decode(&compressed_hex).context("invalid compressed_pubkey hex")?;
+        let tx_hash = submit_domain_account_set(
+            xrpl_url,
+            enclave_url,
+            &eth_address,
+            &session_key,
+            &xrpl_address,
+            &signing_pubkey,
+            &ecdh_pubkey,
+        )
+        .await?;
+        println!("  TX hash: {tx_hash}");
+    } else {
+        println!("\n[4/4] Skipped Domain publish (no --publish-domain)");
+    }
+
+    // Step 5: Output signer entry
     let entry = SignerEntry {
         name: name.to_string(),
         enclave_url: enclave_url.to_string(),
@@ -325,11 +390,12 @@ pub async fn operator_setup(
         session_key,
         compressed_pubkey: compressed_hex,
         xrpl_address: xrpl_address.clone(),
+        ecdh_pubkey: Some(ecdh_pubkey),
     };
 
     let json = serde_json::to_string_pretty(&entry)?;
 
-    println!("\n[3/3] Signer entry:");
+    println!("\nSigner entry:");
     println!("{json}");
 
     if let Some(path) = output {
@@ -340,10 +406,227 @@ pub async fn operator_setup(
 
     println!("\nNext steps:");
     println!("  1. Add this entry to signers_config.json");
-    println!("  2. Run `escrow-setup` to configure XRPL SignerListSet");
+    if !publish_domain {
+        println!("  2. Re-run with --publish-domain --xrpl-url <url> once the account is funded,");
+        println!("     OR submit the AccountSet.Domain transaction by other means.");
+    }
     println!("  3. Verify on XRPL explorer: https://testnet.xrpl.org/accounts/{xrpl_address}");
 
     Ok(())
+}
+
+/// Fetches the enclave's ECDH identity public key. The enclave returns
+/// `{pubkey: "0x<33-byte hex>"}` per `/v1/pool/ecdh/pubkey`.
+async fn fetch_ecdh_pubkey(http: &reqwest::Client, enclave_url: &str) -> Result<String> {
+    let resp: serde_json::Value = http
+        .get(format!("{enclave_url}/pool/ecdh/pubkey"))
+        .send()
+        .await
+        .context("failed to reach /pool/ecdh/pubkey")?
+        .json()
+        .await
+        .context("invalid JSON from /pool/ecdh/pubkey")?;
+    let pk = resp["pubkey"]
+        .as_str()
+        .context("missing pubkey field on /pool/ecdh/pubkey response")?;
+    // Use removeprefix-equivalent: strip exactly "0x" if present, do NOT
+    // use lstrip("0x") which strips any combination of {0,x} chars and
+    // silently corrupts pubkeys that happen to start with `0` after the
+    // prefix. See `feedback_dkg_cross_machine_bug.md` foot-gun #1.
+    let trimmed = pk.strip_prefix("0x").unwrap_or(pk).to_uppercase();
+    if trimmed.len() != 66 {
+        anyhow::bail!(
+            "ECDH pubkey has unexpected length: got {} hex chars, expected 66 (33 bytes)",
+            trimmed.len()
+        );
+    }
+    Ok(trimmed)
+}
+
+/// Faucet-fund an XRPL account on networks that have a faucet (testnet,
+/// devnet). On mainnet there is no faucet — operators fund their own
+/// accounts via other means and skip this call by omitting --faucet-url.
+async fn faucet_fund(faucet_url: &str, address: &str) -> Result<()> {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let resp = http
+        .post(faucet_url)
+        .json(&serde_json::json!({ "destination": address }))
+        .send()
+        .await
+        .with_context(|| format!("faucet request to {faucet_url} failed"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("faucet returned HTTP {status}: {body}");
+    }
+    println!("  faucet OK ({status})");
+    // Faucet-funded accounts take a few ledgers to validate. Wait a bit
+    // before submitting AccountSet, otherwise we can race ahead and get
+    // `actNotFound`.
+    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    Ok(())
+}
+
+/// Builds an AccountSet transaction setting `Domain` to the structured
+/// value `xperp-ecdh-v1:<33-byte-pubkey-hex>` (per
+/// `docs/multi-operator-architecture.md` §3.3), signs it via the
+/// operator's enclave-bound key, and submits via XRPL JSON-RPC.
+/// Returns the on-chain tx hash.
+async fn submit_domain_account_set(
+    xrpl_url: &str,
+    enclave_url: &str,
+    eth_address: &str,
+    session_key: &str,
+    xrpl_address: &str,
+    signing_pubkey: &[u8],
+    ecdh_pubkey_hex: &str,
+) -> Result<String> {
+    use sha2::Digest;
+
+    if signing_pubkey.len() != 33 {
+        anyhow::bail!(
+            "signing_pubkey must be 33-byte compressed secp256k1, got {} bytes",
+            signing_pubkey.len()
+        );
+    }
+
+    let domain_value = format!("xperp-ecdh-v1:{}", ecdh_pubkey_hex.to_lowercase());
+    let domain_bytes = domain_value.as_bytes();
+    if domain_bytes.len() > 256 {
+        anyhow::bail!("Domain payload exceeds XRPL's 256-byte limit");
+    }
+
+    let account_id = decode_xrpl_address(xrpl_address)?;
+
+    // Account must exist on chain — read its current Sequence.
+    let account_info = fetch_account_info(xrpl_url, xrpl_address).await?;
+    let sequence = account_info.sequence;
+
+    // Build canonical AccountSet fields. Field codes per XRPL spec:
+    //   TransactionType = 2 (UInt16),  AccountSet = 3
+    //   Sequence        = 4 (UInt32)
+    //   Fee             = 8 (Amount drops)
+    //   Domain          = 7 (Blob)
+    //   Account         = 1 (AccountID)
+    //   SigningPubKey   = 3 (Blob)
+    //   TxnSignature    = 4 (Blob)
+    let mut fields = vec![
+        XrplField::uint16(2, 3),
+        XrplField::uint32(4, sequence),
+        XrplField::amount_drops(8, 12),
+        XrplField::blob(7, domain_bytes),
+        XrplField::account_id(1, &account_id),
+        XrplField::blob(3, signing_pubkey),
+    ];
+
+    // Compute the signing hash: SHA-512Half(STX\0 || canonical(fields))
+    fields.sort_by_key(|f| f.sort_key());
+    let mut signing_data = HASH_PREFIX_TX_SIGN.to_vec();
+    for f in &fields {
+        signing_data.extend_from_slice(&f.serialize());
+    }
+    let h = sha2::Sha512::digest(&signing_data);
+    let mut signing_hash = [0u8; 32];
+    signing_hash.copy_from_slice(&h[..32]);
+
+    // Ask the enclave to sign.
+    let sig_der = sign_via_enclave(enclave_url, eth_address, session_key, &signing_hash).await?;
+
+    // Append TxnSignature, re-serialize, submit.
+    fields.push(XrplField::blob(4, &sig_der));
+    fields.sort_by_key(|f| f.sort_key());
+    let mut blob = Vec::new();
+    for f in &fields {
+        blob.extend_from_slice(&f.serialize());
+    }
+
+    let result = submit_tx_blob(xrpl_url, &blob).await?;
+    let engine = result["result"]["engine_result"]
+        .as_str()
+        .unwrap_or("unknown");
+    if !engine.starts_with("tes") {
+        anyhow::bail!("AccountSet failed: engine_result={engine}: {result}");
+    }
+    let hash = result["result"]["tx_json"]["hash"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
+    Ok(hash)
+}
+
+/// Asks the operator's enclave to ECDSA-sign a 32-byte hash with the
+/// account-bound key, returns the DER-encoded signature.
+async fn sign_via_enclave(
+    enclave_url: &str,
+    eth_address: &str,
+    session_key: &str,
+    hash: &[u8; 32],
+) -> Result<Vec<u8>> {
+    let http = crate::http_helpers::loopback_http_client(std::time::Duration::from_secs(30))?;
+    let resp: serde_json::Value = http
+        .post(format!("{enclave_url}/pool/sign"))
+        .json(&serde_json::json!({
+            "from": eth_address,
+            "hash": format!("0x{}", hex::encode(hash)),
+            "session_key": session_key,
+        }))
+        .send()
+        .await
+        .context("/pool/sign failed")?
+        .json()
+        .await
+        .context("invalid JSON from /pool/sign")?;
+    if resp["status"].as_str() != Some("success") {
+        anyhow::bail!("/pool/sign rejected: {resp}");
+    }
+    let r_hex = resp["signature"]["r"]
+        .as_str()
+        .context("missing r in /pool/sign response")?;
+    let s_hex = resp["signature"]["s"]
+        .as_str()
+        .context("missing s in /pool/sign response")?;
+    let r = hex::decode(r_hex).context("bad r hex")?;
+    let s = hex::decode(s_hex).context("bad s hex")?;
+    Ok(xrpl_signer::der_encode_signature(&r, &s))
+}
+
+/// Minimal `account_info` query — returns the next sequence number we
+/// must use. Reused by submit_domain_account_set.
+struct AccountInfo {
+    sequence: u32,
+}
+
+async fn fetch_account_info(xrpl_url: &str, xrpl_address: &str) -> Result<AccountInfo> {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let body = serde_json::json!({
+        "method": "account_info",
+        "params": [{
+            "account": xrpl_address,
+            "ledger_index": "validated",
+        }],
+    });
+    let resp: serde_json::Value = http
+        .post(xrpl_url)
+        .json(&body)
+        .send()
+        .await
+        .context("account_info request failed")?
+        .json()
+        .await
+        .context("invalid JSON from account_info")?;
+    let result = &resp["result"];
+    if let Some(err) = result["error"].as_str() {
+        anyhow::bail!("account_info error: {err}");
+    }
+    let sequence = result["account_data"]["Sequence"]
+        .as_u64()
+        .context("account_info missing account_data.Sequence — is the account funded?")?
+        as u32;
+    Ok(AccountInfo { sequence })
 }
 
 // ── escrow-setup ────────────────────────────────────────────────
@@ -829,6 +1112,7 @@ pub async fn operator_add(
         session_key,
         compressed_pubkey: compressed_hex,
         xrpl_address: xrpl_address.clone(),
+        ecdh_pubkey: None,
     };
 
     // Step 3: Update config

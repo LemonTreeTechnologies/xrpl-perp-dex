@@ -69,8 +69,9 @@ pub struct NodeDeployResult {
 }
 
 /// Entry point. Stops services, swaps binaries, starts enclaves only.
-/// Orchestrators remain stopped — Phase 2.1c (operator-setup + escrow)
-/// is the natural next step before they come back up.
+/// Orchestrators remain stopped — Phase 2.1c (node-bootstrap +
+/// escrow-init + node-config-apply) is the natural next step before
+/// they come back up.
 pub async fn deploy(
     topology: &DkgTopology,
     artefacts: &ArtefactSet,
@@ -107,7 +108,7 @@ pub async fn deploy(
 
     info!(
         nodes = results.len(),
-        "cluster-deploy complete; orchestrators are STOPPED — run Phase 2.1c (operator-setup + escrow) next"
+        "cluster-deploy complete; orchestrators are STOPPED — run Phase 2.1c (node-bootstrap + escrow-init) next"
     );
     Ok(results)
 }

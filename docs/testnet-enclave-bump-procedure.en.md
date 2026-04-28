@@ -187,7 +187,7 @@ ssh andrey@94.130.18.162 "
     esac
     ssh azureuser@\$ip \"
       cd ~/perp
-      ./perp-dex-orchestrator operator-setup \\
+      ./perp-dex-orchestrator node-bootstrap \\
         --enclave-url https://localhost:9088/v1 \\
         --name node-\$i \\
         --output /tmp/node-\$i.json
@@ -215,7 +215,7 @@ ssh andrey@94.130.18.162 "
        ~/.secrets/perp-dex-xrpl/escrow-testnet.json.prev-\$(date +%Y%m%d-%H%M%S)
   fi
 
-  # Pull the 3 new xrpl_addresses from the operator-setup outputs
+  # Pull the 3 new xrpl_addresses from the node-bootstrap outputs
   N1=\$(jq -r .xrpl_address ~/phase7-entries/node-1.json)
   N2=\$(jq -r .xrpl_address ~/phase7-entries/node-2.json)
   N3=\$(jq -r .xrpl_address ~/phase7-entries/node-3.json)
