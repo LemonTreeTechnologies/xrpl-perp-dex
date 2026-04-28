@@ -1408,10 +1408,7 @@ mod tests {
     fn decode_domain_v1_rejects_missing_prefix() {
         let raw = "03d3869df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57";
         let err = decode_domain_v1(raw.as_bytes()).unwrap_err();
-        assert!(
-            err.to_string().contains("xperp-ecdh-v1"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("xperp-ecdh-v1"), "got: {err}");
     }
 
     #[test]
