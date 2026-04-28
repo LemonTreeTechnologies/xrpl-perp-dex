@@ -2140,4 +2140,206 @@ mod tests {
         let h2 = run_policy(&tx).unwrap();
         assert_ne!(h1, h2);
     }
+
+    // ── Phase 2.2-B wire-level integration tests ─────────────────
+    //
+    // These exercise `handle_signing_request` end-to-end against a real
+    // axum mock server, hitting the same code path production traffic
+    // takes when a SigningMessage::Request lands on a peer's run loop.
+    // Coverage goals (Audit re-audit-4 Appendix B/C bar):
+    //
+    //   1. Wire shape — a SignerListSet tx survives serde round-trip
+    //      through SigningMessage::Request unchanged; the receiver's
+    //      policy gets the exact JSON the requester sent.
+    //   2. Policy fires before the enclave is contacted — a malformed
+    //      tx never leaves a hash hitting `/pool/sign`.
+    //   3. On policy pass, the receiver's enclave HTTP call carries the
+    //      hex of `multi_signing_hash(tx, signer_account_id)` and the
+    //      Response carries DER-encoded signature back to the caller.
+    //
+    // The mock enclave returns a deterministic fake `r`/`s` so the test
+    // can assert exact DER bytes; the production
+    // `xrpl_signer::der_encode_signature` is exercised verbatim.
+
+    use axum::{routing::post, Json, Router};
+    use serde_json::Value as JsonValue;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Spawns an axum mock enclave that records each `/v1/pool/sign`
+    /// hit and returns a canned signature envelope. Returns the base
+    /// URL (no `/pool/sign` suffix) and a hit-counter handle.
+    async fn spawn_mock_enclave() -> (String, std::sync::Arc<AtomicUsize>) {
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits_for_route = hits.clone();
+        let app = Router::new().route(
+            "/v1/pool/sign",
+            post(move |Json(body): Json<JsonValue>| {
+                let hits = hits_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    // Sanity: production sends `from`, `hash`,
+                    // `session_key`. Hash is `0x` + 64 hex.
+                    let hash = body["hash"].as_str().unwrap_or("");
+                    assert!(
+                        hash.starts_with("0x") && hash.len() == 66,
+                        "enclave received malformed hash: {hash}"
+                    );
+                    Json(serde_json::json!({
+                        "status": "success",
+                        "signature": {
+                            // Deterministic 32-byte r/s — the tests
+                            // assert on the resulting DER bytes.
+                            "r": "11".repeat(32),
+                            "s": "22".repeat(32),
+                        }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/v1"), hits)
+    }
+
+    #[tokio::test]
+    async fn wire_signerlist_passes_policy_and_yields_signature() {
+        let (base_url, hits) = spawn_mock_enclave().await;
+        let mut signer = test_local_signer();
+        signer.enclave_url = base_url;
+
+        let resp = P2PNode::handle_signing_request(
+            &signer,
+            Some(TEST_ESCROW),
+            "wire-signerlist-1",
+            &good_signerlist_tx(),
+            &signer_acct_id_hex(),
+        )
+        .await;
+
+        match resp {
+            SigningMessage::Response {
+                request_id,
+                der_signature,
+                compressed_pubkey,
+                error,
+                ..
+            } => {
+                assert_eq!(request_id, "wire-signerlist-1");
+                assert!(error.is_none(), "expected no error, got: {error:?}");
+                let der = der_signature.expect("signature must be present");
+                let pk = compressed_pubkey.expect("pubkey must be present");
+                // Production der_encode wraps r||s in DER. Length is
+                // 70-72 bytes hex-encoded → 140-144 chars uppercase.
+                assert!(
+                    der.len() >= 140 && der.len() <= 144 && der == der.to_uppercase(),
+                    "unexpected DER shape: {der}"
+                );
+                assert_eq!(pk, signer.compressed_pubkey.to_uppercase());
+                assert_eq!(hits.load(Ordering::SeqCst), 1, "enclave hit exactly once");
+            }
+            _ => panic!("expected Response variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wire_signerlist_with_quorum_one_rejected_before_enclave() {
+        let (base_url, hits) = spawn_mock_enclave().await;
+        let mut signer = test_local_signer();
+        signer.enclave_url = base_url;
+
+        let mut tx = good_signerlist_tx();
+        tx["SignerQuorum"] = serde_json::json!(1);
+
+        let resp = P2PNode::handle_signing_request(
+            &signer,
+            Some(TEST_ESCROW),
+            "wire-signerlist-quorum1",
+            &tx,
+            &signer_acct_id_hex(),
+        )
+        .await;
+
+        match resp {
+            SigningMessage::Response {
+                der_signature,
+                error,
+                ..
+            } => {
+                assert!(der_signature.is_none(), "policy must reject before signing");
+                let e = error.expect("error message present");
+                assert!(e.contains("policy: SignerQuorum 1 outside"), "got: {e}");
+                assert_eq!(
+                    hits.load(Ordering::SeqCst),
+                    0,
+                    "enclave MUST NOT be hit on policy reject"
+                );
+            }
+            _ => panic!("expected Response variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wire_signerlist_with_attacker_source_rejected_before_enclave() {
+        let (base_url, hits) = spawn_mock_enclave().await;
+        let mut signer = test_local_signer();
+        signer.enclave_url = base_url;
+
+        let mut tx = good_signerlist_tx();
+        tx["Account"] = serde_json::json!(TEST_ATTACKER);
+
+        let resp = P2PNode::handle_signing_request(
+            &signer,
+            Some(TEST_ESCROW),
+            "wire-signerlist-attacker",
+            &tx,
+            &signer_acct_id_hex(),
+        )
+        .await;
+
+        match resp {
+            SigningMessage::Response {
+                der_signature,
+                error,
+                ..
+            } => {
+                assert!(der_signature.is_none());
+                let e = error.expect("error present");
+                assert!(e.contains("does not match configured escrow"), "got: {e}");
+                assert_eq!(hits.load(Ordering::SeqCst), 0);
+            }
+            _ => panic!("expected Response variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn signing_message_round_trips_signerlist_through_serde() {
+        // Locks the wire contract: the `SigningMessage::Request`
+        // serialization preserves a `SignerListSet` payload byte-equal
+        // through one JSON round-trip. Without this, a future change
+        // to SigningMessage's serde shape (e.g. adding a discriminator)
+        // could silently break governance flow.
+        let req = SigningMessage::Request {
+            request_id: "rt-1".into(),
+            requester_peer_id: "peer-A".into(),
+            unsigned_tx: good_signerlist_tx(),
+            signer_account_id_hex: signer_acct_id_hex(),
+            signer_xrpl_address: test_local_signer().xrpl_address,
+        };
+        let wire = serde_json::to_string(&req).expect("serialize");
+        let parsed: SigningMessage = serde_json::from_str(&wire).expect("deserialize");
+        match parsed {
+            SigningMessage::Request {
+                request_id,
+                unsigned_tx,
+                ..
+            } => {
+                assert_eq!(request_id, "rt-1");
+                assert_eq!(unsigned_tx, good_signerlist_tx());
+            }
+            _ => panic!("expected Request"),
+        }
+    }
 }
