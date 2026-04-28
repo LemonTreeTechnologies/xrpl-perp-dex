@@ -14,6 +14,7 @@ mod dkg_bootstrap;
 mod dkg_coordinate;
 mod election;
 mod http_helpers;
+mod node_deploy;
 mod orderbook;
 mod p2p;
 mod path_a_redkg;
@@ -263,6 +264,23 @@ enum Command {
         /// Testnet/devnet only.
         #[arg(long)]
         faucet_url: Option<String>,
+    },
+
+    /// Phase 2.1c-E — node-local deploy. Each operator runs this on
+    /// their own VM after `cargo build` + Docker `enclave.signed.so`
+    /// production. Stops local services, backs up prior binaries with
+    /// a timestamp suffix, installs new binaries, restarts the enclave
+    /// only. Orchestrator stays STOPPED — operator runs
+    /// `node-config-apply` (Phase 2.1c-C) afterwards to bring it back
+    /// up with the discovered roster.
+    NodeDeploy {
+        /// Path to the freshly-built perp-dex-orchestrator binary.
+        #[arg(long)]
+        orchestrator: PathBuf,
+        /// Path to the freshly-built `dist-azure/` directory containing
+        /// enclave.signed.so + perp-dex-server + (optional) build-manifest.txt.
+        #[arg(long)]
+        enclave_dist: PathBuf,
     },
 
     /// Stop services, swap binaries, restart enclaves only (Phase 2.1b).
@@ -604,6 +622,23 @@ async fn main() -> Result<()> {
                 faucet_url.as_deref(),
             )
             .await;
+        }
+        Some(Command::NodeDeploy {
+            orchestrator,
+            enclave_dist,
+        }) => {
+            let manifest = enclave_dist.join("build-manifest.txt");
+            let artefacts = node_deploy::LocalArtefactSet {
+                orchestrator,
+                enclave_signed_so: enclave_dist.join("enclave.signed.so"),
+                perp_dex_server: enclave_dist.join("perp-dex-server"),
+                build_manifest: manifest.exists().then_some(manifest),
+            };
+            let result = node_deploy::deploy_local(&artefacts).await?;
+            println!("Node deploy complete:");
+            println!("  mrenclave:     {}", result.mrenclave);
+            println!("  backup_suffix: {}", result.backup_suffix);
+            return Ok(());
         }
         Some(Command::ClusterDeploy {
             topology,
