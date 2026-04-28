@@ -265,6 +265,88 @@ pub enum ShareEnvelopeV2Message {
     },
 }
 
+/// DKG ceremony coordination messages, published on
+/// `perp-dex/cluster/dkg-step` per `docs/multi-operator-architecture.md`
+/// §3.1. Per Phase 2.1c-D — replaces the SSH-driven dkg_bootstrap with
+/// a leader-followers protocol that runs entirely over libp2p.
+///
+/// Wire flow (happy path, 3 nodes, leader = node-0):
+///   1. Leader publishes `Round1Start { ceremony_id, threshold, n,
+///      pid_assignment[] }`. Each follower (and leader itself) calls
+///      its local enclave `/v1/pool/dkg/round1-generate` with the
+///      assigned pid, then publishes `Round1Done { ceremony_id, pid,
+///      vss_commitment }`.
+///   2. Once leader has N `Round1Done` (including its own), it stores
+///      the `vss_commitment` per pid and publishes `Round15Start`.
+///      Each follower exports a share-v2 envelope to every peer via
+///      the existing `perp-dex/path-a/share-v2` topic, then publishes
+///      `Round15Done { ceremony_id, pid }`.
+///   3. After N `Round15Done`, leader publishes `Round2Start` carrying
+///      the `pid → vss_commitment` map (so importers can verify each
+///      incoming share). Followers wait until their share-v2 inbound
+///      importer has imported N-1 shares and the local enclave's
+///      `dkg_session.share_received[]` is full, then publish
+///      `Round2Done { ceremony_id, pid }`.
+///   4. After N `Round2Done`, leader publishes `FinalizeStart`. Each
+///      follower calls `/v1/pool/dkg/finalize` and publishes
+///      `FinalizeDone { ceremony_id, pid, group_pubkey }`. Leader
+///      asserts byte-identical `group_pubkey` across all N.
+///
+/// `ceremony_id` is a 32-byte hex token chosen by the leader at start;
+/// it dedupes if two ceremonies overlap and gives operators a handle
+/// for log correlation. Followers ignore messages whose `ceremony_id`
+/// is not the one they are currently processing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum DkgStepMessage {
+    /// Leader → all
+    Round1Start {
+        ceremony_id: String,
+        threshold: u32,
+        n_participants: u32,
+        /// Map of `xrpl_address` (from on-chain SignerList) → pid.
+        /// Each follower looks up its own xrpl_address (from
+        /// `local_signer.xrpl_address`) here.
+        pid_assignment: Vec<(String, u32)>,
+    },
+    /// Each → all (broadcast)
+    Round1Done {
+        ceremony_id: String,
+        pid: u32,
+        /// Hex-encoded VSS commitment from `/v1/pool/dkg/round1-generate`.
+        vss_commitment: String,
+    },
+    /// Leader → all
+    Round15Start { ceremony_id: String },
+    /// Each → all
+    Round15Done { ceremony_id: String, pid: u32 },
+    /// Leader → all
+    Round2Start {
+        ceremony_id: String,
+        /// Per-pid VSS commitment so each follower can pass it to the
+        /// enclave's `/v1/pool/dkg/round2-import-share-v2` for verify.
+        vss_commitments: Vec<(u32, String)>,
+    },
+    /// Each → all
+    Round2Done { ceremony_id: String, pid: u32 },
+    /// Leader → all
+    FinalizeStart { ceremony_id: String },
+    /// Each → all (final ack carrying the produced group_pubkey)
+    FinalizeDone {
+        ceremony_id: String,
+        pid: u32,
+        /// 32-byte BIP340 x-only group public key, hex no `0x`.
+        group_pubkey: String,
+    },
+    /// Either side → abort the ceremony with a reason. Receivers stop
+    /// processing for this ceremony_id and free resources.
+    Abort {
+        ceremony_id: String,
+        pid: u32,
+        reason: String,
+    },
+}
+
 // ── Network behaviour ───────────────────────────────────────────
 
 const ORDERS_TOPIC: &str = "perp-dex/orders";
@@ -273,6 +355,7 @@ const SIGNING_TOPIC: &str = "perp-dex/signing";
 const EVENTS_TOPIC: &str = "perp-dex/events";
 const PEER_QUOTE_TOPIC: &str = "perp-dex/path-a/peer-quote";
 const SHARE_V2_TOPIC: &str = "perp-dex/path-a/share-v2";
+const DKG_STEP_TOPIC: &str = "perp-dex/cluster/dkg-step";
 
 #[derive(NetworkBehaviour)]
 struct PerpBehaviour {
@@ -290,6 +373,8 @@ pub struct P2PNode {
     events_topic: gossipsub::IdentTopic,
     peer_quote_topic: gossipsub::IdentTopic,
     share_v2_topic: gossipsub::IdentTopic,
+    /// Phase 2.1c-D: DKG ceremony coordination (leader-driven, libp2p).
+    dkg_step_topic: gossipsub::IdentTopic,
     /// Channel to send received batches to the orchestrator (validator).
     batch_tx: mpsc::Sender<OrderBatch>,
     /// Channel to receive batches to publish (sequencer).
@@ -315,6 +400,12 @@ pub struct P2PNode {
     /// Path A: received share envelopes forwarded to import task
     /// (only messages matching `local_ecdh_pubkey` are delivered — hint-only).
     share_v2_inbound_tx: Option<mpsc::Sender<ShareEnvelopeV2Message>>,
+    /// Phase 2.1c-D: outbound DKG ceremony coordination messages
+    /// (published by leader admin route + each follower's step handler).
+    dkg_step_publish_rx: Option<mpsc::Receiver<DkgStepMessage>>,
+    /// Phase 2.1c-D: received DKG ceremony coordination messages
+    /// forwarded to the local follower step handler.
+    dkg_step_inbound_tx: Option<mpsc::Sender<DkgStepMessage>>,
     /// Path A: local ECDH pubkey hex (33B lowercase) used as the recipient
     /// filter on the v2 share topic. `None` = forward every received message.
     local_ecdh_pubkey: Option<String>,
@@ -408,6 +499,7 @@ impl P2PNode {
         let events_topic = gossipsub::IdentTopic::new(EVENTS_TOPIC);
         let peer_quote_topic = gossipsub::IdentTopic::new(PEER_QUOTE_TOPIC);
         let share_v2_topic = gossipsub::IdentTopic::new(SHARE_V2_TOPIC);
+        let dkg_step_topic = gossipsub::IdentTopic::new(DKG_STEP_TOPIC);
 
         let mut node = P2PNode {
             swarm,
@@ -417,6 +509,7 @@ impl P2PNode {
             events_topic,
             peer_quote_topic,
             share_v2_topic,
+            dkg_step_topic,
             batch_tx,
             publish_rx: None,
             election_inbound_tx,
@@ -429,6 +522,8 @@ impl P2PNode {
             peer_quote_inbound_tx: None,
             share_v2_publish_rx: None,
             share_v2_inbound_tx: None,
+            dkg_step_publish_rx: None,
+            dkg_step_inbound_tx: None,
             local_ecdh_pubkey: None,
             local_signer: None,
             escrow_xrpl_address: None,
@@ -470,6 +565,11 @@ impl P2PNode {
             .gossipsub
             .subscribe(&node.share_v2_topic)
             .context("failed to subscribe to share-v2 topic")?;
+        node.swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&node.dkg_step_topic)
+            .context("failed to subscribe to dkg-step topic")?;
 
         // Listen
         let addr: Multiaddr = listen_addr.parse().context("invalid listen address")?;
@@ -526,6 +626,19 @@ impl P2PNode {
     /// forwarded to (consumer calls `/v1/pool/frost/share-import-v2`).
     pub fn set_share_v2_inbound_channel(&mut self, tx: mpsc::Sender<ShareEnvelopeV2Message>) {
         self.share_v2_inbound_tx = Some(tx);
+    }
+
+    /// Phase 2.1c-D: set the channel that DKG ceremony coordination
+    /// messages are pulled from (leader's admin route + each follower's
+    /// step handler use it to publish on `dkg-step` topic).
+    pub fn set_dkg_step_publish_channel(&mut self, rx: mpsc::Receiver<DkgStepMessage>) {
+        self.dkg_step_publish_rx = Some(rx);
+    }
+
+    /// Phase 2.1c-D: set the channel that received DKG-step messages
+    /// are forwarded to (the local follower step handler).
+    pub fn set_dkg_step_inbound_channel(&mut self, tx: mpsc::Sender<DkgStepMessage>) {
+        self.dkg_step_inbound_tx = Some(tx);
     }
 
     /// Path A: set our local ECDH pubkey (33-byte compressed, lowercase hex).
@@ -857,6 +970,7 @@ impl P2PNode {
         let mut events_rx = self.events_publish_rx.take();
         let mut peer_quote_rx = self.peer_quote_publish_rx.take();
         let mut share_v2_rx = self.share_v2_publish_rx.take();
+        let mut dkg_step_rx = self.dkg_step_publish_rx.take();
 
         let orders_topic_hash = self.orders_topic.hash();
         let election_topic_hash = self.election_topic.hash();
@@ -864,6 +978,7 @@ impl P2PNode {
         let events_topic_hash = self.events_topic.hash();
         let peer_quote_topic_hash = self.peer_quote_topic.hash();
         let share_v2_topic_hash = self.share_v2_topic.hash();
+        let dkg_step_topic_hash = self.dkg_step_topic.hash();
 
         let mut signing_cleanup = tokio::time::interval(Duration::from_secs(5));
 
@@ -1009,6 +1124,22 @@ impl P2PNode {
                                 );
                             }
                             Err(e) => warn!("share-v2 publish failed: {}", e),
+                        }
+                    }
+                }
+
+                // Phase 2.1c-D: publish DKG ceremony coordination messages
+                Some(msg) = async {
+                    match &mut dkg_step_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<DkgStepMessage>>().await,
+                    }
+                } => {
+                    if let Ok(data) = serde_json::to_vec(&msg) {
+                        match self.swarm.behaviour_mut().gossipsub
+                            .publish(self.dkg_step_topic.clone(), data) {
+                            Ok(_) => info!(?msg, "published dkg-step message"),
+                            Err(e) => warn!("dkg-step publish failed: {}", e),
                         }
                     }
                 }
@@ -1191,6 +1322,19 @@ impl P2PNode {
                             }
                             Err(e) => {
                                 warn!("invalid share-v2 from {}: {}", propagation_source, e);
+                            }
+                        }
+                    } else if message.topic == dkg_step_topic_hash {
+                        match serde_json::from_slice::<DkgStepMessage>(&message.data) {
+                            Ok(msg) => {
+                                if let Some(ref tx) = self.dkg_step_inbound_tx {
+                                    if let Err(e) = tx.send(msg).await {
+                                        error!("failed to forward dkg-step: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("invalid dkg-step from {}: {}", propagation_source, e);
                             }
                         }
                     }

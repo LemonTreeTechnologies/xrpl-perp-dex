@@ -11,6 +11,7 @@ mod cluster_deploy;
 mod commitment;
 mod db;
 mod dkg_bootstrap;
+mod dkg_coordinate;
 mod election;
 mod http_helpers;
 mod orderbook;
@@ -386,6 +387,13 @@ struct RunArgs {
     /// Defaults to off — the admin surface only exists when set.
     #[arg(long)]
     admin_listen: Option<String>,
+
+    /// Phase 2.1c-D — loopback admin listener for the DKG ceremony
+    /// leader role. Accepts `POST /admin/dkg/start`. Same loopback-only
+    /// constraint as `--admin-listen`. Set this on the operator who is
+    /// initiating the DKG ceremony; followers don't need it.
+    #[arg(long)]
+    dkg_admin_listen: Option<String>,
 }
 
 // ── Funding rate ────────────────────────────────────────────────
@@ -838,6 +846,13 @@ async fn main() -> Result<()> {
     p2p_node.set_share_v2_publish_channel(share_v2_pub_rx);
     p2p_node.set_share_v2_inbound_channel(share_v2_in_tx);
 
+    // Phase 2.1c-D — DKG-step channels. Both leader and followers
+    // publish (leader: *Start, followers: *Done) and listen.
+    let (dkg_step_pub_tx, dkg_step_pub_rx) = tokio::sync::mpsc::channel::<p2p::DkgStepMessage>(32);
+    let (dkg_step_in_tx, dkg_step_in_rx) = tokio::sync::mpsc::channel::<p2p::DkgStepMessage>(32);
+    p2p_node.set_dkg_step_publish_channel(dkg_step_pub_rx);
+    p2p_node.set_dkg_step_inbound_channel(dkg_step_in_tx);
+
     // Best-effort: fetch local ECDH identity pubkey to drive the share-v2
     // recipient filter. Non-fatal — older enclaves or SGX-less dev boxes
     // will simply have Path A unreachable.
@@ -891,30 +906,29 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Phase 2.1c-D — DKG coordinator state (shared between the share-v2
+    // importer and the follower handler) so the importer can look up
+    // sender VSS commitments when DKG-bootstrap envelopes arrive.
+    let dkg_active: Arc<tokio::sync::Mutex<Option<dkg_coordinate::ActiveCeremony>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
     // Spawn Path A share-v2 importer — envelopes addressed to us (the
-    // recipient filter already dropped the rest in p2p.rs) are passed to
-    // /v1/pool/frost/share-import-v2.
+    // recipient filter already dropped the rest in p2p.rs) are passed
+    // to either /v1/pool/dkg/round2-import-share-v2 (DKG bootstrap,
+    // discriminated by group_id == zeros sentinel) or
+    // /v1/pool/frost/share-import-v2 (post-DKG share rotation).
     let importer_client = pool_path_a_client::PoolPathAClient::new(&cli.enclave_url)?;
+    let dkg_active_for_importer = dkg_active.clone();
     let _share_v2_importer = tokio::spawn(async move {
-        while let Some(p2p::ShareEnvelopeV2Message::Deliver {
-            recipient_pubkey: _,
-            shard_id,
-            group_id,
-            signer_id,
-            envelope,
-        }) = share_v2_in_rx.recv().await
-        {
-            let now_ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            match importer_client
-                .frost_share_import_v2(&envelope, shard_id, &group_id, signer_id, now_ts)
-                .await
+        while let Some(msg) = share_v2_in_rx.recv().await {
+            if let Err(e) = dkg_coordinate::route_inbound_share_v2(
+                &importer_client,
+                &dkg_active_for_importer,
+                msg,
+            )
+            .await
             {
-                Ok(true) => info!(signer_id, shard_id, "imported v2 FROST share"),
-                Ok(false) => warn!(signer_id, "v2 share import refused (403)"),
-                Err(e) => warn!(signer_id, "v2 share import error: {}", e),
+                warn!("share-v2 routing error: {e}");
             }
         }
     });
@@ -990,11 +1004,78 @@ async fn main() -> Result<()> {
             }
         });
     }
-    // Keep the share-v2 publish sender alive even when the admin
-    // listener is disabled — future in-process drivers (automated
-    // re-DKG) will clone it. Dropping it would close the outbound
-    // gossipsub arm in p2p.rs.
+
+    // Phase 2.1c-D — DKG coordinator (follower handler always runs;
+    // leader admin route only spawns when --dkg-admin-listen is set).
+    // Built only if signers_config + local_signer + ECDH pubkey are
+    // all available; otherwise the cluster is in a pre-bootstrap
+    // state and the coordinator stays dormant.
+    if let Some(cfg) = signers_config.as_ref() {
+        if let Some(local) = cfg.local_signer.as_ref() {
+            let local_ecdh = match pool_path_a_client::PoolPathAClient::new(&cli.enclave_url)?
+                .ecdh_pubkey()
+                .await
+            {
+                Ok(pk) => pk,
+                Err(e) => {
+                    warn!("DKG coordinator: failed to fetch local ECDH pubkey ({e}); coordinator disabled");
+                    String::new()
+                }
+            };
+            if !local_ecdh.is_empty() {
+                let mut peers = std::collections::HashMap::new();
+                for s in &cfg.signers {
+                    if s.xrpl_address == local.xrpl_address {
+                        continue;
+                    }
+                    if let Some(ref ecdh) = s.ecdh_pubkey {
+                        peers.insert(s.xrpl_address.clone(), ecdh.to_lowercase());
+                    }
+                }
+                let identity = dkg_coordinate::LocalIdentity {
+                    xrpl_address: local.xrpl_address.clone(),
+                    ecdh_pubkey: local_ecdh,
+                    peers,
+                };
+                let coord_state = Arc::new(dkg_coordinate::CoordinatorState {
+                    client: pool_path_a_client::PoolPathAClient::new(&cli.enclave_url)?,
+                    identity,
+                    dkg_step_pub: dkg_step_pub_tx.clone(),
+                    share_v2_pub: share_v2_pub_tx.clone(),
+                    active: dkg_active.clone(),
+                });
+
+                // Always spawn the follower handler.
+                let follower_state = coord_state.clone();
+                tokio::spawn(async move {
+                    dkg_coordinate::run_follower(follower_state, dkg_step_in_rx).await;
+                });
+
+                // Leader admin listener (operator opts in).
+                if let Some(addr) = cli.dkg_admin_listen.clone() {
+                    let leader_state = coord_state.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            dkg_coordinate::spawn_admin_listener(addr, leader_state).await
+                        {
+                            error!("DKG admin listener exited: {e}");
+                        }
+                    });
+                }
+                info!("DKG coordinator initialized (follower active)");
+            }
+        } else {
+            info!("DKG coordinator dormant: no local_signer in signers_config");
+        }
+    } else {
+        info!("DKG coordinator dormant: no --signers-config");
+    }
+
+    // Keep publish senders alive — DKG coordinator + future drivers
+    // hold their own clones; dropping the originals here would close
+    // the outbound gossipsub arms in p2p.rs.
     let _share_v2_pub_tx = share_v2_pub_tx;
+    let _dkg_step_pub_tx = dkg_step_pub_tx;
     // Drop the peer-quote publish sender handle here: any configured
     // announcer holds its own clone, and unconfigured shards never needed it.
     drop(peer_quote_pub_tx);

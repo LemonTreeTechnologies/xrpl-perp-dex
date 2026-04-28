@@ -30,6 +30,21 @@ pub struct ShareEnvelopeV2 {
     pub n_participants: u32,
 }
 
+/// Envelope produced by `POST /v1/pool/dkg/round1-export-share-v2` and
+/// consumed by `POST /v1/pool/dkg/round2-import-share-v2`. Distinct
+/// from `ShareEnvelopeV2` because DKG round-1 shares carry no
+/// `keygen_cache` (the cache is being produced by the ceremony, not
+/// consumed) and no `threshold`/`n_participants` (already known to
+/// the enclave's `dkg_session`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DkgShareEnvelope {
+    pub ceremony_nonce: String,
+    pub iv: String,
+    pub ct: String,
+    pub tag: String,
+    pub sender_pubkey: String,
+}
+
 #[allow(dead_code)]
 impl PoolPathAClient {
     pub fn new(base_url: &str) -> Result<Self> {
@@ -238,6 +253,119 @@ impl PoolPathAClient {
         }
         resp.error_for_status()?;
         Ok(true)
+    }
+
+    // ── DKG ceremony (Phase 2.1c-D) ─────────────────────────────
+
+    /// `POST /v1/pool/dkg/round1-generate` — generate this node's
+    /// VSS commitment polynomial for DKG round 1. Returns the
+    /// hex-encoded commitment (threshold * 33 bytes of compressed
+    /// pubkeys, no `0x` prefix).
+    pub async fn dkg_round1_generate(
+        &self,
+        my_participant_id: u32,
+        threshold: u32,
+        n_participants: u32,
+    ) -> Result<String> {
+        let v = self
+            .post(
+                "/pool/dkg/round1-generate",
+                serde_json::json!({
+                    "my_participant_id": my_participant_id,
+                    "threshold": threshold,
+                    "n_participants": n_participants,
+                }),
+            )
+            .await?;
+        let vss = v["vss_commitment"]
+            .as_str()
+            .context("pool/dkg/round1-generate: missing vss_commitment field")?
+            .strip_prefix("0x")
+            .unwrap_or_else(|| v["vss_commitment"].as_str().unwrap_or(""))
+            .to_string();
+        Ok(vss)
+    }
+
+    /// `POST /v1/pool/dkg/round1-export-share-v2` — ECDH-over-DCAP
+    /// wrapped DKG round-1 share for `target_participant_id`. The
+    /// caller must have populated `peer_attest_cache` for
+    /// `(shard_id, group_id, peer_pubkey_hex)` first (typically via
+    /// the periodic peer-quote announcer plus the inbound verifier).
+    pub async fn dkg_round1_export_share_v2(
+        &self,
+        target_participant_id: u32,
+        peer_pubkey_hex: &str,
+        shard_id: u32,
+        group_id_hex: &str,
+        now_ts: u64,
+    ) -> Result<DkgShareEnvelope> {
+        let v = self
+            .post(
+                "/pool/dkg/round1-export-share-v2",
+                serde_json::json!({
+                    "target_participant_id": target_participant_id,
+                    "peer_pubkey": peer_pubkey_hex,
+                    "shard_id": shard_id,
+                    "group_id": group_id_hex,
+                    "now_ts": now_ts,
+                }),
+            )
+            .await?;
+        let env = v["envelope"].clone();
+        serde_json::from_value(env).context("failed to parse DKG share envelope")
+    }
+
+    /// `POST /v1/pool/dkg/round2-import-share-v2` — decrypt envelope,
+    /// verify share against `vss_commitment`, install into
+    /// `dkg_session.imported_share_bytes[from_participant_id]`. The
+    /// `vss_commitment` is the public output of the sender's
+    /// `dkg_round1_generate` call.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dkg_round2_import_share_v2(
+        &self,
+        from_participant_id: u32,
+        sender_pubkey_hex: &str,
+        shard_id: u32,
+        group_id_hex: &str,
+        now_ts: u64,
+        envelope: &DkgShareEnvelope,
+        vss_commitment_hex: &str,
+    ) -> Result<()> {
+        let _ = self
+            .post(
+                "/pool/dkg/round2-import-share-v2",
+                serde_json::json!({
+                    "from_participant_id": from_participant_id,
+                    "sender_pubkey": sender_pubkey_hex,
+                    "shard_id": shard_id,
+                    "group_id": group_id_hex,
+                    "now_ts": now_ts,
+                    "envelope": {
+                        "ceremony_nonce": envelope.ceremony_nonce,
+                        "iv": envelope.iv,
+                        "ct": envelope.ct,
+                        "tag": envelope.tag,
+                    },
+                    "vss_commitment": vss_commitment_hex,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// `POST /v1/pool/dkg/finalize` — aggregate received shares + own
+    /// share, emit the BIP340 group public key (32 bytes, x-only).
+    pub async fn dkg_finalize(&self) -> Result<String> {
+        let v = self
+            .post("/pool/dkg/finalize", serde_json::json!({}))
+            .await?;
+        let pk = v["group_pubkey"]
+            .as_str()
+            .context("pool/dkg/finalize: missing group_pubkey field")?
+            .strip_prefix("0x")
+            .unwrap_or_else(|| v["group_pubkey"].as_str().unwrap_or(""))
+            .to_string();
+        Ok(pk)
     }
 
     // ── Internal ────────────────────────────────────────────────

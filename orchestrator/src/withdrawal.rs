@@ -53,6 +53,12 @@ pub struct SignerConfig {
     pub session_key: String,       // 0x... per-account auth token
     pub compressed_pubkey: String, // hex, 33 bytes
     pub xrpl_address: String,      // r-address
+    /// 33-byte ECDH identity pubkey from `node-bootstrap`. Optional for
+    /// backward compatibility with pre-Phase-2.1c entry files. Used by
+    /// `dkg_coordinate.rs` to look up peer ECDH pubkeys for DKG share
+    /// envelope encryption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ecdh_pubkey: Option<String>,
 }
 
 /// Multi-operator signing configuration.
