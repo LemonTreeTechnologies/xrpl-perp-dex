@@ -768,16 +768,13 @@ impl P2PNode {
     /// re-derive the multi-signing hash from the tx. Returns the hash
     /// on success, or an error message suitable for a Response payload.
     ///
-    /// Policy:
-    /// - Tx must be a JSON object with `TransactionType == "Payment"`.
-    /// - `Account` must equal the configured escrow address.
-    /// - `Destination` must be a non-empty r-address distinct from `Account`.
-    /// - `Amount` must be a non-empty string (XRP drops) or RLUSD
-    ///   issued-currency object — presence is enough; XRPL parses the
-    ///   binary form downstream.
-    /// - `SigningPubKey` must be `""` (multisig marker).
-    /// - `signer_account_id_hex` must decode to 20 bytes and match the
-    ///   local signer's xrpl_address.
+    /// Dispatcher: per-`TransactionType` validators carry tx-type-specific
+    /// business rules (allowed only `Payment` and `SignerListSet`); the
+    /// universal checks (escrow source binding, multisig marker, local
+    /// signer identity) live here so every allowed type inherits them.
+    /// Per `SECURITY-REAUDIT-4` X-C1 invariants — receiver re-derives the
+    /// hash from the unsigned tx after policy passes, never trusts a
+    /// hash from the wire.
     fn validate_signing_policy(
         local_signer: &LocalSigner,
         escrow_xrpl_address: Option<&str>,
@@ -791,11 +788,20 @@ impl P2PNode {
             .as_object()
             .ok_or_else(|| "unsigned_tx is not a JSON object".to_string())?;
 
-        match tx_obj.get("TransactionType").and_then(|v| v.as_str()) {
-            Some("Payment") => {}
-            Some(other) => return Err(format!("non-Payment TransactionType: {other}")),
-            None => return Err("missing TransactionType".to_string()),
+        let tx_type = tx_obj
+            .get("TransactionType")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing TransactionType".to_string())?;
+
+        // Per-tx-type business validation. Every entry below MUST also
+        // satisfy the universal checks that follow this match.
+        match tx_type {
+            "Payment" => Self::validate_payment_specific(tx_obj, escrow)?,
+            "SignerListSet" => Self::validate_signerlist_set_specific(tx_obj, escrow)?,
+            other => return Err(format!("disallowed TransactionType: {other}")),
         }
+
+        // ── Universal checks (apply to every allowed tx type) ──────
 
         let account = tx_obj
             .get("Account")
@@ -805,24 +811,6 @@ impl P2PNode {
             return Err(format!(
                 "Account {account} does not match configured escrow {escrow}"
             ));
-        }
-
-        let destination = tx_obj
-            .get("Destination")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing Destination".to_string())?;
-        if destination.is_empty() {
-            return Err("empty Destination".to_string());
-        }
-        if destination == escrow {
-            return Err("Destination equals escrow — self-loop rejected".to_string());
-        }
-        if !destination.starts_with('r') {
-            return Err(format!("Destination is not an r-address: {destination}"));
-        }
-
-        if tx_obj.get("Amount").is_none() {
-            return Err("missing Amount".to_string());
         }
 
         match tx_obj.get("SigningPubKey").and_then(|v| v.as_str()) {
@@ -853,6 +841,203 @@ impl P2PNode {
         acct_arr.copy_from_slice(&acct_id_bytes);
         xrpl_mithril_codec::signing::multi_signing_hash(tx_obj, &acct_arr)
             .map_err(|e| format!("multi_signing_hash failed: {e:?}"))
+    }
+
+    /// Per-`TransactionType` validator for Payment. Pre-existing audited
+    /// behaviour (X-C1): destination present, non-empty, distinct from
+    /// escrow, looks like an r-address; amount field present (codec
+    /// validates the binary shape downstream).
+    fn validate_payment_specific(
+        tx_obj: &serde_json::Map<String, serde_json::Value>,
+        escrow: &str,
+    ) -> Result<(), String> {
+        let destination = tx_obj
+            .get("Destination")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing Destination".to_string())?;
+        if destination.is_empty() {
+            return Err("empty Destination".to_string());
+        }
+        if destination == escrow {
+            return Err("Destination equals escrow — self-loop rejected".to_string());
+        }
+        if !destination.starts_with('r') {
+            return Err(format!("Destination is not an r-address: {destination}"));
+        }
+        if tx_obj.get("Amount").is_none() {
+            return Err("missing Amount".to_string());
+        }
+        Ok(())
+    }
+
+    /// Per-`TransactionType` validator for SignerListSet (governance —
+    /// membership change of the escrow's multisig list). New as of
+    /// Phase 2.2; subject to the audit-bar X-C1 invariants. The
+    /// universal checks in `validate_signing_policy` cover Account,
+    /// SigningPubKey, and signer-identity binding; this function adds
+    /// the SignerListSet-specific constraints.
+    ///
+    /// Constraints (all must hold; see Phase 2.2 plan §"Constraint-лист"):
+    ///
+    ///   1. Top-level fields are a strict whitelist — extras rejected.
+    ///   2. `Flags`, if present, must be 0.
+    ///   3. `SignerListID`, if present, must be 0.
+    ///   4. `Sequence` and `Fee` present; `Fee` ≥ 12000 drops (multisig
+    ///      minimum per XRPL spec — `12 drops × (1 + N_signers)`, and
+    ///      we never sign with N=0).
+    ///   5. `SignerEntries` is a JSON array of length 3..=8.
+    ///   6. Each entry is `{"SignerEntry": {"Account": <r-address>,
+    ///      "SignerWeight": 1}}` — exact key set, weight equals 1.
+    ///   7. Each `Account` decodes as a valid XRPL r-address (base58check
+    ///      with the XRPL alphabet, 20-byte AccountID).
+    ///   8. No duplicate `Account` across entries.
+    ///   9. `SignerQuorum` ∈ `[2, len(SignerEntries)]`.
+    ///
+    /// Equal-weight (rule 6) reduces the quorum-math footgun surface to
+    /// zero — `sum(weights) == N_entries` always, so condition (9)
+    /// implies the XRPL semantic `quorum ≤ sum(weights)`.
+    fn validate_signerlist_set_specific(
+        tx_obj: &serde_json::Map<String, serde_json::Value>,
+        _escrow: &str,
+    ) -> Result<(), String> {
+        // (1) Top-level whitelist. NetworkID/LastLedgerSequence are
+        // optional XRPL hygiene fields the operator may set. Memos
+        // intentionally NOT in the whitelist — governance txs do not
+        // benefit from memos and disallowing one more field shrinks
+        // mutator surface.
+        const ALLOWED_TOP_LEVEL: &[&str] = &[
+            "Account",
+            "TransactionType",
+            "Sequence",
+            "Fee",
+            "SigningPubKey",
+            "SignerQuorum",
+            "SignerEntries",
+            "Flags",
+            "SignerListID",
+            "LastLedgerSequence",
+            "NetworkID",
+        ];
+        for key in tx_obj.keys() {
+            if !ALLOWED_TOP_LEVEL.contains(&key.as_str()) {
+                return Err(format!("disallowed top-level field: {key}"));
+            }
+        }
+
+        // (2) Flags
+        if let Some(flags) = tx_obj.get("Flags") {
+            let f = flags
+                .as_u64()
+                .ok_or_else(|| "Flags is not an integer".to_string())?;
+            if f != 0 {
+                return Err(format!("Flags must be 0, got {f}"));
+            }
+        }
+
+        // (3) SignerListID
+        if let Some(slid) = tx_obj.get("SignerListID") {
+            let s = slid
+                .as_u64()
+                .ok_or_else(|| "SignerListID is not an integer".to_string())?;
+            if s != 0 {
+                return Err(format!("SignerListID must be 0, got {s}"));
+            }
+        }
+
+        // (4) Sequence + Fee
+        let _sequence = tx_obj
+            .get("Sequence")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| "missing or non-integer Sequence".to_string())?;
+        let fee_str = tx_obj
+            .get("Fee")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing Fee (must be string-of-drops)".to_string())?;
+        let fee: u64 = fee_str
+            .parse()
+            .map_err(|_| format!("Fee is not numeric: {fee_str}"))?;
+        const MULTISIG_FEE_MIN_DROPS: u64 = 12000;
+        if fee < MULTISIG_FEE_MIN_DROPS {
+            return Err(format!(
+                "Fee {fee} below multisig minimum {MULTISIG_FEE_MIN_DROPS}"
+            ));
+        }
+
+        // (5) SignerEntries shape
+        let entries = tx_obj
+            .get("SignerEntries")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "missing or non-array SignerEntries".to_string())?;
+        if !(3..=8).contains(&entries.len()) {
+            return Err(format!(
+                "SignerEntries length {} outside allowed [3,8]",
+                entries.len()
+            ));
+        }
+
+        // (6+7+8) Per-entry shape, weight, address validation, dedup.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (i, entry_outer) in entries.iter().enumerate() {
+            let outer_obj = entry_outer
+                .as_object()
+                .ok_or_else(|| format!("SignerEntries[{i}] is not an object"))?;
+            // Outer wrapper must be exactly {"SignerEntry": ...}
+            let entry_keys: Vec<&String> = outer_obj.keys().collect();
+            if entry_keys.len() != 1 || entry_keys[0] != "SignerEntry" {
+                return Err(format!(
+                    "SignerEntries[{i}] must wrap a single \"SignerEntry\" key, got {entry_keys:?}"
+                ));
+            }
+            let entry = outer_obj["SignerEntry"]
+                .as_object()
+                .ok_or_else(|| format!("SignerEntries[{i}].SignerEntry is not an object"))?;
+            // Inner exact key set
+            const INNER_KEYS: &[&str] = &["Account", "SignerWeight"];
+            for k in entry.keys() {
+                if !INNER_KEYS.contains(&k.as_str()) {
+                    return Err(format!(
+                        "SignerEntries[{i}].SignerEntry: disallowed field {k}"
+                    ));
+                }
+            }
+            for k in INNER_KEYS {
+                if !entry.contains_key(*k) {
+                    return Err(format!("SignerEntries[{i}].SignerEntry: missing {k}"));
+                }
+            }
+            let acct = entry["Account"]
+                .as_str()
+                .ok_or_else(|| format!("SignerEntries[{i}].Account is not a string"))?;
+            // (7) Address validation
+            crate::xrpl_signer::decode_xrpl_address(acct).map_err(|e| {
+                format!("SignerEntries[{i}].Account invalid r-address ({acct}): {e}")
+            })?;
+            // (8) Dedup
+            if !seen.insert(acct.to_string()) {
+                return Err(format!("duplicate SignerEntries[{i}].Account: {acct}"));
+            }
+            // (6) Weight == 1
+            let weight = entry["SignerWeight"]
+                .as_u64()
+                .ok_or_else(|| format!("SignerEntries[{i}].SignerWeight is not an integer"))?;
+            if weight != 1 {
+                return Err(format!(
+                    "SignerEntries[{i}].SignerWeight must be 1 (equal-weight), got {weight}"
+                ));
+            }
+        }
+
+        // (9) SignerQuorum range
+        let quorum = tx_obj
+            .get("SignerQuorum")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| "missing or non-integer SignerQuorum".to_string())?;
+        let n = entries.len() as u64;
+        if !(2..=n).contains(&quorum) {
+            return Err(format!("SignerQuorum {quorum} outside allowed [2, {n}]"));
+        }
+
+        Ok(())
     }
 
     /// Handle an incoming signing request: sign with local enclave if we own the address.
@@ -1484,7 +1669,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_rejects_non_payment() {
+    fn policy_rejects_disallowed_tx_type() {
         let mut tx = good_tx();
         tx["TransactionType"] = serde_json::json!("SetRegularKey");
         let err = P2PNode::validate_signing_policy(
@@ -1494,7 +1679,7 @@ mod tests {
             &signer_acct_id_hex(),
         )
         .unwrap_err();
-        assert!(err.contains("non-Payment"), "got: {err}");
+        assert!(err.contains("disallowed TransactionType"), "got: {err}");
     }
 
     #[test]
@@ -1611,5 +1796,348 @@ mod tests {
         }
         // The 120s-old entry must be evicted; the 30s-old one stays.
         assert_eq!(q.len(), 2);
+    }
+
+    // ── Phase 2.2 SignerListSet policy tests ────────────────────
+    //
+    // These cover `validate_signerlist_set_specific` plus the
+    // dispatcher's universal-check interaction (Account binding,
+    // SigningPubKey, signer-identity). One mutation per test, every
+    // other field valid — the audit-bar pattern that locks each
+    // constraint behind its own assertion.
+    //
+    // Addresses below are real XRPL r-addresses (base58check valid).
+    // None correspond to live escrow accounts.
+    const SLS_ENTRY_A: &str = "rN7n7otQDd6FczFgLdSqtcsAUxDkw6fzRH";
+    const SLS_ENTRY_B: &str = "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe";
+    const SLS_ENTRY_C: &str = "rNrjh1KGZk2jBR3wPfAQnoidtFFYQKbQn2";
+    const SLS_ENTRY_D: &str = "rwoAC7KZD3UYtzpWSB4jQUt1qvQjhqXTUn";
+
+    fn signer_entry(addr: &str, weight: u32) -> serde_json::Value {
+        serde_json::json!({
+            "SignerEntry": {"Account": addr, "SignerWeight": weight}
+        })
+    }
+
+    /// Canonical 3-of-3 SignerListSet. Used as the base every negative
+    /// test mutates one field of.
+    fn good_signerlist_tx() -> serde_json::Value {
+        serde_json::json!({
+            "TransactionType": "SignerListSet",
+            "Account": TEST_ESCROW,
+            "Fee": "12000",
+            "Sequence": 1,
+            "SigningPubKey": "",
+            "SignerQuorum": 3,
+            "SignerEntries": [
+                signer_entry(SLS_ENTRY_A, 1),
+                signer_entry(SLS_ENTRY_B, 1),
+                signer_entry(SLS_ENTRY_C, 1),
+            ],
+        })
+    }
+
+    fn run_policy(tx: &serde_json::Value) -> Result<[u8; 32], String> {
+        P2PNode::validate_signing_policy(
+            &test_local_signer(),
+            Some(TEST_ESCROW),
+            tx,
+            &signer_acct_id_hex(),
+        )
+    }
+
+    // ── Positive cases ──────────────────────────────────────────
+
+    #[test]
+    fn signerlist_accepts_3of3() {
+        let h = run_policy(&good_signerlist_tx()).expect("3-of-3 must pass");
+        assert_eq!(h.len(), 32);
+    }
+
+    #[test]
+    fn signerlist_accepts_2of3() {
+        let mut tx = good_signerlist_tx();
+        tx["SignerQuorum"] = serde_json::json!(2);
+        run_policy(&tx).expect("2-of-3 must pass");
+    }
+
+    #[test]
+    fn signerlist_accepts_3of4() {
+        let mut tx = good_signerlist_tx();
+        tx["SignerQuorum"] = serde_json::json!(3);
+        tx["SignerEntries"] = serde_json::json!([
+            signer_entry(SLS_ENTRY_A, 1),
+            signer_entry(SLS_ENTRY_B, 1),
+            signer_entry(SLS_ENTRY_C, 1),
+            signer_entry(SLS_ENTRY_D, 1),
+        ]);
+        run_policy(&tx).expect("3-of-4 must pass");
+    }
+
+    #[test]
+    fn signerlist_accepts_max_size_3of8() {
+        let mut tx = good_signerlist_tx();
+        // 8 distinct r-addresses (recycle the 4 we have via offsets in
+        // the alphabet — these are also real valid XRPL addresses).
+        tx["SignerEntries"] = serde_json::json!([
+            signer_entry("rN7n7otQDd6FczFgLdSqtcsAUxDkw6fzRH", 1),
+            signer_entry("rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe", 1),
+            signer_entry("rNrjh1KGZk2jBR3wPfAQnoidtFFYQKbQn2", 1),
+            signer_entry("rwoAC7KZD3UYtzpWSB4jQUt1qvQjhqXTUn", 1),
+            signer_entry("rKe1hu3iRvyRnJB4xHBMXvzEwsnXTHMxnJ", 1),
+            signer_entry("rL3LYCP6gkduRoiD9pB6KDEUyNVPXeDo2j", 1),
+            signer_entry("rJWSAM1cHSfwDrSnA1qyJbnEaSaAvJNp18", 1),
+            signer_entry("rBWt8nw2DGpJoh3qUyTkNAiRjW7C3Ds7ti", 1),
+        ]);
+        tx["SignerQuorum"] = serde_json::json!(3);
+        run_policy(&tx).expect("3-of-8 must pass");
+    }
+
+    // ── Universal-check rejections (apply to SignerListSet, too) ───
+
+    #[test]
+    fn signerlist_rejects_account_not_escrow() {
+        let mut tx = good_signerlist_tx();
+        tx["Account"] = serde_json::json!(TEST_ATTACKER);
+        let err = run_policy(&tx).unwrap_err();
+        assert!(
+            err.contains("does not match configured escrow"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn signerlist_rejects_signing_pubkey_nonempty() {
+        let mut tx = good_signerlist_tx();
+        tx["SigningPubKey"] = serde_json::json!("02abc...");
+        let err = run_policy(&tx).unwrap_err();
+        assert!(err.contains("SigningPubKey must be empty"), "got: {err}");
+    }
+
+    // ── SignerListSet-specific rejections ───────────────────────
+
+    #[test]
+    fn signerlist_rejects_quorum_zero() {
+        let mut tx = good_signerlist_tx();
+        tx["SignerQuorum"] = serde_json::json!(0);
+        let err = run_policy(&tx).unwrap_err();
+        assert!(err.contains("SignerQuorum 0 outside"), "got: {err}");
+    }
+
+    #[test]
+    fn signerlist_rejects_quorum_one() {
+        let mut tx = good_signerlist_tx();
+        tx["SignerQuorum"] = serde_json::json!(1);
+        let err = run_policy(&tx).unwrap_err();
+        assert!(err.contains("SignerQuorum 1 outside"), "got: {err}");
+    }
+
+    #[test]
+    fn signerlist_rejects_quorum_exceeds_n() {
+        let mut tx = good_signerlist_tx();
+        tx["SignerQuorum"] = serde_json::json!(4); // N=3
+        let err = run_policy(&tx).unwrap_err();
+        assert!(err.contains("SignerQuorum 4 outside"), "got: {err}");
+    }
+
+    #[test]
+    fn signerlist_rejects_weight_zero() {
+        let mut tx = good_signerlist_tx();
+        tx["SignerEntries"][0] = signer_entry(SLS_ENTRY_A, 0);
+        let err = run_policy(&tx).unwrap_err();
+        assert!(
+            err.contains("SignerWeight must be 1") && err.contains("got 0"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn signerlist_rejects_weight_two() {
+        let mut tx = good_signerlist_tx();
+        tx["SignerEntries"][0] = signer_entry(SLS_ENTRY_A, 2);
+        let err = run_policy(&tx).unwrap_err();
+        assert!(
+            err.contains("SignerWeight must be 1") && err.contains("got 2"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn signerlist_rejects_duplicate_account() {
+        let mut tx = good_signerlist_tx();
+        tx["SignerEntries"][2] = signer_entry(SLS_ENTRY_A, 1); // duplicates [0]
+        let err = run_policy(&tx).unwrap_err();
+        assert!(err.contains("duplicate SignerEntries"), "got: {err}");
+    }
+
+    #[test]
+    fn signerlist_rejects_too_few_entries_2() {
+        let mut tx = good_signerlist_tx();
+        tx["SignerEntries"] =
+            serde_json::json!([signer_entry(SLS_ENTRY_A, 1), signer_entry(SLS_ENTRY_B, 1),]);
+        tx["SignerQuorum"] = serde_json::json!(2);
+        let err = run_policy(&tx).unwrap_err();
+        assert!(err.contains("length 2 outside"), "got: {err}");
+    }
+
+    #[test]
+    fn signerlist_rejects_too_many_entries_9() {
+        let mut tx = good_signerlist_tx();
+        let nine: Vec<serde_json::Value> = [
+            "rN7n7otQDd6FczFgLdSqtcsAUxDkw6fzRH",
+            "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe",
+            "rNrjh1KGZk2jBR3wPfAQnoidtFFYQKbQn2",
+            "rwoAC7KZD3UYtzpWSB4jQUt1qvQjhqXTUn",
+            "rKe1hu3iRvyRnJB4xHBMXvzEwsnXTHMxnJ",
+            "rL3LYCP6gkduRoiD9pB6KDEUyNVPXeDo2j",
+            "rJWSAM1cHSfwDrSnA1qyJbnEaSaAvJNp18",
+            "rBWt8nw2DGpJoh3qUyTkNAiRjW7C3Ds7ti",
+            "rnzQC8HNEcgVHd8y8jb7PWDDJZ5Vd1P9WQ",
+        ]
+        .iter()
+        .map(|a| signer_entry(a, 1))
+        .collect();
+        tx["SignerEntries"] = serde_json::json!(nine);
+        let err = run_policy(&tx).unwrap_err();
+        assert!(err.contains("length 9 outside"), "got: {err}");
+    }
+
+    #[test]
+    fn signerlist_rejects_malformed_account() {
+        let mut tx = good_signerlist_tx();
+        tx["SignerEntries"][0] = serde_json::json!({
+            "SignerEntry": {"Account": "not-an-r-address", "SignerWeight": 1}
+        });
+        let err = run_policy(&tx).unwrap_err();
+        assert!(err.contains("invalid r-address"), "got: {err}");
+    }
+
+    #[test]
+    fn signerlist_rejects_extra_top_level_field() {
+        let mut tx = good_signerlist_tx();
+        tx.as_object_mut()
+            .unwrap()
+            .insert("RegularKey".into(), serde_json::json!("rXXXXX"));
+        let err = run_policy(&tx).unwrap_err();
+        assert!(err.contains("disallowed top-level field"), "got: {err}");
+    }
+
+    #[test]
+    fn signerlist_rejects_extra_signer_entry_field() {
+        let mut tx = good_signerlist_tx();
+        tx["SignerEntries"][0] = serde_json::json!({
+            "SignerEntry": {
+                "Account": SLS_ENTRY_A,
+                "SignerWeight": 1,
+                "WalletLocator": "00".repeat(32),
+            }
+        });
+        let err = run_policy(&tx).unwrap_err();
+        assert!(err.contains("disallowed field WalletLocator"), "got: {err}");
+    }
+
+    #[test]
+    fn signerlist_rejects_missing_inner_account() {
+        let mut tx = good_signerlist_tx();
+        tx["SignerEntries"][0] = serde_json::json!({
+            "SignerEntry": {"SignerWeight": 1}
+        });
+        let err = run_policy(&tx).unwrap_err();
+        assert!(err.contains("missing Account"), "got: {err}");
+    }
+
+    #[test]
+    fn signerlist_rejects_wrong_outer_wrapper_key() {
+        let mut tx = good_signerlist_tx();
+        tx["SignerEntries"][0] = serde_json::json!({
+            "NotSignerEntry": {"Account": SLS_ENTRY_A, "SignerWeight": 1}
+        });
+        let err = run_policy(&tx).unwrap_err();
+        assert!(
+            err.contains("must wrap a single \"SignerEntry\" key"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn signerlist_rejects_signerlist_id_nonzero() {
+        let mut tx = good_signerlist_tx();
+        tx.as_object_mut()
+            .unwrap()
+            .insert("SignerListID".into(), serde_json::json!(1));
+        let err = run_policy(&tx).unwrap_err();
+        assert!(err.contains("SignerListID must be 0"), "got: {err}");
+    }
+
+    #[test]
+    fn signerlist_rejects_flags_nonzero() {
+        let mut tx = good_signerlist_tx();
+        tx["Flags"] = serde_json::json!(0x80000000u64);
+        let err = run_policy(&tx).unwrap_err();
+        assert!(err.contains("Flags must be 0"), "got: {err}");
+    }
+
+    #[test]
+    fn signerlist_rejects_missing_sequence() {
+        let mut tx = good_signerlist_tx();
+        tx.as_object_mut().unwrap().remove("Sequence");
+        let err = run_policy(&tx).unwrap_err();
+        assert!(err.contains("Sequence"), "got: {err}");
+    }
+
+    #[test]
+    fn signerlist_rejects_missing_fee() {
+        let mut tx = good_signerlist_tx();
+        tx.as_object_mut().unwrap().remove("Fee");
+        let err = run_policy(&tx).unwrap_err();
+        assert!(err.contains("missing Fee"), "got: {err}");
+    }
+
+    #[test]
+    fn signerlist_rejects_fee_below_minimum() {
+        let mut tx = good_signerlist_tx();
+        tx["Fee"] = serde_json::json!("11999");
+        let err = run_policy(&tx).unwrap_err();
+        assert!(err.contains("below multisig minimum"), "got: {err}");
+    }
+
+    #[test]
+    fn signerlist_accepts_optional_lastledgersequence() {
+        let mut tx = good_signerlist_tx();
+        tx.as_object_mut().unwrap().insert(
+            "LastLedgerSequence".into(),
+            serde_json::json!(99_999_999u64),
+        );
+        run_policy(&tx).expect("LastLedgerSequence is allowed");
+    }
+
+    #[test]
+    fn signerlist_accepts_optional_networkid() {
+        let mut tx = good_signerlist_tx();
+        tx.as_object_mut()
+            .unwrap()
+            .insert("NetworkID".into(), serde_json::json!(1u64));
+        run_policy(&tx).expect("NetworkID is allowed");
+    }
+
+    /// Sanity: `multi_signing_hash` is deterministic for SignerListSet
+    /// just as it is for Payment — same input → same hash.
+    #[test]
+    fn signerlist_hash_is_deterministic() {
+        let h1 = run_policy(&good_signerlist_tx()).unwrap();
+        let h2 = run_policy(&good_signerlist_tx()).unwrap();
+        assert_eq!(h1, h2);
+    }
+
+    /// Different membership → different hash. Locks down that tweaks
+    /// in SignerEntries actually flow into the hash (codec wires
+    /// `SignerEntries` correctly).
+    #[test]
+    fn signerlist_hash_changes_on_entries_change() {
+        let h1 = run_policy(&good_signerlist_tx()).unwrap();
+        let mut tx = good_signerlist_tx();
+        tx["SignerEntries"][0] = signer_entry(SLS_ENTRY_D, 1);
+        let h2 = run_policy(&tx).unwrap();
+        assert_ne!(h1, h2);
     }
 }
