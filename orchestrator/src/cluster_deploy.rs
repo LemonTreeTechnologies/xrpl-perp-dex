@@ -1,3 +1,12 @@
+//! **[DEPRECATED — violates `docs/multi-operator-architecture.md` §4 by
+//! requiring SSH from a coordinator host to every cluster node. Replace
+//! with `node-deploy` (node-local, run by each operator on their own
+//! VM) per the Phase 2.1c-E replacement plan in §11.3 of the same
+//! document. Coordinated MRENCLAVE bumps are governance, not a single
+//! command. This module exists only to keep testnet operations running
+//! during the transition; do NOT extend it, and do NOT inform mainnet
+//! design from its shape.]**
+//!
 //! Phase 2.1b — cluster artefact deploy + service lifecycle.
 //!
 //! Codifies §3-§5 of `docs/testnet-enclave-bump-procedure.md` as a Rust

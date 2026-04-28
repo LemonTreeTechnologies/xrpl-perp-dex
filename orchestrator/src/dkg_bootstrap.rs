@@ -1,3 +1,11 @@
+//! **[DEPRECATED — violates `docs/multi-operator-architecture.md` §4 by
+//! requiring SSH from a coordinator host to every cluster node. Replace
+//! with `dkg-coordinate` (cluster-coordinated, libp2p-driven) per the
+//! Phase 2.1c-D replacement plan in §11.3 of the same document. This
+//! module exists only to keep testnet operations running during the
+//! transition; do NOT extend it, and do NOT inform mainnet design from
+//! its shape.]**
+//!
 //! Phase 2.1a — DKG bootstrap subcommand.
 //!
 //! Drives the full §9 ceremony from the testnet enclave-bump procedure:
