@@ -21,6 +21,7 @@ mod pool_path_a_client;
 mod price_feed;
 mod rate_limit;
 pub mod shard_router;
+mod signerlist_update;
 mod singleton;
 mod trading;
 mod types;
@@ -378,6 +379,16 @@ struct RunArgs {
     /// initiating the DKG ceremony; followers don't need it.
     #[arg(long)]
     dkg_admin_listen: Option<String>,
+
+    /// Phase 2.2-C — loopback admin listener for `SignerListSet`
+    /// governance (membership change per
+    /// `docs/multi-operator-architecture.md` §8). Accepts
+    /// `POST /admin/signerlist-update`. Same loopback-only constraint
+    /// as `--admin-listen`. Only the operator initiating the change
+    /// needs this; the others participate via the same libp2p signing
+    /// relay that already serves withdrawals.
+    #[arg(long)]
+    signerlist_admin_listen: Option<String>,
 }
 
 // ── Funding rate ────────────────────────────────────────────────
@@ -1039,6 +1050,41 @@ async fn main() -> Result<()> {
         }
     } else {
         info!("DKG coordinator dormant: no --signers-config");
+    }
+
+    // Phase 2.2-C — SignerListSet governance admin listener. Only
+    // spawned when the operator opts in via --signerlist-admin-listen
+    // AND signers_config + escrow_address are available. The listener
+    // shares the same libp2p signing relay (signing_tx) used by
+    // withdraw, so the same X-C1-hardened policy in p2p.rs gates both
+    // tx types.
+    if let Some(addr) = cli.signerlist_admin_listen.clone() {
+        match signers_config.as_ref() {
+            Some(cfg) => {
+                let signing_request_tx = app_state.signing_tx.clone().context(
+                    "signerlist-update needs the libp2p signing relay; \
+                         signers_config was set but signing_tx is None",
+                )?;
+                let admin_state = Arc::new(signerlist_update::AdminState {
+                    xrpl_url: cli.xrpl_url.clone(),
+                    escrow_address: escrow_address.clone(),
+                    signers_config: cfg.clone(),
+                    signing_request_tx,
+                });
+                tokio::spawn(async move {
+                    if let Err(e) = signerlist_update::spawn_admin_listener(addr, admin_state).await
+                    {
+                        error!("signerlist-update admin listener exited: {e}");
+                    }
+                });
+                info!("signerlist-update admin listener configured");
+            }
+            None => {
+                warn!(
+                    "--signerlist-admin-listen ignored: requires --signers-config (with quorum + signers)"
+                );
+            }
+        }
     }
 
     // Keep publish senders alive — DKG coordinator + future drivers
