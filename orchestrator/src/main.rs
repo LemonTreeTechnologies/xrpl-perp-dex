@@ -213,6 +213,29 @@ enum Command {
         topology: PathBuf,
     },
 
+    /// Phase 2.1c-C — discover the cluster roster from the on-chain
+    /// SignerList plus each signer's `Domain` field (the ECDH pubkey),
+    /// then build a local `signers_config.json` with `local_signer`
+    /// set to this node's entry. Run by each operator on their own
+    /// node after the founder has published the escrow address. Per
+    /// `docs/multi-operator-architecture.md` §6.5: the orchestrator
+    /// daemon then boots, joins libp2p, and coordinates with peers via
+    /// the mesh — direct HTTP-to-peer-enclave is not used.
+    NodeConfigApply {
+        /// XRPL JSON-RPC URL.
+        #[arg(long)]
+        xrpl_url: String,
+        /// Escrow r-address whose SignerList defines the cluster roster.
+        #[arg(long)]
+        escrow_address: String,
+        /// Path to this node's `node-<i>.json` (output of `node-bootstrap`).
+        #[arg(long)]
+        node_entry: PathBuf,
+        /// Where to write `signers_config.json`. Default `~/perp/signers_config.json`.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
     /// Phase 2.1c-B — generate a fresh XRPL escrow account, register the
     /// agreed N operator addresses as a SignerList, immediately disable
     /// master key, and persist the seed to the canonical file path.
@@ -529,6 +552,20 @@ async fn main() -> Result<()> {
                 println!("  {label}: 0x{pk}");
             }
             return Ok(());
+        }
+        Some(Command::NodeConfigApply {
+            xrpl_url,
+            escrow_address,
+            node_entry,
+            output,
+        }) => {
+            let default_output = PathBuf::from(format!(
+                "{}/perp/signers_config.json",
+                std::env::var("HOME").context("HOME not set")?
+            ));
+            let out = output.unwrap_or(default_output);
+            return cli_tools::node_config_apply(&xrpl_url, &escrow_address, &node_entry, &out)
+                .await;
         }
         Some(Command::EscrowInit {
             xrpl_url,

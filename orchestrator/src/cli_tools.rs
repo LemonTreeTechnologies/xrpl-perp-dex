@@ -221,7 +221,7 @@ fn sign_xrpl_tx(
 
 // ── node-bootstrap ───────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SignerEntry {
     name: String,
     enclave_url: String,
@@ -983,6 +983,223 @@ pub async fn escrow_init(
     Ok(())
 }
 
+/// Phase 2.1c-C — `node-config-apply` subcommand. Runs locally on a
+/// single node by its operator. Discovers the cluster roster from the
+/// on-chain SignerList of the escrow account: for each member, queries
+/// `AccountInfo`, parses `Domain` via `decode_domain_v1` to extract the
+/// ECDH public key, builds a `signers_config.json` with `local_signer`
+/// set to this node's entry. The discovered roster only carries
+/// `xrpl_address` + `ecdh_pubkey` per peer — fields that depend on
+/// per-operator credentials (`enclave_url`, `address`, `session_key`,
+/// `compressed_pubkey`) are empty for non-local entries because they
+/// are not knowable from on-chain. The local entry is fully populated
+/// from `--node-entry` (the file emitted by `node-bootstrap`).
+///
+/// Per `docs/multi-operator-architecture.md` §6.5: each operator runs
+/// this on their own node after the founder publishes the escrow
+/// address. The orchestrator daemon then boots, joins libp2p, and does
+/// any cross-operator coordination (e.g., FROST signing) over the mesh
+/// — direct HTTP-to-peer-enclave is not used. The empty credential
+/// fields on non-local entries are intentional: anything that tries to
+/// use them today (the legacy testnet `withdrawal.rs` HTTP-to-each-
+/// signer flow) will fail loudly until the libp2p signing coordinator
+/// lands in a follow-up wedge.
+pub async fn node_config_apply(
+    xrpl_url: &str,
+    escrow_address: &str,
+    node_entry_path: &Path,
+    output: &Path,
+) -> Result<()> {
+    println!("Node Config Apply");
+    println!("=================");
+    println!("XRPL:    {xrpl_url}");
+    println!("Escrow:  {escrow_address}");
+    println!("Entry:   {}", node_entry_path.display());
+    println!("Output:  {}", output.display());
+    println!();
+
+    // 1. Read local node-entry to populate `local_signer`.
+    let local_data = std::fs::read_to_string(node_entry_path)
+        .with_context(|| format!("cannot read {}", node_entry_path.display()))?;
+    let local: SignerEntry = serde_json::from_str(&local_data)
+        .with_context(|| format!("invalid SignerEntry JSON in {}", node_entry_path.display()))?;
+    println!("[1/4] Loaded local entry");
+    println!("  xrpl_address: {}", local.xrpl_address);
+    if local.ecdh_pubkey.is_none() {
+        anyhow::bail!(
+            "local entry {} is missing `ecdh_pubkey` — re-run `node-bootstrap` to regenerate it",
+            node_entry_path.display()
+        );
+    }
+
+    // 2. Query SignerList from on-chain.
+    println!("\n[2/4] Querying on-chain SignerList...");
+    let (signer_addresses, quorum) = fetch_signer_list(xrpl_url, escrow_address).await?;
+    println!("  Quorum: {} of {}", quorum, signer_addresses.len());
+    for a in &signer_addresses {
+        println!("    {a}");
+    }
+
+    // 3. For each signer, fetch AccountInfo + decode Domain → ECDH pubkey.
+    println!("\n[3/4] Discovering ECDH pubkeys from each operator's Domain field...");
+    let mut roster: Vec<SignerEntry> = Vec::with_capacity(signer_addresses.len());
+    let mut local_seen = false;
+    for addr in &signer_addresses {
+        let pubkey = fetch_domain_ecdh_pubkey(xrpl_url, addr).await?;
+        let pubkey_hex = hex::encode_upper(pubkey);
+        println!("  {addr}");
+        println!("    ecdh_pubkey: {pubkey_hex}");
+
+        if addr == &local.xrpl_address {
+            roster.push(local.clone());
+            local_seen = true;
+        } else {
+            roster.push(SignerEntry {
+                name: format!("operator-{}", &addr[..addr.len().min(8)]),
+                enclave_url: String::new(),
+                address: String::new(),
+                session_key: String::new(),
+                compressed_pubkey: String::new(),
+                xrpl_address: addr.clone(),
+                ecdh_pubkey: Some(pubkey_hex),
+            });
+        }
+    }
+    if !local_seen {
+        anyhow::bail!(
+            "local node entry's xrpl_address {} is not on the on-chain SignerList — \
+             this node is not a registered cluster member yet, or the founder used a \
+             different address. Verify with `escrow-init` output.",
+            local.xrpl_address
+        );
+    }
+
+    // 4. Write the merged signers_config.json.
+    println!("\n[4/4] Writing {}", output.display());
+    let config = FullSignersConfig {
+        escrow_address: escrow_address.to_string(),
+        escrow_seed: String::new(),
+        quorum,
+        signer_list_set_tx_hash: String::new(),
+        signers: roster,
+        local_signer: Some(local),
+    };
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot mkdir -p {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(&config)?;
+    std::fs::write(output, &json)
+        .with_context(|| format!("failed to write {}", output.display()))?;
+
+    println!();
+    println!(
+        "✓ Wrote signers_config.json with {} roster entries",
+        config.signers.len()
+    );
+    println!();
+    println!("Next: restart the local orchestrator service so it picks up");
+    println!("the new config. (Operator action — `sudo systemctl restart");
+    println!("perp-dex-orchestrator` on this node only.)");
+    Ok(())
+}
+
+/// Fetches the SignerList for an XRPL account via `account_objects`.
+/// Returns `(signer_addresses_in_on-chain-order, quorum)`. Bails if the
+/// account has no SignerList (unconfigured escrow).
+async fn fetch_signer_list(xrpl_url: &str, account: &str) -> Result<(Vec<String>, u32)> {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let body = serde_json::json!({
+        "method": "account_objects",
+        "params": [{
+            "account": account,
+            "type": "signer_list",
+            "ledger_index": "validated",
+        }],
+    });
+    let resp: serde_json::Value = http
+        .post(xrpl_url)
+        .json(&body)
+        .send()
+        .await
+        .context("account_objects request failed")?
+        .json()
+        .await
+        .context("invalid JSON from account_objects")?;
+    parse_signer_list_response(&resp)
+        .with_context(|| format!("failed to extract SignerList for {account}"))
+}
+
+fn parse_signer_list_response(resp: &serde_json::Value) -> Result<(Vec<String>, u32)> {
+    let result = &resp["result"];
+    if let Some(err) = result["error"].as_str() {
+        anyhow::bail!("account_objects error: {err}");
+    }
+    let objects = result["account_objects"]
+        .as_array()
+        .context("account_objects.account_objects missing")?;
+    let entry = objects
+        .iter()
+        .find(|o| o["LedgerEntryType"].as_str() == Some("SignerList"))
+        .context("account has no SignerList — escrow not configured yet")?;
+    let quorum = entry["SignerQuorum"]
+        .as_u64()
+        .context("SignerList missing SignerQuorum")? as u32;
+    let signer_entries = entry["SignerEntries"]
+        .as_array()
+        .context("SignerList missing SignerEntries")?;
+    let mut addresses = Vec::with_capacity(signer_entries.len());
+    for se in signer_entries {
+        let acct = se["SignerEntry"]["Account"]
+            .as_str()
+            .context("SignerEntry missing Account")?;
+        addresses.push(acct.to_string());
+    }
+    Ok((addresses, quorum))
+}
+
+/// Fetches an account's `Domain` field via `account_info` and decodes
+/// it to a 33-byte ECDH pubkey using `decode_domain_v1`. Bails if the
+/// account has no Domain or it is malformed.
+async fn fetch_domain_ecdh_pubkey(xrpl_url: &str, account: &str) -> Result<[u8; 33]> {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let body = serde_json::json!({
+        "method": "account_info",
+        "params": [{
+            "account": account,
+            "ledger_index": "validated",
+        }],
+    });
+    let resp: serde_json::Value = http
+        .post(xrpl_url)
+        .json(&body)
+        .send()
+        .await
+        .context("account_info request failed")?
+        .json()
+        .await
+        .context("invalid JSON from account_info")?;
+    parse_domain_from_account_info(&resp)
+        .with_context(|| format!("failed to extract Domain for {account}"))
+}
+
+fn parse_domain_from_account_info(resp: &serde_json::Value) -> Result<[u8; 33]> {
+    let result = &resp["result"];
+    if let Some(err) = result["error"].as_str() {
+        anyhow::bail!("account_info error: {err}");
+    }
+    let domain_hex = result["account_data"]["Domain"].as_str().context(
+        "account_info missing account_data.Domain — operator has not run `node-bootstrap \
+             --publish-domain` yet",
+    )?;
+    let domain_bytes = hex::decode(domain_hex).context("Domain field is not valid hex")?;
+    decode_domain_v1(&domain_bytes)
+}
+
 /// Pure-logic argument validation for `escrow_init`. Extracted so the
 /// failure modes (too-few/too-many signers, bad quorum, malformed
 /// XRPL address) are unit-testable without touching the network. Real
@@ -1742,6 +1959,85 @@ mod tests {
         let seed = generate_secp256k1_family_seed();
         let kp = derive_keypair_from_seed(&seed).expect("freshly-generated seed must derive");
         decode_xrpl_address(&kp.address).expect("derived address must be valid XRPL r-address");
+    }
+
+    // ── Phase 2.1c-C node-config-apply parsers ─────────────────────
+
+    #[test]
+    fn parse_signer_list_response_extracts_quorum_and_addresses() {
+        let resp = serde_json::json!({
+            "result": {
+                "account_objects": [
+                    {
+                        "LedgerEntryType": "SignerList",
+                        "SignerQuorum": 2,
+                        "SignerEntries": [
+                            {"SignerEntry": {"Account": "rKe1hu3iRvyRnJB4xHBMXvzEwsnXTHMxnJ", "SignerWeight": 1}},
+                            {"SignerEntry": {"Account": "rL3LYCP6gkduRoiD9pB6KDEUyNVPXeDo2j", "SignerWeight": 1}},
+                            {"SignerEntry": {"Account": "rwoAC7KZD3UYtzpWSB4jQUt1qvQjhqXTUn", "SignerWeight": 1}},
+                        ],
+                    }
+                ]
+            }
+        });
+        let (addrs, quorum) = parse_signer_list_response(&resp).unwrap();
+        assert_eq!(quorum, 2);
+        assert_eq!(addrs.len(), 3);
+        assert_eq!(addrs[0], "rKe1hu3iRvyRnJB4xHBMXvzEwsnXTHMxnJ");
+    }
+
+    #[test]
+    fn parse_signer_list_response_rejects_account_without_signerlist() {
+        let resp = serde_json::json!({"result": {"account_objects": []}});
+        let err = parse_signer_list_response(&resp).unwrap_err();
+        assert!(
+            err.to_string().contains("no SignerList") || err.to_string().contains("escrow"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_signer_list_response_propagates_xrpl_error() {
+        let resp = serde_json::json!({"result": {"error": "actNotFound"}});
+        let err = parse_signer_list_response(&resp).unwrap_err();
+        assert!(err.to_string().contains("actNotFound"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_domain_from_account_info_round_trips_with_encode_v1() {
+        // Round-trip a real-looking ECDH pubkey through the on-chain
+        // representation: encode_domain_v1 → ASCII bytes → hex (which is
+        // how XRPL stores Domain) → parse → 33-byte pubkey.
+        let pk_hex_upper = "03D3869DF7C134DA8066006A6304C3F3AFB9357BABE6326F5D8655A3DD2DE0CF57";
+        let domain_str = encode_domain_v1(pk_hex_upper);
+        let domain_hex = hex::encode_upper(domain_str.as_bytes());
+        let resp = serde_json::json!({
+            "result": {"account_data": {"Domain": domain_hex}}
+        });
+        let pk = parse_domain_from_account_info(&resp).unwrap();
+        assert_eq!(hex::encode(pk).to_uppercase(), pk_hex_upper);
+    }
+
+    #[test]
+    fn parse_domain_from_account_info_rejects_missing_domain() {
+        let resp = serde_json::json!({"result": {"account_data": {}}});
+        let err = parse_domain_from_account_info(&resp).unwrap_err();
+        assert!(err.to_string().contains("Domain"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_domain_from_account_info_rejects_wrong_prefix() {
+        // Domain is hex-encoded ASCII for "example.com" — common but
+        // not our protocol prefix. Should fail.
+        let domain_hex = hex::encode_upper(b"example.com");
+        let resp = serde_json::json!({
+            "result": {"account_data": {"Domain": domain_hex}}
+        });
+        let err = parse_domain_from_account_info(&resp).unwrap_err();
+        assert!(
+            err.to_string().contains("xperp-ecdh-v1") || err.to_string().contains("prefix"),
+            "got: {err}"
+        );
     }
 
     #[test]
