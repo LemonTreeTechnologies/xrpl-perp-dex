@@ -213,6 +213,34 @@ enum Command {
         topology: PathBuf,
     },
 
+    /// Phase 2.1c-B — generate a fresh XRPL escrow account, register the
+    /// agreed N operator addresses as a SignerList, immediately disable
+    /// master key, and persist the seed to the canonical file path.
+    /// Replaces `setup_testnet_escrow.py`. Single-mode: `--faucet-url`
+    /// is the only network-specific input — testnet ops provide it for
+    /// auto-funding, mainnet ops omit and pre-fund.
+    EscrowInit {
+        /// XRPL JSON-RPC URL.
+        #[arg(long)]
+        xrpl_url: String,
+        /// Signer entry as `name=raddress` (repeatable, requires N ≥ 2).
+        #[arg(long = "signer", action = clap::ArgAction::Append, required = true, num_args = 1..)]
+        signers: Vec<String>,
+        /// Multisig quorum (e.g. 2 for 2-of-3). Must satisfy 1 ≤ quorum ≤ N.
+        #[arg(long, default_value_t = 2)]
+        quorum: u32,
+        /// Where to persist the escrow seed. Default
+        /// `~/.secrets/perp-dex-xrpl/escrow-testnet.json` (mode 0600).
+        /// Mainnet operators pass an explicit path, e.g.
+        /// `~/.secrets/perp-dex-xrpl/escrow-mainnet.json`.
+        #[arg(long)]
+        seed_file: Option<PathBuf>,
+        /// Optional faucet URL for auto-funding the new escrow.
+        /// Testnet/devnet only.
+        #[arg(long)]
+        faucet_url: Option<String>,
+    },
+
     /// Stop services, swap binaries, restart enclaves only (Phase 2.1b).
     /// Replaces §3-§5 of docs/testnet-enclave-bump-procedure.md. Per
     /// node: stage artefacts to /tmp via scp, verify SHAs, stop both
@@ -501,6 +529,36 @@ async fn main() -> Result<()> {
                 println!("  {label}: 0x{pk}");
             }
             return Ok(());
+        }
+        Some(Command::EscrowInit {
+            xrpl_url,
+            signers,
+            quorum,
+            seed_file,
+            faucet_url,
+        }) => {
+            let parsed_signers: Vec<(String, String)> = signers
+                .iter()
+                .map(|s| {
+                    let (n, a) = s
+                        .split_once('=')
+                        .with_context(|| format!("--signer expects name=raddress, got {s:?}"))?;
+                    Ok((n.trim().to_string(), a.trim().to_string()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let default_seed_path = PathBuf::from(format!(
+                "{}/.secrets/perp-dex-xrpl/escrow-testnet.json",
+                std::env::var("HOME").context("HOME not set")?
+            ));
+            let seed_path = seed_file.unwrap_or(default_seed_path);
+            return cli_tools::escrow_init(
+                &xrpl_url,
+                &parsed_signers,
+                quorum,
+                &seed_path,
+                faucet_url.as_deref(),
+            )
+            .await;
         }
         Some(Command::ClusterDeploy {
             topology,

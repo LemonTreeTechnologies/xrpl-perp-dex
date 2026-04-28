@@ -809,6 +809,220 @@ pub async fn escrow_setup(
     Ok(())
 }
 
+/// Phase 2.1c-B — `escrow-init` subcommand. The genesis ceremony for a
+/// fresh cluster: founder generates a brand-new XRPL escrow account,
+/// optionally faucet-funds it, registers the agreed operator addresses
+/// as a SignerList, and immediately disables the master key. Replaces
+/// `orchestrator/scripts/setup_testnet_escrow.py`.
+///
+/// Single-mode: `--faucet-url` is the only network-specific input.
+/// Testnet operators provide it for auto-funding; mainnet operators
+/// omit it and pre-fund the account from their own XRP holdings before
+/// running this subcommand. The same code path runs in both cases.
+///
+/// Per `docs/multi-operator-architecture.md` §6.4, after master is
+/// disabled the founder has no on-going authority over the escrow —
+/// every future change goes through current-quorum multisig. The
+/// founder's seed file is preserved at the canonical path as proof of
+/// provenance, but post-disable it has no operational power.
+pub async fn escrow_init(
+    xrpl_url: &str,
+    signers: &[(String, String)],
+    quorum: u32,
+    seed_file: &Path,
+    faucet_url: Option<&str>,
+) -> Result<()> {
+    if seed_file.exists() {
+        anyhow::bail!(
+            "seed file already exists at {} — refusing to overwrite. \
+             Move it aside (e.g. add a .prev-<TS> suffix) before re-running.",
+            seed_file.display()
+        );
+    }
+    if signers.len() < 2 || signers.len() > 32 {
+        anyhow::bail!(
+            "need 2..=32 signers, got {} (XRPL SignerList limit)",
+            signers.len()
+        );
+    }
+    if quorum < 1 || quorum as usize > signers.len() {
+        anyhow::bail!("quorum must be in 1..={}, got {}", signers.len(), quorum);
+    }
+    // Validate signer addresses parse as XRPL r-addresses up-front so
+    // we don't burn the faucet entry on a typo'd config.
+    for (name, addr) in signers {
+        decode_xrpl_address(addr)
+            .with_context(|| format!("signer {name} has invalid XRPL address {addr:?}"))?;
+    }
+
+    println!("Escrow Init");
+    println!("===========");
+    println!("XRPL:    {xrpl_url}");
+    if let Some(f) = faucet_url {
+        println!("Faucet:  {f}");
+    } else {
+        println!("Faucet:  (none — escrow account must be pre-funded)");
+    }
+    println!("Quorum:  {quorum}-of-{}", signers.len());
+    for (name, addr) in signers {
+        println!("  {name} → {addr}");
+    }
+    println!();
+
+    // Step 1: generate fresh secp256k1 family seed.
+    println!("[1/5] Generating fresh secp256k1 escrow keypair...");
+    let seed = generate_secp256k1_family_seed();
+    let keypair = derive_keypair_from_seed(&seed)?;
+    let escrow_address = keypair.address.clone();
+    let account_id = decode_xrpl_address(&escrow_address)?;
+    println!("  Address: {escrow_address}");
+    println!("  Seed:    (not echoed — will be persisted to seed-file in step 5)");
+
+    // Step 2: fund (faucet if URL given, otherwise verify pre-funded).
+    if let Some(f) = faucet_url {
+        println!("\n[2/5] Faucet-funding {escrow_address}...");
+        faucet_fund(f, &escrow_address).await?;
+    } else {
+        println!("\n[2/5] Verifying account is pre-funded...");
+    }
+
+    // Step 3: read sequence (also confirms the account exists on chain).
+    println!("\n[3/5] Reading account state...");
+    let info = fetch_account_info(xrpl_url, &escrow_address).await?;
+    let sequence = info.sequence;
+    println!("  Sequence: {sequence}");
+
+    // Step 4a: submit SignerListSet.
+    println!(
+        "\n[4/5] Submitting SignerListSet ({}-of-{})...",
+        quorum,
+        signers.len()
+    );
+    let signer_entries_bin: Vec<([u8; 20], u16)> = signers
+        .iter()
+        .map(|(_, addr)| Ok((decode_xrpl_address(addr)?, 1u16)))
+        .collect::<Result<Vec<_>>>()?;
+    let signer_entries_suffix = serialize_signer_entries(&signer_entries_bin);
+    let mut sls_fields = vec![
+        XrplField::uint16(2, 12),
+        XrplField::uint32(4, sequence),
+        XrplField::uint32(35, quorum),
+        XrplField::amount_drops(8, 12),
+        XrplField::account_id(1, &account_id),
+    ];
+    let sls_blob = sign_xrpl_tx(&keypair, &mut sls_fields, Some(&signer_entries_suffix))?;
+    let sls_result = submit_tx_blob(xrpl_url, &sls_blob).await?;
+    let sls_status = sls_result["result"]["engine_result"]
+        .as_str()
+        .unwrap_or("unknown");
+    let sls_hash = sls_result["result"]["tx_json"]["hash"]
+        .as_str()
+        .unwrap_or("unknown");
+    println!("  Status: {sls_status}");
+    println!("  TX:     {sls_hash}");
+    if !sls_status.starts_with("tes") {
+        anyhow::bail!("SignerListSet failed: {sls_status}: {sls_result}");
+    }
+
+    // Wait one ledger before submitting AccountSet so the new sequence
+    // is observable (avoids transient `terPRE_SEQ` retries).
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+
+    // Step 4b: submit AccountSet asfDisableMaster.
+    println!("\n[5/5] Submitting AccountSet asfDisableMaster...");
+    let mut acset_fields = vec![
+        XrplField::uint16(2, 3),
+        XrplField::uint32(4, sequence + 1),
+        XrplField::uint32(33, 4), // asfDisableMaster
+        XrplField::amount_drops(8, 12),
+        XrplField::account_id(1, &account_id),
+    ];
+    let acset_blob = sign_xrpl_tx(&keypair, &mut acset_fields, None)?;
+    let acset_result = submit_tx_blob(xrpl_url, &acset_blob).await?;
+    let acset_status = acset_result["result"]["engine_result"]
+        .as_str()
+        .unwrap_or("unknown");
+    let acset_hash = acset_result["result"]["tx_json"]["hash"]
+        .as_str()
+        .unwrap_or("unknown");
+    println!("  Status: {acset_status}");
+    println!("  TX:     {acset_hash}");
+    if !acset_status.starts_with("tes") {
+        anyhow::bail!("AccountSet asfDisableMaster failed: {acset_status}: {acset_result}");
+    }
+
+    // Step 5: persist seed to canonical path.
+    if let Some(parent) = seed_file.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot mkdir -p {}", parent.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let signers_json: Vec<serde_json::Value> = signers
+        .iter()
+        .map(|(name, addr)| serde_json::json!({"name": name, "xrpl_address": addr}))
+        .collect();
+    let seed_json = serde_json::json!({
+        "escrow_address": escrow_address,
+        "escrow_seed": seed,
+        "quorum": quorum,
+        "signers": signers_json,
+        "signer_list_set_tx_hash": sls_hash,
+        "disable_master_tx_hash": acset_hash,
+    });
+    std::fs::write(seed_file, serde_json::to_string_pretty(&seed_json)?)
+        .with_context(|| format!("cannot write {}", seed_file.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(seed_file, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("cannot chmod 0600 {}", seed_file.display()))?;
+    }
+
+    println!();
+    println!("============================================================");
+    println!("ESCROW_ADDRESS={escrow_address}");
+    println!("SEED_FILE={}", seed_file.display());
+    println!("Explorer: https://testnet.xrpl.org/accounts/{escrow_address}");
+    println!();
+    println!("Master key disabled. All future escrow changes require");
+    println!(
+        "{quorum}-of-{} multisig signed by current operators.",
+        signers.len()
+    );
+
+    Ok(())
+}
+
+/// Generate a fresh XRPL secp256k1 family seed: 16 random bytes wrapped
+/// in `[0x21] || entropy || sha256_double(prefix||entropy)[..4]`,
+/// base58-encoded with the XRPL alphabet. Operator never types this
+/// seed; it's persisted to the canonical seed file by `escrow_init` and
+/// re-loaded by future runs of `escrow-setup` if the founder ever needs
+/// to re-submit (which they cannot post-master-disable).
+fn generate_secp256k1_family_seed() -> String {
+    use rand::RngCore;
+    use sha2::Digest;
+
+    let mut entropy = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut entropy);
+
+    let mut payload = Vec::with_capacity(21);
+    payload.push(0x21);
+    payload.extend_from_slice(&entropy);
+
+    let h1 = sha2::Sha256::digest(&payload);
+    let h2 = sha2::Sha256::digest(h1);
+    payload.extend_from_slice(&h2[..4]);
+
+    bs58::encode(&payload)
+        .with_alphabet(xrpl_alphabet())
+        .into_string()
+}
+
 async fn submit_tx_blob(xrpl_url: &str, blob: &[u8]) -> Result<serde_json::Value> {
     let http = reqwest::Client::new();
     let hex = hex::encode_upper(blob);
