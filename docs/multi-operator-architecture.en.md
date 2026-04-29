@@ -331,11 +331,26 @@ The following SSH-driven modules existed during the Phase 2.1c transition. They 
 | 2.1c-A | `node-bootstrap` | node-local | `operator-setup` (rename + extend with Domain publish) | ✅ landed `b068ecb`+`cc4e25f`+`e95ebcc` |
 | 2.1c-B | `escrow-init` | XRPL-only | `setup_testnet_escrow.py` | ✅ landed `d64ce67`+`dc2bcd0` |
 | 2.1c-C | `node-config-apply` | node-local | new | ✅ landed `0e41678` |
-| 2.1c-D | `dkg-coordinate` | cluster-coordinated (libp2p) | `dkg-bootstrap` (SSH) | ✅ code-complete `dc54fa4` |
-| 2.1c-E | `node-deploy` | node-local | `cluster-deploy` (SSH) | ✅ code-complete `9130033` |
-| 2.1c-F | retire `dkg_bootstrap.rs` + `cluster_deploy.rs` | (delete) | (retiring debt) | ✅ this commit |
+| 2.1c-D | `dkg-coordinate` | cluster-coordinated (libp2p) | `dkg-bootstrap` (SSH) | ✅ live-validated `dc54fa4`+`2f4385b` |
+| 2.1c-E | `node-deploy` | node-local | `cluster-deploy` (SSH) | ✅ live-validated `9130033`+`2f4385b` |
+| 2.1c-F | retire `dkg_bootstrap.rs` + `cluster_deploy.rs` | (delete) | (retiring debt) | ✅ landed `396eace` |
 
-Phase 2.1c is complete. The repository no longer contains any SSH-driven cross-operator code paths. Live testnet validation of the 2.1c-D + 2.1c-E flow is the natural next operational step; it does not require any further code work.
+Phase 2.1c is complete and live-validated. The repository no longer contains any SSH-driven cross-operator code paths.
+
+### 11.4 Phase 2.2 — governance (membership change)
+
+§8 add/remove-operator decomposes into already-shipped primitives plus one new wedge: governance multisig over `SignerListSet`. Phase 2.2 adds it without weakening the X-C1 invariants the existing signing relay already enforces.
+
+| Phase | Surface | Class | Status |
+|---|---|---|---|
+| 2.2-A | `validate_signing_policy` per-`TransactionType` dispatcher + `validate_signerlist_set_specific` (14 constraints, 28 unit tests) | (in `p2p.rs`) | ✅ landed `fce46ff` |
+| 2.2-B | wire-level integration tests against an in-process axum mock enclave (4 `#[tokio::test]`) | (in `p2p.rs`) | ✅ landed `f7a707f` |
+| 2.2-C | `signerlist_update.rs` admin route (`POST /admin/signerlist-update`) + `--signerlist-admin-listen` CLI flag (18 unit tests) | cluster-coordinated | ✅ landed `0b1dae5` |
+| 2.2-D | live testnet rotation 2-of-3 ↔ 3-of-3, on-chain confirmed | (live-only) | ✅ validated 2026-04-29 |
+
+The relay now accepts two `TransactionType`s — `Payment` (preserved verbatim, audit-approved) and `SignerListSet`. Each tx type has a dedicated validator with its own constraint set; the universal X-C1 hardening (replay guard, peer allowlist, per-peer rate limit, source-account binding, multisig marker, signer-identity binding) lives in the dispatcher and applies to every allowed type. Equal-weight (`SignerWeight=1`) and SignerQuorum∈[2, N] are enforced pre-sign so quorum-math footguns are unreachable.
+
+The full §8 add/remove-operator flow is now code-complete: `node-bootstrap` (new operator) → `signerlist-update --add r…` (existing-quorum multisig over the relay) → on-chain SignerListSet → `node-config-apply` (each operator re-discovers roster) → `dkg-coordinate` (fresh group_pubkey under new membership). No SSH; no manual XRPL-cli ceremony; no per-environment branching.
 
 ## 12. Glossary
 
