@@ -132,7 +132,7 @@ This is multi-month architectural work inside the enclave, plus audit, plus orac
 ### 5.1 If we pick Variant A
 
 - **Nothing in our current documentation needs to change.** `comparison-arch-network.md`, `btc-perp-dex-feasibility.md`, `sgx-enclave-capabilities-and-limits.md` remain accurate. The investor pitch remains "in-enclave CLOB with microsecond matching, hardware-attested, FROST-settled".
-- **`vault_mm.rs` gets a new pricing module.** This is the post-hackathon Phase 1 work. Clear owner: Tom. Clear scope: bounded. Clear review surface: vault layer only.
+- **`vault_mm.rs` gets a new pricing module.** This is the post-hackathon Phase 1 work. Spec owner: Tom. Implementation owner: dev-perp (under Tom's review). Clear scope: bounded. Clear review surface: vault layer only.
 - **Maker rebates get added** to the fee logic, either in the enclave or in a settlement wrapper. Small change. Compatible with Variant A (and in fact more natural under it, because the maker/taker distinction still exists).
 - **Tom's arb bot runs externally** as described. No new enclave work to support it.
 - **The margin system review Tom asked for** happens independently, as a knowledge-sharing pass. Not coupled to the vault redesign.
@@ -168,7 +168,7 @@ Because that phrasing is loaded and implies one answer is the right one. The A/B
 
 ### What if Tom answers "I don't know, what do you think?"
 
-Then we have surfaced the real situation: the post-hackathon plan had not yet distinguished these two variants, and the distinction needs to be made collaboratively. In that case, Andrey decides (because it is a product-scope question) and Tom implements whichever variant Andrey picks.
+Then we have surfaced the real situation: the post-hackathon plan had not yet distinguished these two variants, and the distinction needs to be made collaboratively. In that case, Andrey decides (because it is a product-scope question), Tom owns the spec for whichever variant Andrey picks, and dev-perp implements that spec.
 
 ---
 
@@ -176,7 +176,7 @@ Then we have surfaced the real situation: the post-hackathon plan had not yet di
 
 ### If Variant A is chosen
 
-1. Tom owns the `vault_mm` pricing upgrade. Scope: `orchestrator/src/vault_mm.rs` and adjacent. No enclave changes.
+1. Tom owns the `vault_mm` pricing **spec**; dev-perp implements. Scope: `orchestrator/src/vault_mm.rs` and adjacent. No enclave changes.
 2. Maker rebate logic added in parallel. Owner: TBD but small scope.
 3. Margin system review scheduled as a standalone knowledge-sharing session. Not blocking the vault work.
 4. No documentation changes required beyond normal implementation notes.
