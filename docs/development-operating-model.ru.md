@@ -59,7 +59,7 @@
 
 ## 2. Audit workflow — AI-Auditor cycle
 
-> **Interim notice (2026-05-01).** Этот раздел interim. Cross-project `AUDIT-PROTOCOL.md` пишется AI-Auditor'ом (в `~/llm-work/security-audit-playbook/`) для стандартизации цикла across всех SGX-related проектов под управлением одного оператора. Когда playbook доставлен, этот раздел становится тонким wrapper'ом референсящим его; field/file naming и PR shape ожидаемо меняются (см. `reference_audit_protocol_in_flight.md` в memory для expected diff). Принципы ниже — independent review, mainnet-sync gating, append-only artefacts — stable и переживают format harmonisation. До тех пор `REQ-1` не стартует для этого проекта, чтобы избежать drift между interim format и playbook canon.
+> **Authoritative protocol (2026-05-01).** Audit cycle управляется [`docs/audit/AUDIT-PROTOCOL.md`](audit/AUDIT-PROTOCOL.md) v1.0 (cross-project, cross-repo) и per-repo wrapper [`docs/audit/PROTOCOL.md`](audit/PROTOCOL.md). Этот §2 сохраняет conceptual rationale (зачем AI-Auditor; как gate композируется с §3 mainnet sync) но defer'ит все field/file/PR-shape specifics к protocol document. Где этот раздел и protocol document расходятся — protocol document каноничен.
 
 ### 2.1 Зачем AI-Auditor
 
