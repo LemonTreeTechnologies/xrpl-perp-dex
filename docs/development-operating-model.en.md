@@ -59,6 +59,8 @@ Reverting from 1.2 to 1.1 (an operator leaves, no replacement found) is allowed;
 
 ## 2. Audit workflow — AI-Auditor cycle
 
+> **Interim notice (2026-05-01).** This section is interim. A cross-project `AUDIT-PROTOCOL.md` is being authored by the AI-Auditor (in `~/llm-work/security-audit-playbook/`) to standardise the cycle across all SGX-related projects under one operator's control. When that playbook is delivered, this section becomes a thin wrapper that references it; field/file naming and PR shape are expected to change (see `reference_audit_protocol_in_flight.md` in memory for the expected diff). The principles below — independent review, mainnet-sync gating, append-only artefacts — are stable and survive the format harmonisation. Until then, no `REQ-1` is started for this project, to avoid drift between an interim format and the playbook canon.
+
 ### 2.1 Why an AI-Auditor
 
 Real third-party human audits are expensive and slow; we cannot trigger one for every mainnet sync (which happens every few weeks). An AI-Auditor — a Claude Code instance running on a separate machine with an audit-specialised knowledge base, no exposure to dev-context — provides an **independent review** between formal third-party audits. It is not a replacement for human audit at production-launch time; it is a higher-frequency gate during the sandbox phases.
