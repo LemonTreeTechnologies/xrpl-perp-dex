@@ -23,6 +23,8 @@ The critical implication: testnet today, where one human runs all three nodes an
 
 ## 1. Trust model
 
+> **Operating mode caveat (2026-05-01).** The trust model below is the **aspirational target** that holds when the cluster is run by N independent human operators with zero trust between them. Today the project is in `product-sandbox-single-operator` mode (one physical operator plays all N roles); the operator-vs-operator zero-trust property cannot be enforced when N=1 in human terms. See `docs/development-operating-model.md` §1.1 for what is suspended in that mode and what mainnet sync looks like under it. This document remains the authoritative architecture for `product-sandbox-multi-operator` and `production` modes.
+
 The trust we place in each component:
 
 | Component | Trusted? | What it can do | What it cannot do |

@@ -23,6 +23,8 @@
 
 ## 1. Trust model
 
+> **Operating mode caveat (2026-05-01).** Trust model ниже — это **aspirational target** который держится когда кластер запускается N независимыми human operator'ами с zero trust между ними. Сегодня проект в `product-sandbox-single-operator` mode (один физический оператор играет все N ролей); operator-vs-operator zero-trust property не может enforce'иться когда N=1 в человеческих terms. См. `docs/development-operating-model.md` §1.1 — что suspended в этом mode и как выглядит mainnet sync под ним. Этот документ остаётся authoritative architecture для `product-sandbox-multi-operator` и `production` modes.
+
 Доверие, которое мы оказываем каждому компоненту:
 
 | Компонент | Доверенный? | Что может | Что не может |
