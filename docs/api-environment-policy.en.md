@@ -1,8 +1,8 @@
 # API environment policy — Tom integration
 
 **Status:** Accepted (2026-05-01).
-**Audience:** Andrey, Tom, Alex, dev-perp, future maintainers.
-**Companions:** [`development-operating-model.{en,ru}.md`](development-operating-model.en.md) (operating modes + mainnet sync procedure), [`feedback_api_boundary_with_tom.md`](../.claude/projects/-home-andrey-llm-perp-xrpl/memory/feedback_api_boundary_with_tom.md) in memory (API boundary — Tom owns clients black-box; we own the API).
+**Audience:** the internal team and dev-perp; future maintainers.
+**Companions:** [`development-operating-model.{en,ru}.md`](development-operating-model.en.md) (operating modes + mainnet sync procedure). The companion API-boundary rule (Tom owns clients black-box; we own the API) is summarised inline below where it matters.
 
 This document fixes the policy for which **environment** Tom's components target during development, and the conditions under which a component graduates from testnet to the mainnet-sandbox. The companion document defines what is in Tom's scope vs ours; this document defines where each side runs.
 
@@ -18,7 +18,7 @@ Tom's component connects to **our same-environment instance**, never crosses env
 
 Cross-environment connection (Tom-testnet client hitting our mainnet, or vice versa) is forbidden. Both the API surface and the data model are environment-tagged; bridging them risks polluting real funds with test signals or vice versa.
 
-The `single-mode check` rule (sister memory `feedback_single_mode_check.md`) keeps testnet and mainnet on the same code, which means **the API contract is identical** between the two — no testnet-only branches, no mainnet-only quirks. The pairing rule is therefore not a code-level enforcement; it is an operational discipline.
+The single-mode-check rule (every cross-node subcommand works identically on testnet and mainnet, no environment branches in committed code) keeps testnet and mainnet on the same code, which means **the API contract is identical** between the two — no testnet-only branches, no mainnet-only quirks. The pairing rule is therefore not a code-level enforcement; it is an operational discipline.
 
 ---
 
@@ -28,7 +28,7 @@ For each new Tom component (new bot, new screen, new demo, new synthetic trader)
 
 Why testnet first:
 
-- **Cost asymmetry.** Testnet is faucet-funded and resets cheaply; mainnet uses Andrey's real XRP. A client-side bug that fires repeatedly costs nothing on testnet and costs real funds on mainnet, even at sandbox scale.
+- **Cost asymmetry.** Testnet is faucet-funded and resets cheaply; mainnet uses real XRP held by the operator-of-record for sandbox use. A client-side bug that fires repeatedly costs nothing on testnet and costs real funds on mainnet, even at sandbox scale.
 - **Audit cadence.** Per `development-operating-model.md` §3, every mainnet-sandbox sync requires the audit cycle (REQ-N → RESP-N PASS). Fast iteration on Tom's client side surfaces API issues that may require our patches, which then require re-auditing — running this cycle for every iteration of a Tom component is operationally infeasible. Testnet absorbs the iteration without the audit-cycle cost.
 - **Bug isolation.** When a problem appears on testnet, the participating sides are: Tom's client + our orchestrator + our enclave. When the same problem appears on mainnet during dev iteration, additional variables enter (real XRPL state, real fees, real network conditions). Testnet is the calibration step that tells us which problems are Tom's vs ours.
 - **Reversibility.** Testnet "broken" → redeploy. Mainnet "broken" with real XRP → no redeploy fixes the lost funds.
@@ -55,11 +55,11 @@ If after this conversation Tom still has a real reason that none of these addres
 
 Each Tom component graduates separately. The sequence:
 
-1. **Iteration on testnet** until "demonstrably stable" — definition: Tom's component passes its happy-path repeatedly + Andrey's spot review confirms the surface area is what it claims to be.
+1. **Iteration on testnet** until "demonstrably stable" — definition: Tom's component passes its happy-path repeatedly + an operator-side spot review confirms the surface area is what it claims to be.
 2. **API contract check** — dev-perp confirms the API surface Tom's component depends on matches the documented spec (`docs/frontend-api-guide.md`, OpenAPI). Any deviation gets fixed in our docs/code before graduation; we do not ship a graduation that requires Tom to depend on undocumented behaviour.
 3. **Mainnet-sandbox sync gate** — per `development-operating-model.md` §3, the orchestrator + enclave on mainnet are at the same code as testnet via Mode S sync. Audit verdict for that sync is PASS. Without this, no graduation.
 4. **Sandbox connection** — Tom switches his component's API endpoint to the mainnet-sandbox URL. Volume is small XRP only (definition: amounts that, if lost entirely, are an acceptable cost-of-learning per the `product-sandbox-single-operator` mode in `development-operating-model.md` §1.1).
-5. **Sandbox observation period** — dev-perp + Tom + Andrey watch for behaviour deltas (any difference between testnet and sandbox is a signal that the code-paths or environments are not actually identical, and graduation rolls back). Period length: at least one full sandbox session before considering the component "graduated."
+5. **Sandbox observation period** — dev-perp + Tom + operator-of-record watch for behaviour deltas (any difference between testnet and sandbox is a signal that the code-paths or environments are not actually identical, and graduation rolls back). Period length: at least one full sandbox session before considering the component "graduated."
 
 There is no automatic promotion to production. Production is a separate launch event with its own playbook; sandbox graduation is not the same step.
 
@@ -78,15 +78,13 @@ There is no automatic promotion to production. Production is a separate launch e
 
 - Not a rule against demos. Demos run on the appropriate environment (testnet for early, sandbox for later). The policy is "match the environment", not "no demos".
 - Not a discipline imposed on Tom. The policy is symmetric — dev-perp also doesn't connect our test infra to mainnet during iteration.
-- Not a permanent block on mainnet. The graduation gate exists precisely so components can move; the gate is `audit-verdict + Mode S sync`, not "Andrey's mood".
+- Not a permanent block on mainnet. The graduation gate exists precisely so components can move; the gate is `audit-verdict + Mode S sync`, not subjective discretion.
 - Not negotiable per-iteration. The conditions in §4 are the gate; if they're met, graduation proceeds. If they're not, dev-perp fixes the gap.
 
 ---
 
 ## 7. References
 
-- [`feedback_api_boundary_with_tom.md`](../.claude/projects/-home-andrey-llm-perp-xrpl/memory/feedback_api_boundary_with_tom.md) — Tom owns clients black-box; dev-perp owns the API.
-- [`feedback_division_of_work_tom.md`](../.claude/projects/-home-andrey-llm-perp-xrpl/memory/feedback_division_of_work_tom.md) — Tom = spec; dev-perp = code.
-- [`feedback_single_mode_check.md`](../.claude/projects/-home-andrey-llm-perp-xrpl/memory/feedback_single_mode_check.md) — same code on testnet + mainnet.
-- [`development-operating-model.{en,ru}.md`](development-operating-model.en.md) §1 (operating modes), §3 (mainnet sync procedure).
+- [`development-operating-model.{en,ru}.md`](development-operating-model.en.md) §1 (operating modes), §3 (mainnet sync procedure) — the authoritative environment + sync-gate definitions.
+- [`multi-operator-architecture.{en,ru}.md`](multi-operator-architecture.en.md) §1 (trust model), §10 (subcommand classes) — same-code-on-testnet-and-mainnet is implicit in this architecture.
 - Hackathon precedent: Paris 2026-04-12 demo predates the audit gate; "the chaos we agreed never to repeat" is the operational reference for §3 row 5.

@@ -1,8 +1,8 @@
 # API environment policy — Tom integration
 
 **Status:** Принято (2026-05-01).
-**Audience:** Andrey, Tom, Alex, dev-perp, будущие maintainer'ы.
-**Companions:** [`development-operating-model.{en,ru}.md`](development-operating-model.ru.md) (operating modes + mainnet sync procedure), [`feedback_api_boundary_with_tom.md`](../.claude/projects/-home-andrey-llm-perp-xrpl/memory/feedback_api_boundary_with_tom.md) в memory (API boundary — Tom owns clients black-box; we own the API).
+**Audience:** internal team и dev-perp; будущие maintainer'ы.
+**Companions:** [`development-operating-model.{en,ru}.md`](development-operating-model.ru.md) (operating modes + mainnet sync procedure). Companion API-boundary rule (Том владеет clients black-box; мы владеем API) summarise'на inline ниже где это важно.
 
 Этот документ фиксирует policy для того в каком **окружении** работают компоненты Тома во время разработки, и условия при которых компонент graduate'ится с testnet на mainnet-sandbox. Companion document определяет что в scope Тома vs наш; этот документ определяет где каждая сторона запускается.
 
@@ -18,7 +18,7 @@
 
 Cross-environment подключение (Tom-testnet client стучится в наш mainnet, или наоборот) запрещено. И API surface, и data model environment-tagged; bridging их рискует загрязнить реальные средства тестовыми сигналами или наоборот.
 
-`single-mode check` rule (sister memory `feedback_single_mode_check.md`) держит testnet и mainnet на одном коде, что значит **API contract идентичен** между ними — никаких testnet-only branches, никаких mainnet-only quirks. Pairing rule поэтому не code-level enforcement; это operational discipline.
+Single-mode-check rule (каждый cross-node subcommand работает идентично на testnet и mainnet, никаких environment branches в committed коде) держит testnet и mainnet на одном коде, что значит **API contract идентичен** между ними — никаких testnet-only branches, никаких mainnet-only quirks. Pairing rule поэтому не code-level enforcement; это operational discipline.
 
 ---
 
@@ -28,7 +28,7 @@ Cross-environment подключение (Tom-testnet client стучится в
 
 Почему testnet first:
 
-- **Cost asymmetry.** Testnet faucet-funded и сбрасывается дёшево; mainnet использует реальные XRP Andrey. Client-side баг который часто стреляет — на testnet ничего не стоит, на mainnet стоит реальных средств даже на sandbox масштабе.
+- **Cost asymmetry.** Testnet faucet-funded и сбрасывается дёшево; mainnet использует реальные XRP held by the operator-of-record для sandbox использования. Client-side баг который часто стреляет — на testnet ничего не стоит, на mainnet стоит реальных средств даже на sandbox масштабе.
 - **Audit cadence.** Per `development-operating-model.md` §3, каждый mainnet-sandbox sync требует audit cycle (REQ-N → RESP-N PASS). Быстрая итерация на client-side Тома вскрывает API-проблемы, требующие наших патчей, что требует re-audit'а — гонять этот цикл на каждую итерацию компонента Тома операционно нереально. Testnet поглощает итерацию без audit-cycle стоимости.
 - **Bug isolation.** Когда проблема появляется на testnet, участвующие стороны: client Тома + наш orchestrator + наш enclave. Когда та же проблема появляется на mainnet во время dev-итерации, в игру входят дополнительные переменные (real XRPL state, real fees, real network conditions). Testnet — calibration step говорящий какие проблемы Тома vs наши.
 - **Reversibility.** Testnet "сломан" → redeploy. Mainnet "сломан" с реальными XRP → никакой redeploy не вернёт потерянные средства.
@@ -55,11 +55,11 @@ Cross-environment подключение (Tom-testnet client стучится в
 
 Каждый компонент Тома graduate'ится отдельно. Последовательность:
 
-1. **Итерация на testnet** до "demonstrably stable" — definition: компонент Тома проходит свой happy-path repeatedly + spot review Andrey подтверждает что surface area такой как заявлено.
+1. **Итерация на testnet** до "demonstrably stable" — definition: компонент Тома проходит свой happy-path repeatedly + operator-side spot review подтверждает что surface area такой как заявлено.
 2. **API contract check** — dev-perp подтверждает что API surface от которого зависит компонент Тома соответствует documented spec (`docs/frontend-api-guide.md`, OpenAPI). Любое отклонение чинится в наших docs/code до graduation; мы не shipping graduation требующий чтобы Том зависел от undocumented behaviour.
 3. **Mainnet-sandbox sync gate** — per `development-operating-model.md` §3, orchestrator + enclave на mainnet на том же коде что testnet через Mode S sync. Audit verdict для того sync — PASS. Без этого, никакого graduation.
 4. **Sandbox connection** — Том переключает API endpoint своего компонента на mainnet-sandbox URL. Volume small XRP only (definition: суммы которые если потеряны полностью — acceptable cost-of-learning per `product-sandbox-single-operator` mode в `development-operating-model.md` §1.1).
-5. **Sandbox observation period** — dev-perp + Том + Andrey смотрят на behaviour deltas (любая разница между testnet и sandbox — signal что code-paths или environments не actually идентичны, и graduation откатывается). Длина периода: минимум одна полная sandbox session до того чтобы considered компонент "graduated."
+5. **Sandbox observation period** — dev-perp + Том + operator-of-record смотрят на behaviour deltas (любая разница между testnet и sandbox — signal что code-paths или environments не actually идентичны, и graduation откатывается). Длина периода: минимум одна полная sandbox session до того чтобы considered компонент "graduated."
 
 Никакого автоматического promotion в production. Production — отдельное launch event со своим playbook; sandbox graduation — не тот же шаг.
 
@@ -78,15 +78,13 @@ Cross-environment подключение (Tom-testnet client стучится в
 
 - Не правило против демо. Демо запускаются на appropriate environment (testnet для раннего, sandbox для позднего). Policy — "match the environment", не "no demos".
 - Не дисциплина imposed на Тома. Policy симметричная — dev-perp тоже не подключает наш test infra к mainnet во время итерации.
-- Не permanent block на mainnet. Graduation gate существует именно чтобы компоненты могли двигаться; gate — `audit-verdict + Mode S sync`, не "настроение Andrey".
+- Не permanent block на mainnet. Graduation gate существует именно чтобы компоненты могли двигаться; gate — `audit-verdict + Mode S sync`, не subjective discretion.
 - Не negotiable per-iteration. Conditions в §4 — gate; если они met, graduation proceeds. Если не — dev-perp чинит gap.
 
 ---
 
 ## 7. References
 
-- [`feedback_api_boundary_with_tom.md`](../.claude/projects/-home-andrey-llm-perp-xrpl/memory/feedback_api_boundary_with_tom.md) — Том владеет clients black-box; dev-perp владеет API.
-- [`feedback_division_of_work_tom.md`](../.claude/projects/-home-andrey-llm-perp-xrpl/memory/feedback_division_of_work_tom.md) — Tom = spec; dev-perp = code.
-- [`feedback_single_mode_check.md`](../.claude/projects/-home-andrey-llm-perp-xrpl/memory/feedback_single_mode_check.md) — same code on testnet + mainnet.
-- [`development-operating-model.{en,ru}.md`](development-operating-model.ru.md) §1 (operating modes), §3 (mainnet sync procedure).
+- [`development-operating-model.{en,ru}.md`](development-operating-model.ru.md) §1 (operating modes), §3 (mainnet sync procedure) — authoritative environment + sync-gate definitions.
+- [`multi-operator-architecture.{en,ru}.md`](multi-operator-architecture.ru.md) §1 (trust model), §10 (subcommand classes) — same-code-on-testnet-and-mainnet implicit в этой архитектуре.
 - Прецедент хакатона: Paris 2026-04-12 demo предшествует audit gate; "the chaos we agreed never to repeat" — операционная reference для §3 row 5.
