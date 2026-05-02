@@ -21,17 +21,19 @@ Revenue Streams for Vaults:
 
 ## Accepted Liquidity.
 
-The vaults accept the following liqudity:
+The vaults accept the following liquidity:
 
-1) XRP: The native asset of the XRP Ledger. It is used for transaction fees and is the native currency of the ledger.
+1) **RLUSD**: The vault unit-of-account. Depositors bring RLUSD, share NAV is RLUSD-denominated, and APY is reported in RLUSD/USD terms. This matches the production market spec in `docs/perp-dex-faq-ru.md` and `BACKEND-API.md` where the perp market is RLUSD-quoted and RLUSD is the primary collateral asset (100% LTV).
 
-## TODO: Add more assets as we expand the vault offerings.
+> **Note (2026-05-01):** the live code path in `orchestrator/src/vault_mm.rs` is currently XRP-denominated (testnet / hackathon scope, ahead of RLUSD trustline + issuer setup). The production target — and the basis for any vault performance modelling — is RLUSD-in / RLUSD-NAV. Code migration to RLUSD-margin is tracked separately.
+
+## TODO: Add XRP as a secondary accepted asset (90% LTV per the market collateral schedule) once the deposit-flow swap path to RLUSD is in place.
 
 ## Vault Types
 
 ### 1. Market Making Vault
 
-This vault allows users to deposit their XRP and earn yield by providing liquidity to the order book. The vault will place orders on the book and earn a spread between the buy and sell prices. The vault will also earn fees from the trades that are executed.
+This vault allows users to deposit their RLUSD and earn yield by providing liquidity to the order book. The vault will place orders on the book and earn a spread between the buy and sell prices. The vault will also earn fees from the trades that are executed.
 
 The Order size and price is based on placing orders at a certain spread from the mid price, and the size of the orders is based on a percentage of the vault's total assets. The vault will also rebalance its orders on the book at a certain frequency to maintain its desired spread and order size parameters.
 
@@ -50,7 +52,7 @@ The strategy for this vault is designed to be low risk and contains the followin
 - Min Delta: This parameter determines the minimum delta that the vault can pick up as a result of its orders being executed. This is designed to ensure that the vault does not take on too little risk by picking up small deltas from executed orders.
 
 ### 2. Delta Neutral Vault
-This vault is primarily a short strategy vault that allows users to deposit their XRP and earn yield by providing liquidity to the order book while maintaining a delta neutral position. The vault will place orders on the book and earn a spread between the buy and sell prices, while also earning fees from the trades that are executed. The vault will aim to take positions in perpetual contracts to maintain a delta neutral position, which means that the vault's overall exposure to the underlying asset's price movements is minimized, and enables the vault to earn yield from both the spread and the funding rates.
+This vault allows users to deposit their RLUSD and earn yield by providing liquidity to the order book while maintaining a delta neutral position. The vault will place orders on the book and earn a spread between the buy and sell prices, while also earning fees from the trades that are executed. Because the depositor's RLUSD collateral is already USD-flat, the vault's only delta exposure comes from the running perp inventory accumulated through MM fills; the strategy caps that inventory at `max_delta` and earns the funding rate on it between fills, capturing yield from spread, fees, and funding simultaneously.
 
 The strategy for this vault is designed to be medium risk and contains the following parameters:
 
@@ -73,16 +75,16 @@ This is a vault which benefits from the interest rate discrepency between borrow
 
 The flow of this vault is as follows;
 
-1) The User deposits XRP into the vault.
-2) The vault uses this collateral to borrow USD from the lending protocol.
-3) The vault then uses the borrowed USD to buy spot XRP on the exchange.
-4) The vault then shorts the perpetual contract on the exchange, which allows it to earn the funding rate while maintaining a delta one position.
+1) The User deposits RLUSD into the vault.
+2) The vault uses the RLUSD to buy spot XRP on the exchange.
+3) The vault posts the spot XRP as collateral with a lending protocol and borrows additional RLUSD against it.
+4) The vault uses the borrowed RLUSD as additional perp margin and shorts the perpetual contract on the exchange — capturing the funding rate while the spot XRP holding maintains the delta-one exposure.
 
-Note, this particular vault is designed to be higher risk than the other vaults, as it involves borrowing and taking on leverage, which can amplify losses if the market moves against the vault's positions. However, it also has the potential to earn higher yields due to the interest rate discrepancy between borrowing USD and the funding rate on the perpetuals.
+Note, this particular vault is designed to be higher risk than the other vaults, as it involves borrowing and taking on leverage, which can amplify losses if the market moves against the vault's positions. However, it also has the potential to earn higher yields due to the interest rate discrepancy between borrowing RLUSD and the funding rate on the perpetuals.
 
 Note, there are several missing pieces to this vault;
 
-1) Spot RLUSD / XRP market on the exchange: This is needed for the vault to be able to buy spot XRP using the borrowed USD.
-2) Lending protocol integration: The vault needs to be able to borrow USD using the XRP collateral that is deposited by the users. This requires integration with a lending protocol that supports borrowing USD against XRP collateral.
+1) Spot RLUSD / XRP market on the exchange: This is needed for the vault to be able to swap depositor RLUSD into spot XRP and back.
+2) Lending protocol integration: The vault needs to be able to borrow RLUSD against the spot XRP collateral it acquires in step 2. This requires integration with a lending protocol that supports borrowing RLUSD against XRP collateral.
 
 
