@@ -41,6 +41,7 @@ Cluster invariants, выпадающие из этого:
 2. **Ни один оператор не может произвести валидную FROST подпись.** FROST 2-of-N (или выше) предотвращает это; `frost_group` state sealed внутри каждого enclave'а.
 3. **Ни один оператор не может ротировать состав операторов.** On-chain SignerList — источник истины membership'а; обновления SignerListSet требуют existing-quorum multisig.
 4. **Ни один оператор не может в одиночку заблокировать прогресс.** N-1 из N операторов могут подписать и выполнить (если quorum достигнут).
+5. **Production-mode недостижим без работающего enclave-software-upgrade mechanism сохраняющего real customer state.** Foundation invariant установленный 2026-05-02 после discovery что текущий Mode S sync rip-and-replace'ит sealed state. Построение DEX features поверх unfounded upgrade assumption запрещено. Текущие sandbox modes (§1.1, §1.2 of `docs/development-operating-model.md`) допускают state-loss потому что держат no real customer state; production-mode (§1.3) требует чтобы сначала приземлился cross-enclave Local Attestation migration mechanism (Path A). См. `feedback_upgrade_path_is_foundation.md` для правила и `feedback_tee_thesis_no_chain_state.md` — почему chain-checkpointing не альтернатива.
 
 ## 2. Operator scope
 

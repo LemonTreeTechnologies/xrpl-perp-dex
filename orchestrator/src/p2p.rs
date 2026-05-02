@@ -427,6 +427,23 @@ pub struct P2PNode {
     recent_signing_requests: HashMap<String, Instant>,
     /// X-C1: per-peer rate limiter on inbound signing requests.
     signing_request_rate: HashMap<PeerId, VecDeque<Instant>>,
+    /// F-5-P2P-M1 (perp RESP-5): replay guard for DKG-step messages.
+    /// Keyed on `(ceremony_id, type_tag, optional pid)` → first-seen
+    /// timestamp. Bounds: an attacker who compromises one operator host
+    /// can replay a captured DkgStepMessage from a prior ceremony. Without
+    /// the guard they could re-trigger expensive enclave work on every
+    /// follower; with the guard the replay is dropped at the dispatch
+    /// layer before reaching `run_follower`.
+    recent_dkg_step_keys: HashMap<String, Instant>,
+    /// F-5-P2P-M1 (perp RESP-5): per-peer rate limiter for DKG-step
+    /// messages. Same shape as signing_request_rate; protects against
+    /// a single peer flooding the topic.
+    dkg_step_rate: HashMap<PeerId, VecDeque<Instant>>,
+    /// F-5-P2P-L3 (perp RESP-5): replay guard for share-v2 envelope
+    /// deliveries. Keyed on (group_id, signer_id, ceremony_nonce-prefix).
+    recent_share_v2_keys: HashMap<String, Instant>,
+    /// F-5-P2P-L3 (perp RESP-5): per-peer rate limiter for share-v2.
+    share_v2_rate: HashMap<PeerId, VecDeque<Instant>>,
     /// Our peer ID.
     pub peer_id: PeerId,
     /// Shared counter of connected peers (read by health endpoint).
@@ -438,6 +455,18 @@ pub struct P2PNode {
 const SIGNING_REPLAY_TTL: Duration = Duration::from_secs(10 * 60);
 const SIGNING_RATE_WINDOW: Duration = Duration::from_secs(60);
 const SIGNING_RATE_MAX_PER_WINDOW: usize = 30;
+
+/// F-5-P2P-M1 / F-5-P2P-L3 tunables (perp RESP-5). DKG and share-v2
+/// traffic is naturally bursty (one ceremony = one wave of messages,
+/// then quiet) — so the replay TTL is longer than a typical ceremony
+/// (which completes in 6-30 seconds) and the rate limit is generous
+/// enough not to block legitimate ceremony traffic.
+const DKG_STEP_REPLAY_TTL: Duration = Duration::from_secs(30 * 60);
+const DKG_STEP_RATE_WINDOW: Duration = Duration::from_secs(60);
+const DKG_STEP_RATE_MAX_PER_WINDOW: usize = 60;
+const SHARE_V2_REPLAY_TTL: Duration = Duration::from_secs(30 * 60);
+const SHARE_V2_RATE_WINDOW: Duration = Duration::from_secs(60);
+const SHARE_V2_RATE_MAX_PER_WINDOW: usize = 60;
 
 impl P2PNode {
     /// Create a new P2P node with the given libp2p identity.
@@ -530,6 +559,10 @@ impl P2PNode {
             allowed_signing_peers: None,
             recent_signing_requests: HashMap::new(),
             signing_request_rate: HashMap::new(),
+            recent_dkg_step_keys: HashMap::new(),
+            dkg_step_rate: HashMap::new(),
+            recent_share_v2_keys: HashMap::new(),
+            share_v2_rate: HashMap::new(),
             peer_id,
             peer_count,
         };
@@ -668,11 +701,30 @@ impl P2PNode {
     /// in the set has its signing requests dropped. Pass an empty vec to
     /// disable the allowlist (dev/test only — logs a warning).
     ///
-    /// Not wired into `main.rs` yet — the first four defenses
-    /// (hash re-derivation, policy validation, replay guard,
-    /// per-peer rate limit) already kill the X-C1 attack. Allowlist
-    /// is pure defense-in-depth and requires plumbing peer_ids
-    /// through operator config, tracked separately.
+    /// **Not wired into `main.rs` (perp RESP-5 §C1 acknowledged):** the
+    /// REQ-5 §1 row X-C1 claim that "peer allowlist + replay guard +
+    /// per-peer rate limit all live on the dispatch path" was partially
+    /// false at HEAD because this method had no caller. The four
+    /// load-bearing defenses against the published X-C1 attack —
+    /// (1) hash re-derivation from the unsigned tx, (2) per-tx-type
+    /// policy with source-account binding, (3) replay guard,
+    /// (4) per-peer rate limit — remain in place and are sufficient
+    /// against the published PoC.
+    ///
+    /// Wiring the allowlist requires plumbing libp2p peer IDs through
+    /// operator config (no deterministic mapping from `xrpl_address` to
+    /// peer_id — they are independent identities). Two paths to wire:
+    /// (a) extend `SignerEntry` schema with `libp2p_peer_id`, populated
+    /// during `node-bootstrap` and discoverable via on-chain `Domain`
+    /// or a new XRPL field; (b) collect peer_ids from authenticated
+    /// peer-quote announcements over time and union them into the
+    /// allowlist. Both are non-trivial. Tracked as separate work item.
+    ///
+    /// `#[allow(dead_code)]` is intentional and explicit (not the
+    /// previously-misleading "feature pending" attribute): the function
+    /// is preserved as the wiring entry point for the future allowlist
+    /// implementation. The `#[allow]` documents the choice rather than
+    /// hiding it.
     #[allow(dead_code)]
     pub fn set_allowed_signing_peers(&mut self, peers: Vec<PeerId>) {
         if peers.is_empty() {
@@ -758,6 +810,70 @@ impl P2PNode {
             }
         }
         if q.len() >= SIGNING_RATE_MAX_PER_WINDOW {
+            return false;
+        }
+        q.push_back(now);
+        true
+    }
+
+    /// F-5-P2P-M1 (perp RESP-5): record a DKG-step message key as seen.
+    /// Returns `false` if the same key was already in the window (replay).
+    /// Key format: `<ceremony_id>:<type_tag>[:<pid>]`. Cleans entries
+    /// older than `DKG_STEP_REPLAY_TTL` on insertion.
+    fn mark_dkg_step_fresh(&mut self, key: &str) -> bool {
+        let now = Instant::now();
+        self.recent_dkg_step_keys
+            .retain(|_, seen| now.duration_since(*seen) < DKG_STEP_REPLAY_TTL);
+        if self.recent_dkg_step_keys.contains_key(key) {
+            return false;
+        }
+        self.recent_dkg_step_keys.insert(key.to_string(), now);
+        true
+    }
+
+    /// F-5-P2P-M1: per-peer rate limit on DKG-step inbound. Same shape
+    /// as `check_signing_rate` but for the dkg-step topic.
+    fn check_dkg_step_rate(&mut self, peer: &PeerId) -> bool {
+        let now = Instant::now();
+        let q = self.dkg_step_rate.entry(*peer).or_default();
+        while let Some(front) = q.front() {
+            if now.duration_since(*front) >= DKG_STEP_RATE_WINDOW {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+        if q.len() >= DKG_STEP_RATE_MAX_PER_WINDOW {
+            return false;
+        }
+        q.push_back(now);
+        true
+    }
+
+    /// F-5-P2P-L3 (perp RESP-5): replay guard for share-v2 envelopes.
+    fn mark_share_v2_fresh(&mut self, key: &str) -> bool {
+        let now = Instant::now();
+        self.recent_share_v2_keys
+            .retain(|_, seen| now.duration_since(*seen) < SHARE_V2_REPLAY_TTL);
+        if self.recent_share_v2_keys.contains_key(key) {
+            return false;
+        }
+        self.recent_share_v2_keys.insert(key.to_string(), now);
+        true
+    }
+
+    /// F-5-P2P-L3: per-peer rate limit on share-v2 inbound.
+    fn check_share_v2_rate(&mut self, peer: &PeerId) -> bool {
+        let now = Instant::now();
+        let q = self.share_v2_rate.entry(*peer).or_default();
+        while let Some(front) = q.front() {
+            if now.duration_since(*front) >= SHARE_V2_RATE_WINDOW {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+        if q.len() >= SHARE_V2_RATE_MAX_PER_WINDOW {
             return false;
         }
         q.push_back(now);
@@ -1489,15 +1605,44 @@ impl P2PNode {
                     } else if message.topic == share_v2_topic_hash {
                         match serde_json::from_slice::<ShareEnvelopeV2Message>(&message.data) {
                             Ok(msg) => {
+                                // F-5-P2P-L3: per-peer rate limit before any
+                                // other work. Enforce BEFORE recipient filter
+                                // so a flooding peer can't burn cycles.
+                                if !self.check_share_v2_rate(&propagation_source) {
+                                    warn!(
+                                        from = %propagation_source,
+                                        "F-5-P2P-L3: share-v2 rate-limited; message dropped"
+                                    );
+                                    continue;
+                                }
                                 // Recipient filter: if we know our ECDH pubkey,
                                 // silently drop envelopes addressed to others.
                                 let ShareEnvelopeV2Message::Deliver {
-                                    ref recipient_pubkey, ..
+                                    ref recipient_pubkey,
+                                    ref group_id,
+                                    signer_id,
+                                    ref envelope,
+                                    ..
                                 } = msg;
                                 if let Some(ref local_pk) = self.local_ecdh_pubkey {
                                     if recipient_pubkey.to_lowercase() != *local_pk {
                                         continue;
                                     }
+                                }
+                                // F-5-P2P-L3: replay guard keyed on the unique
+                                // share envelope identifier. ceremony_nonce
+                                // comes from sgx_read_rand inside the sender's
+                                // enclave, so collision under honest behaviour
+                                // is cryptographically negligible.
+                                let nonce = &envelope.ceremony_nonce;
+                                let replay_key = format!("{group_id}:{signer_id}:{nonce}");
+                                if !self.mark_share_v2_fresh(&replay_key) {
+                                    warn!(
+                                        from = %propagation_source,
+                                        key = %replay_key,
+                                        "F-5-P2P-L3: share-v2 replay dropped"
+                                    );
+                                    continue;
                                 }
                                 if let Some(ref tx) = self.share_v2_inbound_tx {
                                     if let Err(e) = tx.send(msg).await {
@@ -1512,6 +1657,57 @@ impl P2PNode {
                     } else if message.topic == dkg_step_topic_hash {
                         match serde_json::from_slice::<DkgStepMessage>(&message.data) {
                             Ok(msg) => {
+                                // F-5-P2P-M1: per-peer rate limit before parsing /
+                                // forwarding. Bounds spam.
+                                if !self.check_dkg_step_rate(&propagation_source) {
+                                    warn!(
+                                        from = %propagation_source,
+                                        "F-5-P2P-M1: dkg-step rate-limited; message dropped"
+                                    );
+                                    continue;
+                                }
+                                // F-5-P2P-M1: replay guard keyed on
+                                // (ceremony_id, type_tag[, pid]). Identical
+                                // messages within REPLAY_TTL are dropped at
+                                // the dispatch layer before reaching
+                                // run_follower's enclave-call path.
+                                let replay_key = match &msg {
+                                    DkgStepMessage::Round1Start { ceremony_id, .. } => {
+                                        format!("{ceremony_id}:R1Start")
+                                    }
+                                    DkgStepMessage::Round1Done { ceremony_id, pid, .. } => {
+                                        format!("{ceremony_id}:R1Done:{pid}")
+                                    }
+                                    DkgStepMessage::Round15Start { ceremony_id } => {
+                                        format!("{ceremony_id}:R15Start")
+                                    }
+                                    DkgStepMessage::Round15Done { ceremony_id, pid } => {
+                                        format!("{ceremony_id}:R15Done:{pid}")
+                                    }
+                                    DkgStepMessage::Round2Start { ceremony_id, .. } => {
+                                        format!("{ceremony_id}:R2Start")
+                                    }
+                                    DkgStepMessage::Round2Done { ceremony_id, pid } => {
+                                        format!("{ceremony_id}:R2Done:{pid}")
+                                    }
+                                    DkgStepMessage::FinalizeStart { ceremony_id } => {
+                                        format!("{ceremony_id}:FinStart")
+                                    }
+                                    DkgStepMessage::FinalizeDone { ceremony_id, pid, .. } => {
+                                        format!("{ceremony_id}:FinDone:{pid}")
+                                    }
+                                    DkgStepMessage::Abort { ceremony_id, pid, .. } => {
+                                        format!("{ceremony_id}:Abort:{pid}")
+                                    }
+                                };
+                                if !self.mark_dkg_step_fresh(&replay_key) {
+                                    warn!(
+                                        from = %propagation_source,
+                                        key = %replay_key,
+                                        "F-5-P2P-M1: dkg-step replay dropped"
+                                    );
+                                    continue;
+                                }
                                 if let Some(ref tx) = self.dkg_step_inbound_tx {
                                     if let Err(e) = tx.send(msg).await {
                                         error!("failed to forward dkg-step: {}", e);

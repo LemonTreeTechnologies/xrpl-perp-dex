@@ -205,21 +205,23 @@ async fn detailed_status(State(state): State<Arc<AppState>>) -> impl IntoRespons
     let peers = state.peer_count.load(std::sync::atomic::Ordering::Relaxed);
     let uptime_secs = state.start_time.elapsed().as_secs();
 
-    let enclave_ok = match reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-    {
-        Ok(c) => {
-            let url = format!("{}/pool/status", state.perp.base_url());
-            c.get(&url)
-                .send()
-                .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false)
-        }
-        Err(_) => false,
-    };
+    // X-L4 cosmetic fix per perp RESP-5 §1: use the centralised
+    // loopback_http_client() helper instead of an inline builder. The
+    // destination is loopback by construction (PerpClient::new went
+    // through ensure_loopback_url) so the security objective is
+    // unchanged; this is the centralization-claim cleanup.
+    let enclave_ok =
+        match crate::http_helpers::loopback_http_client(std::time::Duration::from_secs(3)) {
+            Ok(c) => {
+                let url = format!("{}/pool/status", state.perp.base_url());
+                c.get(&url)
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false)
+            }
+            Err(_) => false,
+        };
 
     Json(serde_json::json!({
         "status": "ok",

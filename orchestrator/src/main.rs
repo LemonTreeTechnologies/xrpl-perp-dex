@@ -1153,6 +1153,14 @@ async fn main() -> Result<()> {
     if let Some(ref cfg) = signers_config {
         p2p_node.set_signing_channel(signing_rx);
         if let Some(ref local) = cfg.local_signer {
+            // X-C1 condition C2 (perp RESP-5): enforce loopback on the
+            // enclave URL the signing relay will hit. signers_config is
+            // a JSON file an attacker with shell access can tamper —
+            // without this check, a tampered config could redirect
+            // /pool/sign HTTP requests to a remote attacker host that
+            // mints arbitrary signatures.
+            crate::http_helpers::ensure_loopback_url(&local.enclave_url)
+                .context("X-C1 C2: signers_config local_signer.enclave_url must be loopback")?;
             p2p_node.set_local_signer(p2p::LocalSigner {
                 enclave_url: local.enclave_url.clone(),
                 address: local.address.clone(),
@@ -1161,6 +1169,11 @@ async fn main() -> Result<()> {
                 xrpl_address: local.xrpl_address.clone(),
             });
         } else if let Some(first) = cfg.signers.first() {
+            // X-C1 C2: same loopback check on the fallback path. cli.enclave_url
+            // already goes through PerpClient::new ensure_loopback_url, but
+            // assert here so the property holds at this site too.
+            crate::http_helpers::ensure_loopback_url(&cli.enclave_url)
+                .context("X-C1 C2: --enclave-url must be loopback for signing relay")?;
             p2p_node.set_local_signer(p2p::LocalSigner {
                 enclave_url: cli.enclave_url.clone(),
                 address: first.address.clone(),

@@ -41,6 +41,7 @@ Cluster invariants that fall out of this:
 2. **No single operator can produce a valid FROST signature.** FROST 2-of-N (or higher) prevents it; `frost_group` state is sealed inside each enclave.
 3. **No single operator can rotate operator membership.** The on-chain SignerList is the membership source of truth; SignerListSet updates require existing-quorum multisig.
 4. **No single operator can deny progress alone.** N-1 of N operators can sign and execute (when quorum is met).
+5. **Production-mode is unreachable without a working enclave-software-upgrade mechanism that preserves real customer state.** This is the foundation invariant established 2026-05-02 after discovery that current Mode S sync rip-and-replaces sealed state. Building DEX features on top of an unfounded upgrade assumption is forbidden. The current sandbox modes (§1.1, §1.2 of `docs/development-operating-model.md`) tolerate state-loss because they hold no real customer state; production-mode (§1.3) needs the cross-enclave Local Attestation migration mechanism (Path A) to land first. See `feedback_upgrade_path_is_foundation.md` for the rule and `feedback_tee_thesis_no_chain_state.md` for why chain-checkpointing is not an alternative.
 
 ## 2. Operator scope
 
