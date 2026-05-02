@@ -516,6 +516,61 @@ TDX (ported):
 
 ---
 
+## 10. Architectural friction pattern (added 2026-05-03)
+
+### What we noticed during the perp REQ-6 audit cycle
+
+The cost-and-performance comparison in §1-§9 stays accurate, but the perp audit cycle revealed a category of **architectural friction** that the original analysis under-weighted: SGX's strict network-isolation creates recurring design overhead in our system.
+
+The pattern: every time the trust anchor (the enclave) needs to verify external state — chain transactions, peer authority, time, prices — SGX cannot do it directly. The host (orchestrator) acts as a courier that the threat model treats as untrusted, so we need delegation/verification protocols whose only job is "let the enclave see external state without trusting the host."
+
+Concrete instances we ship workarounds for, all traceable to this single cause:
+
+| Audit issue | What's needed | SGX workaround we built | TDX would do instead |
+|---|---|---|---|
+| **C-02** admin session keys | Authentication on price/funding/liquidation ecalls | Multi-operator architecture as compensating control (FROST 2-of-N quorum required) | Direct chain read of authorisation |
+| **C-04** deposit trust model | Verify XRPL deposit happened | Trust orchestrator's claim, multi-operator quorum to compensate | TDX guest does SPV header-chain verification itself |
+| **E-H5** DCAP `/tmp` TOCTOU | Generate DCAP quote for attestation | Subprocess helper compiled at runtime to private dir (because DCAP QL crashes if loaded in same process as enclave) | TDX includes attestation natively in-process |
+| **Path A MRENCLAVE allowlist** (perp REQ-7 §3.4) | Old enclave knows which new MRENCLAVE is blessed | Delegation messages signed by operator quorum, verified locally inside enclave against pubkeys sealed at bootstrap | Direct on-chain read of approved MRENCLAVE |
+| **Price feeds** | Mark price for funding/liquidation | Orchestrator fetches Binance, enclave trusts | TDX guest fetches HTTPS directly |
+| **Clock** | Funding application timing | Host clock + tolerance window | TDX guest runs NTP |
+
+Each individual workaround is correct and shipped. The pattern is that we ship one of these every audit cycle, and they compound in maintenance + audit + correctness cost. The cost was invisible while we were head-down implementing each one; it became visible when we listed them together.
+
+### Why this didn't appear in §1-§9 comparison
+
+The original analysis is largely about per-server resource costs (€/year, ms/sign, audit dollar costs of code review, bare-metal availability). Those are real and the original analysis is accurate. The friction-pattern analysis is a different axis — it's about **per-feature architectural costs** that SGX imposes on workflows that need to bridge the trust boundary.
+
+A useful framing: §1-§9 is "cost to RUN the system," §10 is "cost to ADD features that the system needs to do."
+
+### The decision (operator-level, 2026-05-03)
+
+**Stay on SGX for now.** Reasons:
+
+1. **Sunk cost is real but not the deciding factor.** ~5K LOC of audited SGX-specific code, three working multi-operator clusters, Phase 2.1c + 2.2 hardening, REQ-1..6 audit history all on SGX. Switching means redoing these.
+2. **TDX is not zero-cost.** Per §9, TDX requires re-implementing attestation pipeline, sealed-state semantics, build process, deploy procedure. Even with 95%-portable crypto code, the surrounding ~5% (which is exactly the bridge code that motivates §10) is the most-touched code.
+3. **Critical path is unblocked.** With Path A spec landing as REQ-7, the upgrade-path foundation rule (`feedback_upgrade_path_is_foundation.md`) clears. We can reach production-mode on SGX without first deciding TDX.
+4. **TDX strategic option remains open.** This document gets updated as more friction points emerge or as TDX availability/maturity changes the calculus.
+
+### When to revisit
+
+Triggers that would escalate this from "open option" to "active migration project":
+
+- **Friction-point inventory exceeds N items.** Currently 6 instances mapped above. If new audit cycles surface 3+ more in the same pattern, that's a signal SGX network-isolation has become the dominant tax on velocity.
+- **SGX reaches end-of-life on Intel's roadmap.** Intel has pivoted DC silicon away from SGX-with-large-EPC towards TDX. If our hardware platform stops shipping with usable SGX EPC sizes, migration becomes forced rather than discretionary.
+- **A specific feature requires in-enclave network access** that cannot be resolved via host-courier protocols. Hypothetical: real-time oracle that needs <100 ms freshness — can't be done with operator-quorum signed delegation messages.
+- **Audit cost on bridge code exceeds audit cost on TDX migration.** When the next audit round spends >50% of its budget on the bridge protocols (current Path A spec verification is the canary metric).
+
+None of those are firing today. Status: **fact-gathering**, not active migration project.
+
+### What changes in the original §1-§9 comparison
+
+Nothing structural. The §1-§9 numbers are still accurate for the per-server cost question. §10 adds a per-feature cost axis that the original didn't surface. The Decision Matrix in §8 remains valid for "should we use SGX OR TDX for this kind of workload"; §10 is "given we chose SGX, what should we know about the recurring tax."
+
+The Summary at the end of this document should be read as: SGX dominates on §1-§9 axes; SGX has a recurring §10 tax; net we stay on SGX, with the trigger list above as the off-ramp.
+
+---
+
 ## Summary
 
 **SGX wins on ALL dimensions for our use case:**
