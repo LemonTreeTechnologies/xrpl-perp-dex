@@ -31,3 +31,9 @@ venv/
 # Multisig test secrets (testnet only but still secrets)
 tests/multisig_accounts.json
 tests/multisig_escrow.json
+
+# uv (poetry.lock is the project's source of truth)
+uv.lock
+
+# Vault backtest data cache (parquet, ~50 MB/year — fetched, not committed)
+research/backtest-data/
