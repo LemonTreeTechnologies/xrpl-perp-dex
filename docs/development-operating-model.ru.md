@@ -45,6 +45,7 @@
 
 - Реальные клиентские средства. Multi-operator архитектурно и операционно. Third-party human audit. Формальный launch playbook.
 - Процедуры этого режима намеренно не специфицированы в этом документе. Когда проект готов войти в production mode, отдельный launch playbook будет написан; он унаследует большую часть §3 и §2 со strictness ratchets и реальным third-party audit'ом заменяющим AI-Auditor как primary gate.
+- **Production-mode unlock gated на ДВУХ foundation invariants** (см. `multi-operator-architecture.md` §1 invariants 5 и 7): (a) работающий enclave-software-upgrade mechanism сохраняющий real customer state across MRENCLAVE bumps — Path A, currently being implemented в REQ-8; (b) reproducible MRENCLAVE produced независимо ≥N operators с bit-identical result — currently being instantiated через GHA build-gate (`docs/build-requirements.{en,ru}.md` §5). Failure любого gate'а значит production-mode unreachable; оба должны hold.
 
 ### 1.4 Mode transitions
 
