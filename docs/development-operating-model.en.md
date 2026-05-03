@@ -45,6 +45,7 @@ This mode is honest about what we have. It is not a violation of the architectur
 
 - Real customer funds. Multi-operator architecturally and operationally. Third-party human audit. Formal launch playbook.
 - This mode's procedures are intentionally not specified in this document. When the project is ready to enter production mode, a separate launch playbook will be written; it will inherit most of §3 and §2 with strictness ratchets and a real third-party audit replacing the AI-Auditor as the primary gate.
+- **Production-mode unlock is gated on TWO foundation invariants** (see `multi-operator-architecture.md` §1 invariants 5 and 7): (a) a working enclave-software-upgrade mechanism that preserves real customer state across MRENCLAVE bumps — Path A, currently being implemented at REQ-8; (b) reproducible MRENCLAVE produced independently by ≥N operators with bit-identical result — currently being instantiated via the GHA build-gate (`docs/build-requirements.{en,ru}.md` §5). Either gate failing means production-mode is unreachable; both must hold.
 
 ### 1.4 Mode transitions
 
