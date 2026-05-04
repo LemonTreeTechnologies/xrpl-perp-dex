@@ -166,42 +166,77 @@ What Hetzner stops being:
 
 ---
 
-## 7. Mainnet migration plan (legacy Hetzner → mainnet-sandbox on Azure)
+## 7. mainnet-sandbox setup — no migration needed (revised 2026-05-04)
 
-Confirmed direction 2026-05-04: legacy Hetzner mainnet deployment (`cf65d92a…`, built April 7 with SDK 2.25) is retired in favour of a fresh **mainnet-sandbox** on Azure DCsv3 with canonical Dockerfile.azure-built MRENCLAVE.
+Earlier drafts of this section described a "Hetzner → Azure migration" with two options (α: extend Path A cross-host; β: non-state-preserving fresh bootstrap). On 2026-05-04 verification revealed there is **nothing to migrate** — see findings in `reference_infra_findings_2026-05-04.md` (memory). This section replaces the prior framing.
 
-### 7.1 Steps
+### 7.1 What 2026-05-04 verification established
 
-| Step | What | When | Dependencies |
-|---|---|---|---|
-| 1 | Provision new Azure DCsv3 VM dedicated to mainnet-sandbox | Operations task | After Path A REQ-8 PASS (so the migration mechanism is documented and reviewed even if not used for this specific transition) |
-| 2 | Bootstrap fresh enclave there via `Dockerfile.azure` → new MRENCLAVE_canonical (will match testnet-cluster's value if source state is the same) | After step 1 | `Dockerfile.azure` build artefact |
-| 3 | State migration legacy `cf65d92a…` (Hetzner OOT) → new MRENCLAVE_canonical (Azure in-kernel) | TBD — see §6.2 | Decision on mechanism |
-| 4 | XRPL escrow signing authority transfer (via signerlist-update OR account swap if the new enclave has its own bootstrapped XRPL keys) | After step 3 | XRPL multisig from current signers |
-| 5 | Hetzner mainnet shutdown + role transition to dev-hetzner only | After step 4 verification | Confirm Azure mainnet-sandbox is healthy and signing |
+| Claim | Verified state |
+|---|---|
+| "Mainnet runs on Hetzner port 9088" | False. The process at `/opt/perp-dex/v0.1.0/perp-dex-server` (PID 1601200, MRENCLAVE `cf65d92a…`) is a **legacy SGX Ethereum signer** (`escrow_account.json` shows Ethereum address `0x36b245c5…`, `last_ledger_mainnet.txt = 0`). It is **not** the XRPL perp-dex; it predates the project's repurpose to XRPL. |
+| "There are ~108 XRP in mainnet escrow" | False. Mainnet escrow `r4rwwSM9PUu7VcvPRWdu9pmZpmhCZS9mmc` was deleted via `AccountDelete` on 2026-04-18 (per `project_mainnet_live.md`). 103.36 XRP withdrawn to `rPUmnJ8x…` (kupermind), ~5 XRP burned as protocol fee, SignerList removed first. Verified 2026-05-04 via XRPL mainnet `account_info` → "Account not found." |
+| "We need a migration ceremony" | False. There is no XRPL state on Hetzner to preserve; the configured signer-set `multisig_escrow_mainnet.json` references an XRPL account that no longer exists. There is also no real customer state in scope (`product-sandbox-single-operator` mode, per `development-operating-model.md` §1.1). |
+| "Hetzner port 9089 v0.1.1 is XRPL testnet/dev" | True. Cmdline includes `--xrpl-url https://s.altnet.rippletest.net:51234` and testnet escrow `rhfcqLFTi3UFfpAwjqSKoYs3UjK99Kth6K`. MRENCLAVE `29d2ca57…`. |
 
-### 7.2 Cross-host migration mechanism — open question
+### 7.2 Implication: no migration needed, only fresh setup when ready
 
-Path A as currently specified (REQ-7) is **single-host**: it requires OLD enclave and NEW enclave running on the same machine for Local Attestation. The Hetzner-to-Azure transition is cross-host, which is outside Path A's scope.
+The mainnet-sandbox environment listed in §1 (XRPL mainnet + sandbox-single + Azure DCsv3 + in-kernel + 2.28 + canonical MRENCLAVE) is **not currently provisioned anywhere**. There is no legacy state to migrate from; there is no escrow to drain. When operator-of-record decides to stand it up, the procedure is a clean fresh setup, not a migration ceremony.
 
-Two options for resolving this:
+### 7.3 Future setup procedure (when operator-of-record decides)
 
-**Option α — Extend Path A spec for cross-host migration.** Cross-host Local Attestation does not exist (Local Attestation is by definition same-platform). Cross-host migration would have to use DCAP-attested ECDH between OLD-enclave (Hetzner) and NEW-enclave (Azure), similar to existing `share-v2` transport. This is a non-trivial spec extension that would consume an audit cycle (REQ-7.6 or REQ-8.5).
+1. Provision (or repurpose) an Azure DCsv3 VM dedicated to mainnet-sandbox runtime. May reuse one of the existing `sgx-node-1/2/3` VMs as a separate parallel deployment, or use a fresh VM.
+2. Bootstrap fresh XRPL perp-dex enclave there via committed `Dockerfile.azure` → new MRENCLAVE_canonical (matches testnet-cluster's `4dfe8997…` if source is unchanged, otherwise reflects whatever testnet-validated source state is being promoted).
+3. Generate fresh XRPL escrow address from the new enclave (the enclave's account-pool primitive).
+4. Submit `SignerListSet` on XRPL mainnet authorising the operator-of-record's XRPL key (sandbox-single-operator: just one signer initially; sandbox-multi-operator: all participating operators per their bootstrap output).
+5. Seal the resulting on-chain SignerList state inside the enclave per REQ-7.5 spec (after that REQ implements).
+6. **Stop here.** No funding step in this procedure.
 
-**Option β — Non-state-preserving fresh-bootstrap on Azure.** Per `project_mainnet_live.md`, the legacy `cf65d92a…` deployment holds only seed/test funds (~108 XRP) belonging to the operator-of-record. There is no real customer state to migrate. Operator-of-record can:
-1. On Hetzner: standard XRPL withdrawal of remaining XRP from escrow → to operator's own XRPL address.
-2. Bootstrap fresh on Azure with `Dockerfile.azure`-built enclave → new MRENCLAVE_canonical, fresh XRPL escrow address from the new enclave.
-3. Re-fund new escrow from operator's address.
-4. Update any external references (deployment docs, dashboards) to the new escrow address.
-5. Decommission Hetzner mainnet runtime; Hetzner repurposed as dev-hetzner + orchestrator-only.
+### 7.4 Funding is a separate decision
 
-This is **NOT a Path A migration**. It is a clean shutdown + clean restart, valid because there is nothing to preserve on the legacy side.
+Funding the new mainnet-sandbox escrow is **not part of the setup procedure**. Reasons:
 
-### 7.3 Recommendation
+- **Decoupling stability:** the setup procedure must complete cleanly without operational dependency on a funding decision. Bundling the two together means "we couldn't finish setup because we hadn't decided funding amount" — bad coupling.
+- **Funding requires a separate trigger:** operator-of-record decides "we are ready to operate small real XRP for sandbox-mode validation" as an independent event from "the enclave runtime is provisioned."
+- **Risk staging:** an empty mainnet-sandbox escrow is operationally invisible (no funds at risk). Funding it activates the customer-trust risk surface. These two states should be transitioned through deliberately, not coupled.
 
-Option β (fresh-bootstrap on Azure) is operationally simpler, requires no Path A spec extension, and is acceptable because no real customer state is on the legacy deployment. Option α (cross-host Path A extension) is overkill for sandbox-mode-only legacy state.
+When the funding decision is made, the action is a standard XRPL Payment from the operator-of-record's address to the new escrow address with the appropriate `DestinationTag` (per `feedback_destination_tag.md` — always confirm `DestinationTag` before mainnet XRP transfers).
 
-Decision still requires explicit operator-of-record sign-off; capturing here as the recommended path pending that.
+### 7.5 Decommissioning Hetzner port 9088 v0.1.0 — separate operational task
+
+The legacy SGX Ethereum signer at port 9088 (PID 1601200) is unrelated to the XRPL perp-dex project and can be stopped at any time after operator-of-record sign-off. It does not block any current work. Once stopped:
+
+- `/opt/perp-dex/v0.1.0/` directory can be archived or removed
+- Port 9088 freed for other use
+- Hetzner role narrows to dev-hetzner playground (port 9089 v0.1.1) + orchestrator-only + build host per §6
+
+This is bookkeeping, not a coordination event. Recommended timing: when convenient, no urgency.
+
+### 7.6 Timing — definitely not before Path A is debugged
+
+Per operator-of-record direction 2026-05-04: mainnet-sandbox setup must NOT happen before Path A is operationally proven on testnet-cluster (REQ-8 implementation review PASSED + live testnet ceremony succeeded). Reasoning: setting up a real-XRP environment whose upgrade mechanism is unproven means we may need to "rescue funds again" if Path A turns out broken — same scenario `project_mainnet_live.md` documents from 2026-04-18 (the AccountDelete withdrawal). One rescue is the lesson; repeating it is not.
+
+The sequence forward:
+
+```
+NOW              → REQ-7.5 audit cycle (in flight)
+                  ↓
+REQ-7.5 PASS     → Implementation (~2-3 days)
+                  ↓
+REQ-8 spec       → Path A implementation review
+                  ↓
+REQ-8 PASS       → Path A operationally proven on testnet-cluster
+                  ↓
+[gap of validation]
+                  ↓
+mainnet-sandbox setup decision point → operator-of-record decides timing
+                  ↓
+Setup procedure → §7.3 (no migration; fresh setup; ~1 day operational work)
+                  ↓
+[gap — no funding yet; new escrow remains empty]
+                  ↓
+Funding decision → operator-of-record decides → standard XRPL Payment per §7.4
+```
 
 ---
 
