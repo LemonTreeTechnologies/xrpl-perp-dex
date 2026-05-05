@@ -428,13 +428,8 @@ async fn drive(
     // call seal-update manually, or wait for next signerlist-update
     // to re-sync). We log the error but don't fail the whole admin
     // route, since the chain part succeeded.
-    let seal_result = seal_signerlist_after_landed(
-        state,
-        &xrpl_hash,
-        &new_entries,
-        new_quorum,
-    )
-    .await;
+    let seal_result =
+        seal_signerlist_after_landed(state, &xrpl_hash, &new_entries, new_quorum).await;
     let seal_message = match &seal_result {
         Ok(version) => format!("sealed in enclave at version={}", version),
         Err(e) => format!("WARNING: enclave seal-update failed: {} — sealed state may diverge from chain; operator should investigate via GET /admin/signerlist/status", e),
@@ -448,10 +443,7 @@ async fn drive(
         new_quorum,
         xrpl_tx_hash: Some(xrpl_hash),
         unsigned_tx: None,
-        message: format!(
-            "SignerListSet submitted to XRPL — {}",
-            seal_message
-        ),
+        message: format!("SignerListSet submitted to XRPL — {}", seal_message),
     })
 }
 
@@ -474,8 +466,7 @@ async fn seal_signerlist_after_landed(
     new_quorum: u32,
 ) -> Result<u64> {
     // 1. Poll for validated tx.
-    let (tx_blob_hex, ledger_index) =
-        poll_validated_tx(&state.xrpl_url, xrpl_hash).await?;
+    let (tx_blob_hex, ledger_index) = poll_validated_tx(&state.xrpl_url, xrpl_hash).await?;
 
     // 2. Get current version from enclave.
     let current_version = fetch_enclave_signerlist_version(&state.enclave_url).await?;
@@ -509,7 +500,7 @@ async fn seal_signerlist_after_landed(
     // 4. POST to enclave.
     let url = format!("{}/admin/signerlist/seal-update", state.enclave_url);
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)  // local self-signed cert; loopback per Pattern 318
+        .danger_accept_invalid_certs(true) // local self-signed cert; loopback per Pattern 318
         .build()
         .context("reqwest client")?;
     let resp: serde_json::Value = client
@@ -564,9 +555,7 @@ async fn poll_validated_tx(xrpl_url: &str, tx_hash: &str) -> Result<(String, u64
         }
         last_err = format!(
             "attempt {}: validated={:?}, status={:?}",
-            attempt,
-            resp["result"]["validated"],
-            resp["result"]["status"]
+            attempt, resp["result"]["validated"], resp["result"]["status"]
         );
     }
     bail!("tx not validated within 5 attempts: {}", last_err)
@@ -587,9 +576,7 @@ async fn fetch_enclave_signerlist_version(enclave_url: &str) -> Result<u64> {
         .await
         .context("enclave status response parse failed")?;
     if resp["bootstrapped"].as_bool() != Some(true) {
-        bail!(
-            "enclave is not bootstrapped — call /admin/signerlist/seal-initial first"
-        );
+        bail!("enclave is not bootstrapped — call /admin/signerlist/seal-initial first");
     }
     resp["signerlist_version"]
         .as_u64()
