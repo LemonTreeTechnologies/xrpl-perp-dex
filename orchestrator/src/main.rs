@@ -1070,6 +1070,7 @@ async fn main() -> Result<()> {
                     escrow_address: escrow_address.clone(),
                     signers_config: cfg.clone(),
                     signing_request_tx,
+                    enclave_url: cli.enclave_url.clone(),
                 });
                 tokio::spawn(async move {
                     if let Err(e) = signerlist_update::spawn_admin_listener(addr, admin_state).await
