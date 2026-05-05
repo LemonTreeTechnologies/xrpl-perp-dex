@@ -431,8 +431,8 @@ async fn drive(
     let seal_result =
         seal_signerlist_after_landed(state, &xrpl_hash, &new_entries, new_quorum).await;
     let seal_message = match &seal_result {
-        Ok(version) => format!("sealed in enclave at version={}", version),
-        Err(e) => format!("WARNING: enclave seal-update failed: {} — sealed state may diverge from chain; operator should investigate via GET /admin/signerlist/status", e),
+        Ok(version) => format!("sealed in enclave at version={version}"),
+        Err(e) => format!("WARNING: enclave seal-update failed: {e} — sealed state may diverge from chain; operator should investigate via GET /admin/signerlist/status"),
     };
 
     Ok(SignerlistUpdateResponse {
@@ -443,7 +443,7 @@ async fn drive(
         new_quorum,
         xrpl_tx_hash: Some(xrpl_hash),
         unsigned_tx: None,
-        message: format!("SignerListSet submitted to XRPL — {}", seal_message),
+        message: format!("SignerListSet submitted to XRPL — {seal_message}"),
     })
 }
 
@@ -477,14 +477,14 @@ async fn seal_signerlist_after_landed(
         .iter()
         .map(|addr| {
             let acct = xrpl_signer::decode_xrpl_address(addr)
-                .map(|a| hex::encode(a))
+                .map(hex::encode)
                 .unwrap_or_default();
             serde_json::json!({"account_id": acct, "weight": 1})
         })
         .collect();
 
     let escrow_acct_hex = xrpl_signer::decode_xrpl_address(&state.escrow_address)
-        .map(|a| hex::encode(a))
+        .map(hex::encode)
         .context("invalid escrow_address")?;
 
     let payload = serde_json::json!({
@@ -558,11 +558,11 @@ async fn poll_validated_tx(xrpl_url: &str, tx_hash: &str) -> Result<(String, u64
             attempt, resp["result"]["validated"], resp["result"]["status"]
         );
     }
-    bail!("tx not validated within 5 attempts: {}", last_err)
+    bail!("tx not validated within 5 attempts: {last_err}")
 }
 
 async fn fetch_enclave_signerlist_version(enclave_url: &str) -> Result<u64> {
-    let url = format!("{}/admin/signerlist/status", enclave_url);
+    let url = format!("{enclave_url}/admin/signerlist/status");
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
