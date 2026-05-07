@@ -15,6 +15,7 @@ mod http_helpers;
 mod node_deploy;
 mod orderbook;
 mod p2p;
+mod path_a_ceremony;
 mod path_a_redkg;
 mod perp_client;
 mod pool_path_a_client;
