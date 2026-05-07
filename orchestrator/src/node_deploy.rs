@@ -432,7 +432,7 @@ pub async fn deploy_local_side_by_side(
     //    backup_existing (post-mortem fix where root-owned accounts/
     //    blocked the daemon-running user from writing sealed files).
     info!("[1/4] preparing NEW deploy dir {}", DEPLOY_DIR_NEW);
-    std::fs::create_dir_all(DEPLOY_DIR_NEW).with_context(|| format!("mkdir {}", DEPLOY_DIR_NEW))?;
+    std::fs::create_dir_all(DEPLOY_DIR_NEW).with_context(|| format!("mkdir {DEPLOY_DIR_NEW}"))?;
     let accounts_dir = format!("{DEPLOY_DIR_NEW}/accounts");
     std::fs::create_dir_all(&accounts_dir).with_context(|| format!("mkdir {accounts_dir}"))?;
     chown_to_parent(&accounts_dir);
@@ -532,14 +532,12 @@ fn preflight_new_dir_clean() -> Result<()> {
         return Ok(());
     }
     let mut entries =
-        std::fs::read_dir(p).with_context(|| format!("read_dir {}", DEPLOY_DIR_NEW))?;
+        std::fs::read_dir(p).with_context(|| format!("read_dir {DEPLOY_DIR_NEW}"))?;
     if entries.next().is_some() {
         bail!(
-            "NEW deploy dir {} is not empty. \
+            "NEW deploy dir {DEPLOY_DIR_NEW} is not empty. \
              Either a prior --side-by-side attempt left state behind, or the path is in unexpected use. \
-             Operator must inspect + clean (sudo rm -rf {}) before retrying.",
-            DEPLOY_DIR_NEW,
-            DEPLOY_DIR_NEW
+             Operator must inspect + clean (sudo rm -rf {DEPLOY_DIR_NEW}) before retrying."
         );
     }
     Ok(())
@@ -547,16 +545,15 @@ fn preflight_new_dir_clean() -> Result<()> {
 
 async fn preflight_new_port_free() -> Result<()> {
     use tokio::net::TcpListener;
-    let bind_addr = format!("127.0.0.1:{}", ENCLAVE_PORT_NEW);
+    let bind_addr = format!("127.0.0.1:{ENCLAVE_PORT_NEW}");
     match TcpListener::bind(&bind_addr).await {
         Ok(listener) => {
             drop(listener);
             Ok(())
         }
         Err(e) => bail!(
-            "port {} is not available for NEW enclave (bind {bind_addr} failed: {e}). \
-             Stop the conflicting process before --side-by-side deploy.",
-            ENCLAVE_PORT_NEW
+            "port {ENCLAVE_PORT_NEW} is not available for NEW enclave (bind {bind_addr} failed: {e}). \
+             Stop the conflicting process before --side-by-side deploy."
         ),
     }
 }
