@@ -267,6 +267,15 @@ enum Command {
         /// enclave.signed.so + perp-dex-server + (optional) build-manifest.txt.
         #[arg(long)]
         enclave_dist: PathBuf,
+        /// REQ-8 Path A: deploy NEW enclave alongside the still-running
+        /// OLD on port 9089 + /home/azureuser/perp-next/. Refuses if
+        /// OLD service is not active, NEW unit file is missing,
+        /// /home/azureuser/perp-next/ is not empty, or port 9089 is
+        /// occupied. After success, operator drives the migration
+        /// ceremony via POST /admin/migrate-state on OLD's orchestrator
+        /// (commit 11).
+        #[arg(long, default_value_t = false)]
+        side_by_side: bool,
     },
 }
 
@@ -595,6 +604,7 @@ async fn main() -> Result<()> {
         Some(Command::NodeDeploy {
             orchestrator,
             enclave_dist,
+            side_by_side,
         }) => {
             let manifest = enclave_dist.join("build-manifest.txt");
             let artefacts = node_deploy::LocalArtefactSet {
@@ -603,10 +613,23 @@ async fn main() -> Result<()> {
                 perp_dex_server: enclave_dist.join("perp-dex-server"),
                 build_manifest: manifest.exists().then_some(manifest),
             };
-            let result = node_deploy::deploy_local(&artefacts).await?;
-            println!("Node deploy complete:");
-            println!("  mrenclave:     {}", result.mrenclave);
-            println!("  backup_suffix: {}", result.backup_suffix);
+            if side_by_side {
+                let result = node_deploy::deploy_local_side_by_side(&artefacts).await?;
+                println!("Side-by-side deploy complete:");
+                println!("  mrenclave_new: {}", result.mrenclave_new);
+                println!("  deploy_dir:    {}", result.deploy_dir.display());
+                println!("  unit:          {}", result.unit);
+                println!("  port:          {}", result.port);
+                println!();
+                println!("OLD enclave (port 9088) is UNTOUCHED. Next step:");
+                println!("  Run `POST /admin/migrate-state` on OLD orchestrator (REQ-8 commit 11) \
+                          to drive the migration ceremony.");
+            } else {
+                let result = node_deploy::deploy_local(&artefacts).await?;
+                println!("Node deploy complete:");
+                println!("  mrenclave:     {}", result.mrenclave);
+                println!("  backup_suffix: {}", result.backup_suffix);
+            }
             return Ok(());
         }
         Some(Command::OperatorAdd {
