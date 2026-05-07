@@ -1,0 +1,10 @@
+{
+  "port": 9089,
+  "enclave_path": "/home/azureuser/perp-next/enclave.signed.so",
+  "accounts_dir": "/home/azureuser/perp-next/accounts",
+  "bind_address": "0.0.0.0",
+  "use_ssl": true,
+  "_comment_a": "REQ-8 Path A side-by-side NEW enclave config. OLD continues on /home/azureuser/perp/config.json (port 9088, accounts/).",
+  "_comment_b": "Operator pre-stages this file as /home/azureuser/perp-next/config.json BEFORE invoking `perp-dex-orchestrator node-deploy --side-by-side`.",
+  "_comment_c": "Adjust ssl_cert_path / ssl_key_path keys here to match the operator's TLS topology — defaults pull from sibling files in WorkingDirectory."
+}

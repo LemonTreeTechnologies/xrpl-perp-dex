@@ -1,0 +1,30 @@
+[Unit]
+Description=Perp DEX Enclave (REQ-8 Path A side-by-side NEW, port 9089)
+After=network.target aesmd.service
+Requires=aesmd.service
+# Side-by-side discipline: NEW unit must NOT race with OLD on accounts/.
+# Different WorkingDirectory + different config.json = different
+# accounts_dir + different port. Both units may be active simultaneously
+# during the migration ceremony.
+
+[Service]
+Type=simple
+User=azureuser
+WorkingDirectory=/home/azureuser/perp-next
+ExecStart=/home/azureuser/perp-next/perp-dex-server
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/azureuser/perp-next/enclave.log
+StandardError=append:/home/azureuser/perp-next/enclave.log
+
+# Match OLD unit's environment for consistency on Azure DCsv3 — see
+# docs/azure_dcap_deployment.md and feedback_dcap_azure_two_bugs.md.
+Environment=AZDCAP_DEBUG_LOG_LEVEL=FATAL
+
+# DCAP allowlist: same as OLD unit. SW_HARDENING_NEEDED is the
+# Azure DCsv3 testnet posture; mainnet (Hetzner bare-metal) MUST
+# remove this — see docs/accepted-platform-risks.md P-1.
+Environment=PERP_DCAP_ACCEPTED_QV_RESULTS=OK,SW_HARDENING_NEEDED
+
+[Install]
+WantedBy=multi-user.target
