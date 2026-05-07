@@ -622,8 +622,10 @@ async fn main() -> Result<()> {
                 println!("  port:          {}", result.port);
                 println!();
                 println!("OLD enclave (port 9088) is UNTOUCHED. Next step:");
-                println!("  Run `POST /admin/migrate-state` on OLD orchestrator (REQ-8 commit 11) \
-                          to drive the migration ceremony.");
+                println!(
+                    "  Run `POST /admin/migrate-state` on OLD orchestrator (REQ-8 commit 11) \
+                          to drive the migration ceremony."
+                );
             } else {
                 let result = node_deploy::deploy_local(&artefacts).await?;
                 println!("Node deploy complete:");

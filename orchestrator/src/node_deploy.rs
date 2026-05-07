@@ -432,8 +432,7 @@ pub async fn deploy_local_side_by_side(
     //    backup_existing (post-mortem fix where root-owned accounts/
     //    blocked the daemon-running user from writing sealed files).
     info!("[1/4] preparing NEW deploy dir {}", DEPLOY_DIR_NEW);
-    std::fs::create_dir_all(DEPLOY_DIR_NEW)
-        .with_context(|| format!("mkdir {}", DEPLOY_DIR_NEW))?;
+    std::fs::create_dir_all(DEPLOY_DIR_NEW).with_context(|| format!("mkdir {}", DEPLOY_DIR_NEW))?;
     let accounts_dir = format!("{DEPLOY_DIR_NEW}/accounts");
     std::fs::create_dir_all(&accounts_dir).with_context(|| format!("mkdir {accounts_dir}"))?;
     chown_to_parent(&accounts_dir);
@@ -615,9 +614,7 @@ async fn curl_version_with_retry(port: u16, budget: Duration) -> Result<String> 
     let start = SystemTime::now();
     let mut last_err: Option<String> = None;
     loop {
-        let elapsed = SystemTime::now()
-            .duration_since(start)
-            .unwrap_or_default();
+        let elapsed = SystemTime::now().duration_since(start).unwrap_or_default();
         if elapsed >= budget {
             bail!(
                 "curl /version on port {port} failed after {:?}. last error: {}",
