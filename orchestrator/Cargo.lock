@@ -3788,6 +3788,7 @@ name = "perp-dex-orchestrator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "bs58",
  "clap",
