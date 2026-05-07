@@ -531,8 +531,7 @@ fn preflight_new_dir_clean() -> Result<()> {
     if !p.exists() {
         return Ok(());
     }
-    let mut entries =
-        std::fs::read_dir(p).with_context(|| format!("read_dir {DEPLOY_DIR_NEW}"))?;
+    let mut entries = std::fs::read_dir(p).with_context(|| format!("read_dir {DEPLOY_DIR_NEW}"))?;
     if entries.next().is_some() {
         bail!(
             "NEW deploy dir {DEPLOY_DIR_NEW} is not empty. \
