@@ -18,6 +18,7 @@ mod p2p;
 mod path_a_ceremony;
 mod path_a_delegation;
 mod path_a_http_client;
+mod path_a_migrate_admin;
 mod path_a_redkg;
 mod perp_client;
 mod pool_path_a_client;
@@ -401,6 +402,16 @@ struct RunArgs {
     /// relay that already serves withdrawals.
     #[arg(long)]
     signerlist_admin_listen: Option<String>,
+
+    /// REQ-8 PRG-2 part 4/4 — loopback admin listener for the Path A
+    /// migration ceremony driver. Accepts `POST /admin/migrate-state`.
+    /// Only the operator initiating the migration needs this on; the
+    /// other operators participate via libp2p signing-relay (same
+    /// channel used by withdrawals + signerlist-update). Off by
+    /// default; gated by --signers-config (delegation collection
+    /// requires the local signer's pool key).
+    #[arg(long)]
+    migrate_admin_listen: Option<String>,
 }
 
 // ── Funding rate ────────────────────────────────────────────────
@@ -766,6 +777,24 @@ async fn main() -> Result<()> {
     // Create P2P signing relay channel
     let (signing_tx, signing_rx) = tokio::sync::mpsc::channel::<p2p::SigningRelay>(32);
 
+    // REQ-8 PRG-2 part 4/4: Path A migration delegation-collection
+    // channel. Constructed lazily — only allocated when signers_config
+    // is present (delegation collection requires a local pool-account
+    // signer). The Option<sender> is owned at this scope so the
+    // admin listener spawn can consume it later.
+    let path_a_delegation_tx: Option<tokio::sync::mpsc::Sender<p2p::PathADelegationRelay>>;
+    let path_a_delegation_rx_holder: Option<
+        tokio::sync::mpsc::Receiver<p2p::PathADelegationRelay>,
+    >;
+    if signers_config.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<p2p::PathADelegationRelay>(8);
+        path_a_delegation_tx = Some(tx);
+        path_a_delegation_rx_holder = Some(rx);
+    } else {
+        path_a_delegation_tx = None;
+        path_a_delegation_rx_holder = None;
+    }
+
     let peer_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     let maintenance_mode = Arc::new(std::sync::atomic::AtomicBool::new(matches!(
@@ -1116,6 +1145,42 @@ async fn main() -> Result<()> {
         }
     }
 
+    // REQ-8 PRG-2 part 4/4 — Path A migration ceremony admin listener.
+    // Spawned when --migrate-admin-listen + signers_config are both
+    // provided. signers_config gates because delegation collection
+    // needs a local pool-account signer; without one this node can't
+    // contribute to its own M-of-N quorum.
+    if let Some(addr) = cli.migrate_admin_listen.clone() {
+        match path_a_delegation_tx.clone() {
+            Some(delegation_tx) => {
+                let admin_state = Arc::new(path_a_migrate_admin::AdminState {
+                    path_a_delegation_tx: delegation_tx,
+                    default_old_api_base: cli.enclave_url.clone(),
+                    default_new_api_base: "https://localhost:9089/v1".into(),
+                });
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        path_a_migrate_admin::spawn_admin_listener(addr, admin_state).await
+                    {
+                        error!("migrate-state admin listener exited: {e}");
+                    }
+                });
+                info!("migrate-state admin listener configured");
+            }
+            None => {
+                warn!(
+                    "--migrate-admin-listen ignored: requires --signers-config (Path A delegation \
+                     needs a local pool-account signer for M-of-N quorum participation)"
+                );
+            }
+        }
+    }
+    // Drop the unused delegation sender if no admin listener spawned.
+    // The receive end was already wired into p2p.rs (when signers_config
+    // was set), but without an admin endpoint nobody pushes onto the
+    // sender — silent backpressure on a zero-traffic channel is fine.
+    drop(path_a_delegation_tx);
+
     // Keep publish senders alive — DKG coordinator + future drivers
     // hold their own clones; dropping the originals here would close
     // the outbound gossipsub arms in p2p.rs.
@@ -1181,6 +1246,13 @@ async fn main() -> Result<()> {
     // Wire P2P signing relay
     if let Some(ref cfg) = signers_config {
         p2p_node.set_signing_channel(signing_rx);
+        // REQ-8 PRG-2 part 4/4: wire the Path A migration ceremony
+        // driver's delegation-collection channel into the same p2p
+        // run-loop. The /admin/migrate-state endpoint owns the
+        // sender (path_a_delegation_tx); receiver lives here.
+        if let Some(rx) = path_a_delegation_rx_holder {
+            p2p_node.set_path_a_delegation_channel(rx);
+        }
         if let Some(ref local) = cfg.local_signer {
             // X-C1 condition C2 (perp RESP-5): enforce loopback on the
             // enclave URL the signing relay will hit. signers_config is
