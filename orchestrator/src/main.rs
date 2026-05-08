@@ -16,6 +16,7 @@ mod node_deploy;
 mod orderbook;
 mod p2p;
 mod path_a_ceremony;
+mod path_a_delegation;
 mod path_a_http_client;
 mod path_a_redkg;
 mod perp_client;

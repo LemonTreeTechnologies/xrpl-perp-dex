@@ -152,6 +152,36 @@ pub enum SigningMessage {
         compressed_pubkey: Option<String>,
         error: Option<String>,
     },
+    /// REQ-8 PRG-2 part 3/4: Path A migration delegation request.
+    /// Each operator's local enclave signs (domain || mrenclave_new
+    /// || ceremony_nonce) with their pool account key, contributing a
+    /// signature toward the M-of-N quorum that authorises the migration.
+    ///
+    /// X-C1 hardening parity with the XRPL Request variant: the
+    /// receiver re-derives `SHA-256(domain || mrenclave_new || ceremony_nonce)`
+    /// LOCALLY from the bytes carried here — never trusts a hash on
+    /// the wire. domain string is fixed at `"PATHA_DELEGATION_v1"`
+    /// (REQ-7 amendment 2026-05-07 (b)); mrenclave_new + ceremony_nonce
+    /// are 32-byte raw bytes hex-encoded.
+    ///
+    /// `request_id` MUST start with the prefix `"pa-delegation-"`
+    /// so Response routing on the receiver side can distinguish
+    /// delegation responses (mpsc, multi-responder) from XRPL multisig
+    /// responses (oneshot, single addressee).
+    PathADelegationRequest {
+        request_id: String,
+        requester_peer_id: String,
+        /// 64-char hex of the new MRENCLAVE the operator quorum is
+        /// authorising for migration.
+        mrenclave_new_hex: String,
+        /// 64-char hex of the 32-byte ceremony_nonce.
+        ceremony_nonce_hex: String,
+        /// Hex of the signer's 20-byte AccountID — receiver checks
+        /// this matches the local signer; mismatch → silently skip
+        /// (gossipsub broadcast; not for us).
+        signer_account_id_hex: String,
+        signer_xrpl_address: String,
+    },
 }
 
 /// Events broadcast by sequencer for validator PG replication.
@@ -197,6 +227,30 @@ pub struct SigningRelay {
     pub signer_account_id_hex: String,
     pub signer_xrpl_address: String,
     pub response_tx: tokio::sync::oneshot::Sender<SigningMessage>,
+}
+
+/// REQ-8 PRG-2 part 3/4: outbound Path A delegation collection request.
+///
+/// Distinct from `SigningRelay` because delegation collection is
+/// many-receivers (M-of-N operators reply concurrently), so the
+/// response channel must be mpsc instead of oneshot. The
+/// `LibP2PDelegationCollector` (in `path_a_delegation.rs`) constructs
+/// one of these per migration ceremony, sends it down the
+/// `set_path_a_delegation_channel` mpsc, and receives signed
+/// delegation responses on `responses_tx` until either the timeout
+/// expires or quorum is reached.
+#[derive(Debug)]
+pub struct PathADelegationRelay {
+    /// Unique per-ceremony id; MUST start with `"pa-delegation-"`
+    /// so the p2p response router knows to forward to this relay
+    /// rather than the XRPL signing oneshot map.
+    pub request_id: String,
+    pub mrenclave_new: [u8; 32],
+    pub ceremony_nonce: [u8; 32],
+    /// Channel to receive `SigningMessage::Response` instances as
+    /// peers reply. The collector closes the receive end when it has
+    /// enough responses or the timeout fires.
+    pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
 }
 
 /// Local signer credentials — used to handle incoming signing requests.
@@ -387,6 +441,12 @@ pub struct P2PNode {
     signing_request_rx: Option<mpsc::Receiver<SigningRelay>>,
     /// In-flight signing requests waiting for P2P responses.
     pending_signing: HashMap<String, tokio::sync::oneshot::Sender<SigningMessage>>,
+    /// REQ-8 PRG-2 part 3/4: outbound Path A delegation collection
+    /// requests from the migration ceremony driver.
+    path_a_delegation_rx: Option<mpsc::Receiver<PathADelegationRelay>>,
+    /// In-flight Path A delegation requests; mpsc per-request because
+    /// many peers reply concurrently (M-of-N quorum collection).
+    pending_path_a_delegation: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
     /// Channel for outbound state events (sequencer publishes).
     events_publish_rx: Option<mpsc::Receiver<StateEvent>>,
     /// Channel for received state events (validator consumes).
@@ -545,6 +605,8 @@ impl P2PNode {
             election_outbound_rx: None,
             signing_request_rx: None,
             pending_signing: HashMap::new(),
+            path_a_delegation_rx: None,
+            pending_path_a_delegation: HashMap::new(),
             events_publish_rx: None,
             events_inbound_tx: None,
             peer_quote_publish_rx: None,
@@ -625,6 +687,22 @@ impl P2PNode {
     /// Set signing request channel (withdrawal module sends requests here).
     pub fn set_signing_channel(&mut self, rx: mpsc::Receiver<SigningRelay>) {
         self.signing_request_rx = Some(rx);
+    }
+
+    /// REQ-8 PRG-2 part 3/4: wire the migration ceremony driver's
+    /// delegation-collection channel. Caller (the admin migrate-state
+    /// endpoint in PRG-2 part 4/4) sends one `PathADelegationRelay`
+    /// per ceremony; the p2p run-loop publishes the corresponding
+    /// `PathADelegationRequest` on the signing topic and forwards each
+    /// peer's `Response` back via the relay's `responses_tx`.
+    ///
+    /// `#[allow(dead_code)]`: consumer (admin endpoint composing a
+    /// `ComposedEnclaveApi<HttpEnclaveApi, LibP2PDelegationCollector>`)
+    /// lands in PRG-2 part 4/4. Until then cargo's dead-code analysis
+    /// flags this setter as unused — it's not, just not yet wired.
+    #[allow(dead_code)]
+    pub fn set_path_a_delegation_channel(&mut self, rx: mpsc::Receiver<PathADelegationRelay>) {
+        self.path_a_delegation_rx = Some(rx);
     }
 
     /// Set events publish channel (sequencer sends events to broadcast).
@@ -1157,6 +1235,114 @@ impl P2PNode {
     }
 
     /// Handle an incoming signing request: sign with local enclave if we own the address.
+    /// REQ-8 PRG-2 part 3/4: receiver-side handler for Path A delegation
+    /// signing requests. Re-derives the canonical message hash LOCALLY
+    /// from the carried bytes (X-C1 parity with handle_signing_request),
+    /// then routes to the local enclave's `/pool/sign` to obtain the
+    /// per-operator-key signature.
+    ///
+    /// Hash construction (REQ-7 amendment 2026-05-07 (b)):
+    ///   message_hash = SHA-256(
+    ///     "PATHA_DELEGATION_v1"  // 19 ASCII bytes, no terminator
+    ///     || mrenclave_new (32)
+    ///     || ceremony_nonce (32)
+    ///   )
+    ///
+    /// The domain separator + raw bytes ensure the operator's per-key
+    /// signature CANNOT be replayed as an XRPL transaction or any other
+    /// context — distinct from XRPL's TXN/SMT/STX prefixes.
+    async fn handle_path_a_delegation_request(
+        local_signer: &LocalSigner,
+        request_id: &str,
+        mrenclave_new: &[u8; 32],
+        ceremony_nonce: &[u8; 32],
+    ) -> SigningMessage {
+        use sha2::{Digest, Sha256};
+        const DOMAIN: &[u8] = b"PATHA_DELEGATION_v1";
+
+        // X-C1: re-derive hash LOCALLY. Never trust a hash on the wire.
+        let mut hasher = Sha256::new();
+        hasher.update(DOMAIN);
+        hasher.update(mrenclave_new);
+        hasher.update(ceremony_nonce);
+        let hash = hasher.finalize();
+        let hash_hex = format!("0x{}", hex::encode(hash));
+
+        let http = match crate::http_helpers::loopback_http_client(Duration::from_secs(15)) {
+            Ok(c) => c,
+            Err(e) => {
+                return SigningMessage::Response {
+                    request_id: request_id.to_string(),
+                    signer_xrpl_address: local_signer.xrpl_address.clone(),
+                    der_signature: None,
+                    compressed_pubkey: None,
+                    error: Some(format!("http client: {e}")),
+                };
+            }
+        };
+
+        let sign_url = format!("{}/pool/sign", local_signer.enclave_url);
+        let resp = http
+            .post(&sign_url)
+            .json(&serde_json::json!({
+                "from": local_signer.address,
+                "hash": hash_hex,
+                "session_key": local_signer.session_key,
+            }))
+            .send()
+            .await;
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                return SigningMessage::Response {
+                    request_id: request_id.to_string(),
+                    signer_xrpl_address: local_signer.xrpl_address.clone(),
+                    der_signature: None,
+                    compressed_pubkey: None,
+                    error: Some(format!("enclave request: {e}")),
+                };
+            }
+        };
+
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                return SigningMessage::Response {
+                    request_id: request_id.to_string(),
+                    signer_xrpl_address: local_signer.xrpl_address.clone(),
+                    der_signature: None,
+                    compressed_pubkey: None,
+                    error: Some(format!("enclave response parse: {e}")),
+                };
+            }
+        };
+
+        if body["status"].as_str() != Some("success") {
+            return SigningMessage::Response {
+                request_id: request_id.to_string(),
+                signer_xrpl_address: local_signer.xrpl_address.clone(),
+                der_signature: None,
+                compressed_pubkey: None,
+                error: Some(format!("enclave: {}", body.get("message").unwrap_or(&body))),
+            };
+        }
+
+        let r_hex = body["signature"]["r"].as_str().unwrap_or("");
+        let s_hex = body["signature"]["s"].as_str().unwrap_or("");
+        let r_bytes = hex::decode(r_hex).unwrap_or_default();
+        let s_bytes = hex::decode(s_hex).unwrap_or_default();
+        let der = crate::xrpl_signer::der_encode_signature(&r_bytes, &s_bytes);
+
+        SigningMessage::Response {
+            request_id: request_id.to_string(),
+            signer_xrpl_address: local_signer.xrpl_address.clone(),
+            der_signature: Some(hex::encode_upper(&der)),
+            compressed_pubkey: Some(local_signer.compressed_pubkey.clone()),
+            error: None,
+        }
+    }
+
     async fn handle_signing_request(
         local_signer: &LocalSigner,
         escrow_xrpl_address: Option<&str>,
@@ -1268,6 +1454,7 @@ impl P2PNode {
         let mut publish_rx = self.publish_rx.take();
         let mut election_rx = self.election_outbound_rx.take();
         let mut signing_rx = self.signing_request_rx.take();
+        let mut path_a_delegation_rx = self.path_a_delegation_rx.take();
         let mut events_rx = self.events_publish_rx.take();
         let mut peer_quote_rx = self.peer_quote_publish_rx.take();
         let mut share_v2_rx = self.share_v2_publish_rx.take();
@@ -1365,6 +1552,55 @@ impl P2PNode {
                     }
                 }
 
+                // REQ-8 PRG-2 part 3/4: Path A delegation collection
+                Some(relay) = async {
+                    match &mut path_a_delegation_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<PathADelegationRelay>>().await,
+                    }
+                } => {
+                    // If our local signer is one of the operators, sign locally too
+                    // (gossipsub doesn't deliver to the publisher).
+                    if let Some(ref local) = self.local_signer {
+                        let local_response = Self::handle_path_a_delegation_request(
+                            local,
+                            &relay.request_id,
+                            &relay.mrenclave_new,
+                            &relay.ceremony_nonce,
+                        ).await;
+                        let _ = relay.responses_tx.send(local_response).await;
+                    }
+
+                    let msg = SigningMessage::PathADelegationRequest {
+                        request_id: relay.request_id.clone(),
+                        requester_peer_id: self.peer_id.to_string(),
+                        mrenclave_new_hex: hex::encode(relay.mrenclave_new),
+                        ceremony_nonce_hex: hex::encode(relay.ceremony_nonce),
+                        // Empty signer fields broadcast to all peers; each
+                        // peer's local signer is the addressee. The X-C1
+                        // policy gate is in handle_path_a_delegation_request
+                        // (re-derives hash locally; never trusts wire).
+                        signer_account_id_hex: String::new(),
+                        signer_xrpl_address: String::new(),
+                    };
+                    match self.publish_signing(&msg) {
+                        Ok(_) => {
+                            self.pending_path_a_delegation.insert(
+                                relay.request_id, relay.responses_tx);
+                        }
+                        Err(e) => {
+                            warn!("path-a delegation publish failed: {}", e);
+                            let _ = relay.responses_tx.send(SigningMessage::Response {
+                                request_id: relay.request_id,
+                                signer_xrpl_address: String::new(),
+                                der_signature: None,
+                                compressed_pubkey: None,
+                                error: Some(format!("P2P publish failed: {e}")),
+                            }).await;
+                        }
+                    }
+                }
+
                 // Publish state events (sequencer → validators)
                 Some(event) = async {
                     match &mut events_rx {
@@ -1449,6 +1685,10 @@ impl P2PNode {
                 _ = signing_cleanup.tick() => {
                     // oneshot senders that are closed (receiver dropped) get cleaned up
                     self.pending_signing.retain(|_, tx| !tx.is_closed());
+                    // mpsc senders for path-a delegation: same closed-receiver
+                    // detection. Collector drops the receive end on timeout
+                    // or quorum-met; we GC entries here to bound memory.
+                    self.pending_path_a_delegation.retain(|_, tx| !tx.is_closed());
                 }
 
                 // Handle swarm events
@@ -1565,11 +1805,103 @@ impl P2PNode {
                                 request_id,
                                 ..
                             }) => {
-                                // Deliver to waiting withdrawal task
-                                if let Some(tx) = self.pending_signing.remove(&request_id) {
+                                // REQ-8 PRG-2 part 3/4: route by request_id
+                                // prefix. Path A delegation responses go to
+                                // mpsc (multi-receiver); XRPL multisig
+                                // responses go to oneshot.
+                                if request_id.starts_with("pa-delegation-") {
+                                    if let Some(tx) =
+                                        self.pending_path_a_delegation.get(&request_id) {
+                                        if let Ok(msg) = serde_json::from_slice::<SigningMessage>(&message.data) {
+                                            let _ = tx.send(msg).await;
+                                        }
+                                    }
+                                } else if let Some(tx) = self.pending_signing.remove(&request_id) {
                                     if let Ok(msg) = serde_json::from_slice::<SigningMessage>(&message.data) {
                                         let _ = tx.send(msg);
                                     }
+                                }
+                            }
+                            Ok(SigningMessage::PathADelegationRequest {
+                                request_id,
+                                requester_peer_id,
+                                mrenclave_new_hex,
+                                ceremony_nonce_hex,
+                                signer_account_id_hex: _,
+                                signer_xrpl_address: _,
+                            }) => {
+                                // REQ-8 PRG-2 part 3/4: Path A delegation
+                                // signing request from a peer's ceremony
+                                // driver. We sign IF we have a local signer
+                                // (every operator is a co-signer in the
+                                // M-of-N quorum); the X-C1 policy gate is
+                                // in handle_path_a_delegation_request which
+                                // re-derives the message hash locally from
+                                // the bytes carried here.
+                                let local_opt = self.local_signer.clone();
+                                let Some(local) = local_opt else {
+                                    continue;
+                                };
+
+                                // X-C1: peer allowlist + per-peer rate
+                                // limit + replay guard, mirroring the
+                                // existing XRPL signing path.
+                                if let Some(ref allow) = self.allowed_signing_peers {
+                                    if !allow.contains(&propagation_source) {
+                                        warn!(
+                                            req_id = %request_id,
+                                            from = %propagation_source,
+                                            "X-C1: path-a delegation request from peer outside allowlist — dropped"
+                                        );
+                                        continue;
+                                    }
+                                }
+                                if !self.check_signing_rate(&propagation_source) {
+                                    warn!(req_id = %request_id, "X-C1: path-a delegation rate-limited");
+                                    continue;
+                                }
+                                if !self.mark_signing_request_fresh(&request_id) {
+                                    warn!(req_id = %request_id, "X-C1: duplicate path-a delegation request_id — dropped");
+                                    continue;
+                                }
+
+                                let mre_bytes = match hex::decode(&mrenclave_new_hex) {
+                                    Ok(b) if b.len() == 32 => {
+                                        let mut a = [0u8; 32];
+                                        a.copy_from_slice(&b);
+                                        a
+                                    }
+                                    _ => {
+                                        warn!(req_id = %request_id, "path-a delegation: bad mrenclave_new_hex");
+                                        continue;
+                                    }
+                                };
+                                let nonce_bytes = match hex::decode(&ceremony_nonce_hex) {
+                                    Ok(b) if b.len() == 32 => {
+                                        let mut a = [0u8; 32];
+                                        a.copy_from_slice(&b);
+                                        a
+                                    }
+                                    _ => {
+                                        warn!(req_id = %request_id, "path-a delegation: bad ceremony_nonce_hex");
+                                        continue;
+                                    }
+                                };
+
+                                info!(
+                                    req_id = %request_id,
+                                    from = %requester_peer_id,
+                                    propagation = %propagation_source,
+                                    "path-a delegation request received — signing locally"
+                                );
+                                let response = Self::handle_path_a_delegation_request(
+                                    &local,
+                                    &request_id,
+                                    &mre_bytes,
+                                    &nonce_bytes,
+                                ).await;
+                                if let Err(e) = self.publish_signing(&response) {
+                                    error!("failed to publish path-a delegation response: {}", e);
                                 }
                             }
                             Err(e) => {
