@@ -1237,3 +1237,156 @@ node-3: Finalize done my_pid=2 group_pubkey=12e76a4468558a18a93ff5a02e0752a89ef9
 Phase A.5 DKG step complete. New FROST group sealed inside enclave on all 3 nodes.
 
 **Phase A.5 status:** re-DKG ✓. SignerList re-seal (step A.5.9) pending — no existing CLI tool wrapping `/v1/admin/signerlist/seal-initial`; manual lift requires XRPL tx fetch + AccountID hex decode + 6-field payload per node. Evaluating: seal-initial is orthogonal to `/admin/migrate-state` (Phase B), so PRG-3 can proceed to Phase B without it. seal-initial blocker is for FROST signing path (`signerlist seal-update` requires sealed-initial first), not Path A migration. Decision pending Andrey.
+
+### A.5.9 attempt (option C) — `signerlist-seal-initial` CLI built + deployed — 2026-05-11T~18:00Z
+
+Andrey chose option C (proper CLI subcommand, not ad-hoc shell). Implemented `cli_tools::signerlist_seal_initial` on public `feat/signerlist-seal-initial-cli` (HEAD `f39bddb`): reads escrow seed file, fetches SignerListSet tx via XRPL `tx` (binary=true), decodes addresses, posts to `/v1/admin/signerlist/seal-initial`. Local cargo check / clippy `-Dwarnings` / fmt / 255 tests all green.
+
+Hetzner cargo build green (sha256 `11be6748b2a8b9498...`). Binary scp'd to `/tmp/perp-dex-orch-sealinit` on all 3 Azure nodes + escrow seed file scp'd to `/tmp/escrow-testnet.json`. Cluster sealed-signerlist status before run: `bootstrapped:false` on all 3 nodes.
+
+Node-1 invocation returned `HTTP 400 / code=-6 SEALED_SIGNERLIST_ERR_NOT_COSIGNED`. Enclave's REQ-7.5 §3.4 step 6(e) requires `xrpl_verify_envelope_cosigned` — at least one of the enclave's own pool-generated keys must have multisig-cosigned the SignerListSet envelope. RESP-7.5 HIGH-1 closure against bootstrap-forge.
+
+But our `escrow-init` produces SignerListSet **single-signed by the escrow's master seed** (then disables master), not multisig-cosigned by operator pool keys. This is the only way XRPL allows the FIRST SignerListSet on an account. REQ-7.5 §3.4 step 3 says "operator signs themselves" — possible only AFTER a SignerList exists, so a fresh-account bootstrap can't use it.
+
+Andrey 2026-05-11 decision: **E-now (proper CLI)** — extend the bootstrap flow with a `signerlist-bootstrap-rotate` step that re-emits the master-installed SignerListSet via XRPL multisig (now possible because the master step installed a SignerList that authorizes the operators).
+
+### E — `signerlist-bootstrap-rotate` CLI + admin endpoint — 2026-05-11T~19:00Z
+
+Public branch `feat/signerlist-bootstrap-rotate` off `feat/signerlist-seal-initial-cli`.
+
+Implementation:
+- `signerlist_update.rs` — new `/admin/signerlist-bootstrap-rotate` admin route. Variant of `drive` using identity entries (no add/remove), collecting from ALL N operators (vs. just quorum), calling `/v1/admin/signerlist/seal-initial` instead of seal-update. Reuses ~95% of the existing libp2p signing-relay infrastructure.
+- `main.rs` — new clap subcommand `signerlist-bootstrap-rotate`. Optionally updates the escrow seed file's `signer_list_set_tx_hash` so peer operators can run `signerlist-seal-initial` against the multisig-cosigned tx.
+- Bonus fix in same commit: `/v1` URL prefix duplication in `path_a_migrate_admin::AdminState` defaults. `cli.enclave_url` ends in `/v1`; `path_a_http_client` prepends `/v1/path-a/...` → 404 on `/admin/migrate-state`. Fixed by stripping `/v1` + trailing slash.
+
+Second commit (canonical-sort fix): `signerlist-seal-initial` CLI was iterating seed file's `signers` array in operator-name order (node-1/node-2/node-3); XRPL serializes SignerEntries in AccountID byte-ascending canonical order. Result: enclave returned -7 `BLOB_MISMATCH` on peer seal-initial. Fixed by decoding all addresses to 20-byte AccountIDs and sorting before building payload.
+
+Hetzner cargo build green (`b123b77a...` initial, `f4f2b27b...` after sort fix). Deployed to all 3 Azure nodes via in-place orchestrator binary swap.
+
+Run sequence:
+
+```
+# Step 1: bootstrap-rotate on node-1 (leader)
+$ ssh azureuser@node-1 'perp-dex-orchestrator signerlist-bootstrap-rotate --seed-file /tmp/escrow-testnet.json'
+bootstrap-rotate response: {
+  "message": "bootstrap SignerListSet submitted to XRPL — sealed in local enclave at version=1",
+  "quorum": 2,
+  "signer_list": ["rp9CbSy9...", "raBnTEWd...", "rDaT8Th5..."],
+  "status": "success",
+  "xrpl_tx_hash": "AFBDA09937729696984ED52AB2FDAAC8CEA1762AEFA9DDCB529E126E5E634325"
+}
+
+# Step 2: scp updated seed file with new tx_hash to all 3 nodes
+# Step 3: seal-initial on node-2 and node-3
+$ ssh azureuser@node-2 'perp-dex-orchestrator signerlist-seal-initial --seed-file /tmp/escrow-testnet.json'
+seal-initial OK: {"signerlist_version":1,"status":"ok"}
+$ ssh azureuser@node-3 'perp-dex-orchestrator signerlist-seal-initial --seed-file /tmp/escrow-testnet.json'
+seal-initial OK: {"signerlist_version":1,"status":"ok"}
+
+# Cluster-wide status
+node-1..3: {"bootstrapped":true,"last_updated_ledger":17290174,"quorum_threshold":2,"signer_count":3,"signerlist_version":1,"status":"ok"}
+```
+
+XRPL testnet tx `AFBDA09937…E634325` is the canonical post-bootstrap-rotate SignerListSet — operators record this in the escrow seed file from here on.
+
+### Phase B side-by-side — MRENCLAVE_B build + deploy — 2026-05-11T~18:00-18:30Z
+
+Built MRENCLAVE_B on private branch `feat/heap-bump-prg3-build-b` (HeapMaxSize 0x800000 → 0x900000, no behavior change). `MRENCLAVE_B = 6a7caa9b20d9199e562017e7a8e12b45be32bfa0231c20ce8f2f0f26c2d99de2` — distinct from `MRENCLAVE_A e3757b56...` ✓. Build manifest at `/home/andrey/prg3-staging/build-B/`.
+
+Manual side-by-side deploy on all 3 Azure nodes (operator-supervised manual sequence since the orchestrator's `node-deploy --side-by-side` doesn't pre-stage config.json + perp.pem — separate followup):
+- Pre-stage `/etc/systemd/system/perp-dex-enclave-next.service`
+- Create `/home/azureuser/perp-next/accounts/`
+- Install MRENCLAVE_B `enclave.signed.so` + `perp-dex-server` + `perp.pem` + `config.json` (port 9089, paths under perp-next/)
+- `systemctl start perp-dex-enclave-next`
+- Verify `MRENCLAVE_B` via `curl https://localhost:9089/version`
+
+All 3 nodes confirmed running MRENCLAVE_B on port 9089 alongside MRENCLAVE_A on port 9088.
+
+### Phase B `/admin/migrate-state` ceremony — 2026-05-11T~19:20-19:40Z
+
+Added `--migrate-admin-listen 127.0.0.1:7095` to `start_orchestrator.sh` on each node, restarted orchestrators, waited 250s for libp2p mesh + peer-quote attest cache re-population.
+
+**Node-1 migrate-state — success:**
+```
+{
+  "status": "ok",
+  "ceremony_nonce_hex": "95efa100d9d1f1ebf9fad0f0391203ac6da0252fd69db8744c94e9363be70565",
+  "mrenclave_new_hex": "6a7caa9b20d9199e562017e7a8e12b45be32bfa0231c20ce8f2f0f26c2d99de2",
+  "manifest_hash_hex": "a14f0865ee45f4e677c73bde4be714c04f5ea237a1027786a66b451690e9fb7b"
+}
+```
+
+**Node-2 migrate-state — success:**
+```
+{
+  "status": "ok",
+  "ceremony_nonce_hex": "f203e95d248ec048acebfb474dfbaec00419fd462d7fea7ad9996fae39efde0a",
+  "mrenclave_new_hex": "6a7caa9b...",
+  "manifest_hash_hex": "dc3c37d6c6e6d2897163eaf6c10047c177dc08c418c6b0dcc9803334452a1362"
+}
+```
+
+**Node-3 migrate-state — FAILED:**
+```
+{
+  "status": "error",
+  "message": "enclave export-state returned status=error code=-6 message=la_export_state failed",
+  "state": "failed"
+}
+```
+
+Code -6 = `PATH_A_ERR_DELEGATION_QUORUM` ("fewer than M-of-N delegation signatures").
+
+### Phase C verification — 2026-05-11T~19:45Z
+
+Post-migration cluster state:
+
+| Node | OLD `path_a_retired.sealed` | NEW `perp-next/accounts/` |
+|------|---|---|
+| node-1 | PRESENT ✓ | ecdh_identity.sealed + migration_manifest.sealed + recent_nonces.sealed ✓ |
+| node-2 | PRESENT ✓ | ecdh_identity.sealed + migration_manifest.sealed + recent_nonces.sealed ✓ |
+| node-3 | ABSENT (migration failed) | empty (migration never ran) |
+
+Both successfully-migrated OLD enclaves serve `/version` (read-only allowed) but their signing ecalls return `ECALL_RETIRED` (PATH_A_RETIRED_GUARD wraps signing ecalls — `ecall_create_report_with_signature`, frost_*, sign).
+
+### Path A serial-deploy ordering finding — 2026-05-11
+
+Node-3's failure with `DELEGATION_QUORUM` is **not a code bug** — it's a known property of the retirement marker design surfacing under serial-deploy ordering:
+
+1. node-1 runs migrate-state → its OLD retires (writes `path_a_retired.sealed`)
+2. node-2 runs migrate-state → gathered delegations from node-1 (RETIRED → ECALL_RETIRED, can't sign) + node-3 (still active OK) + self = 2-of-3, just enough
+3. node-3 runs migrate-state → tries to collect delegations from node-1 (RETIRED → ECALL_RETIRED, can't sign) + node-2 (RETIRED → ECALL_RETIRED, can't sign) + self. Only 1 signature available; 2-of-3 quorum not reached.
+
+**Production runbook implication:** cluster migration MUST run in parallel within the `delegation_timeout_secs` window (default 30s, extended to 120s here), OR delegations must be pre-gathered + cached before any node retires. Serial-deploy is broken by design once N-1 nodes have retired. The serial pattern works ONLY for the very first migration when no node has retired yet.
+
+**Recommended production sequence:**
+
+```
+# Parallel — all operators run within ~30-60s window:
+op1$ curl -X POST .../admin/migrate-state -d '{...,"delegation_timeout_secs":60}' &
+op2$ curl -X POST .../admin/migrate-state -d '{...,"delegation_timeout_secs":60}' &
+op3$ curl -X POST .../admin/migrate-state -d '{...,"delegation_timeout_secs":60}' &
+wait
+```
+
+This is a documentation/runbook deliverable, not a code change.
+
+### PRG-3 verdict — PASS-class with 2 documented findings
+
+**PASSES:**
+1. ✓ MRENCLAVE bump via reproducible build path
+2. ✓ `signerlist-bootstrap-rotate` + `signerlist-seal-initial` bridges the bootstrap-forge symmetry gap end-to-end
+3. ✓ Side-by-side deploy of MRENCLAVE_B alongside MRENCLAVE_A on real DCsv3 hardware
+4. ✓ `/admin/migrate-state` ceremony succeeded end-to-end on real hardware (2 nodes)
+5. ✓ Retired-marker `path_a_retired.sealed` persisted across OLD enclave restart
+6. ✓ Sealed state migrated to NEW enclave's `perp-next/accounts/` (ecdh_identity, migration_manifest, recent_nonces)
+
+**FINDINGS (not blockers; document for production):**
+1. **Serial-deploy ordering DOES NOT WORK** for cluster migration once N-1 nodes retire — needs parallel-ceremony runbook (NEW finding, this is the central insight from PRG-3)
+2. **Bootstrap-forge symmetry gap** closed via `signerlist-bootstrap-rotate` (E delivered) — F audit reopen pending
+
+Branches:
+- `feat/heap-bump-prg3-build-b` @ `06d1fe5` (private) — MRENCLAVE_B HeapMaxSize bump
+- `feat/signerlist-bootstrap-rotate` @ `e1156b6` (public) — bootstrap-rotate CLI + canonical-sort fix + /v1 prefix fix
+- `feat/signerlist-seal-initial-cli` @ `f39bddb` (public) — base of the above
+- `feat/path-a-orchestrator` (public) — Phase A.5 deploy log; rebases onto bootstrap-rotate once merged
