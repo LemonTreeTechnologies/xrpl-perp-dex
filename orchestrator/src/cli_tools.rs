@@ -1853,17 +1853,31 @@ pub async fn signerlist_seal_initial(
     let escrow_id = decode_xrpl_address(escrow_address)?;
     let escrow_id_hex = hex::encode(escrow_id);
 
-    let mut signers_payload = Vec::with_capacity(signers.len());
-    for s in signers {
-        let addr = s["xrpl_address"]
-            .as_str()
-            .context("signer entry missing xrpl_address")?;
-        let id = decode_xrpl_address(addr)?;
-        signers_payload.push(serde_json::json!({
-            "account_id": hex::encode(id),
-            "weight": 1u32,
-        }));
-    }
+    // XRPL canonicalizes SignerEntries by AccountID ascending byte
+    // order when emitting the SignerListSet blob. The enclave's
+    // seal-initial step 6(f) compares supplied signers byte-for-byte
+    // against the blob's parsed entries, so the payload here MUST be
+    // in the same canonical order — seed file's "signers" array
+    // (sorted by operator name) won't match.
+    let mut decoded_signers: Vec<[u8; 20]> = signers
+        .iter()
+        .map(|s| {
+            let addr = s["xrpl_address"]
+                .as_str()
+                .context("signer entry missing xrpl_address")?;
+            decode_xrpl_address(addr)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    decoded_signers.sort();
+    let signers_payload: Vec<serde_json::Value> = decoded_signers
+        .iter()
+        .map(|id| {
+            serde_json::json!({
+                "account_id": hex::encode(id),
+                "weight": 1u32,
+            })
+        })
+        .collect();
 
     println!("Fetching SignerListSet tx {tx_hash} from XRPL...");
     let (blob_hex, ledger_index) = fetch_signerlist_set_tx(xrpl_url, tx_hash).await?;
