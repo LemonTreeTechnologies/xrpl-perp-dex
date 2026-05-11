@@ -256,6 +256,36 @@ enum Command {
         faucet_url: Option<String>,
     },
 
+    /// Phase 2.2-D — re-emit the master-installed SignerListSet via
+    /// XRPL multisig so the enclave's `seal-initial` cosigner check
+    /// (REQ-7.5 §3.4 step 6(e)) passes. Bridges the bootstrap-forge
+    /// symmetry gap: XRPL requires master for the FIRST SignerListSet,
+    /// but the enclave's seal-initial requires multisig-cosigned
+    /// envelope. Drives via the orchestrator daemon's
+    /// `/admin/signerlist-bootstrap-rotate` admin route, so the daemon
+    /// must be running with `--signerlist-admin-listen`. After this
+    /// lands the leader's enclave is bootstrapped; peers run
+    /// `signerlist-seal-initial --seed-file <updated>` against the
+    /// same tx_hash.
+    SignerlistBootstrapRotate {
+        /// Local orchestrator's signerlist-admin URL.
+        #[arg(long, default_value = "http://127.0.0.1:9101")]
+        admin_url: String,
+        /// If true, build the tx and log it but do NOT submit / seal.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Escrow seed file to update on success with the new
+        /// `signer_list_set_tx_hash`. Default
+        /// `~/.secrets/perp-dex-xrpl/escrow-testnet.json`.
+        #[arg(long)]
+        seed_file: Option<PathBuf>,
+        /// Don't update the seed file's `signer_list_set_tx_hash` on
+        /// success (the on-chain tx still landed; updating the seed
+        /// is a separate convenience).
+        #[arg(long, default_value_t = false)]
+        no_update_seed_file: bool,
+    },
+
     /// Phase 2.2-B — seal the on-chain SignerList as the enclave's
     /// version=1 baseline. Each operator runs once after the founder
     /// publishes escrow + SignerListSet tx hash. Reads the seed file,
@@ -646,6 +676,28 @@ async fn main() -> Result<()> {
             ));
             let seed_path = seed_file.unwrap_or(default_seed_path);
             return cli_tools::signerlist_seal_initial(&xrpl_url, &seed_path, &enclave_url).await;
+        }
+        Some(Command::SignerlistBootstrapRotate {
+            admin_url,
+            dry_run,
+            seed_file,
+            no_update_seed_file,
+        }) => {
+            let default_seed_path = PathBuf::from(format!(
+                "{}/.secrets/perp-dex-xrpl/escrow-testnet.json",
+                std::env::var("HOME").context("HOME not set")?
+            ));
+            let seed_path = seed_file.unwrap_or(default_seed_path);
+            return cli_tools::signerlist_bootstrap_rotate(
+                &admin_url,
+                dry_run,
+                if no_update_seed_file {
+                    None
+                } else {
+                    Some(&seed_path)
+                },
+            )
+            .await;
         }
         Some(Command::NodeDeploy {
             orchestrator,
@@ -1185,10 +1237,21 @@ async fn main() -> Result<()> {
     if let Some(addr) = cli.migrate_admin_listen.clone() {
         match path_a_delegation_tx.clone() {
             Some(delegation_tx) => {
+                // path_a_http_client prepends "/v1/path-a/..." to the
+                // base URL. cli.enclave_url already ends in "/v1"
+                // (e.g. "https://localhost:9088/v1") for the other
+                // pool/admin routes, so strip "/v1" + trailing slash
+                // here to avoid building "/v1/v1/path-a/..." 404s.
+                let strip_v1 = |s: &str| -> String {
+                    s.trim_end_matches('/')
+                        .trim_end_matches("/v1")
+                        .trim_end_matches('/')
+                        .to_string()
+                };
                 let admin_state = Arc::new(path_a_migrate_admin::AdminState {
                     path_a_delegation_tx: delegation_tx,
-                    default_old_api_base: cli.enclave_url.clone(),
-                    default_new_api_base: "https://localhost:9089/v1".into(),
+                    default_old_api_base: strip_v1(&cli.enclave_url),
+                    default_new_api_base: "https://localhost:9089".into(),
                 });
                 tokio::spawn(async move {
                     if let Err(e) =

@@ -1908,6 +1908,90 @@ pub async fn signerlist_seal_initial(
     Ok(())
 }
 
+/// Phase 2.2-D — `signerlist-bootstrap-rotate` subcommand. Operator
+/// runs once on any participating node after `escrow-init` has
+/// landed the master-signed initial SignerListSet (and disabled
+/// master). Calls the local orchestrator daemon's
+/// `/admin/signerlist-bootstrap-rotate` admin route, which:
+///   1. Reads current SignerList from XRPL (master-installed).
+///   2. Rebuilds the identical SignerListSet tx.
+///   3. Collects signatures from all current operators via the
+///      libp2p signing relay.
+///   4. Submits the multisig-cosigned envelope to XRPL.
+///   5. POSTs the validated blob to local enclave's
+///      `/admin/signerlist/seal-initial` so the enclave seals
+///      version=1.
+///
+/// On success this CLI optionally rewrites the escrow seed file's
+/// `signer_list_set_tx_hash` so peer operators running
+/// `signerlist-seal-initial` use the multisig-cosigned tx instead
+/// of the master-signed one.
+pub async fn signerlist_bootstrap_rotate(
+    admin_url: &str,
+    dry_run: bool,
+    seed_file_to_update: Option<&Path>,
+) -> Result<()> {
+    let url = format!(
+        "{}/admin/signerlist-bootstrap-rotate",
+        admin_url.trim_end_matches('/')
+    );
+    let body = serde_json::json!({"dry_run": dry_run});
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()?;
+    info!(%url, dry_run, "posting signerlist-bootstrap-rotate");
+    let resp = http
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url} failed"))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .context("invalid JSON from signerlist-bootstrap-rotate")?;
+    if !status.is_success() {
+        anyhow::bail!("signerlist-bootstrap-rotate HTTP {status}: {body}");
+    }
+    println!(
+        "bootstrap-rotate response: {}",
+        serde_json::to_string_pretty(&body)?
+    );
+
+    if dry_run {
+        return Ok(());
+    }
+
+    let new_hash = body["xrpl_tx_hash"]
+        .as_str()
+        .context("response missing xrpl_tx_hash")?;
+
+    if let Some(seed_path) = seed_file_to_update {
+        let content = std::fs::read_to_string(seed_path)
+            .with_context(|| format!("cannot read {}", seed_path.display()))?;
+        let mut seed: serde_json::Value = serde_json::from_str(&content)
+            .with_context(|| format!("invalid JSON in {}", seed_path.display()))?;
+        let old_hash = seed["signer_list_set_tx_hash"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        seed["signer_list_set_tx_hash"] = serde_json::Value::String(new_hash.to_string());
+        let new_content = serde_json::to_string_pretty(&seed)?;
+        std::fs::write(seed_path, new_content)
+            .with_context(|| format!("cannot write {}", seed_path.display()))?;
+        println!(
+            "updated {}: signer_list_set_tx_hash {} → {}",
+            seed_path.display(),
+            old_hash,
+            new_hash
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
