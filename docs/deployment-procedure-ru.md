@@ -528,6 +528,77 @@ Deploy agent держит предыдущий бинарь на диске. Е�
 5. Audit log запись закоммичена в релиз-репо, подписана дежурным оператором, с указанием: версия релиза, start/end timestamp, таймингов по каждой ноде, любых отклонений от этого runbook.
 6. Предыдущий релиз сохранён на диске как `.prev` на стандартное rollback-окно (предлагается 30 дней), затем подчищается.
 
+### 11.10 Инвариант порядка кластера — параллельная Path A ceremony обязательна
+
+**Naming note.** В audit track и текущем коде (REQ-7, REQ-8, `docs/path-a-runbook.{en,ru}.md`, `orchestrator/src/path_a_*.rs`, `EthSignerEnclave/Enclave/path_a.cpp`), **"Path A"** = ceremony миграции через Local Attestation, которая шипится в REQ-8 commits 11–12. В §11.5 этого документа **"Путь B"** исторически referred to той же upgrade-family (изменение энклейва → новый MRENCLAVE), но описывал другой механизм (on-chain add-then-remove ротация signer'а пер-нода). Реализация которая landед — audit-track Path A — Local Attestation cross-enclave state migration сохраняющая sealed customer state без on-chain signer ротации. CLI `signerlist-bootstrap-rotate` (Phase 2.2-D) закрывает bootstrap-forge symmetry gap. **§11.5 sequential add/swap/remove SUPERSEDED — не выполнять. Использовать этот раздел + `docs/path-a-runbook.ru.md`.**
+
+#### Инвариант
+
+Path A's `/admin/migrate-state` ceremony на каждой ноде retire'ит локальный OLD enclave при успехе: пишет `path_a_retired.sealed` и `PATH_A_RETIRED_GUARD()` затем заставляет каждый signing ecall возвращать `ECALL_RETIRED`. Retirement **permanent** — sealed, one-way, un-retirement не реализован и архитектурно небезопасен.
+
+Delegation collection ceremony'и M-of-N просит OLD энклейв каждого peer'а подписать authorization через libp2p. Once peer's OLD retired, он НЕ МОЖЕТ contribute delegation — retirement intentional и load-bearing для security model (никакой post-migration signing не выскальзывает из permitted code base).
+
+**Следствие:** если N-1 операторов уже завершили ceremonies серийно, у N-го оператора максимум 1 delegation (свой) и не достичь M-of-N (M ≥ 2 в любом sane SignerListSet). N-ая ceremony fails with `PATH_A_ERR_DELEGATION_QUORUM` (-6). Эта нода застряла на OLD permanently — manual recovery = fresh bootstrap на NEW (discarding unmigrated state по §11.7 worst case).
+
+**Поэтому: Path A cluster migration ОБЯЗАНА выполняться параллельно у всех операторов в окне `delegation_timeout_secs`.**
+
+#### Процедура
+
+Out-of-band координация критична. Все операторы договариваются до T₀:
+- Новый MRENCLAVE hash (точно совпадает с build manifest).
+- Расписанный timestamp T₀ (например, "2026-MM-DD 14:00 UTC").
+- Ceremony timeout window (default `delegation_timeout_secs=30s`; bump до 60–120s если latency cluster'а такого требует).
+
+В T₀ каждый оператор запускает одновременно на своей ноде:
+
+```
+curl -X POST http://127.0.0.1:7095/admin/migrate-state \
+    -H 'Content-Type: application/json' \
+    -d '{"expected_mrenclave_new": "<MRENCLAVE_NEW>", "delegation_timeout_secs": 60}'
+```
+
+Ceremony driver на каждой ноде concurrently:
+1. Спрашивает локальный NEW за `target_info` + генерирует migration keypair.
+2. Публикует `PathADelegationRequest` на libp2p signing-relay topic.
+3. Orchestrator'ы других операторов получают request; их локальные OLD энклейвы подписывают delegation **потому что ни один не retired** — export-state retirement каждого оператора происходит ПОСЛЕ delegation collection completes, и так как все 3 leader'а в delegation-collection phase одновременно (parallel start), ни один peer не retired в момент запроса подписи.
+4. Каждый leader collects M-of-N delegations, drive'ит остальную ceremony (export → import → verify-confirmation), retire'ит локальный OLD в конце.
+5. Cluster заканчивается with всеми OLDs retired ~simultaneously и всеми NEWs holding migrated state.
+
+#### Empirical reference
+
+PRG-3 testnet (2026-05-11) намеренно прогнал ceremony серийно как часть валидации:
+- node-1 succeeded.
+- node-2 succeeded (gathered delegations from node-3-still-active + self).
+- node-3 failed with `PATH_A_ERR_DELEGATION_QUORUM` — node-1 и node-2 OLDs retired и не могли подписать.
+
+Recovery на node-3 потребовала full Plan B reset: discard OLD state, fresh `node-bootstrap` на NEW, fresh `escrow-init`, fresh `signerlist-bootstrap-rotate`, fresh DKG. Plan B sequence задокументирована в `docs/path-a-prg3-deploy-log.md`. Этот раздел документирует процедурный урок; не повторять серийный pattern в production.
+
+#### Failure modes
+
+| Симптом | Причина | Recovery |
+|---|---|---|
+| Один оператор пропустил T₀ на > `delegation_timeout` | Schedule miss | Abort всех in-progress ceremonies (Ctrl-C curl; OLDs which haven't retired stay active). Re-coordinate T₀. Retry parallel. |
+| Network partition между операторами в ходе ceremony | libp2p mesh disruption | Каждый leader'а delegation collector times out; OLD не retired (retire только при full success). Re-coordinate, retry. |
+| NEW энклейв одного оператора не стартовал в T₀ | Build artefact mismatch, port 9089 занят и т.п. | Abort всех ceremonies. Investigate этого оператора NEW. Retry parallel когда все NEWs verified healthy на /version. |
+| Оператор завершил ceremony серийно раньше других | Procedure violation / out-of-coordination drift | OLD этого оператора permanently retired. Его нода застряла — §11.7 worst case (fresh bootstrap на NEW). Investigate cluster discipline до next attempt. |
+
+#### Код или процедура?
+
+PRG-3 surfaced это empirically. Два долговременных resolution path:
+
+(а) **Процедура** (этот раздел): задокументировать parallel-ceremony requirement как operational invariant; rely на out-of-band operator coordination.
+
+(b) **Код**: pre-collect delegations со всех операторов **до того как** any node заходит в export-state retirement step; cache delegations cluster-wide; ceremonies process cached set вместо demanding live signatures от peers. Требует extending libp2p delegation phase to be cluster-coordinated rather than per-leader. Retirement-marker permanence semantics intact — только delegation-gathering timing меняется.
+
+Оба valid. Audit-reopen (F submission, см. `project_seal_initial_gap.md` X-XX-2) carries вопрос auditor'у for authoritative решение; до этого, **процедура (а) governs production**.
+
+#### Reference
+
+- Operator runbook (operator-facing details): `docs/path-a-runbook.{en,ru}.md`
+- Реализация: `orchestrator/src/path_a_ceremony.rs`, `path_a_migrate_admin.rs`, `path_a_delegation.rs`; enclave-side `EthSignerEnclave/Enclave/path_a.cpp`
+- Empirical trace: `docs/path-a-prg3-deploy-log.md` (PRG-3 closure 2026-05-11; includes serial-deploy failure на node-3 и Plan B recovery)
+- Audit cycle: REQ-7, REQ-8 (private repo `77ph/xrpl-perp-dex-enclave/docs/audit/`); F audit-reopen submission pending
+
 ---
 
 ## Приложение A — Что эта схема НЕ решает
