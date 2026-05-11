@@ -561,3 +561,234 @@ active
 **State after rollback:** all 3 nodes back to MRENCLAVE 4dfe8997... v0.1.0, both services active. Cluster healthy. No data lost (sealed state was wiped on node-1 during failed attempt — restored from backup).
 
 **Next:** civetweb upgrade work in private repo; PRG-3 retry after that. Separate CI-smoke-test design also queued.
+
+---
+
+# PRG-3 Phase A retry — 2026-05-11 ~15:00 UTC
+
+After 2026-05-11 morning Phase A abort (civetweb SIGSEGV), branch
+`feat/sim-mode-build` HEAD `c197105` on private repo carries:
+- civetweb 1.16 vendored (commit `7b9ddfe`)
+- SSL_DYNAMIC_LOADING=OFF flag (commit `58ef2dc`)
+- build-azure.sh smoke gate (commit `6d331b5`)
+- SIM-mode build path + GHA smoke (commit `c197105`)
+
+Fresh artefacts at `/home/andrey/prg3-staging/build-A/`:
+- enclave.signed.so sha256 `b5e566604113988b6c3c94ab7f292d9f32ffa96bcd0dc145432396f81f598342`
+- perp-dex-server sha256 `68eda8accc51ca4f910d76cb18cd33233bf2bddc4fc28b4051958d30dedae267`
+- perp-dex-orchestrator sha256 `dfb5ced36965dbf2a441269f67f55b216213d926fbee2bc9d905185ac791ea6a`
+- MRENCLAVE `e3757b5646ccfc8a055bba0e56e9e3d8e07241346e4ba678b3a8d8fb64fc8fb4`
+
+Broken-civetweb build moved to `/home/andrey/prg3-staging/build-A-broken-civetweb/` for historical reference.
+
+Pre-flight verification (2026-05-11 retry):
+- build-azure.sh end-to-end: exit 0, smoke ✓ HTTP 200, server alive
+- SIM-build (GHA workflow `c197105`): green at 1m 38s
+- MRENCLAVE matches first attempt (civetweb fix is host-side; doesn't affect enclave content)
+
+Re-running Phase A on node-1 with FRESH (fixed) artefacts.
+
+## Phase A retry — node-1 (20.71.184.176)
+
+(commands + results appended below as they execute)
+
+### Phase A retry pre-flight Azure cluster state — 2026-05-11T12:24:35Z
+
+```
+=== 20.71.184.176 ===
+sgx-node-1
+active active 
+mre=4dfe899771bdb3f3... ver=0.1.0
+=== 20.224.243.60 ===
+sgx-node-2
+active active 
+mre=4dfe899771bdb3f3... ver=0.1.0
+=== 52.236.130.102 ===
+sgx-node-3
+active active 
+mre=4dfe899771bdb3f3... ver=0.1.0
+```
+
+### A.retry.1 stage artefacts to /tmp/ — 2026-05-11T12:27:19Z
+
+```
+$ ssh andrey@94.130.18.162 "scp /home/andrey/prg3-staging/build-A/{enclave.signed.so,perp-dex-server,perp-dex-orchestrator,build-manifest.txt} azureuser@20.71.184.176:/tmp/ 2>&1; ssh azureuser@20.71.184.176 \"sha256sum /tmp/enclave.signed.so /tmp/perp-dex-server /tmp/perp-dex-orchestrator; echo ===; cat /tmp/build-manifest.txt\""
+b5e566604113988b6c3c94ab7f292d9f32ffa96bcd0dc145432396f81f598342  /tmp/enclave.signed.so
+68eda8accc51ca4f910d76cb18cd33233bf2bddc4fc28b4051958d30dedae267  /tmp/perp-dex-server
+dfb5ced36965dbf2a441269f67f55b216213d926fbee2bc9d905185ac791ea6a  /tmp/perp-dex-orchestrator
+===
+git_sha=c197105-dirty
+build_date=2026-05-11T12:23:25Z
+image=perp-dex-azure:c197105-dirty
+enclave_sha256=b5e566604113988b6c3c94ab7f292d9f32ffa96bcd0dc145432396f81f598342
+server_sha256=68eda8accc51ca4f910d76cb18cd33233bf2bddc4fc28b4051958d30dedae267
+mrenclave=0xe30x750x7b0x560x460xcc0xfc0x8a0x050x5b0xba0x0e0x560xe90xe30xd8
+```
+
+### A.retry.2 stop services — 2026-05-11T12:27:34Z
+
+```
+$ ssh andrey@94.130.18.162 "ssh azureuser@20.71.184.176 \"sudo systemctl stop perp-dex-orchestrator perp-dex-enclave; systemctl is-active perp-dex-orchestrator perp-dex-enclave; ss -ltn sport = :9088 2>/dev/null | tail -2\""
+inactive
+inactive
+State Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+```
+
+### A.retry.3 backup current — 2026-05-11T12:27:46Z
+
+```
+accounts.prg3-retry-pre-20260511-122746
+enclave.signed.so.prg3-retry-pre-20260511-122746
+perp-dex-orchestrator.prg3-retry-pre-20260511-122746
+perp-dex-server.prg3-retry-pre-20260511-122746
+```
+
+### A.retry.4 install new artefacts + fresh accounts/ — 2026-05-11T12:28:13Z
+
+```
+drwxr-xr-x  2 azureuser azureuser     4096 May 11 12:28 accounts
+-rw-rw-r--  1 azureuser azureuser      323 May 11 12:27 build-manifest.txt
+-rw-rw-r--  1 azureuser azureuser      311 May 11 09:07 build-manifest.txt.PRG3-attempted-58deb57-20260511-094302
+-rw-r--r--  1 azureuser azureuser  3539032 May 11 12:27 enclave.signed.so
+-rwxrwxr-x  1 azureuser azureuser 22969640 May 11 12:27 perp-dex-orchestrator
+-rwxr-xr-x  1 azureuser azureuser  7975400 May 11 12:27 perp-dex-server
+---
+b5e566604113988b6c3c94ab7f292d9f32ffa96bcd0dc145432396f81f598342  /home/azureuser/perp/enclave.signed.so
+68eda8accc51ca4f910d76cb18cd33233bf2bddc4fc28b4051958d30dedae267  /home/azureuser/perp/perp-dex-server
+dfb5ced36965dbf2a441269f67f55b216213d926fbee2bc9d905185ac791ea6a  /home/azureuser/perp/perp-dex-orchestrator
+```
+
+### A.retry.5 start perp-dex-enclave + verify /version — 2026-05-11T12:28:44Z
+
+```
+active
+LISTEN 0      200        127.0.0.1:9088      0.0.0.0:*          
+---
+{"enclave_build":"2026-04-08","enclave_path":"/home/azureuser/perp/enclave.signed.so","enclave_version":"0.1.0","mrenclave":"e3757b5646ccfc8a055bba0e56e9e3d8e07241346e4ba678b3a8d8fb64fc8fb4","status":"success"}
+```
+
+### A.retry.5-stability check — 2026-05-11T12:29:09Z
+
+```
+active
+azureus+  527333  0.3  0.0 318284 13532 ?        Ssl  12:28   0:00 /home/azureuser/perp/perp-dex-server
+=== second probe ===
+HTTP 200
+active
+Using listening port: 127.0.0.1:9088s
+Server started on port 9088 (HTTPS)
+API available at: https://localhost:9088/v1
+OpenAPI documentation: https://localhost:9088/docs/openapi.yaml
+Version info: https://localhost:9088/version
+```
+
+## Phase A retry — node-2 (20.224.243.60)
+
+### A.retry.6 stage artefacts to /tmp/ — 2026-05-11T12:30:06Z
+
+```
+b5e566604113988b6c3c94ab7f292d9f32ffa96bcd0dc145432396f81f598342  /tmp/enclave.signed.so
+68eda8accc51ca4f910d76cb18cd33233bf2bddc4fc28b4051958d30dedae267  /tmp/perp-dex-server
+dfb5ced36965dbf2a441269f67f55b216213d926fbee2bc9d905185ac791ea6a  /tmp/perp-dex-orchestrator
+```
+
+### A.retry.7 stop services — 2026-05-11T12:30:23Z
+
+```
+inactive
+inactive
+State Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+```
+
+### A.retry.8 backup current — 2026-05-11T12:30:36Z
+
+```
+accounts.prg3-retry-pre-20260511-123036
+enclave.signed.so.prg3-retry-pre-20260511-123036
+perp-dex-orchestrator.prg3-retry-pre-20260511-123036
+perp-dex-server.prg3-retry-pre-20260511-123036
+```
+
+### A.retry.9 install new + fresh accounts/ — 2026-05-11T12:30:47Z
+
+```
+b5e566604113988b6c3c94ab7f292d9f32ffa96bcd0dc145432396f81f598342  /home/azureuser/perp/enclave.signed.so
+68eda8accc51ca4f910d76cb18cd33233bf2bddc4fc28b4051958d30dedae267  /home/azureuser/perp/perp-dex-server
+dfb5ced36965dbf2a441269f67f55b216213d926fbee2bc9d905185ac791ea6a  /home/azureuser/perp/perp-dex-orchestrator
+```
+
+### A.retry.10 start + verify + stability — 2026-05-11T12:31:00Z
+
+```
+active
+LISTEN 0      200        127.0.0.1:9088      0.0.0.0:*          
+---
+{"enclave_build":"2026-04-08","enclave_path":"/home/azureuser/perp/enclave.signed.so","enclave_version":"0.1.0","mrenclave":"e3757b5646ccfc8a055bba0e56e9e3d8e07241346e4ba678b3a8d8fb64fc8fb4","status":"success"}
+=== stability check ===
+active
+second probe HTTP 200
+```
+
+## Phase A retry — node-3 (52.236.130.102)
+
+### A.retry.11 stage artefacts to /tmp/ — 2026-05-11T12:31:43Z
+
+```
+b5e566604113988b6c3c94ab7f292d9f32ffa96bcd0dc145432396f81f598342  /tmp/enclave.signed.so
+68eda8accc51ca4f910d76cb18cd33233bf2bddc4fc28b4051958d30dedae267  /tmp/perp-dex-server
+dfb5ced36965dbf2a441269f67f55b216213d926fbee2bc9d905185ac791ea6a  /tmp/perp-dex-orchestrator
+```
+
+### A.retry.12 stop services — 2026-05-11T12:31:59Z
+
+```
+inactive
+inactive
+State Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+```
+
+### A.retry.13 backup current — 2026-05-11T12:32:11Z
+
+```
+accounts.prg3-retry-pre-20260511-123211
+enclave.signed.so.prg3-retry-pre-20260511-123211
+perp-dex-orchestrator.prg3-retry-pre-20260511-123211
+perp-dex-server.prg3-retry-pre-20260511-123211
+```
+
+### A.retry.14 install + fresh accounts/ — 2026-05-11T12:32:25Z
+
+```
+b5e566604113988b6c3c94ab7f292d9f32ffa96bcd0dc145432396f81f598342  /home/azureuser/perp/enclave.signed.so
+68eda8accc51ca4f910d76cb18cd33233bf2bddc4fc28b4051958d30dedae267  /home/azureuser/perp/perp-dex-server
+dfb5ced36965dbf2a441269f67f55b216213d926fbee2bc9d905185ac791ea6a  /home/azureuser/perp/perp-dex-orchestrator
+```
+
+### A.retry.15 start + verify + stability — 2026-05-11T12:32:38Z
+
+```
+active
+LISTEN 0      200        127.0.0.1:9088      0.0.0.0:*          
+---
+{"enclave_build":"2026-04-08","enclave_path":"/home/azureuser/perp/enclave.signed.so","enclave_version":"0.1.0","mrenclave":"e3757b5646ccfc8a055bba0e56e9e3d8e07241346e4ba678b3a8d8fb64fc8fb4","status":"success"}
+=== stability ===
+active
+second probe HTTP 200
+```
+
+## Phase A retry COMPLETE — cluster snapshot — 2026-05-11T12:33:03Z
+
+```
+=== 20.71.184.176 ===
+sgx-node-1
+active inactive 
+mre=e3757b5646ccfc8a055bba0e... ver=0.1.0
+=== 20.224.243.60 ===
+sgx-node-2
+active inactive 
+mre=e3757b5646ccfc8a055bba0e... ver=0.1.0
+=== 52.236.130.102 ===
+sgx-node-3
+active inactive 
+mre=e3757b5646ccfc8a055bba0e... ver=0.1.0
+```
