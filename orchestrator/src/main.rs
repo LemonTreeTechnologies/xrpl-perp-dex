@@ -256,6 +256,26 @@ enum Command {
         faucet_url: Option<String>,
     },
 
+    /// Phase 2.2-B — seal the on-chain SignerList as the enclave's
+    /// version=1 baseline. Each operator runs once after the founder
+    /// publishes escrow + SignerListSet tx hash. Reads the seed file,
+    /// fetches the signed tx blob + ledger index via XRPL `tx`
+    /// (binary=true), decodes addresses, posts to enclave's
+    /// `/v1/admin/signerlist/seal-initial`.
+    SignerlistSealInitial {
+        /// XRPL JSON-RPC URL.
+        #[arg(long, default_value = "https://s.altnet.rippletest.net:51234")]
+        xrpl_url: String,
+        /// Escrow seed file (produced by `escrow-init`). Default
+        /// `~/.secrets/perp-dex-xrpl/escrow-testnet.json`. Mainnet
+        /// operators pass an explicit path.
+        #[arg(long)]
+        seed_file: Option<PathBuf>,
+        /// Enclave REST API base URL (loopback only).
+        #[arg(long, default_value = "https://localhost:9088/v1")]
+        enclave_url: String,
+    },
+
     /// Phase 2.1c-E — node-local deploy. Each operator runs this on
     /// their own VM after `cargo build` + Docker `enclave.signed.so`
     /// production. Stops local services, backs up prior binaries with
@@ -614,6 +634,18 @@ async fn main() -> Result<()> {
                 faucet_url.as_deref(),
             )
             .await;
+        }
+        Some(Command::SignerlistSealInitial {
+            xrpl_url,
+            seed_file,
+            enclave_url,
+        }) => {
+            let default_seed_path = PathBuf::from(format!(
+                "{}/.secrets/perp-dex-xrpl/escrow-testnet.json",
+                std::env::var("HOME").context("HOME not set")?
+            ));
+            let seed_path = seed_file.unwrap_or(default_seed_path);
+            return cli_tools::signerlist_seal_initial(&xrpl_url, &seed_path, &enclave_url).await;
         }
         Some(Command::NodeDeploy {
             orchestrator,
