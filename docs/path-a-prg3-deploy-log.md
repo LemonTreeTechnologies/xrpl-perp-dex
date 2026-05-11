@@ -792,3 +792,448 @@ sgx-node-3
 active inactive 
 mre=e3757b5646ccfc8a055bba0e... ver=0.1.0
 ```
+
+# Phase A.5 inventory (2026-05-11)
+
+## Per-node config files state
+
+```
+=== 20.71.184.176 ===
+/home/azureuser/perp/config.json
+/home/azureuser/perp/p2p_identity.key
+/home/azureuser/perp/perp.pem
+/home/azureuser/perp/shards.toml
+/home/azureuser/perp/signers_config.json
+/home/azureuser/perp/start_orchestrator.sh
+--- signers_config ---
+{
+  "escrow_address": "rbqCUxgiacJC6AxmfQJwtpZ2teGiTYCJF",
+  "escrow_seed": "",
+  "quorum": 2,
+  "signer_list_set_tx_hash": "",
+  "signers": [
+    {
+      "name": "operator-rnzQC8HN",
+      "enclave_url": "",
+      "address": "",
+      "compressed_pubkey": "",
+      "xrpl_address": "rnzQC8HNEcgVHd8y8jb7PWDDJZ5Vd1P9WQ",
+      "ecdh_pubkey": "0317829AFAD2D8354E6115CB806534AFF1DB82A0523E47D73431D635834A1E020E"
+    },
+    {
+      "name": "operator-rBWt8nw2",
+      "enclave_url": "",
+      "address": "",
+      "compressed_pubkey": "",
+      "xrpl_address": "rBWt8nw2DGpJoh3qUyTkNAiRjW7C3Ds7ti",
+      "ecdh_pubkey": "03F38415EBB2CDEC738BC22F4800D3707CFF5FC146ADF8D94F6DF4D9EC07D9FFEF"
+    },
+    {
+      "name": "node-1",
+      "enclave_url": "https://localhost:9088/v1",
+=== 20.224.243.60 ===
+/home/azureuser/perp/config.json
+/home/azureuser/perp/p2p_identity.key
+/home/azureuser/perp/perp.pem
+/home/azureuser/perp/shards.toml
+/home/azureuser/perp/signers_config.json
+/home/azureuser/perp/start_orchestrator.sh
+--- signers_config ---
+{
+  "escrow_address": "rbqCUxgiacJC6AxmfQJwtpZ2teGiTYCJF",
+  "escrow_seed": "",
+  "quorum": 2,
+  "signer_list_set_tx_hash": "",
+  "signers": [
+    {
+      "name": "operator-rnzQC8HN",
+      "enclave_url": "",
+      "address": "",
+      "compressed_pubkey": "",
+      "xrpl_address": "rnzQC8HNEcgVHd8y8jb7PWDDJZ5Vd1P9WQ",
+      "ecdh_pubkey": "0317829AFAD2D8354E6115CB806534AFF1DB82A0523E47D73431D635834A1E020E"
+    },
+    {
+      "name": "node-2",
+      "enclave_url": "https://localhost:9088/v1",
+      "address": "0xac25906af8d3d31e8b57d4bb60c75225c43df41e",
+      "compressed_pubkey": "027C38AADDED6D361C880D96B5F37C17DC1B089AF3F7A49A789DA63CC7160CF125",
+      "xrpl_address": "rBWt8nw2DGpJoh3qUyTkNAiRjW7C3Ds7ti",
+      "ecdh_pubkey": "03F38415EBB2CDEC738BC22F4800D3707CFF5FC146ADF8D94F6DF4D9EC07D9FFEF"
+    },
+    {
+      "name": "operator-rJWSAM1c",
+      "enclave_url": "",
+=== 52.236.130.102 ===
+/home/azureuser/perp/config.json
+/home/azureuser/perp/p2p_identity.key
+/home/azureuser/perp/perp.pem
+/home/azureuser/perp/shards.toml
+/home/azureuser/perp/signers_config.json
+/home/azureuser/perp/start_orchestrator.sh
+--- signers_config ---
+{
+  "escrow_address": "rbqCUxgiacJC6AxmfQJwtpZ2teGiTYCJF",
+  "escrow_seed": "",
+  "quorum": 2,
+  "signer_list_set_tx_hash": "",
+  "signers": [
+    {
+      "name": "node-3",
+      "enclave_url": "https://localhost:9088/v1",
+      "address": "0x8ef8b79342eee4e4c44774f58174f945f336929e",
+      "compressed_pubkey": "02E3DBBAA3BDAA00611E29E01E0323C2A74FCD9AD4B0744598DAB7A0C1D1788DBB",
+      "xrpl_address": "rnzQC8HNEcgVHd8y8jb7PWDDJZ5Vd1P9WQ",
+      "ecdh_pubkey": "0317829AFAD2D8354E6115CB806534AFF1DB82A0523E47D73431D635834A1E020E"
+    },
+    {
+      "name": "operator-rBWt8nw2",
+      "enclave_url": "",
+      "address": "",
+      "compressed_pubkey": "",
+      "xrpl_address": "rBWt8nw2DGpJoh3qUyTkNAiRjW7C3Ds7ti",
+      "ecdh_pubkey": "03F38415EBB2CDEC738BC22F4800D3707CFF5FC146ADF8D94F6DF4D9EC07D9FFEF"
+    },
+    {
+      "name": "operator-rJWSAM1c",
+      "enclave_url": "",
+```
+
+## Phase A.5 — re-bootstrap cluster on MRENCLAVE_A
+
+### A.5.1 node-bootstrap node-1 — 2026-05-11T13:03:38Z
+
+```
+Node Bootstrap
+==============
+Enclave: https://localhost:9088/v1
+Name:    node-1
+XRPL:    https://s.altnet.rippletest.net:51234 (publishing Domain)
+Faucet:  https://faucet.altnet.rippletest.net/accounts
+
+[1/4] Generating keypair in enclave...
+  Ethereum address: 0xd4742f6508f44bc9c03eba79bbabb2b4d2d820bd
+  Session key:      0xd86d113450ffb7831c59cc25132a0f55bb1aa9437142795f1dbf6c3dbefbb59a
+
+[2/4] Deriving XRPL address...
+  XRPL address:     rDaT8Th5NHYLNy39yGJcbceeEbm6P1BdFU
+  Compressed pubkey: 033C1933E7C023C6B99E87C41ADFC41CB159EC21C7C15D1540FD1F4CAE95FA6748
+
+[3/4] Fetching ECDH identity pubkey...
+  ECDH pubkey:      02117B8826DE2C2C6AF7F7A15A9B4D9B09626229B1AE848CF3245EA64E7D621EBF
+
+[4/4] Publishing AccountSet.Domain on XRPL...
+  faucet OK (200 OK)
+[2m2026-05-11T13:03:50.035241Z[0m [32m INFO[0m [2mperp_dex_orchestrator::cli_tools[0m[2m:[0m submitting tx_blob [3mblob_len[0m[2m=[0m229
+  TX hash: 6B282C793A876FD93D34ECAE6BFD3C7B237F048B3E67A497DEC9A952CE9A2821
+
+Signer entry:
+{
+  "name": "node-1",
+  "enclave_url": "https://localhost:9088/v1",
+  "address": "0xd4742f6508f44bc9c03eba79bbabb2b4d2d820bd",
+  "session_key": "0xd86d113450ffb7831c59cc25132a0f55bb1aa9437142795f1dbf6c3dbefbb59a",
+  "compressed_pubkey": "033C1933E7C023C6B99E87C41ADFC41CB159EC21C7C15D1540FD1F4CAE95FA6748",
+  "xrpl_address": "rDaT8Th5NHYLNy39yGJcbceeEbm6P1BdFU",
+  "ecdh_pubkey": "02117B8826DE2C2C6AF7F7A15A9B4D9B09626229B1AE848CF3245EA64E7D621EBF"
+}
+
+Written to /tmp/node-1.entry.json
+
+Next steps:
+  1. Add this entry to signers_config.json
+  3. Verify on XRPL explorer: https://testnet.xrpl.org/accounts/rDaT8Th5NHYLNy39yGJcbceeEbm6P1BdFU
+```
+
+### A.5.2 node-bootstrap node-2 — 2026-05-11T13:04:01Z
+
+```
+Node Bootstrap
+==============
+Enclave: https://localhost:9088/v1
+Name:    node-2
+XRPL:    https://s.altnet.rippletest.net:51234 (publishing Domain)
+Faucet:  https://faucet.altnet.rippletest.net/accounts
+
+[1/4] Generating keypair in enclave...
+  Ethereum address: 0x1b397979ce9f296ad19ab05746d12e054de7a05e
+  Session key:      0xb839f3c4c781fe18b219bc9b5baac97185ccaa8c88b4604e905b336038412fef
+
+[2/4] Deriving XRPL address...
+  XRPL address:     raBnTEWd9QKvmox2NgbcpK7YYWtStJwmDh
+  Compressed pubkey: 034C95D2150F6F71DB1C0E93E0072279A06D9B72594950436A5DCEEFF0BC0A8053
+
+[3/4] Fetching ECDH identity pubkey...
+  ECDH pubkey:      02FF17E37DE8EEB42984DC2C272311E00EAB381A591957934365336F2D09C625F2
+
+[4/4] Publishing AccountSet.Domain on XRPL...
+  faucet OK (200 OK)
+[2m2026-05-11T13:04:12.558742Z[0m [32m INFO[0m [2mperp_dex_orchestrator::cli_tools[0m[2m:[0m submitting tx_blob [3mblob_len[0m[2m=[0m228
+  TX hash: A2B5472CB7EBA28AFA66F1504F91466E133616C8C3486ADB6D40190B0C0EB0B4
+
+Signer entry:
+{
+  "name": "node-2",
+  "enclave_url": "https://localhost:9088/v1",
+  "address": "0x1b397979ce9f296ad19ab05746d12e054de7a05e",
+  "session_key": "0xb839f3c4c781fe18b219bc9b5baac97185ccaa8c88b4604e905b336038412fef",
+  "compressed_pubkey": "034C95D2150F6F71DB1C0E93E0072279A06D9B72594950436A5DCEEFF0BC0A8053",
+  "xrpl_address": "raBnTEWd9QKvmox2NgbcpK7YYWtStJwmDh",
+  "ecdh_pubkey": "02FF17E37DE8EEB42984DC2C272311E00EAB381A591957934365336F2D09C625F2"
+}
+
+Written to /tmp/node-2.entry.json
+
+Next steps:
+  1. Add this entry to signers_config.json
+  3. Verify on XRPL explorer: https://testnet.xrpl.org/accounts/raBnTEWd9QKvmox2NgbcpK7YYWtStJwmDh
+```
+
+### A.5.3 node-bootstrap node-3 — 2026-05-11T13:04:27Z
+
+```
+Node Bootstrap
+==============
+Enclave: https://localhost:9088/v1
+Name:    node-3
+XRPL:    https://s.altnet.rippletest.net:51234 (publishing Domain)
+Faucet:  https://faucet.altnet.rippletest.net/accounts
+
+[1/4] Generating keypair in enclave...
+  Ethereum address: 0x68e9acb5f05be990b9ea826ee3478519781d9015
+  Session key:      0x55e10ef15ead2a6c98d139382d8f52b91bbd199765c9472f8fb4f90ad396d809
+
+[2/4] Deriving XRPL address...
+  XRPL address:     rp9CbSy9ux8KxiWpfRyZZELKE3w9JuKWFN
+  Compressed pubkey: 03341312A809A1C24B8D6AFA6C10D1B003A3E52ABCBA4DB8C2AAE5E1D366BED9DD
+
+[3/4] Fetching ECDH identity pubkey...
+  ECDH pubkey:      029C90314C52AE77F39A933D28D6DC649BE40340788A0F713183802FD7D9244E94
+
+[4/4] Publishing AccountSet.Domain on XRPL...
+  faucet OK (200 OK)
+[2m2026-05-11T13:04:38.237149Z[0m [32m INFO[0m [2mperp_dex_orchestrator::cli_tools[0m[2m:[0m submitting tx_blob [3mblob_len[0m[2m=[0m228
+  TX hash: 52B4AC1FC9F03D01E580D516D1DF466A363885B3AC8AFF37FE86DAD29BE44F59
+
+Signer entry:
+{
+  "name": "node-3",
+  "enclave_url": "https://localhost:9088/v1",
+  "address": "0x68e9acb5f05be990b9ea826ee3478519781d9015",
+  "session_key": "0x55e10ef15ead2a6c98d139382d8f52b91bbd199765c9472f8fb4f90ad396d809",
+  "compressed_pubkey": "03341312A809A1C24B8D6AFA6C10D1B003A3E52ABCBA4DB8C2AAE5E1D366BED9DD",
+  "xrpl_address": "rp9CbSy9ux8KxiWpfRyZZELKE3w9JuKWFN",
+  "ecdh_pubkey": "029C90314C52AE77F39A933D28D6DC649BE40340788A0F713183802FD7D9244E94"
+}
+
+Written to /tmp/node-3.entry.json
+
+Next steps:
+  1. Add this entry to signers_config.json
+  3. Verify on XRPL explorer: https://testnet.xrpl.org/accounts/rp9CbSy9ux8KxiWpfRyZZELKE3w9JuKWFN
+```
+
+### A.5.4 escrow-init fresh testnet escrow — 2026-05-11T13:14:41Z
+
+```
+escrow-testnet.json.prev-20260426-162704
+escrow-testnet.json.prev-20260426-223827
+escrow-testnet.json.prev-20260426-231950
+escrow-testnet.json.prev-20260428-154032
+escrow-testnet.json.prev-prg3-20260511-131441
+=== escrow-init ===
+Escrow Init
+===========
+XRPL:    https://s.altnet.rippletest.net:51234
+Faucet:  https://faucet.altnet.rippletest.net/accounts
+Quorum:  2-of-3
+  node-1 → rDaT8Th5NHYLNy39yGJcbceeEbm6P1BdFU
+  node-2 → raBnTEWd9QKvmox2NgbcpK7YYWtStJwmDh
+  node-3 → rp9CbSy9ux8KxiWpfRyZZELKE3w9JuKWFN
+
+[1/5] Generating fresh secp256k1 escrow keypair...
+  Address: rhKdcEZX3sL1FMSydxZZpto7NnNDBr4bXY
+  Seed:    (not echoed — will be persisted to seed-file in step 5)
+
+[2/5] Faucet-funding rhKdcEZX3sL1FMSydxZZpto7NnNDBr4bXY...
+  faucet OK (200 OK)
+
+[3/5] Reading account state...
+  Sequence: 17283322
+
+[4/5] Submitting SignerListSet (2-of-3)...
+[2m2026-05-11T13:14:52.408864Z[0m [32m INFO[0m [2mperp_dex_orchestrator::cli_tools[0m[2m:[0m submitting tx_blob [3mblob_len[0m[2m=[0m236
+  Status: tesSUCCESS
+  TX:     ED7BCFEA7079BF1988E130D55560F64C7732CEF604232A40B0F31962B1BE733E
+
+[5/5] Submitting AccountSet asfDisableMaster...
+[2m2026-05-11T13:14:57.116239Z[0m [32m INFO[0m [2mperp_dex_orchestrator::cli_tools[0m[2m:[0m submitting tx_blob [3mblob_len[0m[2m=[0m152
+  Status: tesSUCCESS
+  TX:     2440FD328EC1987A97AACE25D9C28D25AB76018742232F54FE92ECFAA4F818D1
+
+============================================================
+ESCROW_ADDRESS=rhKdcEZX3sL1FMSydxZZpto7NnNDBr4bXY
+SEED_FILE=/home/andrey/.secrets/perp-dex-xrpl/escrow-testnet.json
+Explorer: https://testnet.xrpl.org/accounts/rhKdcEZX3sL1FMSydxZZpto7NnNDBr4bXY
+
+Master key disabled. All future escrow changes require
+2-of-3 multisig signed by current operators.
+```
+
+### A.5.5 node-config-apply (assemble signers_config) — 2026-05-11T13:15:11Z
+
+```
+=== node-1 ip=20.71.184.176 ===
+  rDaT8Th5NHYLNy39yGJcbceeEbm6P1BdFU
+    ecdh_pubkey: 02117B8826DE2C2C6AF7F7A15A9B4D9B09626229B1AE848CF3245EA64E7D621EBF
+
+[4/4] Writing /home/azureuser/perp/signers_config.json
+
+✓ Wrote signers_config.json with 3 roster entries
+
+Next: restart the local orchestrator service so it picks up
+the new config. (Operator action — `sudo systemctl restart
+perp-dex-orchestrator` on this node only.)
+=== node-2 ip=20.224.243.60 ===
+  rDaT8Th5NHYLNy39yGJcbceeEbm6P1BdFU
+    ecdh_pubkey: 02117B8826DE2C2C6AF7F7A15A9B4D9B09626229B1AE848CF3245EA64E7D621EBF
+
+[4/4] Writing /home/azureuser/perp/signers_config.json
+
+✓ Wrote signers_config.json with 3 roster entries
+
+Next: restart the local orchestrator service so it picks up
+the new config. (Operator action — `sudo systemctl restart
+perp-dex-orchestrator` on this node only.)
+=== node-3 ip=52.236.130.102 ===
+  rDaT8Th5NHYLNy39yGJcbceeEbm6P1BdFU
+    ecdh_pubkey: 02117B8826DE2C2C6AF7F7A15A9B4D9B09626229B1AE848CF3245EA64E7D621EBF
+
+[4/4] Writing /home/azureuser/perp/signers_config.json
+
+✓ Wrote signers_config.json with 3 roster entries
+
+Next: restart the local orchestrator service so it picks up
+the new config. (Operator action — `sudo systemctl restart
+perp-dex-orchestrator` on this node only.)
+```
+
+### A.5.6 update start_orchestrator.sh with new escrow address — 2026-05-11T13:18:06Z
+
+```
+=== 20.71.184.176 ===
+exec ./perp-dex-orchestrator   --enclave-url https://localhost:9088/v1   --api-listen 0.0.0.0:3000   --priority 0   --escrow-address rhKdcEZX3sL1FMSydxZZpto7NnNDBr4bXY   --xrpl-url https://s.altnet.rippletest.net:51234   --p2p-listen /ip4/0.0.0.0/tcp/4001   --p2p-peers /ip4/20.224.243.60/tcp/4001,/ip4/52.236.130.102/tcp/4001   --database-url postgres://perp:perp_dex_2026@localhost/perp_dex   --shards-config /home/azureuser/perp/shards.toml \
+=== 20.224.243.60 ===
+exec ./perp-dex-orchestrator   --enclave-url https://localhost:9088/v1   --api-listen 0.0.0.0:3000   --priority 1   --escrow-address rhKdcEZX3sL1FMSydxZZpto7NnNDBr4bXY   --xrpl-url https://s.altnet.rippletest.net:51234   --p2p-listen /ip4/0.0.0.0/tcp/4001   --p2p-peers /ip4/20.71.184.176/tcp/4001,/ip4/52.236.130.102/tcp/4001   --database-url postgres://perp:perp_dex_2026@localhost/perp_dex   --shards-config /home/azureuser/perp/shards.toml \
+=== 52.236.130.102 ===
+exec ./perp-dex-orchestrator   --enclave-url https://localhost:9088/v1   --api-listen 0.0.0.0:3000   --priority 2   --escrow-address rhKdcEZX3sL1FMSydxZZpto7NnNDBr4bXY   --xrpl-url https://s.altnet.rippletest.net:51234   --p2p-listen /ip4/0.0.0.0/tcp/4001   --p2p-peers /ip4/20.71.184.176/tcp/4001,/ip4/20.224.243.60/tcp/4001   --database-url postgres://perp:perp_dex_2026@localhost/perp_dex   --shards-config /home/azureuser/perp/shards.toml \
+```
+
+### A.5.7 start orchestrators — 2026-05-11T13:29:11Z
+
+```
+=== 20.71.184.176 ===
+active
+LISTEN 0      1024         0.0.0.0:4001      0.0.0.0:*          
+May 11 13:29:13 sgx-node-1 start_orchestrator.sh[528854]: 2026-05-11T13:29:13.193014Z  INFO perp_dex_orchestrator::p2p: listening on addr=/ip4/10.0.0.6/tcp/4001
+May 11 13:29:13 sgx-node-1 start_orchestrator.sh[528854]: 2026-05-11T13:29:13.709871Z  INFO perp_dex_orchestrator: queued peer-quote announce shard_id=0 group_id=68c204457fe8d205d50bcdbe25e581ecca1fc53901ccdbe0f493b4f154de7ee7
+May 11 13:29:13 sgx-node-1 start_orchestrator.sh[528854]: 2026-05-11T13:29:13.710016Z  WARN perp_dex_orchestrator::p2p: peer-quote publish failed: InsufficientPeers
+May 11 13:29:14 sgx-node-1 start_orchestrator.sh[528854]: 2026-05-11T13:29:14.139523Z  INFO perp_dex_orchestrator::xrpl_monitor: deposit detected sender=rJjHYTCPpNA3qAM8ZpCDtip3a8xg7B8PFo amount=100.00000000 tx_hash="84209219545be7d6" destination_tag=None
+May 11 13:29:14 sgx-node-1 start_orchestrator.sh[528854]: 2026-05-11T13:29:14.145129Z  WARN perp_dex_orchestrator::p2p: events publish failed: InsufficientPeers
+=== 20.224.243.60 ===
+active
+LISTEN 0      1024         0.0.0.0:4001      0.0.0.0:*          
+May 11 13:29:16 sgx-node-2 start_orchestrator.sh[1567440]: 2026-05-11T13:29:16.961177Z  WARN libp2p_gossipsub::behaviour: GRAFT: ignoring request from direct peer peer=12D3KooWFWoBBUJrQBX1aPCKbWBXgkj2SgZjYPy48i2rZxAGc5sY
+May 11 13:29:16 sgx-node-2 start_orchestrator.sh[1567440]: 2026-05-11T13:29:16.961185Z  WARN libp2p_gossipsub::behaviour: GRAFT: ignoring request from direct peer peer=12D3KooWFWoBBUJrQBX1aPCKbWBXgkj2SgZjYPy48i2rZxAGc5sY
+May 11 13:29:16 sgx-node-2 start_orchestrator.sh[1567440]: 2026-05-11T13:29:16.961192Z  WARN libp2p_gossipsub::behaviour: GRAFT: ignoring request from direct peer peer=12D3KooWFWoBBUJrQBX1aPCKbWBXgkj2SgZjYPy48i2rZxAGc5sY
+May 11 13:29:17 sgx-node-2 start_orchestrator.sh[1567440]: 2026-05-11T13:29:17.302560Z  INFO perp_dex_orchestrator: queued peer-quote announce shard_id=0 group_id=68c204457fe8d205d50bcdbe25e581ecca1fc53901ccdbe0f493b4f154de7ee7
+May 11 13:29:17 sgx-node-2 start_orchestrator.sh[1567440]: 2026-05-11T13:29:17.302725Z  INFO perp_dex_orchestrator::p2p: published peer-quote announcement peer_pubkey=02ff17e37de8eeb42984dc2c272311e00eab381a591957934365336f2d09c625f2 shard_id=0
+=== 52.236.130.102 ===
+active
+LISTEN 0      1024         0.0.0.0:4001      0.0.0.0:*          
+May 11 13:29:20 sgx-node-3 start_orchestrator.sh[1488528]: 2026-05-11T13:29:20.566461Z  WARN libp2p_gossipsub::behaviour: GRAFT: ignoring request from direct peer peer=12D3KooWFWoBBUJrQBX1aPCKbWBXgkj2SgZjYPy48i2rZxAGc5sY
+May 11 13:29:20 sgx-node-3 start_orchestrator.sh[1488528]: 2026-05-11T13:29:20.566468Z  WARN libp2p_gossipsub::behaviour: GRAFT: ignoring request from direct peer peer=12D3KooWFWoBBUJrQBX1aPCKbWBXgkj2SgZjYPy48i2rZxAGc5sY
+May 11 13:29:20 sgx-node-3 start_orchestrator.sh[1488528]: 2026-05-11T13:29:20.566475Z  WARN libp2p_gossipsub::behaviour: GRAFT: ignoring request from direct peer peer=12D3KooWFWoBBUJrQBX1aPCKbWBXgkj2SgZjYPy48i2rZxAGc5sY
+May 11 13:29:20 sgx-node-3 start_orchestrator.sh[1488528]: 2026-05-11T13:29:20.566481Z  WARN libp2p_gossipsub::behaviour: GRAFT: ignoring request from direct peer peer=12D3KooWFWoBBUJrQBX1aPCKbWBXgkj2SgZjYPy48i2rZxAGc5sY
+May 11 13:29:20 sgx-node-3 start_orchestrator.sh[1488528]: 2026-05-11T13:29:20.566488Z  WARN libp2p_gossipsub::behaviour: GRAFT: ignoring request from direct peer peer=12D3KooWFWoBBUJrQBX1aPCKbWBXgkj2SgZjYPy48i2rZxAGc5sY
+```
+
+### A.5.8 trigger DKG ceremony (leader=node-1, threshold=2) — 2026-05-11T13:30:04Z
+
+```
+{"ceremony_id":"dd2ec8240a0946e9bf60f42275798db5","status":"timeout","group_pubkey":null,"message":"ceremony stalled past 180s"}
+```
+
+### A.5.8-diag DKG logs all nodes — 
+
+```
+=== 20.71.184.176 ===
+=== 20.224.243.60 ===
+=== 52.236.130.102 ===
+```
+
+### A.5.8-rca Root cause analysis — `peer_attest_cache` key mismatch — 2026-05-11T~14:30Z
+
+Two consecutive `/admin/dkg/start` invocations both stalled at `r1=3 r15=0 r2=0 fin=0`. Round1 completes (`Round1Done observed pid=1 count=2`, `pid=2 count=3`), leader publishes `Round15Start: exporting v2 envelopes to peers my_pid=0`, then nothing — no `queued DKG share envelope`, no `Round15Done`, no error log on leader.
+
+Manual probe of the enclave endpoint reveals the failure:
+
+```
+$ curl -k -X POST https://localhost:9088/v1/pool/dkg/round1-export-share-v2 \
+    -d '{"target_participant_id":1,"peer_pubkey":"02FF17E37D...","shard_id":0,
+         "group_id":"0000000000...0000","now_ts":<now>}'
+Error 403: Forbidden
+{"message":"DKG v2 share export refused — peer not attested or round1 not done","status":"error"}
+```
+
+Round1 IS done. So it's "peer not attested". But periodic verifier logs show all peers attested:
+- `verified peer quote peer_pubkey=02ff17e3... mrenclave=e3757b56...`
+- `verified peer quote peer_pubkey=029c9031... mrenclave=e3757b56...`
+
+**Root cause:** `peer_attest_cache` is keyed by `(shard_id, group_id, peer_pk)`. The periodic peer-quote announcer publishes with `group.group_id_hex` from `shards.toml` — currently `68c204457fe8d205...` (stale carryover from prior 2026-04-28 ceremony group_pubkey). The DKG Round1.5 exporter looks up with `group_id = SENTINEL_GROUP_ID_ZEROS` (32 zero bytes — DKG bootstrap convention). Different cache keys → MISS → 403.
+
+The leader's error is silently swallowed at `dkg_coordinate.rs:552 — let _ = publish_and_self_handle(...)`. Because `handle_message` runs locally BEFORE publishing to gossipsub, and it errored, the `Round15Start` message was never broadcast to followers — which is why node-2 / node-3 logs show no Round1.5 activity at all.
+
+**Documented procedure for the SENTINEL cache seeding** is in `docs/testnet-enclave-bump-procedure.en.md` §319 — "Round 0 — pre-DKG attestation round (group_id = zeros)". It prescribes 6 pairwise `verify-peer-quote` calls with `group_id=zeros` to populate the SENTINEL-keyed cache entries before any DKG triggering. This step was missed because the libp2p-driven `/admin/dkg/start` path doesn't auto-seed.
+
+**Architectural follow-up (queued, NOT in PRG-3 scope):** either (a) peer-quote announcer should fall back to SENTINEL when `frost_group_id` is unset, or (b) `/admin/dkg/start` should seed the SENTINEL cache itself before publishing Round1Start. Both shipped solutions are valid; (a) matches the doc design intent ("Pre-DKG leave it unset — the announcer stays dormant" in shards.toml comment), (b) is the more robust automation.
+
+### A.5.8-fix Manual Round 0 attestation — 2026-05-11T~14:35Z
+
+Ran the documented Round-0 procedure (collect pubkey+rd+quote per node × 6 pairwise verifies with `group_id=zeros`):
+
+```
+=== ALL 6 VERIFICATIONS PASSED ===
+pid=0 verifies pid=1 → HTTP 200
+pid=0 verifies pid=2 → HTTP 200
+pid=1 verifies pid=0 → HTTP 200
+pid=1 verifies pid=2 → HTTP 200
+pid=2 verifies pid=0 → HTTP 200
+pid=2 verifies pid=1 → HTTP 200
+```
+
+SENTINEL cache entries seeded; 5-min TTL applies.
+
+### A.5.8-retry trigger DKG ceremony — 2026-05-11T15:29:29Z
+
+```
+$ curl -X POST http://127.0.0.1:9100/admin/dkg/start -d '{"threshold": 2}'
+{"ceremony_id":"bdfd1d0af617491c885475e2f477caa8",
+ "status":"success",
+ "group_pubkey":"12e76a4468558a18a93ff5a02e0752a89ef93a92ef021a367358a392abe0cb38",
+ "message":null}
+```
+
+Wall-clock: ~6s (Round1 → Round1.5 → Round2 → Finalize).
+
+Cross-node verification (all 3 nodes `FinalizeDone observed` byte-identical group_pubkey):
+
+```
+node-1: Finalize done my_pid=0 group_pubkey=12e76a4468558a18a93ff5a02e0752a89ef93a92ef021a367358a392abe0cb38
+node-2: Finalize done my_pid=1 group_pubkey=12e76a4468558a18a93ff5a02e0752a89ef93a92ef021a367358a392abe0cb38
+node-3: Finalize done my_pid=2 group_pubkey=12e76a4468558a18a93ff5a02e0752a89ef93a92ef021a367358a392abe0cb38
+```
+
+Phase A.5 DKG step complete. New FROST group sealed inside enclave on all 3 nodes.
+
+**Phase A.5 status:** re-DKG ✓. SignerList re-seal (step A.5.9) pending — no existing CLI tool wrapping `/v1/admin/signerlist/seal-initial`; manual lift requires XRPL tx fetch + AccountID hex decode + 6-field payload per node. Evaluating: seal-initial is orthogonal to `/admin/migrate-state` (Phase B), so PRG-3 can proceed to Phase B without it. seal-initial blocker is for FROST signing path (`signerlist seal-update` requires sealed-initial first), not Path A migration. Decision pending Andrey.
