@@ -15,6 +15,10 @@ mod http_helpers;
 mod node_deploy;
 mod orderbook;
 mod p2p;
+mod path_a_ceremony;
+mod path_a_delegation;
+mod path_a_http_client;
+mod path_a_migrate_admin;
 mod path_a_redkg;
 mod perp_client;
 mod pool_path_a_client;
@@ -252,6 +256,56 @@ enum Command {
         faucet_url: Option<String>,
     },
 
+    /// Phase 2.2-D — re-emit the master-installed SignerListSet via
+    /// XRPL multisig so the enclave's `seal-initial` cosigner check
+    /// (REQ-7.5 §3.4 step 6(e)) passes. Bridges the bootstrap-forge
+    /// symmetry gap: XRPL requires master for the FIRST SignerListSet,
+    /// but the enclave's seal-initial requires multisig-cosigned
+    /// envelope. Drives via the orchestrator daemon's
+    /// `/admin/signerlist-bootstrap-rotate` admin route, so the daemon
+    /// must be running with `--signerlist-admin-listen`. After this
+    /// lands the leader's enclave is bootstrapped; peers run
+    /// `signerlist-seal-initial --seed-file <updated>` against the
+    /// same tx_hash.
+    SignerlistBootstrapRotate {
+        /// Local orchestrator's signerlist-admin URL.
+        #[arg(long, default_value = "http://127.0.0.1:9101")]
+        admin_url: String,
+        /// If true, build the tx and log it but do NOT submit / seal.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Escrow seed file to update on success with the new
+        /// `signer_list_set_tx_hash`. Default
+        /// `~/.secrets/perp-dex-xrpl/escrow-testnet.json`.
+        #[arg(long)]
+        seed_file: Option<PathBuf>,
+        /// Don't update the seed file's `signer_list_set_tx_hash` on
+        /// success (the on-chain tx still landed; updating the seed
+        /// is a separate convenience).
+        #[arg(long, default_value_t = false)]
+        no_update_seed_file: bool,
+    },
+
+    /// Phase 2.2-B — seal the on-chain SignerList as the enclave's
+    /// version=1 baseline. Each operator runs once after the founder
+    /// publishes escrow + SignerListSet tx hash. Reads the seed file,
+    /// fetches the signed tx blob + ledger index via XRPL `tx`
+    /// (binary=true), decodes addresses, posts to enclave's
+    /// `/v1/admin/signerlist/seal-initial`.
+    SignerlistSealInitial {
+        /// XRPL JSON-RPC URL.
+        #[arg(long, default_value = "https://s.altnet.rippletest.net:51234")]
+        xrpl_url: String,
+        /// Escrow seed file (produced by `escrow-init`). Default
+        /// `~/.secrets/perp-dex-xrpl/escrow-testnet.json`. Mainnet
+        /// operators pass an explicit path.
+        #[arg(long)]
+        seed_file: Option<PathBuf>,
+        /// Enclave REST API base URL (loopback only).
+        #[arg(long, default_value = "https://localhost:9088/v1")]
+        enclave_url: String,
+    },
+
     /// Phase 2.1c-E — node-local deploy. Each operator runs this on
     /// their own VM after `cargo build` + Docker `enclave.signed.so`
     /// production. Stops local services, backs up prior binaries with
@@ -267,6 +321,15 @@ enum Command {
         /// enclave.signed.so + perp-dex-server + (optional) build-manifest.txt.
         #[arg(long)]
         enclave_dist: PathBuf,
+        /// REQ-8 Path A: deploy NEW enclave alongside the still-running
+        /// OLD on port 9089 + /home/azureuser/perp-next/. Refuses if
+        /// OLD service is not active, NEW unit file is missing,
+        /// /home/azureuser/perp-next/ is not empty, or port 9089 is
+        /// occupied. After success, operator drives the migration
+        /// ceremony via POST /admin/migrate-state on OLD's orchestrator
+        /// (commit 11).
+        #[arg(long, default_value_t = false)]
+        side_by_side: bool,
     },
 }
 
@@ -389,6 +452,16 @@ struct RunArgs {
     /// relay that already serves withdrawals.
     #[arg(long)]
     signerlist_admin_listen: Option<String>,
+
+    /// REQ-8 PRG-2 part 4/4 — loopback admin listener for the Path A
+    /// migration ceremony driver. Accepts `POST /admin/migrate-state`.
+    /// Only the operator initiating the migration needs this on; the
+    /// other operators participate via libp2p signing-relay (same
+    /// channel used by withdrawals + signerlist-update). Off by
+    /// default; gated by --signers-config (delegation collection
+    /// requires the local signer's pool key).
+    #[arg(long)]
+    migrate_admin_listen: Option<String>,
 }
 
 // ── Funding rate ────────────────────────────────────────────────
@@ -592,9 +665,44 @@ async fn main() -> Result<()> {
             )
             .await;
         }
+        Some(Command::SignerlistSealInitial {
+            xrpl_url,
+            seed_file,
+            enclave_url,
+        }) => {
+            let default_seed_path = PathBuf::from(format!(
+                "{}/.secrets/perp-dex-xrpl/escrow-testnet.json",
+                std::env::var("HOME").context("HOME not set")?
+            ));
+            let seed_path = seed_file.unwrap_or(default_seed_path);
+            return cli_tools::signerlist_seal_initial(&xrpl_url, &seed_path, &enclave_url).await;
+        }
+        Some(Command::SignerlistBootstrapRotate {
+            admin_url,
+            dry_run,
+            seed_file,
+            no_update_seed_file,
+        }) => {
+            let default_seed_path = PathBuf::from(format!(
+                "{}/.secrets/perp-dex-xrpl/escrow-testnet.json",
+                std::env::var("HOME").context("HOME not set")?
+            ));
+            let seed_path = seed_file.unwrap_or(default_seed_path);
+            return cli_tools::signerlist_bootstrap_rotate(
+                &admin_url,
+                dry_run,
+                if no_update_seed_file {
+                    None
+                } else {
+                    Some(&seed_path)
+                },
+            )
+            .await;
+        }
         Some(Command::NodeDeploy {
             orchestrator,
             enclave_dist,
+            side_by_side,
         }) => {
             let manifest = enclave_dist.join("build-manifest.txt");
             let artefacts = node_deploy::LocalArtefactSet {
@@ -603,10 +711,25 @@ async fn main() -> Result<()> {
                 perp_dex_server: enclave_dist.join("perp-dex-server"),
                 build_manifest: manifest.exists().then_some(manifest),
             };
-            let result = node_deploy::deploy_local(&artefacts).await?;
-            println!("Node deploy complete:");
-            println!("  mrenclave:     {}", result.mrenclave);
-            println!("  backup_suffix: {}", result.backup_suffix);
+            if side_by_side {
+                let result = node_deploy::deploy_local_side_by_side(&artefacts).await?;
+                println!("Side-by-side deploy complete:");
+                println!("  mrenclave_new: {}", result.mrenclave_new);
+                println!("  deploy_dir:    {}", result.deploy_dir.display());
+                println!("  unit:          {}", result.unit);
+                println!("  port:          {}", result.port);
+                println!();
+                println!("OLD enclave (port 9088) is UNTOUCHED. Next step:");
+                println!(
+                    "  Run `POST /admin/migrate-state` on OLD orchestrator (REQ-8 commit 11) \
+                          to drive the migration ceremony."
+                );
+            } else {
+                let result = node_deploy::deploy_local(&artefacts).await?;
+                println!("Node deploy complete:");
+                println!("  mrenclave:     {}", result.mrenclave);
+                println!("  backup_suffix: {}", result.backup_suffix);
+            }
             return Ok(());
         }
         Some(Command::OperatorAdd {
@@ -737,6 +860,24 @@ async fn main() -> Result<()> {
 
     // Create P2P signing relay channel
     let (signing_tx, signing_rx) = tokio::sync::mpsc::channel::<p2p::SigningRelay>(32);
+
+    // REQ-8 PRG-2 part 4/4: Path A migration delegation-collection
+    // channel. Constructed lazily — only allocated when signers_config
+    // is present (delegation collection requires a local pool-account
+    // signer). The Option<sender> is owned at this scope so the
+    // admin listener spawn can consume it later.
+    let path_a_delegation_tx: Option<tokio::sync::mpsc::Sender<p2p::PathADelegationRelay>>;
+    let path_a_delegation_rx_holder: Option<
+        tokio::sync::mpsc::Receiver<p2p::PathADelegationRelay>,
+    >;
+    if signers_config.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<p2p::PathADelegationRelay>(8);
+        path_a_delegation_tx = Some(tx);
+        path_a_delegation_rx_holder = Some(rx);
+    } else {
+        path_a_delegation_tx = None;
+        path_a_delegation_rx_holder = None;
+    }
 
     let peer_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
@@ -1088,6 +1229,53 @@ async fn main() -> Result<()> {
         }
     }
 
+    // REQ-8 PRG-2 part 4/4 — Path A migration ceremony admin listener.
+    // Spawned when --migrate-admin-listen + signers_config are both
+    // provided. signers_config gates because delegation collection
+    // needs a local pool-account signer; without one this node can't
+    // contribute to its own M-of-N quorum.
+    if let Some(addr) = cli.migrate_admin_listen.clone() {
+        match path_a_delegation_tx.clone() {
+            Some(delegation_tx) => {
+                // path_a_http_client prepends "/v1/path-a/..." to the
+                // base URL. cli.enclave_url already ends in "/v1"
+                // (e.g. "https://localhost:9088/v1") for the other
+                // pool/admin routes, so strip "/v1" + trailing slash
+                // here to avoid building "/v1/v1/path-a/..." 404s.
+                let strip_v1 = |s: &str| -> String {
+                    s.trim_end_matches('/')
+                        .trim_end_matches("/v1")
+                        .trim_end_matches('/')
+                        .to_string()
+                };
+                let admin_state = Arc::new(path_a_migrate_admin::AdminState {
+                    path_a_delegation_tx: delegation_tx,
+                    default_old_api_base: strip_v1(&cli.enclave_url),
+                    default_new_api_base: "https://localhost:9089".into(),
+                });
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        path_a_migrate_admin::spawn_admin_listener(addr, admin_state).await
+                    {
+                        error!("migrate-state admin listener exited: {e}");
+                    }
+                });
+                info!("migrate-state admin listener configured");
+            }
+            None => {
+                warn!(
+                    "--migrate-admin-listen ignored: requires --signers-config (Path A delegation \
+                     needs a local pool-account signer for M-of-N quorum participation)"
+                );
+            }
+        }
+    }
+    // Drop the unused delegation sender if no admin listener spawned.
+    // The receive end was already wired into p2p.rs (when signers_config
+    // was set), but without an admin endpoint nobody pushes onto the
+    // sender — silent backpressure on a zero-traffic channel is fine.
+    drop(path_a_delegation_tx);
+
     // Keep publish senders alive — DKG coordinator + future drivers
     // hold their own clones; dropping the originals here would close
     // the outbound gossipsub arms in p2p.rs.
@@ -1153,6 +1341,13 @@ async fn main() -> Result<()> {
     // Wire P2P signing relay
     if let Some(ref cfg) = signers_config {
         p2p_node.set_signing_channel(signing_rx);
+        // REQ-8 PRG-2 part 4/4: wire the Path A migration ceremony
+        // driver's delegation-collection channel into the same p2p
+        // run-loop. The /admin/migrate-state endpoint owns the
+        // sender (path_a_delegation_tx); receiver lives here.
+        if let Some(rx) = path_a_delegation_rx_holder {
+            p2p_node.set_path_a_delegation_channel(rx);
+        }
         if let Some(ref local) = cfg.local_signer {
             // X-C1 condition C2 (perp RESP-5): enforce loopback on the
             // enclave URL the signing relay will hit. signers_config is

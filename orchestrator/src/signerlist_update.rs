@@ -597,9 +597,269 @@ pub async fn handle_signerlist_update(
     }
 }
 
+// ── Phase 2.2-D bootstrap-rotate ─────────────────────────────────
+//
+// Bridges the asymmetry between the chain's initial-SignerListSet
+// path (master-signed; XRPL requires it for a fresh account) and
+// REQ-7.5 §3.4 step 6(e) (enclave seal-initial requires multisig-
+// cosigned envelope). After `escrow-init` lands the master-signed
+// SignerListSet and disables master, an operator runs this once on
+// any participating node: it re-emits the IDENTICAL SignerListSet
+// via XRPL multisig (which is now possible — current SignerList
+// authorizes the operators), then POSTs to local enclave's
+// `/admin/signerlist/seal-initial` with the multisig-cosigned blob.
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SignerlistBootstrapRotateRequest {
+    /// Dry-run: build + log the tx but do NOT submit / seal. Returns
+    /// the unsigned tx for offline inspection.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SignerlistBootstrapRotateResponse {
+    pub status: String,
+    pub signer_list: Vec<String>,
+    pub quorum: u32,
+    pub xrpl_tx_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsigned_tx: Option<serde_json::Value>,
+    pub message: String,
+}
+
+async fn drive_bootstrap_rotate(
+    state: &AdminState,
+    req: SignerlistBootstrapRotateRequest,
+) -> Result<SignerlistBootstrapRotateResponse> {
+    // 1. Read current SignerList from XRPL (master-installed at
+    //    escrow-init time). This IS the target — we re-emit the
+    //    identical SignerEntries + SignerQuorum to produce a
+    //    multisig-cosigned envelope.
+    let (entries, quorum) =
+        fetch_current_signerlist(&state.xrpl_url, &state.escrow_address).await?;
+    info!(
+        size = entries.len(),
+        quorum, "bootstrap-rotate: fetched current on-chain SignerList"
+    );
+
+    // 2. Build unsigned tx (identical to current SignerList).
+    let sequence = fetch_account_sequence(&state.xrpl_url, &state.escrow_address).await?;
+    let tx_json = build_unsigned_tx(&state.escrow_address, sequence, quorum, &entries);
+
+    if req.dry_run {
+        return Ok(SignerlistBootstrapRotateResponse {
+            status: "dry_run".into(),
+            signer_list: entries,
+            quorum,
+            xrpl_tx_hash: None,
+            unsigned_tx: Some(tx_json),
+            message: "dry-run: bootstrap rotation tx constructed but not submitted".into(),
+        });
+    }
+
+    // 3. Collect signatures from ALL current operators (best-effort
+    //    beyond quorum). REQ-7.5 §3.4 step 6(e) requires the
+    //    envelope to contain a signature from THIS node's own pool
+    //    keys for seal-initial to succeed locally; collecting from
+    //    all-N maximizes the chance that every peer can also seal
+    //    against the same envelope. Quorum is the hard floor.
+    let mut collected: Vec<serde_json::Value> = Vec::new();
+    for current_addr in &entries {
+        let Some(signer) = state
+            .signers_config
+            .signers
+            .iter()
+            .find(|s| s.xrpl_address == *current_addr)
+        else {
+            warn!(
+                addr = %current_addr,
+                "bootstrap-rotate: on-chain signer not in local signers_config — skipping"
+            );
+            continue;
+        };
+        let account_id = match xrpl_signer::decode_xrpl_address(&signer.xrpl_address) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(addr = %signer.xrpl_address, error = %e, "decode failed; skipping");
+                continue;
+            }
+        };
+
+        let request_id = format!("slbr-{:016x}", rand::random::<u64>());
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        if state
+            .signing_request_tx
+            .send(SigningRelay {
+                request_id: request_id.clone(),
+                unsigned_tx: tx_json.clone(),
+                signer_account_id_hex: hex::encode(account_id),
+                signer_xrpl_address: signer.xrpl_address.clone(),
+                response_tx: resp_tx,
+            })
+            .await
+            .is_err()
+        {
+            bail!("signing relay channel closed — orchestrator shutting down?");
+        }
+
+        match tokio::time::timeout(PER_SIGNER_TIMEOUT, resp_rx).await {
+            Ok(Ok(SigningMessage::Response {
+                der_signature: Some(der),
+                compressed_pubkey: Some(pk),
+                error: None,
+                ..
+            })) => {
+                info!(
+                    signer = %signer.xrpl_address,
+                    der_len = der.len() / 2,
+                    "bootstrap-rotate: collected signature"
+                );
+                collected.push(serde_json::json!({
+                    "Signer": {
+                        "Account": signer.xrpl_address,
+                        "SigningPubKey": pk,
+                        "TxnSignature": der,
+                    }
+                }));
+            }
+            Ok(Ok(SigningMessage::Response { error: Some(e), .. })) => {
+                warn!(signer = %signer.xrpl_address, error = %e, "remote signer rejected");
+            }
+            Ok(Ok(_)) => warn!(signer = %signer.xrpl_address, "malformed signing response"),
+            Ok(Err(_)) => warn!(signer = %signer.xrpl_address, "signing response channel dropped"),
+            Err(_) => warn!(signer = %signer.xrpl_address, "signing relay timeout"),
+        }
+    }
+
+    if collected.len() < quorum as usize {
+        bail!(
+            "bootstrap-rotate: collected {} of {} required signatures",
+            collected.len(),
+            quorum
+        );
+    }
+
+    // 4. Canonical Signers[] ordering by AccountID bytes.
+    collected.sort_by(|a, b| {
+        let aa = xrpl_signer::decode_xrpl_address(
+            a.pointer("/Signer/Account")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        )
+        .unwrap_or([0xff; 20]);
+        let bb = xrpl_signer::decode_xrpl_address(
+            b.pointer("/Signer/Account")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        )
+        .unwrap_or([0xff; 20]);
+        aa.cmp(&bb)
+    });
+
+    let mut full_tx = tx_json.clone();
+    full_tx["Signers"] = serde_json::Value::Array(collected);
+
+    // 5. Submit.
+    let xrpl_hash = submit_multisigned(&state.xrpl_url, &full_tx).await?;
+    info!(xrpl_hash = %xrpl_hash, "bootstrap-rotate: SignerListSet submitted");
+
+    // 6. Poll for validation + seal-INITIAL on local enclave.
+    let seal_result =
+        seal_signerlist_initial_after_landed(state, &xrpl_hash, &entries, quorum).await;
+    let seal_message = match &seal_result {
+        Ok(()) => "sealed in local enclave at version=1".to_string(),
+        Err(e) => format!(
+            "WARNING: enclave seal-initial failed: {e} — on-chain tx landed but local enclave is still unbootstrapped; rerun the bootstrap rotation or call /v1/admin/signerlist/seal-initial directly"
+        ),
+    };
+
+    Ok(SignerlistBootstrapRotateResponse {
+        status: "success".into(),
+        signer_list: entries,
+        quorum,
+        xrpl_tx_hash: Some(xrpl_hash),
+        unsigned_tx: None,
+        message: format!("bootstrap SignerListSet submitted to XRPL — {seal_message}"),
+    })
+}
+
+async fn seal_signerlist_initial_after_landed(
+    state: &AdminState,
+    xrpl_hash: &str,
+    entries: &[String],
+    quorum: u32,
+) -> Result<()> {
+    let (tx_blob_hex, ledger_index) = poll_validated_tx(&state.xrpl_url, xrpl_hash).await?;
+
+    let signers_json: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|addr| {
+            let acct = xrpl_signer::decode_xrpl_address(addr)
+                .map(hex::encode)
+                .unwrap_or_default();
+            serde_json::json!({"account_id": acct, "weight": 1})
+        })
+        .collect();
+
+    let escrow_acct_hex = xrpl_signer::decode_xrpl_address(&state.escrow_address)
+        .map(hex::encode)
+        .context("invalid escrow_address")?;
+
+    let payload = serde_json::json!({
+        "escrow_account_id":   escrow_acct_hex,
+        "quorum_threshold":    quorum,
+        "ledger_index":        ledger_index,
+        "tx_hash":             xrpl_hash.to_lowercase(),
+        "signed_xrpl_tx_blob": tx_blob_hex,
+        "signers":             signers_json,
+    });
+
+    let url = format!("{}/admin/signerlist/seal-initial", state.enclave_url);
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .context("reqwest client")?;
+    let resp: serde_json::Value = client
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await
+        .context("enclave seal-initial HTTP failed")?
+        .json()
+        .await
+        .context("enclave seal-initial response parse failed")?;
+    if resp["status"].as_str() != Some("ok") {
+        bail!(
+            "enclave seal-initial rejected: code={:?} message={:?}",
+            resp["code"],
+            resp["message"]
+        );
+    }
+    Ok(())
+}
+
+pub async fn handle_signerlist_bootstrap_rotate(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<SignerlistBootstrapRotateRequest>,
+) -> impl IntoResponse {
+    match drive_bootstrap_rotate(&state, req).await {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"status": "error", "message": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 pub fn router(state: Arc<AdminState>) -> Router {
     Router::new()
         .route("/admin/signerlist-update", post(handle_signerlist_update))
+        .route(
+            "/admin/signerlist-bootstrap-rotate",
+            post(handle_signerlist_bootstrap_rotate),
+        )
         .with_state(state)
 }
 

@@ -1768,6 +1768,244 @@ pub async fn cli_balance(api_url: &str, seed: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fetches a previously-submitted XRPL transaction by hash via the
+/// `tx` JSON-RPC method with `binary: true`. Returns the signed
+/// binary blob (as upper-hex) and the ledger index it was validated
+/// in. Bails if the tx is not validated or the response shape is
+/// unexpected.
+async fn fetch_signerlist_set_tx(xrpl_url: &str, tx_hash: &str) -> Result<(String, u64)> {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let body = serde_json::json!({
+        "method": "tx",
+        "params": [{
+            "transaction": tx_hash,
+            "binary": true,
+        }],
+    });
+    let resp: serde_json::Value = http
+        .post(xrpl_url)
+        .json(&body)
+        .send()
+        .await
+        .context("tx request failed")?
+        .json()
+        .await
+        .context("invalid JSON from tx")?;
+    parse_signerlist_set_tx_response(&resp)
+        .with_context(|| format!("failed to extract tx {tx_hash}"))
+}
+
+fn parse_signerlist_set_tx_response(resp: &serde_json::Value) -> Result<(String, u64)> {
+    let result = &resp["result"];
+    if let Some(err) = result["error"].as_str() {
+        anyhow::bail!("tx error: {err}");
+    }
+    if result["validated"].as_bool() != Some(true) {
+        anyhow::bail!("tx not validated");
+    }
+    let blob = result["tx"]
+        .as_str()
+        .context("tx response missing result.tx (binary blob)")?
+        .to_string();
+    let ledger_index = result["ledger_index"]
+        .as_u64()
+        .context("tx response missing result.ledger_index")?;
+    Ok((blob, ledger_index))
+}
+
+/// Phase 2.2-B — `signerlist-seal-initial` subcommand. Each operator
+/// runs this once on their own node after the founder publishes the
+/// escrow + SignerListSet tx hash. Reads the escrow seed file for
+/// the on-chain anchor (escrow address, SignerListSet tx hash,
+/// quorum, signer roster), fetches the signed binary blob and
+/// ledger index from XRPL via `tx` with `binary: true`, decodes
+/// every r-address to a 20-byte AccountID, and POSTs the resulting
+/// payload to `<enclave_url>/admin/signerlist/seal-initial` so the
+/// enclave can seal the SignerList as its version=1 baseline. After
+/// success the enclave persists the sealed entry and subsequent
+/// `signerlist seal-update` calls (Phase 2.2-C) accept proposed
+/// version=2.
+pub async fn signerlist_seal_initial(
+    xrpl_url: &str,
+    seed_file: &Path,
+    enclave_url: &str,
+) -> Result<()> {
+    let content = std::fs::read_to_string(seed_file)
+        .with_context(|| format!("cannot read {}", seed_file.display()))?;
+    let seed: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("invalid JSON in {}", seed_file.display()))?;
+
+    let escrow_address = seed["escrow_address"]
+        .as_str()
+        .context("seed file missing escrow_address")?;
+    let tx_hash = seed["signer_list_set_tx_hash"]
+        .as_str()
+        .context("seed file missing signer_list_set_tx_hash")?;
+    let quorum = seed["quorum"]
+        .as_u64()
+        .context("seed file missing quorum")? as u32;
+    let signers = seed["signers"]
+        .as_array()
+        .context("seed file missing signers array")?;
+
+    let escrow_id = decode_xrpl_address(escrow_address)?;
+    let escrow_id_hex = hex::encode(escrow_id);
+
+    // XRPL canonicalizes SignerEntries by AccountID ascending byte
+    // order when emitting the SignerListSet blob. The enclave's
+    // seal-initial step 6(f) compares supplied signers byte-for-byte
+    // against the blob's parsed entries, so the payload here MUST be
+    // in the same canonical order — seed file's "signers" array
+    // (sorted by operator name) won't match.
+    let mut decoded_signers: Vec<[u8; 20]> = signers
+        .iter()
+        .map(|s| {
+            let addr = s["xrpl_address"]
+                .as_str()
+                .context("signer entry missing xrpl_address")?;
+            decode_xrpl_address(addr)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    decoded_signers.sort();
+    let signers_payload: Vec<serde_json::Value> = decoded_signers
+        .iter()
+        .map(|id| {
+            serde_json::json!({
+                "account_id": hex::encode(id),
+                "weight": 1u32,
+            })
+        })
+        .collect();
+
+    println!("Fetching SignerListSet tx {tx_hash} from XRPL...");
+    let (blob_hex, ledger_index) = fetch_signerlist_set_tx(xrpl_url, tx_hash).await?;
+    println!("  ledger_index: {ledger_index}");
+    println!("  blob_len: {} hex chars", blob_hex.len());
+
+    crate::http_helpers::ensure_loopback_url(enclave_url)
+        .context("signerlist-seal-initial enclave_url must be loopback")?;
+    let http = crate::http_helpers::loopback_http_client(std::time::Duration::from_secs(30))?;
+    let url = format!(
+        "{}/admin/signerlist/seal-initial",
+        enclave_url.trim_end_matches('/')
+    );
+    let payload = serde_json::json!({
+        "escrow_account_id": escrow_id_hex,
+        "quorum_threshold": quorum,
+        "ledger_index": ledger_index,
+        "tx_hash": tx_hash.to_lowercase(),
+        "signed_xrpl_tx_blob": blob_hex.to_lowercase(),
+        "signers": signers_payload,
+    });
+
+    info!(escrow = %escrow_address, %tx_hash, ledger_index, "posting seal-initial");
+    let resp = http
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await
+        .with_context(|| format!("POST {url} failed"))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .context("invalid JSON from seal-initial")?;
+    if !status.is_success() {
+        anyhow::bail!("seal-initial returned HTTP {status}: {body}");
+    }
+    if body["status"].as_str() != Some("ok") {
+        anyhow::bail!("seal-initial rejected: {body}");
+    }
+    println!("seal-initial OK: {body}");
+    Ok(())
+}
+
+/// Phase 2.2-D — `signerlist-bootstrap-rotate` subcommand. Operator
+/// runs once on any participating node after `escrow-init` has
+/// landed the master-signed initial SignerListSet (and disabled
+/// master). Calls the local orchestrator daemon's
+/// `/admin/signerlist-bootstrap-rotate` admin route, which:
+///   1. Reads current SignerList from XRPL (master-installed).
+///   2. Rebuilds the identical SignerListSet tx.
+///   3. Collects signatures from all current operators via the
+///      libp2p signing relay.
+///   4. Submits the multisig-cosigned envelope to XRPL.
+///   5. POSTs the validated blob to local enclave's
+///      `/admin/signerlist/seal-initial` so the enclave seals
+///      version=1.
+///
+/// On success this CLI optionally rewrites the escrow seed file's
+/// `signer_list_set_tx_hash` so peer operators running
+/// `signerlist-seal-initial` use the multisig-cosigned tx instead
+/// of the master-signed one.
+pub async fn signerlist_bootstrap_rotate(
+    admin_url: &str,
+    dry_run: bool,
+    seed_file_to_update: Option<&Path>,
+) -> Result<()> {
+    let url = format!(
+        "{}/admin/signerlist-bootstrap-rotate",
+        admin_url.trim_end_matches('/')
+    );
+    let body = serde_json::json!({"dry_run": dry_run});
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()?;
+    info!(%url, dry_run, "posting signerlist-bootstrap-rotate");
+    let resp = http
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url} failed"))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .context("invalid JSON from signerlist-bootstrap-rotate")?;
+    if !status.is_success() {
+        anyhow::bail!("signerlist-bootstrap-rotate HTTP {status}: {body}");
+    }
+    println!(
+        "bootstrap-rotate response: {}",
+        serde_json::to_string_pretty(&body)?
+    );
+
+    if dry_run {
+        return Ok(());
+    }
+
+    let new_hash = body["xrpl_tx_hash"]
+        .as_str()
+        .context("response missing xrpl_tx_hash")?;
+
+    if let Some(seed_path) = seed_file_to_update {
+        let content = std::fs::read_to_string(seed_path)
+            .with_context(|| format!("cannot read {}", seed_path.display()))?;
+        let mut seed: serde_json::Value = serde_json::from_str(&content)
+            .with_context(|| format!("invalid JSON in {}", seed_path.display()))?;
+        let old_hash = seed["signer_list_set_tx_hash"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        seed["signer_list_set_tx_hash"] = serde_json::Value::String(new_hash.to_string());
+        let new_content = serde_json::to_string_pretty(&seed)?;
+        std::fs::write(seed_path, new_content)
+            .with_context(|| format!("cannot write {}", seed_path.display()))?;
+        println!(
+            "updated {}: signer_list_set_tx_hash {} → {}",
+            seed_path.display(),
+            old_hash,
+            new_hash
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2001,6 +2239,61 @@ mod tests {
         let resp = serde_json::json!({"result": {"error": "actNotFound"}});
         let err = parse_signer_list_response(&resp).unwrap_err();
         assert!(err.to_string().contains("actNotFound"), "got: {err}");
+    }
+
+    // ── Phase 2.2-B signerlist-seal-initial parsers ────────────────
+
+    #[test]
+    fn parse_signerlist_set_tx_response_extracts_blob_and_ledger() {
+        let resp = serde_json::json!({
+            "result": {
+                "validated": true,
+                "tx": "1200082200000000240000000168400000000000000C",
+                "ledger_index": 12345678u64,
+                "hash": "ED7BCFEA7079BF1988E130D55560F64C7732CEF604232A40B0F31962B1BE733E",
+            }
+        });
+        let (blob, ledger) = parse_signerlist_set_tx_response(&resp).unwrap();
+        assert_eq!(blob, "1200082200000000240000000168400000000000000C");
+        assert_eq!(ledger, 12345678);
+    }
+
+    #[test]
+    fn parse_signerlist_set_tx_response_rejects_unvalidated() {
+        let resp = serde_json::json!({
+            "result": {
+                "validated": false,
+                "tx": "12000822",
+                "ledger_index": 1u64,
+            }
+        });
+        let err = parse_signerlist_set_tx_response(&resp).unwrap_err();
+        assert!(err.to_string().contains("not validated"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_signerlist_set_tx_response_propagates_xrpl_error() {
+        let resp = serde_json::json!({"result": {"error": "txnNotFound"}});
+        let err = parse_signerlist_set_tx_response(&resp).unwrap_err();
+        assert!(err.to_string().contains("txnNotFound"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_signerlist_set_tx_response_rejects_missing_blob() {
+        let resp = serde_json::json!({
+            "result": {"validated": true, "ledger_index": 1u64}
+        });
+        let err = parse_signerlist_set_tx_response(&resp).unwrap_err();
+        assert!(err.to_string().contains("result.tx"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_signerlist_set_tx_response_rejects_missing_ledger_index() {
+        let resp = serde_json::json!({
+            "result": {"validated": true, "tx": "12"}
+        });
+        let err = parse_signerlist_set_tx_response(&resp).unwrap_err();
+        assert!(err.to_string().contains("ledger_index"), "got: {err}");
     }
 
     #[test]

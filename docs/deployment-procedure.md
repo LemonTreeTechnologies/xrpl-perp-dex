@@ -528,6 +528,77 @@ After the cluster is fully on the new release:
 5. Audit log entry committed to the release repo, signed by the on-call operator, recording: release version, start/end timestamps, node-by-node timing, any deviations from this runbook.
 6. Previous release kept on disk as `.prev` for the standard rollback window (30 days suggested), then pruned.
 
+### 11.10 Cluster ordering invariant — parallel Path A ceremony required
+
+**Naming note.** In the audit track and current code (REQ-7, REQ-8, `docs/path-a-runbook.{en,ru}.md`, `orchestrator/src/path_a_*.rs`, `EthSignerEnclave/Enclave/path_a.cpp`), **"Path A"** refers to the Local Attestation–based migration ceremony that ships in REQ-8 commits 11–12. In §11.5 of this document **"Path B"** historically referred to the same upgrade family (enclave change → new MRENCLAVE) but described a different mechanism (on-chain add-then-remove signer rotation per node). The implementation that landed is the audit-track Path A — Local Attestation cross-enclave state migration that preserves sealed customer state without on-chain signer rotation. The `signerlist-bootstrap-rotate` CLI (Phase 2.2-D) closes the bootstrap-forge symmetry gap that emerged on top. **§11.5's per-node sequential add/swap/remove is superseded; do not execute it. Use this section + `docs/path-a-runbook.en.md`.**
+
+#### Invariant
+
+Path A's `/admin/migrate-state` ceremony on each node retires the local OLD enclave on success: writes `path_a_retired.sealed` and `PATH_A_RETIRED_GUARD()` then causes every signing ecall to return `ECALL_RETIRED`. The retirement is **permanent** — sealed; one-way; un-retirement is not implemented and architecturally not safe.
+
+The ceremony's M-of-N delegation collection asks each peer's OLD enclave to sign an authorization over libp2p. Once a peer's OLD is retired, it CANNOT contribute a delegation — retirement is intentional and load-bearing for the security model (no post-migration signing slips out from a permitted code base).
+
+**Consequence:** if N-1 operators have already completed their ceremonies serially, the Nth operator has at most 1 delegation available (their own) and cannot reach M-of-N (M ≥ 2 in any sane SignerListSet). The Nth ceremony fails with `PATH_A_ERR_DELEGATION_QUORUM` (-6). That node is stuck on OLD permanently — manual recovery is fresh bootstrap on NEW (discarding the unmigrated state per §11.7 worst case).
+
+**Therefore: Path A cluster migration MUST run in parallel across all operators within the `delegation_timeout_secs` window.**
+
+#### Procedure
+
+Out-of-band coordination is critical. All operators agree before T₀:
+- The new MRENCLAVE hash (matches build manifest exactly).
+- A scheduled timestamp T₀ (e.g., "2026-MM-DD 14:00 UTC").
+- The ceremony timeout window (default `delegation_timeout_secs=30s`; bump to 60–120s if cluster latency suggests).
+
+At T₀, each operator runs simultaneously on their own node:
+
+```
+curl -X POST http://127.0.0.1:7095/admin/migrate-state \
+    -H 'Content-Type: application/json' \
+    -d '{"expected_mrenclave_new": "<MRENCLAVE_NEW>", "delegation_timeout_secs": 60}'
+```
+
+The ceremony driver on each node concurrently:
+1. Asks local NEW for `target_info` + generates the migration keypair.
+2. Publishes `PathADelegationRequest` on the libp2p signing-relay topic.
+3. Other operators' orchestrators receive the request; their local OLD enclaves sign the delegation **because none has retired yet** — every operator's own export-state retirement happens AFTER delegation collection completes, and since all 3 leaders are in the delegation-collection phase concurrently (parallel start), no peer is retired at the time signatures are requested.
+4. Each leader collects M-of-N delegations, drives the rest of the ceremony (export → import → verify-confirmation), retires the local OLD at the end.
+5. The cluster ends with all OLDs retired ~simultaneously and all NEWs holding migrated state.
+
+#### Empirical reference
+
+PRG-3 testnet (2026-05-11) intentionally ran the ceremony serially as part of the validation:
+- node-1 succeeded.
+- node-2 succeeded (gathered delegations from node-3-still-active + self).
+- node-3 failed with `PATH_A_ERR_DELEGATION_QUORUM` — node-1 and node-2 OLDs were retired and could not sign.
+
+Recovery on node-3 required full Plan B reset: discard OLD state, fresh `node-bootstrap` on NEW, fresh `escrow-init`, fresh `signerlist-bootstrap-rotate`, fresh DKG. The Plan B sequence is documented in `docs/path-a-prg3-deploy-log.md`. This section documents the procedural lesson; do not repeat the serial pattern in production.
+
+#### Failure modes
+
+| Symptom | Cause | Recovery |
+|---|---|---|
+| One operator misses T₀ by > `delegation_timeout` | Schedule miss | Abort all in-progress ceremonies (Ctrl-C the curl; OLDs that haven't retired stay active). Re-coordinate T₀. Retry parallel. |
+| Network partition between operators during ceremony | libp2p mesh disruption | Each leader's delegation collector times out; their OLD has not yet retired (retire happens only on full ceremony success). Re-coordinate, retry. |
+| One operator's NEW enclave fails to start at T₀ | Build artefact mismatch, port 9089 busy, etc. | Abort all ceremonies. Investigate the one operator's NEW. Retry parallel once all NEWs verified healthy on /version. |
+| Operator completes ceremony serially ahead of others | Procedure violation / out-of-coordination drift | That operator's OLD is permanently retired. Their node is now stuck — §11.7 worst case (fresh bootstrap on NEW). Investigate cluster discipline before next attempt. |
+
+#### Code or procedure?
+
+PRG-3 surfaced this finding empirically. Two long-term resolution paths:
+
+(a) **Procedure** (this section): document the parallel-ceremony requirement as an operational invariant; rely on out-of-band operator coordination.
+
+(b) **Code**: pre-collect delegations from all operators **before** any node enters the export-state retirement step; cache delegations cluster-wide; ceremonies process the cached set instead of demanding live signatures from peers. Requires extending the libp2p delegation phase to be cluster-coordinated rather than per-leader. The retirement-marker permanence semantics stay intact — only the delegation-gathering timing changes.
+
+Both are valid. The audit-reopen (F submission, see `project_seal_initial_gap.md` X-XX-2) carries the question to the auditor for the authoritative decision; until that lands, **procedure (a) governs production**.
+
+#### Reference
+
+- Operator runbook (operator-facing details): `docs/path-a-runbook.{en,ru}.md`
+- Implementation: `orchestrator/src/path_a_ceremony.rs`, `path_a_migrate_admin.rs`, `path_a_delegation.rs`; enclave-side `EthSignerEnclave/Enclave/path_a.cpp`
+- Empirical trace: `docs/path-a-prg3-deploy-log.md` (PRG-3 closure 2026-05-11; includes the serial-deploy failure on node-3 and the Plan B recovery)
+- Audit cycle: REQ-7, REQ-8 (private repo `77ph/xrpl-perp-dex-enclave/docs/audit/`); F audit-reopen submission pending
+
 ---
 
 ## Appendix A — What this does NOT solve

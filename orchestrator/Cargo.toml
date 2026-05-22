@@ -60,6 +60,9 @@ toml = "0.8"
 # Error handling
 anyhow = "1"
 
+# REQ-8 commit 13: trait-abstracted async API for Path A ceremony driver
+async-trait = "0.1"
+
 [dev-dependencies]
 # Test fixtures (O-L3: escrow-seed file resolver)
 tempfile = "3"
