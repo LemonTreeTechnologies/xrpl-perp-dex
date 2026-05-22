@@ -17,6 +17,7 @@
 - Первичный bootstrap (`node-deploy` без `--side-by-side`).
 - Disaster recovery, если OLD-энклейв умер до завершения своей церемонии.
 - Cross-host миграцию — Path A привязан к тому же физическому SGX-CPU.
+- Cross-posture миграцию — проверка LA-репорта отклоняет debug-пира, когда импортирующий энклейв не debug (A-PA-1 hardening, REQ-18). debug→non-debug миграция отклоняется by design: переход debug→production — это **fresh bootstrap** (`node-deploy` без `--side-by-side`), а НЕ Path A-миграция — экспортированное состояние debug-энклейва недоверенно. Path A применим только внутри одной posture (debug→debug на testnet, non-debug→non-debug в production).
 
 **Когда запускать:** любой bump MRENCLAVE, который должен сохранить живое состояние — security-релиз, re-key seal-политики (REQ-17), любое изменение enclave-кода, разворачиваемое на кластер, уже держащий клиентское состояние.
 
