@@ -532,6 +532,8 @@ Deploy agent держит предыдущий бинарь на диске. Е�
 
 **Naming note.** В audit track и текущем коде (REQ-7, REQ-8, `docs/path-a-runbook.{en,ru}.md`, `orchestrator/src/path_a_*.rs`, `EthSignerEnclave/Enclave/path_a.cpp`), **"Path A"** = ceremony миграции через Local Attestation, которая шипится в REQ-8 commits 11–12. В §11.5 этого документа **"Путь B"** исторически referred to той же upgrade-family (изменение энклейва → новый MRENCLAVE), но описывал другой механизм (on-chain add-then-remove ротация signer'а пер-нода). Реализация которая landед — audit-track Path A — Local Attestation cross-enclave state migration сохраняющая sealed customer state без on-chain signer ротации. CLI `signerlist-bootstrap-rotate` (Phase 2.2-D) закрывает bootstrap-forge symmetry gap. **§11.5 sequential add/swap/remove SUPERSEDED — не выполнять. Использовать этот раздел + `docs/path-a-runbook.ru.md`.**
 
+**Posture note (A-PA-1, REQ-18).** Проверка LA-репорта Path A отклоняет debug-пира, когда импортирующий энклейв не debug. debug→non-debug миграция поэтому отклоняется by design — переход debug→production это fresh bootstrap (`node-deploy` без `--side-by-side`), а НЕ Path A-миграция (экспортированное состояние debug-энклейва недоверенно). Path A применим только внутри одной posture: debug→debug на testnet, non-debug→non-debug в production.
+
 #### Инвариант
 
 Path A's `/admin/migrate-state` ceremony на каждой ноде retire'ит локальный OLD enclave при успехе: пишет `path_a_retired.sealed` и `PATH_A_RETIRED_GUARD()` затем заставляет каждый signing ecall возвращать `ECALL_RETIRED`. Retirement **permanent** — sealed, one-way, un-retirement не реализован и архитектурно небезопасен.

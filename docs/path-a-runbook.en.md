@@ -17,6 +17,7 @@ A cluster-coordinated upgrade of the perp-dex enclave to a new MRENCLAVE **witho
 - Initial bootstrap (`node-deploy` without `--side-by-side`).
 - Disaster recovery if an OLD enclave dies before its ceremony completes.
 - Cross-host migration — Path A is platform-bound to the same physical SGX CPU.
+- Cross-posture migration — LA-report verification rejects a debug-mode peer enclave when the importer is non-debug (A-PA-1 hardening, REQ-18). A debug→non-debug migration is rejected by design: the debug→production transition is a **fresh bootstrap** (`node-deploy` without `--side-by-side`), NOT a Path A migration — a debug enclave's exported state is not trustworthy. Path A applies only within one posture (debug→debug on testnet, non-debug→non-debug in production).
 
 **When you run it:** any MRENCLAVE bump that must preserve live state — a security release, the seal-policy re-key (REQ-17), or any enclave-code change deployed to a cluster already holding customer state.
 
