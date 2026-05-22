@@ -1,115 +1,136 @@
-# Path A migration ceremony — операторский runbook (RU)
+# Церемония миграции Path A — рунбук оператора (RU)
 
-**Статус:** REQ-8 commit 11 draft. Ceremony driver сам по себе появляется в commit 12; этот runbook документирует видимую оператору процедуру, которую driver обёртывает. Спецификация: `docs/audit/REQ-7.md` (приватный репозиторий).
+**Статус:** production-grade. Церемония выполнялась на реальном SGX-железе (Azure DCsv3) на кластере из 3 нод многократно — bundled HW E2E (2026-05-15), populated-state re-run (2026-05-18) и seal-policy cutover REQ-17 (2026-05-22). Рунбук отражает то, что эти прогоны показали. Спецификация: `docs/audit/REQ-7.md` (приватный репозиторий).
 
 ---
 
-## Что такое Path A
+## 1. Что такое Path A
 
-Координированный кластером апгрейд perp-dex enclave-софта на новый MRENCLAVE без потери клиентского состояния (operator XRPL keys, FROST shares, perp-позиции, баланс vault'ов, account pool). Каждый оператор запускает церемонию локально на своей машине; никакого cross-operator SSH.
+Координированное кластером обновление perp-dex энклейва на новый MRENCLAVE **без потери клиентского состояния** (XRPL-ключи операторов, FROST-доли, perp-позиции, балансы вольтов, account pool). Каждый оператор запускает церемонию локально на своей машине; cross-operator SSH нет.
 
-**Что Path A обеспечивает:**
-- Средства в escrow остаются доступны — старые ключи XRPL подписи переживают апгрейд через миграционную церемонию.
+**Path A даёт:**
+- Средства в escrow остаются доступны — XRPL-ключи подписи переживают bump MRENCLAVE через церемонию миграции.
 - Клиентское perp-состояние сохраняется — клиенты не видят сброса балансов или открытых сделок.
-- Кворум операторов решает, может ли апгрейд произойти.
+- Кворум операторов решает, можно ли проводить апгрейд (delegation bundle).
 
-**Что Path A НЕ покрывает:**
+**Path A НЕ покрывает:**
 - Первичный bootstrap (`node-deploy` без `--side-by-side`).
-- Disaster recovery если OLD enclave умер до завершения церемонии.
-- Cross-host миграцию (Path A platform-bound — тот же физический SGX CPU).
+- Disaster recovery, если OLD-энклейв умер до завершения своей церемонии.
+- Cross-host миграцию — Path A привязан к тому же физическому SGX-CPU.
 
-## Pre-requisites
+**Когда запускать:** любой bump MRENCLAVE, который должен сохранить живое состояние — security-релиз, re-key seal-политики (REQ-17), любое изменение enclave-кода, разворачиваемое на кластер, уже держащий клиентское состояние.
 
-Перед запуском `node-deploy --side-by-side` на любом узле:
+---
 
-1. **OLD enclave запущен и работает** на порту 9088 с sealed state в `/home/azureuser/perp/accounts/`. Проверка: `systemctl is-active perp-dex-enclave` возвращает `active`.
+## 2. Предусловия
 
-2. **Кворум операторов согласовал** новый MRENCLAVE. Out-of-band consensus (Slack / call) до того как любой оператор pre-stages NEW unit. Delegation bundle, который orchestrator собирает позже, доказывает только факт согласия пост-фактум; pre-agreement — это операторская дисциплина.
+1. **Воспроизводимая сборка, MRENCLAVE согласован.** Каждый оператор независимо собирает NEW-энклейв из согласованного git-ref через GHA-пайплайн и подтверждает, что MRENCLAVE бит-в-бит совпадает у всех операторов (INV-BUILD-1). Сборка также прогоняет seal-policy gate (`check-seal-policy.sh`) — сборку, не прошедшую gate, разворачивать нельзя.
 
-3. **Build artefacts готовы**: свежесобранные `perp-dex-orchestrator`, `enclave.signed.so`, `perp-dex-server`, и желательно `build-manifest.txt` с pinned MRENCLAVE. Сборка через GHA pipeline на согласованный git ref. MRENCLAVE из build-manifest — это то, против чего `node-deploy --side-by-side` крест-чекает реально запустившийся NEW enclave через `/version` post-deploy.
+2. **Кворум операторов согласовал** NEW MRENCLAVE вне канала (звонок / подписанное сообщение) ДО того, как кто-либо пред-устанавливает NEW-юнит. Delegation bundle, собираемый в церемонии, доказывает согласие криптографически; пред-согласование — это дисциплина оператора.
 
-4. **One-time per-machine NEW-side setup** выполнен (только самая первая церемония на данной операторской машине):
+3. **OLD-энклейв запущен и здоров** на порту 9088, sealed-состояние в `/home/<user>/perp/accounts/`. Проверка: `systemctl is-active perp-dex-enclave` → `active`.
 
-   а. Скопировать `scripts/path-a/perp-dex-enclave-next.service` в `/etc/systemd/system/perp-dex-enclave-next.service`.
+4. **Артефакты сборки разложены** у каждого оператора: `enclave.signed.so`, `perp-dex-server`, `build-manifest.txt` с зафиксированным ожидаемым MRENCLAVE.
 
-   б. Выполнить `sudo systemctl daemon-reload`.
+5. **Одноразовая настройка NEW-стороны машины** (только первая церемония на данной машине): установить `perp-dex-enclave-next.service`, `systemctl daemon-reload`, создать `/home/<user>/perp-next/`, пред-разложить `perp-next/config.json` (порт 9089). Постоянная — переиспользуется каждый следующий цикл.
 
-   в. Создать `/home/azureuser/perp-next/` (будет наполнено через `node-deploy --side-by-side`).
+---
 
-   г. Pre-stage `/home/azureuser/perp-next/config.json` из `scripts/path-a/config-next.json.sample`. Подкорректировать `ssl_*` пути если ваша TLS-топология отличается от OLD unit.
+## 3. Церемония — ПАРАЛЛЕЛЬНО по всем нодам
 
-   д. Проверить что NEW unit виден: `systemctl status perp-dex-enclave-next` должно показать `inactive (dead)` (unit известен, ещё не стартовал).
+> **Инвариант §11.10 — церемония ОБЯЗАНА идти параллельно на каждой ноде. НЕ мигрируйте одну ноду до конца перед стартом следующей.**
+>
+> Почему: шаг delegation-quorum церемонии требует, чтобы M-of-N операторов подписали одобрение, а оператор может подписать только пока его OLD-энклейв ещё жив. Если закончить node-1 первой, OLD node-1 уходит в retired; как только N-1 OLD'ов ушли в retired, церемония последней ноды больше не может набрать delegation quorum и **застревает не-мигрируемой**. Каждый OLD должен оставаться живым, пока каждая нода не прошла свою фазу export+delegation. Запускайте все ноды вместе.
 
-   Этот setup permanent — последующие церемонии на той же машине переиспользуют его. После успешной post-promotion фазы оператор может оставить NEW unit definition для следующего цикла апгрейда.
-
-## Церемония — взгляд оператора
-
-**Ceremony driver** (commit 12) обёртывает шаги ниже. Операторское взаимодействие:
-
+**3.1 — Side-by-side деплой (каждая нода, можно последовательно — недеструктивно).**
+Каждый оператор на своей ноде:
 ```
-$ perp-dex-orchestrator node-deploy --side-by-side \
-    --orchestrator ./perp-dex-orchestrator-new \
-    --enclave-dist ./dist-azure-new
+perp-dex-orchestrator node-deploy --side-by-side --enclave-dist ./dist-new
 ```
+Устанавливает NEW-артефакты в `perp-next/` и стартует NEW-энклейв на порту 9089 рядом с OLD (9088). NEW поднимается с пустым sealed-состоянием + эфемерной migration-keypair, сгенерированной внутри SGX. Проверка на каждой ноде: `curl -k https://localhost:9089/version` → NEW MRENCLAVE.
 
-Это устанавливает NEW артефакты в `/home/azureuser/perp-next/` и стартует NEW enclave на порту 9089 параллельно с OLD (порт 9088). NEW поднимается с пустым sealed state и эфемерной migration keypair, сгенерированной внутри SGX enclave.
-
-После того как все операторы независимо завершили `node-deploy --side-by-side`, **один оператор** запускает migration ceremony:
-
+**3.2 — Запустить церемонию на ВСЕХ нодах одновременно.**
+Каждый оператор на своей ноде, в одно время:
 ```
-$ curl -k -X POST https://localhost:9088/admin/migrate-state \
-    -H 'Content-Type: application/json' \
-    -d '{"expected_mrenclave_new": "<hex 64>", "ceremony_nonce_request": true}'
+curl -sS -X POST http://127.0.0.1:7095/admin/migrate-state \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_mrenclave_new":"<hex 64>"}'
 ```
+(`--migrate-admin-listen 127.0.0.1:7095` должен быть задан оркестратору; гейтится через `--signers-config`.)
 
-(Семантика ceremony driver определена в commit 12.)
+На каждой ноде драйвер: запрашивает у NEW target_info + свежий ceremony nonce → просит NEW сгенерировать эфемерную keypair → собирает delegation quorum через libp2p signing-relay → просит OLD проверить LA-репорт NEW + delegation + зашифровать состояние → просит NEW проверить LA-репорт OLD, расшифровать, M3 durability self-check, записать M4-манифест ПОСЛЕДНИМ → просит OLD проверить completion-репорт и запечатать свой retired-marker.
 
-Driver:
-1. Запрашивает у NEW (порт 9089) её target_info + свежий ceremony_nonce.
-2. Просит NEW сгенерировать ephemeral migration keypair с binding'ами к (target_info_of_old, ceremony_nonce).
-3. Собирает delegation signatures от кворума операторов через существующий libp2p signing-relay (тот же flow, который SignerListSet update уже использует).
-4. Просит OLD (порт 9088) верифицировать NEW's LA report + delegation quorum, зашифровать state и эмитить (ciphertext, ephemeral_pk, tag, la_report_old).
-5. Просит NEW (порт 9089) верифицировать la_report_old, расшифровать state, выполнить M3 sealed-file durability self-check, записать M4 manifest LAST, эмитить completion LA report.
-6. Просит OLD (порт 9088) верифицировать completion LA report → seal retired-marker → flip in-memory retired flag.
+Каждая нода возвращает `200 OK {"status":"ok", "ceremony_nonce_hex":…, "mrenclave_new_hex":…, "manifest_hash_hex":…}`. Разные ceremony nonce на нодах — ожидаемо.
 
-При успехе ceremony driver возвращает 200 OK с записанным новым MRENCLAVE.
+---
 
-## Post-ceremony promotion
+## 4. Пост-миграционная верификация
 
-После успешной confirmation OLD будет возвращать `PATH_A_ERR_ECALL_RETIRED` (-150) на каждый signing или state-mutating ecall. `/version` OLD и read-only routes продолжают отвечать — полезно для подтверждения retired state.
+Выполнить на каждой ноде до promotion. Не делать promotion на частичном результате.
 
-Promotion sequence:
-1. **Остановить OLD enclave**: `sudo systemctl stop perp-dex-enclave`.
-2. **Перенаправить external traffic** на порт 9089 (reverse proxy оператора / TLS terminator / DNS — зависит от топологии).
-3. **Проверить что NEW обслуживает**: `curl -k https://localhost:9089/version` возвращает новый MRENCLAVE.
-4. **Отключить OLD unit** чтобы последующая перезагрузка случайно не запустила его обратно: `sudo systemctl disable perp-dex-enclave`.
-5. **Опциональный cleanup** (на усмотрение оператора): после того как церемония подтверждена всеми операторами и зафиксирована, OLD `/home/azureuser/perp/accounts/` sealed state — forensic-only (NEW MRENCLAVE не может его расшифровать). Либо хранить как backup несколько недель, либо удалить после стабилизации кластера на NEW.
+1. **NEW MRENCLAVE** — `curl -k https://localhost:9089/version` → ожидаемый NEW MRENCLAVE, все ноды.
+2. **First-boot autoload** — перезапустить NEW один раз; `enclave.log` показывает `migration manifest verified — post-migration boot`, `sealed SignerList loaded`, `Auto-loaded ... account(s)`, `Auto-loaded perp state (chunked)`. Migration-манифест **поглощается** при этой первой верификации (переписывается `file_count=0`), чтобы последующие загрузки после операционных изменений состояния не спотыкались о file-hash проверку.
+3. **Выживание состояния** — пробить известный баланс пользователя и вольт: `curl -k --get --data-urlencode "user_id=<r…>" https://localhost:9089/v1/perp/balance` и `…/v1/perp/vault/status?type=1`. Сравнить с до-миграционными значениями.
+4. **Полнота sealed-файлов + политика** — каждый sealed-файл в `accounts/` NEW должен присутствовать (ожидаемый per-shard набор) и быть MRENCLAVE-policy. `key_policy` — это uint16 LE на байт-офсете 2 каждого `sgx_sealed_data_t` — `0x0001` = MRENCLAVE, `0x0002` = MRSIGNER. Проверять каждый файл, не выборку.
+5. **OLD retired** — OLD возвращает `PATH_A_ERR_ECALL_RETIRED` (-150) для signing/state-mutating ecall'ов; `path_a_retired.sealed` присутствует в `accounts/` OLD; read-only маршруты (`/version`) ещё отвечают.
+6. **Необратимость** — OLD-энклейв (другой MRENCLAVE) больше не может расшифровать перезапечатанные файлы NEW. Это намеренное конечное состояние: откат на pre-NEW энклейв невозможен, как только NEW перезапечатал. Подтвердить, что это понято как осознанный operational checkpoint.
 
-## Failure modes и recovery
+---
+
+## 5. Promotion
+
+Продвинуть NEW в канонический слот `:9088`, чтобы оркестратор (нацеленный на `--enclave-url …:9088`) драйвил NEW. На каждой ноде:
+
+1. `sudo systemctl stop perp-dex-enclave-next perp-dex-enclave`.
+2. Установить NEW в `perp/`: заменить `perp/enclave.signed.so` + `perp/perp-dex-server` на NEW-сборку; заменить `perp/accounts/` на `perp-next/accounts/` (мигрированное, перезапечатанное состояние NEW).
+3. Очистить `perp-next/accounts/` (пусто) — готово к следующему циклу миграции.
+4. `sudo systemctl start perp-dex-enclave` → `:9088` теперь поднимает NEW. `perp-dex-enclave-next` оставить остановленным.
+5. Проверить `:9088/version` = NEW MRENCLAVE; autoload-цепочка зелёная; оркестратор переподключился.
+
+---
+
+## 6. Decommission OLD — ОБЯЗАТЕЛЕН
+
+Decommission OLD-энклейва **не опционален и не «оставить бэкап на пару недель».** `accounts/` OLD — это устаревшая копия клиентского состояния; бинарь энклейва для MRENCLAVE OLD воспроизводим из исходников, поэтому sealed-состояние OLD не является криптографически гарантированно инертным. Устаревшие копии sealed-состояния — это остаток и поверхность экспозиции — это прямой урок инцидента seal-политики MRSIGNER (INCIDENT-2026-05-20).
+
+На каждой ноде, после того как promotion верифицирован:
+1. Процесс OLD уже остановлен (§5.1). Отключить OLD-юнит, если он был отдельно определён.
+2. **Затереть** sealed-состояние OLD: удалить бывшую директорию `accounts/` OLD и любые архивные/snapshot-директории прошлых циклов. Аудит-запись держать в `docs/` + памяти, не как sealed-блобы на диске.
+3. Если миграция вывела из эксплуатации on-chain escrow в рамках изменения — проверить on-chain баланс старого escrow перед затиранием его ключевого материала: подтвердить, что ничего ценного не застревает.
+4. Re-scan: подтвердить, что осталась только `accounts/` активного энклейва, все sealed-файлы ожидаемой политики, ноль устаревших директорий.
+
+Не примешивать sealed-состояние других приложений в эту зачистку — только perp-dex директории.
+
+---
+
+## 7. Режимы отказа и восстановление
 
 | Симптом | Причина | Восстановление |
 |---|---|---|
-| `node-deploy --side-by-side` отклонил: "OLD service not active" | OLD enclave service остановлен или unhealthy | Запустить OLD (`sudo systemctl start perp-dex-enclave`); разобраться почему он остановился |
-| `node-deploy --side-by-side` отклонил: "NEW unit not found" | Pre-requisite 4(а) пропущен | Установить systemd unit по pre-requisites |
-| `node-deploy --side-by-side` отклонил: "perp-next/ not empty" | Половинчатая попытка предыдущей церемонии | `sudo rm -rf /home/azureuser/perp-next/*` и попробовать снова |
-| `node-deploy --side-by-side` отклонил: "port 9089 not available" | Зависший процесс или старый NEW enclave всё ещё работает | `sudo systemctl stop perp-dex-enclave-next`; проверить `ss -ltn` на другие listeners |
-| `node-deploy --side-by-side` отклонил: "MRENCLAVE mismatch" | Build artefacts не соответствуют build-manifest.txt | Разобраться КАКОЙ enclave запустился до retry; НЕ продолжать с mismatched build |
-| Ceremony driver timeout на confirmation step | NEW не смог запечатать один из мигрируемых файлов | OLD НЕ zeroized (он не получил confirmation report) — escrow keys остаются доступны. Изучить enclave.log NEW; если recoverable, рестартовать NEW + перезапустить церемонию с fresh `ceremony_nonce` (OLD's `recent_ceremony_nonces` set отклонит повторное использование предыдущего) |
-| Ceremony driver вернул `ERR_NONCE_REPLAY` | Оператор пытается повторить с тем же nonce | Сгенерировать fresh nonce; retry |
-| Ceremony driver вернул `ERR_DELEGATION_QUORUM` | Недостаточно операторов подписали delegation | Координация с пропавшими операторами; собрать их подписи; retry |
-| Церемония завершилась на NEW, но `verify_import_confirmation` вернул durability error | Confirmation от NEW пришёл, но OLD не смог запечатать retired-marker (disk full / FS bug) | OLD's in-memory state **не** retired (per implementation contract); оператор разбирается с disk health. Замечание: ceremony nonce consumed — любой retry ДОЛЖЕН использовать fresh nonce, и OLD's in-memory migration state всё ещё set, поэтому ceremony driver обязан перезапустить с начала с новым nonce после fix диска |
+| `node-deploy --side-by-side` отклоняет "OLD service not active" | OLD-энклейв остановлен/нездоров | Перезапустить OLD; разобраться, почему остановился |
+| отклоняет "NEW unit not found" | Пропущена одноразовая настройка (§2.5) | Установить systemd-юнит |
+| отклоняет "perp-next/ not empty" | Недоделанная прошлая попытка | Очистить `perp-next/accounts/`, повторить |
+| отклоняет "MRENCLAVE mismatch" | Артефакты сборки ≠ build-manifest | Выяснить, какой энклейв запущен, до повтора; никогда не продолжать на mismatch |
+| церемония возвращает `ERR_DELEGATION_QUORUM` | Слишком мало операторов подписали; ИЛИ нода была мигрирована до конца первой и её OLD ушёл в retired (нарушение §3) | Собрать недостающие подписи; если OLD ушёл в retired рано — нода застряла, см. «застрявшая нода» |
+| церемония возвращает `ERR_NONCE_REPLAY` | Повторно использован тот же nonce | Свежий nonce генерируется на каждый вызов; если срабатывает на действительно свежем nonce — подозревать RNG: снять `recent_nonces.sealed` обеих нод и связаться с dev-perp |
+| церемония таймаутит на confirmation | NEW не смог запечатать мигрированный файл | OLD НЕ ушёл в retired (confirmation не получен) — escrow-ключи остаются доступны. Изучить `enclave.log` NEW; перезапустить NEW + повторить со свежим nonce |
+| пост-миграционный рестарт: энклейв отказывается стартовать, `PATH_A_ERR_FILE_HASH_MISMATCH` (-17) | До-фиксовые сборки ре-верифицировали migration-манифест каждую загрузку; операционное изменение состояния затем ломало file-hash проверку | Текущие сборки **поглощают** манифест после первой успешной верификации — это не происходит. Если видно на текущей сборке — write-back манифеста не удался: изучить `enclave.log`, манифест можно удалить вручную (энклейв тогда трактует состояние как pre-migration) |
+| export падает `PATH_A_ERR_BUFFER_TOO_SMALL` (-2) | До-REQ-16 host-буфер мал для заполненного состояния | Исправлено в текущих сборках (4 MB export-буфер, 16 MB transport-буфер). Пересобрать с текущего ref |
+| частичная миграция кластера — часть нод на NEW, часть на OLD | Церемония ноды упала посередине | Кластер транзиентно терпит split. Перезапустить церемонию на упавшей ноде **пока остальные OLD ещё живы** (не делать promotion/decommission, пока все ноды не на NEW) |
+| **застрявшая нода** — нода не может набрать delegation quorum, потому что N-1 OLD'ов уже в retired | Нарушен параллельный инвариант §3 | Retired OLD'ы не могут подписать. Восстановление операционное: retired-операторы должны заново поднять signing-способный энклейв, либо кластер пересобирает застрявшую ноду из свежего bootstrap. Профилактика: никогда не мигрировать последовательно — §3 |
 
-## Recent ceremony nonces — crash-window note (LR-IMPL-3)
+---
 
-OLD enclave's `recent_ceremony_nonces.sealed` обновляется ПОСЛЕ успешного encrypt + LA report production но ДО `verify_import_confirmation`. Есть **короткое crash-window** между encrypt-success и nonce-seal во время которого crash + restart мог бы оставить nonce незарегистрированным; если orchestrator затем попробует свежую церемонию с другим nonce, она нормально проходит — un-recorded nonce забыт, **но** captured ciphertext из первой попытки не может быть replay'нут, потому что он bound к первому nonce, который NEW уже принял (и consumed в собственном recent_nonces set).
+## 8. Recent ceremony nonces — заметка о crash-окне (LR-IMPL-3)
 
-На практике это окно — микросекунды (пара `sgx_seal_data + ocall_save_to_file`). Действия оператора: **никаких**. Defense-in-depth model держится — replay path не открывается.
+`recent_nonces.sealed` OLD обновляется ПОСЛЕ успешного encrypt + продукции LA-репорта, но ДО `verify_import_confirmation`. Есть микросекундное crash-окно между encrypt-success и nonce-seal; крах там оставляет nonce незаписанным, но захваченный ciphertext нельзя переиграть — он привязан к nonce, который NEW уже поглотил. Действие оператора: никакого. Если `ERR_NONCE_REPLAY` когда-либо срабатывает на свежесгенерированном nonce — снять `recent_nonces.sealed` обеих нод и связаться с dev-perp.
 
-Если вы наблюдаете `ERR_NONCE_REPLAY` от церемонии со свежесгенерированным nonce (что подсказало бы что-то не так с random source), захватите оба OLD's и NEW's `recent_ceremony_nonces.sealed` для forensics и свяжитесь с `dev-perp` до продолжения.
+---
 
-## Reference
+## 9. Справка
 
-- Спецификация: `docs/audit/REQ-7.md` (приватный репо `77ph/xrpl-perp-dex-enclave`)
-- Реализация: `EthSignerEnclave/Enclave/path_a.cpp` (приватный)
-- Orchestrator integration: `orchestrator/src/node_deploy.rs` + ceremony driver в commit 12
-- Audit cycle: REQ-8 R1 verdict в audit channel; R2 verdict ожидается после commit 12
+- Спецификация: `docs/audit/REQ-7.md`, REQ-7.5, REQ-8 (приватный репозиторий `77ph/xrpl-perp-dex-enclave`).
+- Инвариант порядка кластера: `docs/deployment-procedure.md §11.10`.
+- Инцидент seal-политики + cutover: `docs/audit/INCIDENT-2026-05-20-mrsigner-seal-policy.md`, REQ-16, REQ-17 (приватный).
+- Реализация: `EthSignerEnclave/Enclave/path_a.cpp`; `orchestrator/src/node_deploy.rs`, `path_a_migrate_admin.rs`.
+- Инварианты проекта: `docs/audit/PROJECT-INVARIANTS.md`.

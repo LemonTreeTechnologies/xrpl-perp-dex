@@ -1,115 +1,136 @@
 # Path A migration ceremony — operator runbook (EN)
 
-**Status:** REQ-8 commit 11 draft. Ceremony driver itself ships in commit 12; this runbook documents the operator-visible procedure that the driver wraps. Reference spec: `docs/audit/REQ-7.md` (private repo).
+**Status:** production-grade. The ceremony has been executed on real SGX hardware (Azure DCsv3) across a 3-node cluster multiple times — the bundled HW E2E (2026-05-15), the populated-state re-run (2026-05-18), and the REQ-17 seal-policy cutover (2026-05-22). This runbook reflects what those runs taught. Reference spec: `docs/audit/REQ-7.md` (private repo).
 
 ---
 
-## What Path A is
+## 1. What Path A is
 
-A cluster-coordinated upgrade of the perp-dex enclave software to a new MRENCLAVE without losing customer state (operator XRPL keys, FROST shares, perp positions, vault balances, account pool). Each operator runs the ceremony locally on their own machine; no cross-operator SSH.
+A cluster-coordinated upgrade of the perp-dex enclave to a new MRENCLAVE **without losing customer state** (operator XRPL keys, FROST shares, perp positions, vault balances, account pool). Each operator runs the ceremony locally on their own machine; there is no cross-operator SSH.
 
-**What Path A delivers:**
-- Funds in escrow remain accessible — old XRPL signing keys survive the upgrade through the migration ceremony.
+**Path A delivers:**
+- Funds in escrow stay accessible — XRPL signing keys survive the MRENCLAVE bump through the migration ceremony.
 - Customer perp state survives — clients see no reset of balances or open trades.
-- The cluster's quorum-of-operators governs whether an upgrade may proceed.
+- The quorum-of-operators governs whether an upgrade may proceed (delegation bundle).
 
-**What Path A does NOT cover:**
+**Path A does NOT cover:**
 - Initial bootstrap (`node-deploy` without `--side-by-side`).
-- Disaster recovery if OLD enclave dies before the ceremony completes.
-- Cross-host migration (Path A is platform-bound to the same physical SGX CPU).
+- Disaster recovery if an OLD enclave dies before its ceremony completes.
+- Cross-host migration — Path A is platform-bound to the same physical SGX CPU.
 
-## Pre-requisites
+**When you run it:** any MRENCLAVE bump that must preserve live state — a security release, the seal-policy re-key (REQ-17), or any enclave-code change deployed to a cluster already holding customer state.
 
-Before invoking `node-deploy --side-by-side` on any node:
+---
 
-1. **OLD enclave is running and healthy** on port 9088 with sealed state in `/home/azureuser/perp/accounts/`. Verify: `systemctl is-active perp-dex-enclave` returns `active`.
+## 2. Pre-requisites
 
-2. **Quorum of operators agree** on the new MRENCLAVE. Out-of-band consensus (Slack / call) before any operator pre-stages the NEW unit. The delegation bundle the orchestrator collects later only proves the agreement was real after the fact; pre-agreement is operator discipline.
+1. **Reproducible build, MRENCLAVE agreed.** Each operator independently builds the NEW enclave from the agreed git ref via the GHA pipeline and confirms the resulting MRENCLAVE is bit-identical across operators (INV-BUILD-1). The build also runs the seal-policy gate (`check-seal-policy.sh`) — a build that fails the gate must not be deployed.
 
-3. **Build artefacts ready**: freshly-built `perp-dex-orchestrator`, `enclave.signed.so`, `perp-dex-server`, and ideally `build-manifest.txt` with the expected MRENCLAVE pinned. Build via the GHA pipeline against the agreed-on git ref. The build-manifest's MRENCLAVE is what `node-deploy --side-by-side` cross-checks against the running NEW enclave's `/version` post-deploy.
+2. **Quorum of operators agree** on the NEW MRENCLAVE, out-of-band (call / signed message), BEFORE anyone pre-stages the NEW unit. The delegation bundle collected during the ceremony proves the agreement cryptographically; the pre-agreement is operator discipline.
 
-4. **One-time per-machine NEW-side setup** done (only the very first ceremony on a given operator machine):
+3. **OLD enclave running and healthy** on port 9088, sealed state in `/home/<user>/perp/accounts/`. Verify: `systemctl is-active perp-dex-enclave` → `active`.
 
-   a. Copy `scripts/path-a/perp-dex-enclave-next.service` to `/etc/systemd/system/perp-dex-enclave-next.service`.
+4. **Build artefacts staged** per operator: `enclave.signed.so`, `perp-dex-server`, `build-manifest.txt` with the expected MRENCLAVE pinned.
 
-   b. Run `sudo systemctl daemon-reload`.
+5. **One-time NEW-side machine setup** (first ceremony on a given machine only): install `perp-dex-enclave-next.service`, `systemctl daemon-reload`, create `/home/<user>/perp-next/`, pre-stage `perp-next/config.json` (port 9089). Permanent — reused every subsequent cycle.
 
-   c. Create `/home/azureuser/perp-next/` (will be populated by `node-deploy --side-by-side`).
+---
 
-   d. Pre-stage `/home/azureuser/perp-next/config.json` from `scripts/path-a/config-next.json.sample`. Adjust `ssl_*` paths if your TLS topology differs from the OLD unit's.
+## 3. The ceremony — PARALLEL across all nodes
 
-   e. Verify the NEW unit is recognised: `systemctl status perp-dex-enclave-next` should report `inactive (dead)` (unit known, not yet started).
+> **§11.10 invariant — the ceremony MUST run in parallel on every node. Do NOT migrate one node to completion before starting the next.**
+>
+> Why: the ceremony's delegation-quorum step needs M-of-N operators to sign approval, and an operator can only sign while their OLD enclave is still live. If you finish node-1 first, node-1's OLD retires; once N-1 OLDs have retired, the last node's ceremony can no longer reach delegation quorum and is **stuck un-migratable**. Every OLD must stay alive until every node has passed its export+delegation phase. Run all nodes together.
 
-   This setup is permanent — subsequent ceremonies on the same machine reuse it. After a successful ceremony's post-promotion phase the operator may keep the NEW unit definition for the next upgrade cycle.
-
-## Ceremony — operator's view
-
-The **ceremony driver** (commit 12) wraps the steps below. Operator interaction is:
-
+**3.1 — Side-by-side deploy (every node, may be sequential — non-destructive).**
+Each operator, on their own node:
 ```
-$ perp-dex-orchestrator node-deploy --side-by-side \
-    --orchestrator ./perp-dex-orchestrator-new \
-    --enclave-dist ./dist-azure-new
+perp-dex-orchestrator node-deploy --side-by-side --enclave-dist ./dist-new
 ```
+Installs NEW artefacts to `perp-next/` and starts the NEW enclave on port 9089 alongside OLD (9088). NEW boots with empty sealed state + an ephemeral migration keypair generated inside SGX. Verify on each node: `curl -k https://localhost:9089/version` → NEW MRENCLAVE.
 
-This installs the NEW artefacts to `/home/azureuser/perp-next/` and starts the NEW enclave on port 9089 alongside OLD (port 9088). NEW comes up with empty sealed state and an ephemeral migration keypair generated inside the SGX enclave.
-
-After all operators have completed `node-deploy --side-by-side` independently, **one operator** drives the migration ceremony:
-
+**3.2 — Fire the ceremony on ALL nodes concurrently.**
+Each operator, on their own node, at the same time:
 ```
-$ curl -k -X POST https://localhost:9088/admin/migrate-state \
-    -H 'Content-Type: application/json' \
-    -d '{"expected_mrenclave_new": "<hex 64>", "ceremony_nonce_request": true}'
+curl -sS -X POST http://127.0.0.1:7095/admin/migrate-state \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_mrenclave_new":"<hex 64>"}'
 ```
+(`--migrate-admin-listen 127.0.0.1:7095` must be set on the orchestrator; it is gated by `--signers-config`.)
 
-(Ceremony driver semantics defined in commit 12.)
+Per node the driver: asks NEW for target_info + a fresh ceremony nonce → asks NEW to generate the ephemeral keypair → collects the delegation quorum over the libp2p signing-relay → asks OLD to verify NEW's LA report + delegation + encrypt state → asks NEW to verify OLD's LA report, decrypt, M3 durability self-check, write the M4 manifest LAST → asks OLD to verify the completion report and seal its retired-marker.
 
-The driver:
-1. Asks NEW (port 9089) for its target_info + a fresh ceremony_nonce.
-2. Asks NEW to generate the ephemeral migration keypair with bindings to (target_info_of_old, ceremony_nonce).
-3. Collects delegation signatures from quorum of operators using the existing libp2p signing-relay (the same flow the SignerListSet update already uses).
-4. Asks OLD (port 9088) to verify NEW's LA report + delegation quorum, encrypt state, and emit (ciphertext, ephemeral_pk, tag, la_report_old).
-5. Asks NEW (port 9089) to verify la_report_old, decrypt state, run M3 sealed-file durability self-check, write the M4 manifest LAST, emit a completion LA report.
-6. Asks OLD (port 9088) to verify the completion LA report → seal the retired-marker → flip in-memory retired flag.
+Each node returns `200 OK {"status":"ok", "ceremony_nonce_hex":…, "mrenclave_new_hex":…, "manifest_hash_hex":…}`. Distinct ceremony nonces per node are expected.
 
-On success, the ceremony driver returns 200 OK with the new MRENCLAVE recorded.
+---
 
-## Post-ceremony promotion
+## 4. Post-migration verification
 
-After confirmation succeeds OLD will return `PATH_A_ERR_ECALL_RETIRED` (-150) for every signing or state-mutating ecall. OLD's `/version` and read-only routes still respond — useful for confirming the retired state.
+Run on every node before promotion. Do not promote on a partial result.
 
-Promotion sequence:
-1. **Stop OLD enclave**: `sudo systemctl stop perp-dex-enclave`.
-2. **Reroute external traffic** to port 9089 (operator's reverse proxy / TLS terminator / DNS — depends on topology).
-3. **Verify NEW is serving**: `curl -k https://localhost:9089/version` returns the new MRENCLAVE.
-4. **Disable OLD unit** so a subsequent reboot doesn't accidentally restart it: `sudo systemctl disable perp-dex-enclave`.
-5. **Optional cleanup** (operator's discretion): once the ceremony is verified across all operators and committed-to, the OLD `/home/azureuser/perp/accounts/` sealed state is forensic-only (NEW MRENCLAVE cannot unseal it). Either keep it as a backup for a few weeks or remove it after the cluster is stable on NEW.
+1. **NEW MRENCLAVE** — `curl -k https://localhost:9089/version` → expected NEW MRENCLAVE, all nodes.
+2. **First-boot autoload** — restart NEW once; `enclave.log` shows `migration manifest verified — post-migration boot`, `sealed SignerList loaded`, `Auto-loaded ... account(s)`, `Auto-loaded perp state (chunked)`. The migration manifest is **consumed** on this first verify (rewritten `file_count=0`) so later boots after operational state changes do not trip the file-hash check.
+3. **State survival** — probe a known user balance and a vault: `curl -k --get --data-urlencode "user_id=<r…>" https://localhost:9089/v1/perp/balance` and `…/v1/perp/vault/status?type=1`. Compare against pre-migration values.
+4. **Sealed-file completeness + policy** — every sealed file in NEW's `accounts/` must be present (the expected per-shard set) and MRENCLAVE-policy. The `key_policy` is a uint16 LE at byte offset 2 of every `sgx_sealed_data_t` — `0x0001` = MRENCLAVE, `0x0002` = MRSIGNER. Audit every file, not a sample.
+5. **OLD retired** — OLD returns `PATH_A_ERR_ECALL_RETIRED` (-150) for signing/state-mutating ecalls; `path_a_retired.sealed` present in OLD's `accounts/`; read-only routes (`/version`) still respond.
+6. **Irreversibility** — the OLD enclave (different MRENCLAVE) can no longer unseal NEW's re-sealed files. This is the intended end-state: rollback to a pre-NEW enclave is impossible once NEW has re-sealed. Confirm it is understood as a conscious operational checkpoint.
 
-## Failure modes and recovery
+---
+
+## 5. Promotion
+
+Promote NEW into the canonical `:9088` slot so the orchestrator (which targets `--enclave-url …:9088`) drives NEW. Per node:
+
+1. `sudo systemctl stop perp-dex-enclave-next perp-dex-enclave`.
+2. Install NEW into `perp/`: replace `perp/enclave.signed.so` + `perp/perp-dex-server` with the NEW build; replace `perp/accounts/` with `perp-next/accounts/` (NEW's migrated, re-sealed state).
+3. Clear `perp-next/accounts/` (empty) — ready for the next migration cycle.
+4. `sudo systemctl start perp-dex-enclave` → `:9088` now boots NEW. Leave `perp-dex-enclave-next` stopped.
+5. Verify `:9088/version` = NEW MRENCLAVE; autoload chain green; the orchestrator reconnects.
+
+---
+
+## 6. OLD decommission — MANDATORY
+
+Decommissioning the OLD enclave is **not optional and not "keep a backup for a few weeks."** OLD's `accounts/` is a stale copy of customer state; an enclave binary for OLD's MRENCLAVE is reproducible from source, so OLD's sealed state is not cryptographically guaranteed inert. Stale sealed-state copies are a residue and an exposure surface — this is a direct lesson of the MRSIGNER seal-policy incident (INCIDENT-2026-05-20).
+
+Per node, after promotion is verified:
+1. OLD's process is already stopped (§5.1). Disable the OLD unit if it were ever separately defined.
+2. **Scrub** OLD's sealed state: delete OLD's former `accounts/` directory and any archive/snapshot directories from prior cycles. Keep the audit record in `docs/` + memory, not as sealed blobs on disk.
+3. If the migration retired an on-chain escrow as part of the change, check the old escrow's on-chain balance before scrubbing its key material — confirm nothing of value is stranded.
+4. Re-scan: confirm only the active enclave's `accounts/` remains, all sealed files the expected policy, zero stale dirs.
+
+Do not co-mingle other applications' sealed state into this scrub — only perp-dex directories.
+
+---
+
+## 7. Failure modes and recovery
 
 | Symptom | Cause | Recovery |
 |---|---|---|
-| `node-deploy --side-by-side` rejects: "OLD service not active" | OLD enclave service stopped or unhealthy | Restart OLD (`sudo systemctl start perp-dex-enclave`); investigate why it stopped |
-| `node-deploy --side-by-side` rejects: "NEW unit not found" | Pre-requisite 4(a) skipped | Install the systemd unit per pre-requisites |
-| `node-deploy --side-by-side` rejects: "perp-next/ not empty" | Half-completed prior ceremony attempt | `sudo rm -rf /home/azureuser/perp-next/*` then retry |
-| `node-deploy --side-by-side` rejects: "port 9089 not available" | Stray process or earlier NEW enclave still running | `sudo systemctl stop perp-dex-enclave-next`; check `ss -ltn` for other listener |
-| `node-deploy --side-by-side` rejects: "MRENCLAVE mismatch" | Build artefacts don't match build-manifest.txt | Investigate WHICH enclave is running before retry; do NOT proceed with mismatched build |
-| Ceremony driver times out at confirmation step | NEW failed to seal one of the migrated files | OLD did NOT zeroise (it never received a confirmation report) — escrow keys remain accessible. Inspect NEW's enclave.log; if recoverable, restart NEW + retry the ceremony with a fresh `ceremony_nonce` (the OLD enclave's `recent_ceremony_nonces` set rejects re-use of the prior one) |
-| Ceremony driver returns `ERR_NONCE_REPLAY` | Operator re-attempted with the same nonce | Generate a fresh nonce; retry |
-| Ceremony driver returns `ERR_DELEGATION_QUORUM` | Insufficient operators signed the delegation | Coordinate with the missing operators; collect their signatures; retry |
-| Ceremony succeeded on NEW but `verify_import_confirmation` returns durability error | NEW's confirmation arrived but OLD couldn't seal the retired-marker (disk full / FS bug) | OLD's in-memory state is **not** retired (per implementation contract); operator investigates disk health. Note: the ceremony nonce is consumed — any retry MUST use a fresh nonce, and OLD's in-memory migration state is still set, so ceremony driver must restart from the beginning with a new nonce after disk fix |
+| `node-deploy --side-by-side` rejects "OLD service not active" | OLD enclave stopped/unhealthy | Restart OLD; investigate why it stopped |
+| rejects "NEW unit not found" | One-time setup (§2.5) skipped | Install the systemd unit |
+| rejects "perp-next/ not empty" | Half-completed prior attempt | Clear `perp-next/accounts/`, retry |
+| rejects "MRENCLAVE mismatch" | Build artefacts ≠ build-manifest | Find which enclave is running before retry; never proceed on a mismatch |
+| ceremony returns `ERR_DELEGATION_QUORUM` | Too few operators signed; OR a node was migrated to completion first and its OLD retired (§3 violation) | Collect the missing signatures; if an OLD was retired early, that node is stuck — see "stuck node" below |
+| ceremony returns `ERR_NONCE_REPLAY` | Same nonce re-used | A fresh nonce is generated per call; if this fires on a genuinely fresh nonce, suspect the RNG — capture both nodes' `recent_nonces.sealed` and contact dev-perp |
+| ceremony times out at confirmation | NEW failed to seal a migrated file | OLD did NOT retire (no confirmation received) — escrow keys remain accessible. Inspect NEW's `enclave.log`; restart NEW + retry with a fresh nonce |
+| post-migration restart: enclave refuses to start, `PATH_A_ERR_FILE_HASH_MISMATCH` (-17) | Pre-fix builds re-verified the migration manifest every boot; an operational state change then broke the file-hash check | Current builds **consume** the manifest after the first successful verify — this does not occur. If seen on a current build, the manifest write-back failed: inspect `enclave.log`, the manifest can be manually removed (the enclave then treats it as pre-migration state) |
+| export fails `PATH_A_ERR_BUFFER_TOO_SMALL` (-2) | Pre-REQ-16 host buffer too small for populated state | Fixed in current builds (4 MB export buffer, 16 MB transport buffer). Rebuild from a current ref |
+| partial cluster migration — some nodes on NEW, some on OLD | A node's ceremony failed mid-run | The cluster tolerates the split transiently. Re-run the ceremony on the failed node **while the other OLDs are still alive** (do not promote/decommission until all nodes are on NEW) |
+| **stuck node** — a node cannot reach delegation quorum because N-1 OLDs already retired | §3 parallel invariant violated | The retired OLDs cannot sign. Recovery is operational: the retired operators must re-stand a signing-capable enclave, or the cluster rebuilds the stuck node from a fresh bootstrap. Prevention: never migrate serially — §3 |
 
-## Recent ceremony nonces — crash-window note (LR-IMPL-3)
+---
 
-The OLD enclave's `recent_ceremony_nonces.sealed` is updated AFTER successful encrypt + LA report production but BEFORE `verify_import_confirmation`. There is a **short crash-window** between encrypt-success and nonce-seal during which a crash + restart could leave the nonce un-recorded; if the orchestrator then attempts a fresh ceremony with a different nonce, that succeeds normally — the un-recorded nonce is forgotten, **but** the captured ciphertext from the first attempt cannot be replayed because it was bound to the first nonce, which NEW already accepted (and consumed in its own recent_nonces set).
+## 8. Recent ceremony nonces — crash-window note (LR-IMPL-3)
 
-In practice this window is microseconds (the `sgx_seal_data + ocall_save_to_file` pair). Operator action: **none required**. The defense-in-depth model holds — no replay path opens up.
+OLD's `recent_nonces.sealed` is updated AFTER successful encrypt + LA-report production but BEFORE `verify_import_confirmation`. There is a microsecond crash-window between encrypt-success and nonce-seal; a crash there leaves the nonce un-recorded, but the captured ciphertext cannot be replayed — it is bound to a nonce NEW already consumed. Operator action: none. If `ERR_NONCE_REPLAY` ever fires on a freshly-generated nonce, capture both nodes' `recent_nonces.sealed` and contact dev-perp.
 
-If you observe an `ERR_NONCE_REPLAY` from a ceremony with a freshly-generated nonce (which would suggest something is wrong with the random source), capture both OLD's and NEW's `recent_ceremony_nonces.sealed` for forensics and contact `dev-perp` before continuing.
+---
 
-## Reference
+## 9. Reference
 
-- Specification: `docs/audit/REQ-7.md` (private repo `77ph/xrpl-perp-dex-enclave`)
-- Implementation: `EthSignerEnclave/Enclave/path_a.cpp` (private)
-- Orchestrator integration: `orchestrator/src/node_deploy.rs` + ceremony driver in commit 12
-- Audit cycle: REQ-8 R1 verdict in audit channel; R2 verdict pending after commit 12
+- Specification: `docs/audit/REQ-7.md`, REQ-7.5, REQ-8 (private repo `77ph/xrpl-perp-dex-enclave`).
+- Cluster ordering invariant: `docs/deployment-procedure.md §11.10`.
+- Seal-policy incident + cutover: `docs/audit/INCIDENT-2026-05-20-mrsigner-seal-policy.md`, REQ-16, REQ-17 (private).
+- Implementation: `EthSignerEnclave/Enclave/path_a.cpp`; `orchestrator/src/node_deploy.rs`, `path_a_migrate_admin.rs`.
+- Project invariants: `docs/audit/PROJECT-INVARIANTS.md`.
