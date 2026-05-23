@@ -17,7 +17,7 @@ It is foundational: until this mechanism is solid, the system cannot carry real 
 - Path A migration proven on real SGX hardware (a 3-node Azure DCsv3 cluster): all 4 state sections, a parallel per-node ceremony.
 - Verified that real customer state (balances, positions, vaults) survives a migration.
 - Found and fixed a serious latent security bug: sealing used the MRSIGNER key policy instead of MRENCLAVE — "security theater" (the code looked protected, but in fact any enclave signed with the same key could read customer state). Fixed both in code and on the live cluster — all state re-sealed.
-- Found and fixed a second bug (A-PA-1): attestation verification did not check the enclave's debug flag — a debug-build puppet would pass the check. The fix is in review.
+- Found and fixed a second bug (A-PA-1): attestation verification did not check the enclave's debug flag — a debug-build puppet would pass the check. Fix landed and is audit-PASS (REQ-18, 22 May 2026).
 - Wrote a production-grade operator runbook for the Path A ceremony (bilingual RU/EN).
 
 ## The auditor-interaction protocol we introduced
@@ -35,4 +35,4 @@ That the protocol works was shown by bug A-PA-1 — it was found precisely becau
 
 ## We unblocked the path to Tom / vault
 
-Path A is closed (apart from a small REQ-18 in review) — the foundational piece is done. Further development — Tom's feedback items and the V1 vault — now builds on a proven foundation that will not have to be redone.
+Path A is closed — the foundational piece is done. Further development — Tom's feedback items and the V1 vault — now builds on a proven foundation that will not have to be redone.
