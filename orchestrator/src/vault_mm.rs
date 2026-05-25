@@ -1,17 +1,17 @@
-//! Market Making Vault — automated liquidity provision on the CLOB.
+//! V1 vault: virtual-AMM-on-CLOB market making (Tom-spec, post-hackathon-specs.md Issue #3).
 //!
-//! Runs as a background tokio task inside the orchestrator. Every
-//! `rebalance_interval` seconds it cancels stale orders and places fresh
-//! limit buy + sell around the current mark price with a configurable
-//! spread.
+//! Runs as a background tokio task inside the orchestrator. The vault is a
+//! regular user from the enclave's perspective — it deposits collateral,
+//! holds positions, and submits maker orders through the engine. No special
+//! treatment in the matching engine.
 //!
-//! The vault is a regular user from the trading engine's perspective — it
-//! has its own margin balance in the enclave and submits orders through
-//! `TradingEngine::submit_order`. No special treatment in the matching
-//! engine.
+//! Pricing source: the vAMM curve. Tom (Q3.2): "refreshes should be based
+//! on curve-implied price moves, not external mark moves. NOTE, THIS IS
+//! REALLY IMPORTANT as it is the source of the arb flow."
 //!
-//! Designed per Tom's vault-design-spec.md (PR #4), type 1 "Market Making
-//! Vault — low risk".
+//! Curve math, ladder construction, and posture/hysteresis live in
+//! `crate::vamm` — fully unit-tested there. This file is the long-running
+//! loop: poll → trigger → cancel → place.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -21,112 +21,105 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::api::AppState;
-use crate::orderbook::OrderType;
+use crate::orderbook::{OrderType, TimeInForce};
 use crate::types::{Side, FP8};
+use crate::vamm::{build_ladder, evaluate_posture, Curve, Posture};
 
-/// Vault strategy type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VaultStrategy {
-    /// Quote both sides symmetrically around mark price.
-    MarketMaking,
-    /// Quote both sides but bias toward reducing net delta.
-    /// If net long → heavier asks; if net short → heavier bids.
-    /// Target: keep |net_delta| below max_delta.
-    DeltaNeutral,
-}
-
-/// Configuration for the Market Making Vault.
+/// V1 vault (vAMM) configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VaultMmConfig {
-    /// The vault's user_id in the trading engine / enclave.
+    /// Vault user_id in the enclave / CLOB.
     #[serde(default = "default_vault_user_id")]
     pub user_id: String,
-    /// Half-spread as a fraction (e.g. 0.0025 = 0.25% each side, 0.5% total).
-    #[serde(default = "default_half_spread")]
-    pub half_spread: f64,
-    /// Order size in XRP (FP8 string).
-    #[serde(default = "default_order_size")]
-    pub order_size: String,
-    /// Seconds between rebalances.
-    #[serde(default = "default_interval")]
-    pub interval_secs: u64,
-    /// Initial margin to deposit for the vault on startup (FP8 string).
+    /// Seed deposit on startup (FP8 XRP string).
     #[serde(default = "default_initial_deposit")]
     pub initial_deposit: String,
-    /// Max number of open order levels per side.
-    #[serde(default = "default_levels")]
-    pub levels: usize,
-    /// Strategy: market_making (default) or delta_neutral.
-    #[serde(default = "default_strategy")]
-    pub strategy: VaultStrategy,
-    /// Max acceptable net delta (in XRP, FP8). Beyond this the vault
-    /// quotes one-sided to reduce exposure. Only used for delta_neutral.
-    #[serde(default = "default_max_delta")]
-    pub max_delta: f64,
-    /// O-M5: kill-switch cap on aggregate vault inventory (in XRP).
-    /// A one-sided sweep would otherwise pyramid the vault's position
-    /// without bound; this cap pauses placement on levels whose fill
-    /// would push the inventory metric over the limit. For MarketMaking
-    /// the metric is gross inventory (sum of |position sizes|); for
-    /// DeltaNeutral it is |net delta|, since the hedge cancels.
-    #[serde(default = "default_max_inventory")]
-    pub max_inventory: f64,
+    /// Curve depth multiplier: x_0 = depth_mult × collateral. Larger = less slippage per fill.
+    #[serde(default = "default_depth_mult")]
+    pub depth_mult: f64,
+    /// Target delta as a fraction of collateral notional (positive = short bias). Tom-Q3.4. Default 0.5.
+    #[serde(default = "default_target_delta_frac")]
+    pub target_delta_frac: f64,
+    /// Ladder levels per side. Tom-Q3.2 default 5.
+    #[serde(default = "default_steps")]
+    pub steps: usize,
+    /// Spacing between ladder levels in basis points. Tom-Q3.2 default 10.
+    #[serde(default = "default_step_bps")]
+    pub step_bps: u32,
+    /// Per-level size as a fraction of free collateral. Tom-Q3.2 default 0.1 (10%).
+    #[serde(default = "default_level_size_pct")]
+    pub level_size_pct: f64,
+    /// Hard delta cap (fraction of collateral). Tom-Q3.4 / Q4.1. Default 2.0.
+    #[serde(default = "default_delta_cap")]
+    pub delta_cap: f64,
+    /// Collateral utilization cap. Tom-Q4.1. Default 0.8.
+    #[serde(default = "default_util_cap")]
+    pub util_cap: f64,
+    /// Hysteresis gap. Tom-Q4.2. Default 0.25.
+    #[serde(default = "default_hysteresis")]
+    pub hysteresis: f64,
+    /// Curve-implied mid move (bps) that triggers a refresh. Default 5.
+    #[serde(default = "default_refresh_bps")]
+    pub refresh_bps: u32,
+    /// Poll cadence (sec). Default 1.
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_secs: u64,
 }
 
 fn default_vault_user_id() -> String {
-    "vault:mm".into()
-}
-fn default_half_spread() -> f64 {
-    0.0025
-}
-fn default_order_size() -> String {
-    "100.00000000".into()
-}
-fn default_interval() -> u64 {
-    5
+    "vault:vamm".into()
 }
 fn default_initial_deposit() -> String {
     "10000.00000000".into()
 }
-fn default_levels() -> usize {
-    3
+fn default_depth_mult() -> f64 {
+    10.0
 }
-fn default_strategy() -> VaultStrategy {
-    VaultStrategy::MarketMaking
+fn default_target_delta_frac() -> f64 {
+    0.5
 }
-fn default_max_delta() -> f64 {
-    500.0
+fn default_steps() -> usize {
+    5
 }
-fn default_max_inventory() -> f64 {
-    50.0
+fn default_step_bps() -> u32 {
+    10
+}
+fn default_level_size_pct() -> f64 {
+    0.1
+}
+fn default_delta_cap() -> f64 {
+    2.0
+}
+fn default_util_cap() -> f64 {
+    0.8
+}
+fn default_hysteresis() -> f64 {
+    0.25
+}
+fn default_refresh_bps() -> u32 {
+    5
+}
+fn default_poll_interval() -> u64 {
+    1
 }
 
 impl Default for VaultMmConfig {
     fn default() -> Self {
         VaultMmConfig {
             user_id: default_vault_user_id(),
-            half_spread: default_half_spread(),
-            order_size: default_order_size(),
-            interval_secs: default_interval(),
             initial_deposit: default_initial_deposit(),
-            levels: default_levels(),
-            strategy: default_strategy(),
-            max_delta: default_max_delta(),
-            max_inventory: default_max_inventory(),
+            depth_mult: default_depth_mult(),
+            target_delta_frac: default_target_delta_frac(),
+            steps: default_steps(),
+            step_bps: default_step_bps(),
+            level_size_pct: default_level_size_pct(),
+            delta_cap: default_delta_cap(),
+            util_cap: default_util_cap(),
+            hysteresis: default_hysteresis(),
+            refresh_bps: default_refresh_bps(),
+            poll_interval_secs: default_poll_interval(),
         }
     }
-}
-
-/// O-M5: return the index set of levels that can be placed without
-/// exceeding `max_inventory`. Each entry is `true` if the level is
-/// safe to place. If every entry is `false`, the caller should pause
-/// quoting until inventory drains.
-fn levels_to_place(inventory_metric: f64, max_inventory: f64, level_sizes: &[FP8]) -> Vec<bool> {
-    level_sizes
-        .iter()
-        .map(|s| inventory_metric + s.to_f64() <= max_inventory)
-        .collect()
 }
 
 /// Seed the vault user with initial margin in the enclave.
@@ -145,326 +138,355 @@ pub async fn seed_vault_deposit(perp: &crate::perp_client::PerpClient, config: &
         Ok(_) => info!(
             user = %config.user_id,
             amount = %config.initial_deposit,
-            "vault MM: seeded initial deposit"
+            "vault vAMM: seeded initial deposit"
         ),
         Err(e) => warn!(
             user = %config.user_id,
-            "vault MM: seed deposit failed (may already exist): {}",
+            "vault vAMM: seed deposit failed (may already exist): {}",
             e
         ),
     }
 }
 
-/// Run the market-making loop. Call via `tokio::spawn`.
-pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
-    let mut interval = tokio::time::interval(Duration::from_secs(config.interval_secs));
-    // Fallback order size if balance query fails
-    let fallback_size: FP8 = config.order_size.parse().unwrap_or(FP8(100_00000000));
-    // Max fraction of available margin to allocate across ALL levels per side
-    let size_pct: f64 = 0.01; // 1% of balance total, split across levels
-
-    info!(
-        user = %config.user_id,
-        half_spread = config.half_spread,
-        size_pct = size_pct,
-        fallback_size = %fallback_size,
-        interval = config.interval_secs,
-        levels = config.levels,
-        "vault MM started"
-    );
-
-    loop {
-        interval.tick().await;
-
-        // Only run if this node is the sequencer (validators don't submit orders)
-        if !state.is_sequencer.load(Ordering::Relaxed) {
-            continue;
-        }
-
-        let mark_raw = state.mark_price.load(Ordering::Relaxed);
-        if mark_raw <= 0 {
-            debug!("vault MM: no mark price yet, skipping");
-            continue;
-        }
-        let mark = FP8(mark_raw);
-        let mark_f = mark.to_f64();
-
-        // Query vault's available margin from enclave to size orders as %
-        let order_size = match state.perp.get_balance(&config.user_id).await {
-            Ok(bal) => {
-                let avail_str = bal["data"]["available_margin"].as_str().unwrap_or("0");
-                let avail: f64 = avail_str.parse().unwrap_or(0.0);
-                if avail <= 0.0 {
-                    debug!(user = %config.user_id, "vault MM: no available margin");
-                    continue;
-                }
-                // 1% of available margin / number of levels = per-level size
-                let per_level = avail * size_pct / config.levels as f64;
-                let sized = FP8::from_f64(per_level);
-                if sized.raw() <= 0 {
-                    fallback_size
-                } else {
-                    sized
-                }
-            }
-            Err(_) => fallback_size,
-        };
-
-        // Delta Neutral: compute net position delta to decide quoting bias
-        let (quote_bids, quote_asks) = if config.strategy == VaultStrategy::DeltaNeutral {
-            let net_delta = compute_net_delta(&state.perp, &config.user_id).await;
-            if net_delta > config.max_delta {
-                // Too long → only sell (asks) to reduce
-                debug!(
-                    net_delta,
-                    max = config.max_delta,
-                    "vault DN: over max delta, asks only"
-                );
-                (false, true)
-            } else if net_delta < -config.max_delta {
-                // Too short → only buy (bids) to reduce
-                debug!(
-                    net_delta,
-                    max = config.max_delta,
-                    "vault DN: under -max delta, bids only"
-                );
-                (true, false)
-            } else {
-                (true, true)
-            }
-        } else {
-            (true, true) // MM: always quote both sides
-        };
-
-        // Cancel all existing vault orders
-        let cancelled = state.engine.cancel_all(&config.user_id).await;
-        if !cancelled.is_empty() {
-            debug!(cancelled = cancelled.len(), "vault: cancelled stale orders");
-        }
-
-        // Fixed pyramid sizes per level (split across both vaults: mm + dn)
-        // Target visible book: 3.8 / 7.6 / 15.2 — each vault places half
-        // Reduced 10x for mainnet safety (limits max position size)
-        let fixed_sizes: [f64; 3] = [1.9, 3.8, 7.6];
-
-        // O-M5: compute the inventory metric before quoting. A one-sided
-        // sweep would otherwise pyramid without bound; the cap below
-        // pauses placement on levels whose size would push us over.
-        let inventory_metric = match config.strategy {
-            VaultStrategy::MarketMaking => {
-                compute_gross_inventory(&state.perp, &config.user_id).await
-            }
-            VaultStrategy::DeltaNeutral => {
-                compute_net_delta(&state.perp, &config.user_id).await.abs()
-            }
-        };
-
-        // Precompute level sizes so we can query the cap per level.
-        let level_sizes: Vec<FP8> = (0..config.levels)
-            .map(|level| {
-                if level < fixed_sizes.len() {
-                    FP8::from_f64(fixed_sizes[level])
-                } else {
-                    order_size
-                }
-            })
-            .collect();
-        let place_mask = levels_to_place(inventory_metric, config.max_inventory, &level_sizes);
-        if place_mask.iter().all(|b| !*b) {
-            warn!(
-                user = %config.user_id,
-                inventory = inventory_metric,
-                cap = config.max_inventory,
-                "vault: inventory cap reached, pausing quoting until it drains"
-            );
-            continue;
-        }
-
-        // Place levels on each side
-        for level in 0..config.levels {
-            if !place_mask[level] {
-                debug!(
-                    level,
-                    inventory = inventory_metric,
-                    cap = config.max_inventory,
-                    "vault: level skipped to stay under inventory cap"
-                );
-                continue;
-            }
-
-            let spread_mult = config.half_spread * (1.0 + level as f64 * 0.5);
-            let bid_price = FP8::from_f64(mark_f * (1.0 - spread_mult));
-            let ask_price = FP8::from_f64(mark_f * (1.0 + spread_mult));
-
-            if bid_price.raw() <= 0 || ask_price.raw() <= 0 {
-                continue;
-            }
-
-            let level_size = level_sizes[level];
-
-            // Place bid (skipped if delta neutral says "asks only")
-            if quote_bids {
-                if let Err(e) = state
-                    .engine
-                    .submit_order(
-                        config.user_id.clone(),
-                        Side::Long,
-                        OrderType::Limit,
-                        bid_price,
-                        level_size,
-                        1, // leverage
-                        crate::orderbook::TimeInForce::Gtc,
-                        false,
-                        Some(format!("vault-bid-{level}")),
-                        Some("vAMM".into()),
-                    )
-                    .await
-                {
-                    warn!(level, price = %bid_price, "vault bid failed: {}", e);
-                }
-            }
-
-            // Place ask (skipped if delta neutral says "bids only")
-            if quote_asks {
-                if let Err(e) = state
-                    .engine
-                    .submit_order(
-                        config.user_id.clone(),
-                        Side::Short,
-                        OrderType::Limit,
-                        ask_price,
-                        level_size,
-                        1,
-                        crate::orderbook::TimeInForce::Gtc,
-                        false,
-                        Some(format!("vault-ask-{level}")),
-                        Some("vAMM".into()),
-                    )
-                    .await
-                {
-                    warn!(level, price = %ask_price, "vault ask failed: {}", e);
-                }
-            }
-        }
-
-        debug!(
-            mark = %mark,
-            levels = config.levels,
-            quote_bids,
-            quote_asks,
-            "vault: placed fresh quotes"
-        );
-    }
-}
-
-/// Compute the vault's net delta (sum of long sizes - sum of short sizes).
-/// Returns 0.0 if the query fails or the vault has no positions.
-async fn compute_net_delta(perp: &crate::perp_client::PerpClient, user_id: &str) -> f64 {
-    let bal = match perp.get_balance(user_id).await {
-        Ok(b) => b,
-        Err(_) => return 0.0,
-    };
-    let positions = match bal["data"]["positions"].as_array() {
-        Some(arr) => arr,
-        None => return 0.0,
-    };
+/// Sum net XRP position from enclave balance JSON.
+/// Positive = net long; negative = net short.
+fn positions_to_net_xrp(bal: &serde_json::Value) -> f64 {
     let mut net: f64 = 0.0;
-    for pos in positions {
-        let size: f64 = pos["size"]
-            .as_str()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
-        let side = pos["side"].as_str().unwrap_or("");
-        match side {
-            "long" | "1" => net += size,
-            "short" | "2" => net -= size,
-            _ => {}
+    if let Some(arr) = bal["data"]["positions"].as_array() {
+        for p in arr {
+            let size: f64 = p["size"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            let side = p["side"].as_str().unwrap_or("long");
+            if size > 0.0 {
+                if side == "long" || side == "buy" {
+                    net += size;
+                } else {
+                    net -= size;
+                }
+            }
         }
     }
     net
 }
 
-/// Compute gross vault inventory: sum of |position sizes| across all
-/// open positions. Used by the MM-mode inventory cap (O-M5) — a
-/// one-sided sweep shows up as growing gross inventory regardless of
-/// which side accumulated.
-async fn compute_gross_inventory(perp: &crate::perp_client::PerpClient, user_id: &str) -> f64 {
-    let bal = match perp.get_balance(user_id).await {
-        Ok(b) => b,
-        Err(_) => return 0.0,
-    };
-    let positions = match bal["data"]["positions"].as_array() {
-        Some(arr) => arr,
-        None => return 0.0,
-    };
-    let mut gross: f64 = 0.0;
-    for pos in positions {
-        let size: f64 = pos["size"]
+/// Pick the largest absolute position to close when in UtilHot.
+/// Returns (position_id, side, size_to_close). For V1 we close the entire
+/// largest position; partial-close sizing under Tom-Q4.1 ("close only if
+/// still over") is achieved by re-evaluating posture on the next tick.
+fn pick_position_to_reduce(bal: &serde_json::Value) -> Option<(u32, Side, FP8)> {
+    let arr = bal["data"]["positions"].as_array()?;
+    let mut best: Option<(u32, Side, FP8, f64)> = None;
+    for p in arr {
+        let pid: u32 = p["id"].as_u64().unwrap_or(0) as u32;
+        if pid == 0 {
+            continue;
+        }
+        let size_f: f64 = p["size"]
             .as_str()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
-        gross += size.abs();
+        if size_f <= 0.0 {
+            continue;
+        }
+        let size_fp = FP8::from_f64(size_f);
+        let side_str = p["side"].as_str().unwrap_or("long");
+        let side = if side_str == "long" || side_str == "buy" {
+            Side::Long
+        } else {
+            Side::Short
+        };
+        let abs = size_f.abs();
+        if best.as_ref().map(|b| abs > b.3).unwrap_or(true) {
+            best = Some((pid, side, size_fp, abs));
+        }
     }
-    gross
+    best.map(|(pid, side, sz, _)| (pid, side, sz))
+}
+
+/// Run the vAMM market-making loop. Spawn via `tokio::spawn`.
+pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
+    // 1. Parse collateral.
+    let collateral_xrp: f64 = config
+        .initial_deposit
+        .parse::<FP8>()
+        .map(|f| f.to_f64())
+        .unwrap_or(10_000.0);
+    if collateral_xrp <= 0.0 {
+        warn!("vault vAMM: zero collateral, exiting");
+        return;
+    }
+
+    // 2. Wait for an initial mark price to anchor the curve.
+    //    After init the curve is self-referential — external mark is never read.
+    let mark_init: f64 = loop {
+        let raw = state.mark_price.load(Ordering::Relaxed);
+        if raw > 0 {
+            break FP8(raw).to_f64();
+        }
+        debug!("vault vAMM: waiting for initial mark price");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+
+    let curve = Curve::new(
+        collateral_xrp,
+        config.depth_mult,
+        mark_init,
+        config.target_delta_frac,
+    );
+
+    info!(
+        user = %config.user_id,
+        collateral = collateral_xrp,
+        mark_init,
+        target_delta_frac = config.target_delta_frac,
+        depth_mult = config.depth_mult,
+        steps = config.steps,
+        step_bps = config.step_bps,
+        delta_cap = config.delta_cap,
+        util_cap = config.util_cap,
+        refresh_bps = config.refresh_bps,
+        "vault vAMM initialized"
+    );
+
+    let mut last_position: f64 = 0.0;
+    let mut last_mid: f64 = curve.implied_mid(0.0);
+    let mut posture = Posture::Healthy;
+    // Tom-Q4.1 cancel-first / close-second: we close a position only when
+    // UtilHot persists into a second tick. Track that across iterations.
+    let mut util_hot_streak: u32 = 0;
+
+    let mut interval = tokio::time::interval(Duration::from_secs(config.poll_interval_secs.max(1)));
+
+    loop {
+        interval.tick().await;
+
+        if !state.is_sequencer.load(Ordering::Relaxed) {
+            continue;
+        }
+
+        let bal = match state.perp.get_balance(&config.user_id).await {
+            Ok(b) => b,
+            Err(e) => {
+                debug!("vault vAMM: get_balance failed: {}", e);
+                continue;
+            }
+        };
+
+        let free_xrp: f64 = bal["data"]["available_margin"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let net_position = positions_to_net_xrp(&bal);
+        let net_delta_frac = net_position / collateral_xrp;
+        let used = (collateral_xrp - free_xrp).max(0.0);
+        let util = (used / collateral_xrp).clamp(0.0, 1.0);
+
+        let new_posture = evaluate_posture(
+            net_delta_frac,
+            util,
+            posture,
+            config.hysteresis,
+            config.delta_cap,
+            config.util_cap,
+        );
+
+        let curve_mid = curve.implied_mid(net_position);
+        let posture_changed = new_posture != posture;
+        let fill_detected = (net_position - last_position).abs() > 1e-9;
+        let mid_moved_bps = if last_mid > 0.0 {
+            ((curve_mid - last_mid).abs() / last_mid) * 10_000.0
+        } else {
+            f64::INFINITY
+        };
+        let curve_moved = mid_moved_bps >= config.refresh_bps as f64;
+        let trigger = posture_changed || fill_detected || curve_moved;
+
+        if !trigger && !matches!(new_posture, Posture::UtilHot) {
+            // No work this tick. Reset util_hot_streak when we go back to a non-hot posture.
+            if !matches!(posture, Posture::UtilHot) {
+                util_hot_streak = 0;
+            }
+            continue;
+        }
+
+        debug!(
+            posture = ?new_posture,
+            net_position,
+            net_delta_frac,
+            util,
+            curve_mid,
+            posture_changed,
+            fill_detected,
+            mid_moved_bps,
+            "vault vAMM: refresh trigger"
+        );
+
+        // Cancel-first (Tom-Q4.1): always cancel resting orders on trigger.
+        let cancelled = state.engine.cancel_all(&config.user_id).await;
+        if !cancelled.is_empty() {
+            debug!(
+                cancelled = cancelled.len(),
+                "vault vAMM: cancelled resting orders"
+            );
+        }
+
+        // UtilHot: cancel first, close on a second consecutive UtilHot tick.
+        if matches!(new_posture, Posture::UtilHot) {
+            util_hot_streak += 1;
+            if util_hot_streak >= 2 {
+                if let Some((pid, side, size)) = pick_position_to_reduce(&bal) {
+                    // Close via reduce_only IOC market on the opposing side.
+                    let close_side = match side {
+                        Side::Long => Side::Short,
+                        Side::Short => Side::Long,
+                    };
+                    info!(
+                        position_id = pid,
+                        size = %size,
+                        close_side = ?close_side,
+                        "vault vAMM: UtilHot persistent — reducing largest position"
+                    );
+                    if let Err(e) = state
+                        .engine
+                        .submit_order(
+                            config.user_id.clone(),
+                            close_side,
+                            OrderType::Market,
+                            FP8::ZERO,
+                            size,
+                            1,
+                            TimeInForce::Ioc,
+                            true,
+                            Some(format!("vamm-reduce-{pid}")),
+                            Some("vAMM".into()),
+                        )
+                        .await
+                    {
+                        warn!("vault vAMM: reduce-position failed: {}", e);
+                    }
+                } else {
+                    warn!("vault vAMM: UtilHot but no position to reduce");
+                }
+            } else {
+                info!(
+                    util,
+                    cap = config.util_cap,
+                    "vault vAMM: UtilHot — cancelled resting, observing one more tick before reducing"
+                );
+            }
+            posture = new_posture;
+            last_position = net_position;
+            last_mid = curve_mid;
+            continue;
+        }
+
+        util_hot_streak = 0;
+
+        // Build + place ladder.
+        let levels = build_ladder(
+            &curve,
+            net_position,
+            free_xrp,
+            config.steps,
+            config.step_bps,
+            config.level_size_pct,
+            new_posture,
+        );
+
+        let mut placed = 0usize;
+        for lv in &levels {
+            let cid = match lv.side {
+                Side::Short => format!("vamm-ask-{}", lv.price.raw()),
+                Side::Long => format!("vamm-bid-{}", lv.price.raw()),
+            };
+            match state
+                .engine
+                .submit_order(
+                    config.user_id.clone(),
+                    lv.side,
+                    OrderType::Limit,
+                    lv.price,
+                    lv.size,
+                    1,
+                    TimeInForce::Gtc,
+                    false,
+                    Some(cid),
+                    Some("vAMM".into()),
+                )
+                .await
+            {
+                Ok(_) => placed += 1,
+                Err(e) => warn!(side = ?lv.side, price = %lv.price, "vault vAMM order failed: {}", e),
+            }
+        }
+
+        debug!(
+            placed,
+            total = levels.len(),
+            curve_mid,
+            net_position,
+            "vault vAMM: ladder placed"
+        );
+
+        posture = new_posture;
+        last_position = net_position;
+        last_mid = curve_mid;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
-    fn levels_to_place_empty_inventory_allows_all() {
-        let sizes = vec![FP8::from_f64(1.9), FP8::from_f64(3.8), FP8::from_f64(7.6)];
-        let mask = levels_to_place(0.0, 50.0, &sizes);
-        assert_eq!(mask, vec![true, true, true]);
-    }
-
-    #[test]
-    fn levels_to_place_caps_largest_first() {
-        let sizes = vec![FP8::from_f64(1.9), FP8::from_f64(3.8), FP8::from_f64(7.6)];
-        // 45 + 1.9=46.9, 45+3.8=48.8, 45+7.6=52.6 → only the last is capped
-        let mask = levels_to_place(45.0, 50.0, &sizes);
-        assert_eq!(mask, vec![true, true, false]);
-    }
-
-    #[test]
-    fn levels_to_place_one_sided_sweep_eventually_pauses_quoting() {
-        // Simulate a one-sided sweep: inventory ratchets up by the
-        // pyramid sum each rebalance. Assert that the cap bites before
-        // it runs away (the "cap holds" property the audit asks for).
-        let sizes = vec![FP8::from_f64(1.9), FP8::from_f64(3.8), FP8::from_f64(7.6)];
-        let cap = 50.0;
-        let mut inventory = 0.0;
-        let mut rebalances = 0;
-        loop {
-            let mask = levels_to_place(inventory, cap, &sizes);
-            if mask.iter().all(|b| !*b) {
-                break;
+    fn positions_to_net_xrp_sums_long_minus_short() {
+        let bal = json!({
+            "data": {
+                "positions": [
+                    {"side": "long", "size": "100.0"},
+                    {"side": "short", "size": "40.0"},
+                    {"side": "long", "size": "20.0"},
+                ]
             }
-            for (i, placed) in mask.iter().enumerate() {
-                if *placed {
-                    inventory += sizes[i].to_f64();
-                }
-            }
-            rebalances += 1;
-            assert!(
-                rebalances < 20,
-                "cap should bite within a finite number of rebalances"
-            );
-        }
-        // Once we pause, inventory must be bounded above by cap plus one
-        // level size (the last placement can straddle the cap by less
-        // than the largest level size).
-        assert!(
-            inventory <= cap + sizes.iter().map(|s| s.to_f64()).fold(0.0, f64::max),
-            "inventory exceeded cap by more than one level size: {inventory}"
-        );
+        });
+        let net = positions_to_net_xrp(&bal);
+        assert!((net - 80.0).abs() < 1e-9, "expected 80, got {net}");
     }
 
     #[test]
-    fn levels_to_place_cap_exactly_equal_is_allowed() {
-        let sizes = vec![FP8::from_f64(5.0)];
-        let mask = levels_to_place(45.0, 50.0, &sizes); // 45 + 5 == 50
-        assert_eq!(mask, vec![true]);
+    fn positions_to_net_xrp_empty_returns_zero() {
+        let bal = json!({ "data": { "positions": [] } });
+        assert_eq!(positions_to_net_xrp(&bal), 0.0);
+    }
+
+    #[test]
+    fn positions_to_net_xrp_missing_field_returns_zero() {
+        let bal = json!({ "data": {} });
+        assert_eq!(positions_to_net_xrp(&bal), 0.0);
+    }
+
+    #[test]
+    fn pick_position_to_reduce_chooses_largest_absolute() {
+        let bal = json!({
+            "data": {
+                "positions": [
+                    {"id": 1, "side": "long",  "size": "10.0"},
+                    {"id": 2, "side": "short", "size": "50.0"},
+                    {"id": 3, "side": "long",  "size": "30.0"},
+                ]
+            }
+        });
+        let (pid, side, _sz) = pick_position_to_reduce(&bal).expect("some");
+        assert_eq!(pid, 2);
+        assert_eq!(side, Side::Short);
+    }
+
+    #[test]
+    fn pick_position_to_reduce_returns_none_when_empty() {
+        let bal = json!({ "data": { "positions": [] } });
+        assert!(pick_position_to_reduce(&bal).is_none());
     }
 }

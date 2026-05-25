@@ -397,33 +397,14 @@ struct RunArgs {
     #[arg(long)]
     signers_config: Option<PathBuf>,
 
-    /// Enable the Market Making Vault (automated liquidity provider).
-    /// The vault deposits initial margin and continuously quotes bid/ask
-    /// around the mark price on the CLOB.
+    /// Enable the V1 vault: virtual AMM posting a ladder of curve-priced
+    /// limit orders to the CLOB (Tom-spec, post-hackathon-specs.md Issue #3).
+    /// Configuration uses `VaultMmConfig::default()` — curve depth, target
+    /// delta (0.5 short bias), 5×10bps ladder, |delta|≤2, util≤80%, 25%
+    /// hysteresis. Operator-tunable overrides will come as a config file
+    /// when the parameters need per-deployment tuning.
     #[arg(long)]
     vault_mm: bool,
-
-    /// Vault MM half-spread (fraction, e.g. 0.0025 = 0.25% each side).
-    #[arg(long, default_value_t = 0.0025)]
-    vault_mm_spread: f64,
-
-    /// Vault MM order size per level (FP8 string).
-    #[arg(long, default_value = "100.00000000")]
-    vault_mm_size: String,
-
-    /// Vault MM number of price levels per side.
-    #[arg(long, default_value_t = 3)]
-    vault_mm_levels: usize,
-
-    /// O-M5: cap on aggregate vault inventory (XRP). Pauses quoting
-    /// when gross inventory (MM) or |net delta| (DN) would exceed this.
-    /// Guards against unbounded pyramiding on a one-sided sweep.
-    #[arg(long, default_value_t = 50.0)]
-    vault_mm_max_inventory: f64,
-
-    /// Enable Delta Neutral vault (quotes both sides, biases to reduce net delta).
-    #[arg(long)]
-    vault_dn: bool,
 
     /// Path to shards.toml config. If not set, a single-shard router is
     /// created from --enclave-url with shard_id=0.
@@ -1450,7 +1431,6 @@ async fn main() -> Result<()> {
 
     // Clone role_rx for singletons before the watcher consumes it
     let role_rx_vault_mm = role_rx.clone();
-    let role_rx_vault_dn = role_rx.clone();
 
     // Role change watcher — flips is_sequencer AtomicBool
     let is_seq_watcher = is_sequencer.clone();
@@ -1693,42 +1673,12 @@ async fn main() -> Result<()> {
 
     info!(escrow = %escrow_address, "orchestrator started");
 
-    // Market Making Vault — singleton (only runs on sequencer)
+    // V1 vault (vAMM) — singleton (only runs on sequencer).
     let _vault_mm_singleton = if cli.vault_mm {
-        let vault_config = vault_mm::VaultMmConfig {
-            half_spread: cli.vault_mm_spread,
-            order_size: cli.vault_mm_size.clone(),
-            levels: cli.vault_mm_levels,
-            strategy: vault_mm::VaultStrategy::MarketMaking,
-            max_inventory: cli.vault_mm_max_inventory,
-            ..Default::default()
-        };
+        let vault_config = vault_mm::VaultMmConfig::default();
         vault_mm::seed_vault_deposit(&perp, &vault_config).await;
         let vault_state = app_state.clone();
         Some(singleton::spawn("vault-mm", role_rx_vault_mm, move || {
-            let state = vault_state.clone();
-            let cfg = vault_config.clone();
-            async move { vault_mm::run_vault_mm(state, cfg).await }
-        }))
-    } else {
-        None
-    };
-
-    // Delta Neutral Vault — singleton (only runs on sequencer)
-    let _vault_dn_singleton = if cli.vault_dn {
-        let vault_config = vault_mm::VaultMmConfig {
-            user_id: "vault:dn".into(),
-            half_spread: cli.vault_mm_spread,
-            order_size: cli.vault_mm_size.clone(),
-            levels: cli.vault_mm_levels,
-            strategy: vault_mm::VaultStrategy::DeltaNeutral,
-            max_delta: 500.0,
-            max_inventory: cli.vault_mm_max_inventory,
-            ..Default::default()
-        };
-        vault_mm::seed_vault_deposit(&perp, &vault_config).await;
-        let vault_state = app_state.clone();
-        Some(singleton::spawn("vault-dn", role_rx_vault_dn, move || {
             let state = vault_state.clone();
             let cfg = vault_config.clone();
             async move { vault_mm::run_vault_mm(state, cfg).await }
