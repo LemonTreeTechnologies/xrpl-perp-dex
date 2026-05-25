@@ -71,8 +71,9 @@ impl Curve {
             // Return a very large price; caller will throttle quoting.
             return self.mark_init * 1e6;
         }
-        let ratio = self.x_0 / x_eff;
-        self.mark_init * ratio * ratio
+        // Equivalent forms: mid = mark_init·(x_0/x_eff)² = k / x_eff² where
+        // k = x_0² · mark_init. We compute via k to keep the invariant visible.
+        self.k / (x_eff * x_eff)
     }
 }
 
