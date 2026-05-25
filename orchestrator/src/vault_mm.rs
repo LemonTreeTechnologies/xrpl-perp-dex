@@ -205,6 +205,55 @@ fn pick_position_to_reduce(bal: &serde_json::Value) -> Option<(u32, Side, FP8)> 
     best.map(|(pid, side, sz, _)| (pid, side, sz))
 }
 
+/// Output of the per-tick trigger evaluation. Carries the sub-conditions
+/// so the loop can log them, plus `should_refresh()` for the gate decision.
+#[derive(Debug, Clone, Copy)]
+pub struct TriggerEvaluation {
+    pub posture_changed: bool,
+    pub fill_detected: bool,
+    pub mid_moved_bps: f64,
+    pub curve_moved: bool,
+}
+
+impl TriggerEvaluation {
+    pub fn should_refresh(&self) -> bool {
+        self.posture_changed || self.fill_detected || self.curve_moved
+    }
+}
+
+/// Pure trigger evaluation: should the vault cancel + replace on this tick?
+/// Triggers on (a) posture change, (b) fill detected (net position drift),
+/// (c) curve-implied mid moved ≥ `refresh_bps`. External mark is NOT consulted
+/// (Tom-Q3.2 REALLY-IMPORTANT invariant).
+///
+/// `last_mid <= 0.0` is a cold-start sentinel: returns `mid_moved_bps =
+/// f64::INFINITY`, forcing `curve_moved = true` and `should_refresh() =
+/// true` on the very first tick.
+pub fn compute_trigger(
+    new_posture: Posture,
+    prev_posture: Posture,
+    net_position: f64,
+    last_position: f64,
+    curve_mid: f64,
+    last_mid: f64,
+    refresh_bps: u32,
+) -> TriggerEvaluation {
+    let posture_changed = new_posture != prev_posture;
+    let fill_detected = (net_position - last_position).abs() > 1e-9;
+    let mid_moved_bps = if last_mid > 0.0 {
+        ((curve_mid - last_mid).abs() / last_mid) * 10_000.0
+    } else {
+        f64::INFINITY
+    };
+    let curve_moved = mid_moved_bps >= refresh_bps as f64;
+    TriggerEvaluation {
+        posture_changed,
+        fill_detected,
+        mid_moved_bps,
+        curve_moved,
+    }
+}
+
 /// Run the vAMM market-making loop. Spawn via `tokio::spawn`.
 pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
     // 1. Parse collateral.
@@ -251,7 +300,10 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
     );
 
     let mut last_position: f64 = 0.0;
-    let mut last_mid: f64 = curve.implied_mid(0.0);
+    // X-19-2: 0.0 is the cold-start sentinel. The guard `if last_mid > 0.0`
+    // in compute_trigger() maps this to f64::INFINITY for mid_moved_bps, so
+    // trigger=true on the very first tick (and on every singleton respawn).
+    let mut last_mid: f64 = 0.0;
     let mut posture = Posture::Healthy;
     // Tom-Q4.1 cancel-first / close-second: we close a position only when
     // UtilHot persists into a second tick. Track that across iterations.
@@ -293,15 +345,19 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
         );
 
         let curve_mid = curve.implied_mid(net_position);
-        let posture_changed = new_posture != posture;
-        let fill_detected = (net_position - last_position).abs() > 1e-9;
-        let mid_moved_bps = if last_mid > 0.0 {
-            ((curve_mid - last_mid).abs() / last_mid) * 10_000.0
-        } else {
-            f64::INFINITY
-        };
-        let curve_moved = mid_moved_bps >= config.refresh_bps as f64;
-        let trigger = posture_changed || fill_detected || curve_moved;
+        let trig = compute_trigger(
+            new_posture,
+            posture,
+            net_position,
+            last_position,
+            curve_mid,
+            last_mid,
+            config.refresh_bps,
+        );
+        let posture_changed = trig.posture_changed;
+        let fill_detected = trig.fill_detected;
+        let mid_moved_bps = trig.mid_moved_bps;
+        let trigger = trig.should_refresh();
 
         if !trigger && !matches!(new_posture, Posture::UtilHot) {
             // No work this tick. Reset util_hot_streak when we go back to a non-hot posture.
@@ -348,20 +404,16 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
                         close_side = ?close_side,
                         "vault vAMM: UtilHot persistent — reducing largest position"
                     );
+                    // X-19-1 fix: route through submit_close_order so the
+                    // settlement path calls close_position (not open_position).
+                    // submit_order(reduce_only=true) would be blocked by the
+                    // Step-0 margin pre-check at high util, and even if it passed
+                    // it would open a new opposing position because the enclave
+                    // payload doesn't carry reduce_only — collateral would
+                    // self-eat across UtilHot ticks.
                     if let Err(e) = state
                         .engine
-                        .submit_order(
-                            config.user_id.clone(),
-                            close_side,
-                            OrderType::Market,
-                            FP8::ZERO,
-                            size,
-                            1,
-                            TimeInForce::Ioc,
-                            true,
-                            Some(format!("vamm-reduce-{pid}")),
-                            Some("vAMM".into()),
-                        )
+                        .submit_close_order(config.user_id.clone(), close_side, size, 1, pid)
                         .await
                     {
                         warn!("vault vAMM: reduce-position failed: {}", e);
@@ -490,5 +542,107 @@ mod tests {
     fn pick_position_to_reduce_returns_none_when_empty() {
         let bal = json!({ "data": { "positions": [] } });
         assert!(pick_position_to_reduce(&bal).is_none());
+    }
+
+    use crate::vamm::Posture;
+
+    fn eval(
+        prev: Posture,
+        new: Posture,
+        pos: f64,
+        last_pos: f64,
+        mid: f64,
+        last_mid: f64,
+        refresh: u32,
+    ) -> TriggerEvaluation {
+        compute_trigger(new, prev, pos, last_pos, mid, last_mid, refresh)
+    }
+
+    #[test]
+    fn trigger_fires_on_cold_start_via_last_mid_sentinel() {
+        // X-19-2 regression: last_mid = 0.0 must force a refresh on tick 1
+        // (otherwise the vault never places its initial ladder).
+        let t = eval(Posture::Healthy, Posture::Healthy, 0.0, 0.0, 2.0, 0.0, 5);
+        assert!(t.curve_moved);
+        assert!(t.should_refresh(), "cold-start must refresh");
+    }
+
+    #[test]
+    fn trigger_dormant_when_nothing_changes() {
+        let t = eval(
+            Posture::Healthy,
+            Posture::Healthy,
+            100.0,
+            100.0,
+            2.0,
+            2.0,
+            5,
+        );
+        assert!(!t.posture_changed);
+        assert!(!t.fill_detected);
+        assert!(!t.curve_moved);
+        assert!(!t.should_refresh());
+    }
+
+    #[test]
+    fn trigger_fires_on_posture_change() {
+        let t = eval(
+            Posture::Healthy,
+            Posture::DeltaHotLong,
+            100.0,
+            100.0,
+            2.0,
+            2.0,
+            5,
+        );
+        assert!(t.posture_changed);
+        assert!(t.should_refresh());
+    }
+
+    #[test]
+    fn trigger_fires_on_fill_detected() {
+        let t = eval(Posture::Healthy, Posture::Healthy, 100.0, 90.0, 2.0, 2.0, 5);
+        assert!(t.fill_detected);
+        assert!(t.should_refresh());
+    }
+
+    #[test]
+    fn trigger_fires_when_curve_moves_above_refresh_bps() {
+        // 50 bps move on a 2.0 mid → new mid 2.01.
+        let t = eval(
+            Posture::Healthy,
+            Posture::Healthy,
+            100.0,
+            100.0,
+            2.01,
+            2.0,
+            5,
+        );
+        assert!(t.curve_moved);
+        assert!(t.should_refresh());
+    }
+
+    #[test]
+    fn trigger_dormant_below_refresh_bps() {
+        // 1 bp move; refresh_bps = 5 → not enough.
+        let t = eval(
+            Posture::Healthy,
+            Posture::Healthy,
+            100.0,
+            100.0,
+            2.0002,
+            2.0,
+            5,
+        );
+        assert!(!t.curve_moved);
+        assert!(!t.should_refresh());
+    }
+
+    #[test]
+    fn trigger_negative_last_mid_treated_as_cold_start() {
+        // Pathological prev value: same sentinel treatment as 0.0.
+        let t = eval(Posture::Healthy, Posture::Healthy, 0.0, 0.0, 2.0, -1.0, 5);
+        assert!(t.curve_moved);
+        assert!(t.should_refresh());
     }
 }
