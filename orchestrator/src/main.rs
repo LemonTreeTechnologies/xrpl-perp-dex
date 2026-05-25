@@ -399,12 +399,20 @@ struct RunArgs {
 
     /// Enable the V1 vault: virtual AMM posting a ladder of curve-priced
     /// limit orders to the CLOB (Tom-spec, post-hackathon-specs.md Issue #3).
-    /// Configuration uses `VaultMmConfig::default()` — curve depth, target
-    /// delta (0.5 short bias), 5×10bps ladder, |delta|≤2, util≤80%, 25%
-    /// hysteresis. Operator-tunable overrides will come as a config file
-    /// when the parameters need per-deployment tuning.
+    /// Configuration comes from VaultMmConfig::default() unless
+    /// --vault-mm-config is given, in which case the TOML at that path
+    /// is merged on top of the defaults (any subset of fields).
     #[arg(long)]
     vault_mm: bool,
+
+    /// Path to a TOML file overriding any subset of `VaultMmConfig`
+    /// fields (user_id, initial_deposit, depth_mult, target_delta_frac,
+    /// steps, step_bps, level_size_pct, delta_cap, util_cap, hysteresis,
+    /// refresh_bps, poll_interval_secs). Missing fields keep their
+    /// `VaultMmConfig::default()` value. Tom-Q4.2 ("hysteresis can also
+    /// be a configurable parameter") generalizes to all vAMM knobs.
+    #[arg(long)]
+    vault_mm_config: Option<PathBuf>,
 
     /// Path to shards.toml config. If not set, a single-shard router is
     /// created from --enclave-url with shard_id=0.
@@ -1675,7 +1683,24 @@ async fn main() -> Result<()> {
 
     // V1 vault (vAMM) — singleton (only runs on sequencer).
     let _vault_mm_singleton = if cli.vault_mm {
-        let vault_config = vault_mm::VaultMmConfig::default();
+        let vault_config = match cli.vault_mm_config.as_ref() {
+            Some(path) => {
+                let raw = std::fs::read_to_string(path)
+                    .with_context(|| format!("read --vault-mm-config {}", path.display()))?;
+                let cfg: vault_mm::VaultMmConfig = toml::from_str(&raw).with_context(|| {
+                    format!("parse --vault-mm-config {} as TOML", path.display())
+                })?;
+                info!(
+                    path = %path.display(),
+                    util_cap = cfg.util_cap,
+                    delta_cap = cfg.delta_cap,
+                    target_delta_frac = cfg.target_delta_frac,
+                    "vault vAMM: loaded config from file (overrides defaults)"
+                );
+                cfg
+            }
+            None => vault_mm::VaultMmConfig::default(),
+        };
         vault_mm::seed_vault_deposit(&perp, &vault_config).await;
         let vault_state = app_state.clone();
         Some(singleton::spawn("vault-mm", role_rx_vault_mm, move || {
