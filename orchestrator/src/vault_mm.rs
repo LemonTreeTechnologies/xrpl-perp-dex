@@ -179,10 +179,10 @@ fn pick_position_to_reduce(bal: &serde_json::Value) -> Option<(u32, Side, FP8)> 
     let arr = bal["data"]["positions"].as_array()?;
     let mut best: Option<(u32, Side, FP8, f64)> = None;
     for p in arr {
-        let pid: u32 = p["id"].as_u64().unwrap_or(0) as u32;
-        if pid == 0 {
-            continue;
-        }
+        let pid: u32 = match p["position_id"].as_u64() {
+            Some(v) => v as u32,
+            None => continue, // field absent — skip
+        };
         let size_f: f64 = p["size"]
             .as_str()
             .and_then(|s| s.parse().ok())
@@ -330,10 +330,34 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
             .as_str()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
+        // Q-19-4 follow-up (surfaced by Hetzner smoke 2026-05-25): util/delta
+        // denominators use the live margin_balance (Tom-A3.1: cash + uPnL +
+        // accrued funding) rather than the static config.initial_deposit
+        // baseline. The static baseline diverges from reality the moment the
+        // enclave-side balance accumulates across orchestrator restarts (each
+        // seed_vault_deposit credits cumulatively), driving util to 0 even at
+        // high used_margin and silently disabling the UtilHot gate.
+        let margin_balance_xrp: f64 = bal["data"]["margin_balance"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(collateral_xrp);
         let net_position = positions_to_net_xrp(&bal);
-        let net_delta_frac = net_position / collateral_xrp;
-        let used = (collateral_xrp - free_xrp).max(0.0);
-        let util = (used / collateral_xrp).clamp(0.0, 1.0);
+        let denom = if margin_balance_xrp > 0.0 {
+            margin_balance_xrp
+        } else {
+            collateral_xrp
+        };
+        let net_delta_frac = if denom > 0.0 {
+            net_position / denom
+        } else {
+            0.0
+        };
+        let used = (margin_balance_xrp - free_xrp).max(0.0);
+        let util = if denom > 0.0 {
+            (used / denom).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
 
         let new_posture = evaluate_posture(
             net_delta_frac,
@@ -522,14 +546,39 @@ mod tests {
         assert_eq!(positions_to_net_xrp(&bal), 0.0);
     }
 
+    /// NB: this fixture mirrors the actual /v1/perp/balance response shape
+    /// (field name `position_id`, not `id`). Hetzner smoke 2026-05-25 caught
+    /// the prior `"id"` shorthand — code and test were both wrong in the
+    /// same way, so the test passed tautologically.
     #[test]
     fn pick_position_to_reduce_chooses_largest_absolute() {
         let bal = json!({
             "data": {
                 "positions": [
-                    {"id": 1, "side": "long",  "size": "10.0"},
-                    {"id": 2, "side": "short", "size": "50.0"},
-                    {"id": 3, "side": "long",  "size": "30.0"},
+                    {
+                        "position_id": 1,
+                        "side": "long",
+                        "size": "10.0",
+                        "entry_price": "1.23",
+                        "margin": "12.3",
+                        "unrealized_pnl": "0.0"
+                    },
+                    {
+                        "position_id": 2,
+                        "side": "short",
+                        "size": "50.0",
+                        "entry_price": "1.23",
+                        "margin": "61.5",
+                        "unrealized_pnl": "0.0"
+                    },
+                    {
+                        "position_id": 3,
+                        "side": "long",
+                        "size": "30.0",
+                        "entry_price": "1.23",
+                        "margin": "36.9",
+                        "unrealized_pnl": "0.0"
+                    },
                 ]
             }
         });
@@ -542,6 +591,32 @@ mod tests {
     fn pick_position_to_reduce_returns_none_when_empty() {
         let bal = json!({ "data": { "positions": [] } });
         assert!(pick_position_to_reduce(&bal).is_none());
+    }
+
+    /// Hetzner smoke 2026-05-25: position_id=0 is a legitimate enclave-side
+    /// id (sequential numbering starts at 0). The previous
+    /// `unwrap_or(0); if pid == 0 { continue }` pattern conflated "field
+    /// missing" with "valid id 0" and silently skipped every position
+    /// whose id was 0 — UtilHot reduce never reached submit_close_order.
+    #[test]
+    fn pick_position_to_reduce_accepts_position_id_zero() {
+        let bal = json!({
+            "data": {
+                "positions": [
+                    {
+                        "position_id": 0,
+                        "side": "short",
+                        "size": "5000.0",
+                        "entry_price": "1.23",
+                        "margin": "6150.0",
+                        "unrealized_pnl": "0.0"
+                    }
+                ]
+            }
+        });
+        let (pid, side, _sz) = pick_position_to_reduce(&bal).expect("id=0 must not be skipped");
+        assert_eq!(pid, 0);
+        assert_eq!(side, Side::Short);
     }
 
     use crate::vamm::Posture;
