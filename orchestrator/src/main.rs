@@ -29,6 +29,7 @@ mod signerlist_update;
 mod singleton;
 mod trading;
 mod types;
+mod vamm;
 mod vault_mm;
 mod withdrawal;
 mod ws;
