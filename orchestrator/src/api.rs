@@ -97,6 +97,8 @@ pub struct SubmitOrderRequest {
     #[serde(default)]
     pub reduce_only: bool,
     pub client_order_id: Option<String>,
+    /// Categorical tag (e.g. "vAMM") — distinct from client_order_id.
+    pub label: Option<String>,
 }
 
 fn default_limit() -> String {
@@ -614,6 +616,7 @@ async fn submit_order(
             tif,
             req.reduce_only,
             req.client_order_id,
+            req.label,
         )
         .await
     {

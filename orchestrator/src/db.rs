@@ -11,6 +11,28 @@ use tracing::{error, info, warn};
 use crate::types::FP8;
 
 /// Database connection pool.
+#[derive(sqlx::FromRow)]
+#[allow(dead_code)]
+struct RestingOrderRow {
+    order_id: i64,
+    user_id: String,
+    market: String,
+    side: String,
+    price: i64,
+    size: i64,
+    filled: i64,
+    leverage: i32,
+    reduce_only: bool,
+    timestamp_ms: i64,
+    client_order_id: Option<String>,
+    label: Option<String>,
+    signed_body_hex: String,
+    signature_hex: String,
+    signer_timestamp: String,
+    signer_address: String,
+    signer_pubkey_hex: String,
+}
+
 #[derive(Clone)]
 pub struct Db {
     pool: PgPool,
@@ -224,9 +246,9 @@ impl Db {
     ) {
         let r = sqlx::query(
             "INSERT INTO resting_orders \
-             (order_id, user_id, market, side, price, size, filled, leverage, reduce_only, timestamp_ms, client_order_id, \
+             (order_id, user_id, market, side, price, size, filled, leverage, reduce_only, timestamp_ms, client_order_id, label, \
               signed_body_hex, signature_hex, signer_timestamp, signer_address, signer_pubkey_hex) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
              ON CONFLICT (order_id) DO UPDATE SET filled = $7",
         )
         .bind(o.id as i64)
@@ -240,6 +262,7 @@ impl Db {
         .bind(o.reduce_only)
         .bind(o.timestamp_ms as i64)
         .bind(&o.client_order_id)
+        .bind(&o.label)
         .bind(&binding.signed_body_hex)
         .bind(&binding.signature_hex)
         .bind(&binding.timestamp)
@@ -282,30 +305,13 @@ impl Db {
     /// validate, or whose `user_id` doesn't match the signer's address, are
     /// dropped and logged — a compromised PG cannot poison the reloaded
     /// book with forged orders.
+    ///
+    /// V1-vault: row carries `label` (categorical tag, e.g. "vAMM").
+    /// Uses a named `RestingOrderRow` struct because sqlx tuple FromRow
+    /// is bounded at 16 fields and we now have 17.
     pub async fn load_resting_orders(&self) -> Vec<crate::orderbook::Order> {
-        #[allow(clippy::type_complexity)]
-        let rows = sqlx::query_as::<
-            _,
-            (
-                i64,
-                String,
-                String,
-                String,
-                i64,
-                i64,
-                i64,
-                i32,
-                bool,
-                i64,
-                Option<String>,
-                String,
-                String,
-                String,
-                String,
-                String,
-            ),
-        >(
-            "SELECT order_id, user_id, market, side, price, size, filled, leverage, reduce_only, timestamp_ms, client_order_id, \
+        let rows = sqlx::query_as::<_, RestingOrderRow>(
+            "SELECT order_id, user_id, market, side, price, size, filled, leverage, reduce_only, timestamp_ms, client_order_id, label, \
                     signed_body_hex, signature_hex, signer_timestamp, signer_address, signer_pubkey_hex \
              FROM resting_orders ORDER BY order_id",
         )
@@ -315,25 +321,26 @@ impl Db {
 
         let mut out = Vec::with_capacity(rows.len());
         let mut rejected = 0usize;
-        for (
-            id,
-            user_id,
-            market,
-            side,
-            price,
-            size,
-            filled,
-            leverage,
-            reduce_only,
-            ts,
-            coid,
-            signed_body_hex,
-            signature_hex,
-            signer_timestamp,
-            signer_address,
-            signer_pubkey_hex,
-        ) in rows
-        {
+        for row in rows {
+            let RestingOrderRow {
+                order_id: id,
+                user_id,
+                market,
+                side,
+                price,
+                size,
+                filled,
+                leverage,
+                reduce_only,
+                timestamp_ms: ts,
+                client_order_id: coid,
+                label: lbl,
+                signed_body_hex,
+                signature_hex,
+                signer_timestamp,
+                signer_address,
+                signer_pubkey_hex,
+            } = row;
             let binding = crate::auth::OrderSignatureBinding {
                 signed_body_hex,
                 signature_hex,
@@ -375,6 +382,7 @@ impl Db {
                 reduce_only,
                 timestamp_ms: ts as u64,
                 client_order_id: coid,
+                label: lbl,
                 close_position_id: None,
             });
         }

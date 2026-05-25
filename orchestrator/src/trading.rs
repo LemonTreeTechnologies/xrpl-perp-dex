@@ -76,6 +76,7 @@ impl TradingEngine {
         time_in_force: TimeInForce,
         reduce_only: bool,
         client_order_id: Option<String>,
+        label: Option<String>,
     ) -> Result<OrderResult> {
         self.submit_order_inner(
             user_id,
@@ -87,6 +88,7 @@ impl TradingEngine {
             time_in_force,
             reduce_only,
             client_order_id,
+            label,
             None,
         )
         .await
@@ -113,6 +115,7 @@ impl TradingEngine {
             TimeInForce::Ioc,
             true,
             None,
+            None,
             Some(close_position_id),
         )
         .await
@@ -130,6 +133,7 @@ impl TradingEngine {
         time_in_force: TimeInForce,
         reduce_only: bool,
         client_order_id: Option<String>,
+        label: Option<String>,
         close_position_id: Option<u32>,
     ) -> Result<OrderResult> {
         // Step 0: Pre-check margin in enclave before matching (skip for close orders)
@@ -168,6 +172,7 @@ impl TradingEngine {
                 time_in_force,
                 reduce_only,
                 client_order_id,
+                label,
             )?
         };
         order.close_position_id = close_position_id;

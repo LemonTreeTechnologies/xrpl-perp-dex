@@ -316,6 +316,7 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
                         crate::orderbook::TimeInForce::Gtc,
                         false,
                         Some(format!("vault-bid-{level}")),
+                        Some("vAMM".into()),
                     )
                     .await
                 {
@@ -337,6 +338,7 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
                         crate::orderbook::TimeInForce::Gtc,
                         false,
                         Some(format!("vault-ask-{level}")),
+                        Some("vAMM".into()),
                     )
                     .await
                 {

@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS resting_orders (
     reduce_only BOOLEAN NOT NULL DEFAULT FALSE,
     timestamp_ms BIGINT NOT NULL,
     client_order_id VARCHAR(64),
+    label VARCHAR(64),
     signed_body_hex TEXT NOT NULL,
     signature_hex TEXT NOT NULL,
     signer_timestamp TEXT NOT NULL,

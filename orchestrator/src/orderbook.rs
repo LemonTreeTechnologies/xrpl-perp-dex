@@ -60,6 +60,10 @@ pub struct Order {
     pub reduce_only: bool,
     pub timestamp_ms: u64,
     pub client_order_id: Option<String>,
+    /// Categorical tag for filtering & rebate eligibility (e.g. "vAMM").
+    /// Distinct from `client_order_id` which is a free-form caller hint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     /// When set, fills on this order call close_position instead of open_position.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub close_position_id: Option<u32>,
@@ -201,6 +205,7 @@ impl OrderBook {
         time_in_force: TimeInForce,
         reduce_only: bool,
         client_order_id: Option<String>,
+        label: Option<String>,
     ) -> Result<(Order, Vec<Trade>, Vec<(Order, i64)>)> {
         if size.0 <= 0 {
             bail!("order size must be positive");
@@ -239,6 +244,7 @@ impl OrderBook {
             reduce_only,
             timestamp_ms: now_ms,
             client_order_id,
+            label,
             close_position_id: None,
         };
 
@@ -652,6 +658,7 @@ mod tests {
                 TimeInForce::Gtc,
                 false,
                 None,
+                None,
             )
             .unwrap();
 
@@ -676,6 +683,7 @@ mod tests {
             TimeInForce::Gtc,
             false,
             None,
+            None,
         )
         .unwrap();
 
@@ -690,6 +698,7 @@ mod tests {
                 5,
                 TimeInForce::Gtc,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -718,6 +727,7 @@ mod tests {
             TimeInForce::Gtc,
             false,
             None,
+            None,
         )
         .unwrap();
         ob.submit_order(
@@ -730,6 +740,7 @@ mod tests {
             TimeInForce::Gtc,
             false,
             None,
+            None,
         )
         .unwrap();
         ob.submit_order(
@@ -741,6 +752,7 @@ mod tests {
             5,
             TimeInForce::Gtc,
             false,
+            None,
             None,
         )
         .unwrap();
@@ -756,6 +768,7 @@ mod tests {
                 5,
                 TimeInForce::Ioc,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -783,6 +796,7 @@ mod tests {
                 TimeInForce::Gtc,
                 false,
                 None,
+                None,
             )
             .unwrap();
 
@@ -806,6 +820,7 @@ mod tests {
             TimeInForce::Gtc,
             false,
             None,
+            None,
         )
         .unwrap();
 
@@ -819,6 +834,7 @@ mod tests {
                 5,
                 TimeInForce::Gtc,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -851,6 +867,7 @@ mod tests {
             TimeInForce::Gtc,
             false,
             None,
+            None,
         )
         .unwrap();
 
@@ -865,6 +882,7 @@ mod tests {
                 5,
                 TimeInForce::Gtc,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -899,6 +917,7 @@ mod tests {
             TimeInForce::Gtc,
             false,
             None,
+            None,
         )
         .unwrap();
 
@@ -913,6 +932,7 @@ mod tests {
                 5,
                 TimeInForce::Gtc,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -933,6 +953,7 @@ mod tests {
             TimeInForce::Gtc,
             false,
             None,
+            None,
         )
         .unwrap();
         ob.submit_order(
@@ -945,6 +966,7 @@ mod tests {
             TimeInForce::Gtc,
             false,
             None,
+            None,
         )
         .unwrap();
         ob.submit_order(
@@ -956,6 +978,7 @@ mod tests {
             5,
             TimeInForce::Gtc,
             false,
+            None,
             None,
         )
         .unwrap();
@@ -981,6 +1004,7 @@ mod tests {
             TimeInForce::Gtc,
             false,
             None,
+            None,
         )
         .unwrap();
         ob.submit_order(
@@ -992,6 +1016,7 @@ mod tests {
             5,
             TimeInForce::Gtc,
             false,
+            None,
             None,
         )
         .unwrap();
@@ -1007,6 +1032,7 @@ mod tests {
                 5,
                 TimeInForce::Gtc,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -1028,6 +1054,7 @@ mod tests {
             TimeInForce::Gtc,
             false,
             None,
+            None,
         )
         .unwrap();
 
@@ -1042,6 +1069,7 @@ mod tests {
                 5,
                 TimeInForce::Gtc,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -1067,6 +1095,7 @@ mod tests {
             TimeInForce::Gtc,
             false,
             None,
+            None,
         )
         .unwrap();
         ob.submit_order(
@@ -1079,6 +1108,7 @@ mod tests {
             TimeInForce::Gtc,
             false,
             None,
+            None,
         )
         .unwrap();
         ob.submit_order(
@@ -1090,6 +1120,7 @@ mod tests {
             5,
             TimeInForce::Gtc,
             false,
+            None,
             None,
         )
         .unwrap();
@@ -1123,6 +1154,7 @@ mod tests {
             TimeInForce::Gtc,
             false,
             None,
+            None,
         )
         .unwrap();
         ob.submit_order(
@@ -1134,6 +1166,7 @@ mod tests {
             5,
             TimeInForce::Gtc,
             false,
+            None,
             None,
         )
         .unwrap();
@@ -1156,6 +1189,7 @@ mod tests {
             TimeInForce::Gtc,
             false,
             None,
+            None,
         )
         .unwrap();
         ob.submit_order(
@@ -1167,6 +1201,7 @@ mod tests {
             5,
             TimeInForce::Gtc,
             false,
+            None,
             None,
         )
         .unwrap();
@@ -1181,6 +1216,7 @@ mod tests {
                 5,
                 TimeInForce::Gtc,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -1207,6 +1243,7 @@ mod tests {
                 TimeInForce::Gtc,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let (o2, _, _) = ob
@@ -1219,6 +1256,7 @@ mod tests {
                 5,
                 TimeInForce::Gtc,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -1245,6 +1283,7 @@ mod tests {
             1,
             TimeInForce::Gtc,
             false,
+            None,
             None,
         )
     }
