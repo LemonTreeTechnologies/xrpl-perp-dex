@@ -23,6 +23,10 @@ Three options:
 
 For v1 we propose **(1)** — hardcode `minimum_order_size = 0.01 XRP`, `amount_step = 0.01 XRP`, `price_step = 0.0001 RLUSD`. Please confirm or override these values.
 
+*This should be hard coded in a single place in the enclave codebase, however it should be structured as a config struct in a seperate file such that we can easily add further parameters and markets in the future without having to change the code structure.*
+
+
+
 ### Q1.2 (non-blocking) — Rounding semantics
 
 When a submitted order doesn't match `amount_step`, do we:
@@ -31,6 +35,8 @@ When a submitted order doesn't match `amount_step`, do we:
 - (b) **round down** to nearest step and accept?
 
 We propose (a) for correctness. Please confirm.
+
+*Yes we should reject orders that dont comply to amount or price step requirements, this is standard practice on exchanges and ensures that users are aware of the requirements rather than silently having their orders modified.*
 
 ---
 
@@ -51,6 +57,8 @@ Options:
 
 We recommend (4) — partial liquidations. But this is a design decision with UX and MEV implications, not a technical one. Please pick.
 
+* Most traders have a psycological aversion to cutting losers, HOWEVER from a risk mature trading perspective, you want to cut the biggest losers first to free up the most margin. So we recommend (1) largest-loss-first. This also has the benefit of being simple to implement and reason about — we just sort positions by unrealized PnL and close from worst to best until we're back above maintenance margin.*
+
 ### Q2.2 (BLOCKING) — Funding accrual granularity
 
 The spec says "funding is calculated based on position size and the funding rate **each second**". Does that mean:
@@ -61,6 +69,8 @@ The spec says "funding is calculated based on position size and the funding rate
 (a) is cheap and idempotent but requires all ecalls to first call "settle funding" before doing work. (b) is simpler to reason about but runs a global ecall every second across all users (potentially N×ecall calls per second where N = user count).
 
 We recommend (a). Please confirm.
+
+*A is correct*
 
 ### Q2.3 (BLOCKING) — Margin check location
 
@@ -78,6 +88,8 @@ This is a rewrite of the margin check, not an edit. We need confirmation that:
 - Maintenance margin rate is uniform OR tiered by notional size.
 
 What rate are we using? `vault-design-spec.md` implies MM vault uses 0.5% maintenance. Is that the same for retail users?
+
+*Maintence margin is different depending on the market, it is based on the amount of leverage the user is taking on that market. For example, if the market allows 20x leverage, then the maintenance margin would be 5% (1/20). If the market allows 10x leverage, then the maintenance margin would be 10% (1/10). So the maintenance margin is tiered by notional size, and is based on the maximum leverage allowed for that market. NOTE the market config file specified earlier needs to account for this as well*
 
 ### Q2.4 (non-blocking) — Margin migration for existing positions
 
@@ -104,6 +116,8 @@ Two readings:
 2. **Virtual reserves fixed at init:** `k = k_0` forever; `x` and `y` drift as fills happen. This is how Uniswap v2 works, but for a vAMM-to-CLOB hybrid it's unclear how to reconcile fills with reserve drift when the vault's physical collateral can't back arbitrary virtual imbalance.
 
 We can implement either, but we need to know **which**. Please pick.
+*I believe virtual reserves from collateral is the more intuitive and straightforward approach. It also ensures that the curve is always properly collateralized based on the current market conditions, which can help to mitigate risk for the vault. The virtual reserves fixed at init approach could lead to situations where the curve becomes undercollateralized if there are significant market movements or fills, which could be problematic for the vault's risk management.*
+
 
 ### Q3.2 (BLOCKING) — Order placement algorithm
 
@@ -115,6 +129,8 @@ We can implement either, but we need to know **which**. Please pick.
 
 We propose a ladder of 5 levels per side, each 10 bps apart, sized at 10% of free collateral, refreshed on either a 2-second timer or a ≥5 bps mark price move. Please override.
 
+*I envisage the vault to incentivise arbitrage between XPERP and external markets, so I think a ladder of orders is important to provide depth and capture more of the arb flow. The exact parameters can be tuned based on market conditions and risk appetite, but the general idea of a ladder with refreshes based on time and fills makes sense to me. NOTE need to be careful not to just use a reference price as tat defeats the purpose of the vAMM — we want the curve to be the source of truth for pricing, not an external mark. So refreshes should be based on curve-implied price moves, not external mark moves. NOTE, THIS IS REALLY IMPORTANT as it is the source of the arb flow.*
+
 ### Q3.3 (BLOCKING) — Entry vs exit order labels
 
 The spec introduces "entry" and "exit" order types. Clarify:
@@ -122,6 +138,11 @@ The spec introduces "entry" and "exit" order types. Clarify:
 - **Are these just internal labels in the vault's bookkeeping**, or do they need to be a first-class order-type flag on the CLOB? (We recommend internal labels — the CLOB doesn't need to know.)
 - **Exit order pricing** — priced from the same curve as entries, or a fixed offset from the filled entry price?
 - **Exit order cancellation** — what happens to an outstanding exit order if the vault hits its delta cap and wants to stop reducing? Cancel it, or leave it and stop posting new ones?
+
+*The order type needs to have labels, ie. the struct representing an order needs to ave lables as clients will want to be able to place orders with specific labels. The labelling shhould be identical for the mm vault and for regular users such that in the longer term, anyone can create and implement and amnage a vault.*
+
+* Lets remove the idea of exit orders for now to simplify. The vault just posts a ladder of orders based on the curve, and if it hits its delta cap it stops posting new orders until the delta is back within bounds. This way we don't have to manage separate entry/exit orders and can just focus on the curve-based pricing and posting logic.*
+
 
 ### Q3.4 (BLOCKING) — Target delta semantics
 
@@ -132,6 +153,8 @@ The spec introduces "entry" and "exit" order types. Clarify:
 
 The rest of the doc mentions "delta -2 / +2" as risk bounds, which only makes sense as **XRP units**. But "delta 0.5 XRP exposure" as a target makes no sense in absolute units for a 100k vault. We assume (a) = fraction. Please confirm.
 
+*a is correct — the target delta should be a fraction of the collateral notional, not an absolute XRP amount. This allows the strategy to scale with the size of the vault and maintain a consistent risk profile regardless of collateral size.*
+
 ### Q3.5 (BLOCKING) — Relationship between vAMM and MM vault from `vault-design-spec.md`
 
 `vault-design-spec.md` describes a **Market Making Vault** with spread/size/rebalance parameters. `post-hackathon-specs.md` describes a **vAMM vault** posting curve-based orders. Are these:
@@ -141,6 +164,8 @@ The rest of the doc mentions "delta -2 / +2" as risk bounds, which only makes se
 - (c) **vAMM replaces the MM vault entirely**; MM vault is deprecated?
 
 We assume (a). Please confirm, because this drives whether `vault-design-spec.md`'s "Min Spread / Max Spread / Order Size %" parameters survive or are dropped in favor of curve parameters.
+
+*A is correct — the vAMM is the new implementation of the MM vault. The curve parameters replace the previous Min/Max Spread and Order Size % parameters, as the curve-based approach provides a more dynamic and responsive market making strategy compared to static spreads and sizes.*
 
 ---
 
@@ -158,13 +183,19 @@ We assume (a). Please confirm, because this drives whether `vault-design-spec.md
 
 We recommend (3) — cancel first, close only if still over. Please confirm.
 
+*I think this is the most balanced approach. Canceling resting orders immediately reduces risk without incurring the costs and potential slippage of closing positions. If canceling orders is not sufficient to bring utilization back under 80%, then we can proceed to reduce positions as needed. This way we prioritize less costly risk reduction methods first before taking more drastic actions.*
+
 ### Q4.2 (non-blocking) — Delta band hysteresis
 
 If delta oscillates around ±2, we'll thrash between "open for new orders" and "only exits allowed". Do we want hysteresis (e.g. stop posting at |delta|=2, resume at |delta|=1.5)? We propose yes, with a default 25% gap. Please confirm.
 
+*Good suggestion — hysteresis can help to prevent thrashing and provide a smoother trading experience. A 25% gap seems reasonable, but we can also make this a configurable parameter so that it can be tuned based on market conditions and risk appetite.*
+
 ### Q4.3 (non-blocking) — Per-operator vs global limits
 
 The delta and utilization limits — are they **per-vault** (each vault tracks its own) or **global across all vaults** (aggregated)? We assume per-vault. Please confirm.
+
+*Per-vault makes the most sense, as each vault is an independent strategy and should manage its own risk. Global limits could lead to unintended consequences where one vault's activity affects another vault's ability to operate, which could be problematic from a risk management perspective.*
 
 ---
 
@@ -187,6 +218,26 @@ These were raised in the earlier review and not yet resolved. Re-listing with st
 | A6 | Admin auth | Unanswered | Non-blocking for v1 |
 | A7 | DELETE → deprecate | Unanswered | Non-blocking |
 
+
+*
+A1: all vault withdraws must be managed by the MULTISIG, so the session key signs a 2-of-3 multisig transaction with the other vault keys. This is critical for security — if the session key were single-signer, a compromised session key could drain the vault. With 2-of-3 multisig, the vault keys can intervene to stop unauthorized withdraws even if the session key is compromised.
+
+A2: vault-as-user — the vault has its own user_id and interacts with the CLOB as a regular user. This simplifies integration and leverages existing user-based logic for orders, margin, etc. The orchestrator routes API calls to the vault's user_id when managing the vault's positions.
+
+A3.1: NAV = cash + unrealized PnL + accrued funding. This gives the most accurate picture of the vault's value and is standard practice for perpetuals.
+
+A3.2: First deposit seeds shares at 1:1 with cash (e.g. 100 XRP deposit → 100 shares). This is simple and intuitive for users. Subsequent deposits/withdrawals use the formula `shares_to_mint = (deposit_amount / NAV) * total_shares` to maintain proportional ownership.
+
+A3.3: Immediate withdrawals with a 7 day delay before the user can claim the withdrawn funds. During this delay, the vault can adjust its positions to mitigate front-running risk. This provides a good balance between user experience and security.
+
+A3.4: Liquidation losses are socialized across all vault participants, not covered by the insurance fund. This incentivizes the vault to manage risk carefully, as losses directly impact all users. The insurance fund is reserved for protocol-level insolvencies, not individual vault losses.
+
+A4.1: The vault's trading strategy is the vAMM as described in issue #3. This replaces the earlier MM / delta-neutral / passive LP options with a single, well-defined strategy.
+A4.2: The vault participates in the same CLOB as regular users, using its own user_id. This allows the vault to interact with the market naturally and provides better price discovery and execution.
+A4.3: The orchestrator calls `create-order` whenever the vault's curve parameters indicate that new orders should be posted or existing orders should be refreshed. This is based on the refresh policy defined in issue #3 Q3.2, which could be a timer or mark price move.
+A5: Fees are rebated to the vault based on its maker activity, with a rebate rate of 50% of the taker fee. There are no management or performance fees at this time. Capacity and pagination for the vault API will be defined in a future iteration.
+A6: Admin auth is based on a role-based access control (RBAC) model, where certain API endpoints (e.g. for vault management) require admin privileges. Admins are authenticated via a secure mechanism (e.g. JWT tokens, API keys) and can perform actions such as adjusting vault parameters, managing user access, etc.
+
 ---
 
 ## Additional questions on `vault-design-spec.md`
@@ -194,6 +245,8 @@ These were raised in the earlier review and not yet resolved. Re-listing with st
 ### V1 (non-blocking) — Vault type numbering
 
 The spec lists vault types as **1. Market Making**, **2. Delta Neutral**, **4. Delta One**. **There is no Vault Type 3.** Was something intended there (Passive LP? Options-writing?) and dropped, or is it a typo?
+
+*A typo - rename Delta One to Vault Type 3, and reserve Vault Type 4 for future use (e.g. options vaults).*
 
 ### V2 (BLOCKING) — Maker rebate mechanics
 
@@ -211,6 +264,13 @@ Today our fee model is: taker pays 0.05%, maker pays nothing (all fees go to the
 
 We need answers to V2.1 and V2.5 before we touch the fee-settlement code.
 
+*V2.1: Rebate rate of 50% of the taker fee (0.025%) seems reasonable, as it provides a meaningful incentive for vaults to provide liquidity without being overly generous.*
+*V2.2: The remaining fee (0.025%) should still go to the protocol revenue*
+*V2.3: The rebate shhould be paid in the collateral asset (XRP) and should be accrued per-trade, with the rebate amount added to the vault's collateral balance immediately after each trade is executed. This provides a direct incentive for vaults to provide liquidity and allows them to see the benefits of their activity in real-time.*
+*V2.4: The rebate should apply to any vault registered on the protocol, we will be posting the vault's orders with a specific label (e.g. "vAMM") so that we can identify which trades are from vaults and apply the rebate accordingly. To prevent wash trading, We will not have washtrading rules in place, but we will monitor for suspicious activity and have the ability to revoke rebates if we detect abuse. We are the SOLE administrator of the vaults, so we can control which vaults are registered and can ensure that they are legitimate strategies rather than wash trading schemes.*
+*V2.5: The rebate should apply to all maker trades from a protocol vault, regardless of whether they are within the curve's spread or not. This is because the vault is providing liquidity to the market and taking on risk by posting orders, even if they are at mid-1bp/mid+1bp. By providing a rebate for all maker trades, we incentivize the vault to post more orders and provide more liquidity, which benefits the overall market. Additionally, implementing a spread gate could add unnecessary complexity to the rebate calculation and may not be worth the effort given the potential for abuse is low, especially since we will be monitoring for suspicious activity.*
+
+
 ### V3 (non-blocking) — Delta One Vault prerequisites
 
 The spec explicitly notes that the Delta One Vault requires:
@@ -222,6 +282,8 @@ The spec explicitly notes that the Delta One Vault requires:
 
 - **V3.1** — Is Delta One Vault deprioritized until those primitives exist (could be Delta One is a Phase-2 feature), or are we expected to build the lending primitives ourselves?
 - **V3.2** — If deprioritized, should we drop it from the v1 vault spec entirely, or keep it documented as "Phase 2"?
+
+*phase 2 makes sense for the Delta One vault, as it relies on primitives that are not currently available on XRPL. We can keep it documented as "Phase 2" in the spec, so that we have a clear roadmap for future development once the necessary primitives are in place. This way we can focus on delivering the vAMM vault in v1, which is already a significant enhancement, and then iterate towards more complex strategies like Delta One in subsequent phases.*
 
 Our default: keep it documented as Phase 2, don't implement in v1.
 
@@ -235,6 +297,7 @@ The vAMM in `post-hackathon-specs.md` replaces all of those with curve parameter
 
 Our default: replace entirely — `k`, target delta, utilization cap, refresh cadence are the full knob set. Min/Max Spread and Min/Max Delta become derived properties of the curve, not inputs.
 
+*Deprecated aqnd un-needed*
 ---
 
 ## Issue #5 — DestinationTag-based user routing for exchange deposits
