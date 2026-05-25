@@ -418,7 +418,9 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
                 .await
             {
                 Ok(_) => placed += 1,
-                Err(e) => warn!(side = ?lv.side, price = %lv.price, "vault vAMM order failed: {}", e),
+                Err(e) => {
+                    warn!(side = ?lv.side, price = %lv.price, "vault vAMM order failed: {}", e)
+                }
             }
         }
 

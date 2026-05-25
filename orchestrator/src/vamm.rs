@@ -240,7 +240,10 @@ mod tests {
         let c = Curve::new(1000.0, 10.0, 2.0, 0.5);
         let at_target = c.implied_mid(-500.0);
         let above = c.implied_mid(0.0); // 500 XRP above target
-        assert!(above < at_target, "above-target mid {above} not < {at_target}");
+        assert!(
+            above < at_target,
+            "above-target mid {above} not < {at_target}"
+        );
     }
 
     #[test]
@@ -249,7 +252,10 @@ mod tests {
         let c = Curve::new(1000.0, 10.0, 2.0, 0.5);
         let at_target = c.implied_mid(-500.0);
         let below = c.implied_mid(-1000.0); // 500 XRP below target
-        assert!(below > at_target, "below-target mid {below} not > {at_target}");
+        assert!(
+            below > at_target,
+            "below-target mid {below} not > {at_target}"
+        );
     }
 
     #[test]
@@ -321,7 +327,11 @@ mod tests {
         let levels = build_ladder(&c, -500.0, 800.0, 3, 10, 0.1, Posture::Healthy);
         // 10% of 800 = 80 XRP per level.
         for lv in &levels {
-            assert!(approx_eq(lv.size.to_f64(), 80.0, 0.01), "size {} != 80", lv.size.to_f64());
+            assert!(
+                approx_eq(lv.size.to_f64(), 80.0, 0.01),
+                "size {} != 80",
+                lv.size.to_f64()
+            );
         }
     }
 
