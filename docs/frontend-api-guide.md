@@ -93,6 +93,58 @@ python3 tools/xrpl_auth.py --secret spXXX... \
   --request GET "https://api-dev.xperp.fi/v1/account/balance?user_id=rYOUR_ADDRESS"
 ```
 
+### 4a. DestinationTag attribution (v1 contract)
+
+The deposit scanner reads the XRPL `DestinationTag` field. v1 attribution rules are tighter than «whatever the tag says»; the contract below is canonical and load-bearing.
+
+#### Self-deposit with tag (supported)
+
+If you send a Payment FROM YOUR OWN wallet TO the escrow WITH a `DestinationTag`, the deposit lands in an internal `__unclaimed__` holding bucket on first arrival. To claim it and bind the (sender, tag) pair to your `user_id` for all future deposits with the same pair:
+
+1. Send a small probe `Payment` from your wallet to escrow with your chosen tag. Note the `tx_hash`.
+2. Call `POST /v1/deposit-binding` (authenticated, signed body) with:
+   ```json
+   {
+     "sender_addr": "<your-XRPL-address>",
+     "dest_tag": <your-tag>,
+     "probe_tx_hash": "<probe-tx-hash>"
+   }
+   ```
+3. On success the binding registers and the probe credit atomically moves from `__unclaimed__` to your `user_id`. All subsequent deposits with `(your-address, your-tag)` credit your account directly.
+
+#### Exchange-withdrawal with tag (NOT supported in v1)
+
+Withdrawals from custodial exchanges (Binance, Bitstamp, Kraken, …) to the escrow with a `DestinationTag` will NOT auto-attribute in v1. The deposit lands in `__unclaimed__` and stays there. This is by design:
+
+- The v1 binding ceremony requires the prober (you) and the sender (your wallet) to be the same key.
+- Exchange withdrawals are signed by the exchange's hot wallet, not by you — the binding ceremony cannot prove your control over an exchange's withdrawal.
+- An operator-mediated resolution ceremony for the exchange case ships in a follow-up release (REQ-21).
+
+**Recommended workaround until that release:** withdraw from your exchange to a self-controlled XRPL wallet first, then send from that wallet to escrow with your chosen tag.
+
+#### What does NOT happen
+
+- **No silent failures.** Funds in `__unclaimed__` are tracked, auditable, and recoverable via the follow-up release. No funds are «lost»; they are «pending attribution».
+- **No auto-refund in v1.** A separate release will introduce optional automatic refund-to-sender for unclaimed entries older than threshold T. Until then, manual operator handling is the only path.
+
+#### Error codes (for client integration)
+
+| Code | Meaning |
+|---|---|
+| `DB_OK` | Binding registered, probe credit moved. |
+| `DB_IDEMPOTENT_OK` | Binding already exists for the same (user, probe). No-op. |
+| `DB_USER_ID_MISMATCH` | Request signer ≠ claimed user_id. |
+| `DB_PROBE_NOT_FOUND` | Probe `tx_hash` not in deposit log (mis-paste, replay, or out of retention window). |
+| `DB_PROBE_SENDER_MISMATCH` / `DB_PROBE_TAG_MISMATCH` | Probe data doesn't match request. |
+| `DB_SENDER_NOT_SIGNER` | Exchange-deposit case — probe sender ≠ request signer. Use the workaround above or wait for REQ-21. |
+| `DB_FCFS_LOSS` | `(sender, tag)` already bound to a different user (rare coincidental collision). |
+| `DB_ALREADY_BOUND` | Binding exists for your `user_id` with a different probe; second probe orphaned in `__unclaimed__`. |
+| `DB_CAP_REACHED` | Sealed-state cap reached (very rare; contact support). |
+| `DB_RESERVED_NAME` | Attempted to use a reserved internal identifier. |
+| `DB_INVARIANT_VIOLATION` | Internal state inconsistency — unrecoverable; contact support immediately. |
+
+---
+
 ### 5. Verify Your Setup
 
 For testnet, use the Testnet explorer:
@@ -108,7 +160,7 @@ For mainnet, use `https://livenet.xrpl.org/` with the same paths.
 - **Testnet XRP has no real value** — the current dev instance accepts testnet deposits only.
 - **Reserve requirement** — each XRPL account needs minimum 10 XRP base reserve (both networks).
 - **Auto-detection** — deposits are detected automatically (1s scan interval). No manual API call needed.
-- **No DestinationTag support (yet)** — do not deposit from a shared/exchange wallet (Binance, Kraken, etc.). Use a personal wallet only; exchange deposits with `DestinationTag` are not routed correctly in the current build.
+- **DestinationTag attribution** — supported for **self-deposit only** in v1; see [§4a DestinationTag attribution](#4a-destinationtag-attribution-v1-contract) for the full contract. Do NOT deposit from a shared/exchange wallet (Binance, Kraken, etc.) with a `DestinationTag` in v1 — your funds will land in an internal `__unclaimed__` bucket and stay there until a follow-up release (REQ-21) ships. Use a self-controlled wallet only.
 - **Signing** — the DEX uses secp256k1 ECDSA signatures (same curve as XRPL). All wallets above support this natively.
 
 ---
