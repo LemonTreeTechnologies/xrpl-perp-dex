@@ -48,6 +48,19 @@ CREATE TABLE IF NOT EXISTS deposits (
 );
 CREATE INDEX IF NOT EXISTS idx_deposits_user ON deposits(user_id, created_at DESC);
 
+-- REQ-20-impl R2: deposit_bindings mirror (enclave is source of truth).
+-- See migrations/003_deposit_bindings.sql for the full rationale.
+CREATE TABLE IF NOT EXISTS deposit_bindings (
+    user_id VARCHAR(36) NOT NULL,
+    sender_addr VARCHAR(36) NOT NULL,
+    dest_tag BIGINT NOT NULL,
+    bound_at_ms BIGINT NOT NULL,
+    bound_via_probe_tx_hash VARCHAR(64) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (sender_addr, dest_tag)
+);
+CREATE INDEX IF NOT EXISTS deposit_bindings_user_id_idx ON deposit_bindings(user_id);
+
 CREATE TABLE IF NOT EXISTS withdrawals (
     id BIGSERIAL PRIMARY KEY,
     user_id VARCHAR(36) NOT NULL,

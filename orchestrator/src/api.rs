@@ -643,7 +643,28 @@ async fn register_deposit_binding(
         )
         .await
     {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Ok(v) => {
+            // REQ-20-impl R2 commit 3 — on DB_OK (result_code 0), mirror
+            // the binding into PG for operator dashboards / audit cross-
+            // check. DB_IDEMPOTENT_OK (1) skips the write (ON CONFLICT
+            // would handle it but skipping avoids the round-trip). Any
+            // negative result_code means the enclave rejected — no
+            // mirror write.
+            if let Some(0) = v.get("result_code").and_then(|x| x.as_i64()) {
+                if let Some(db) = &state.db {
+                    let bound_at_ms = v.get("bound_at_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+                    db.insert_deposit_binding(
+                        &binding.signer_address,
+                        &req.sender_addr,
+                        req.dest_tag,
+                        bound_at_ms,
+                        &req.probe_tx_hash,
+                    )
+                    .await;
+                }
+            }
+            (StatusCode::OK, Json(v)).into_response()
+        }
         Err(e) => err(StatusCode::BAD_GATEWAY, &e.to_string()).into_response(),
     }
 }
