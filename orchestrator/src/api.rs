@@ -14,6 +14,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/* REQ-20-impl R2 commit 2 — sha2 + ripemd160 for the
+ * compute_account_id_from_pubkey derivation in
+ * register_deposit_binding handler. Mirror of the enclave-side
+ * dbk_compute_account_id at Enclave.cpp (R1 commit 4). */
+use ripemd::Ripemd160;
+use sha2::{Digest, Sha256};
+
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderValue, Method, StatusCode},
@@ -279,6 +286,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/account/trades", get(get_user_trade_history))
         .route("/v1/account/funding", get(get_user_funding_history))
         .route("/v1/withdraw", post(withdraw))
+        // REQ-20-impl R2 commit 2 — POST /v1/deposit-binding
+        // User claims (sender_addr, dest_tag, probe_tx_hash) for their
+        // own user_id. Auth via existing signed-body middleware: the
+        // OrderSignatureBinding's signer_address IS the user_id; this
+        // handler computes the 20-byte AccountID from signer_pubkey_hex
+        // and forwards everything to the enclave's register_deposit_binding
+        // ecall for the actual validation + atomic move.
+        .route("/v1/deposit-binding", post(register_deposit_binding))
         .route("/v1/markets/{market}/orderbook", get(get_orderbook))
         .route("/v1/markets/{market}/ticker", get(get_ticker))
         .route("/v1/markets/{market}/trades", get(get_trades))
@@ -551,6 +566,87 @@ async fn openapi_spec() -> impl IntoResponse {
 }
 
 // ── Handlers ────────────────────────────────────────────────────
+
+/* REQ-20-impl R2 commit 2 — POST /v1/deposit-binding handler.
+ *
+ * Auth: existing signed-body middleware. The OrderSignatureBinding's
+ * signer_address IS the user_id (no separate user_id field in the
+ * request body — derived from auth).
+ *
+ * Body schema:
+ *   {
+ *     "sender_addr":    "rXXX",        // XRPL r-address of the probe sender
+ *     "dest_tag":       42,            // u32 DestinationTag
+ *     "probe_tx_hash":  "ABCDEF...32B" // hex of the probe XRPL tx hash
+ *   }
+ *
+ * Returns whatever the enclave server returned (the enclave's
+ * DB_* result code is encoded in the response payload). Status mapping
+ * to HTTP codes is left simple for now; the response body always carries
+ * the structured outcome for client parsing. */
+#[derive(serde::Deserialize)]
+struct RegisterDepositBindingRequest {
+    sender_addr: String,
+    dest_tag: u32,
+    probe_tx_hash: String,
+}
+
+async fn register_deposit_binding(
+    State(state): State<Arc<AppState>>,
+    binding_ext: Option<axum::extract::Extension<crate::auth::OrderSignatureBinding>>,
+    Json(req): Json<RegisterDepositBindingRequest>,
+) -> impl IntoResponse {
+    let Some(binding) = binding_ext.map(|e| e.0) else {
+        return err(StatusCode::UNAUTHORIZED, "signature binding required").into_response();
+    };
+
+    // Validate body shape (delegate the heavy lifting to enclave).
+    if req.sender_addr.is_empty() || req.sender_addr.len() >= 36 {
+        return err(StatusCode::BAD_REQUEST, "invalid sender_addr").into_response();
+    }
+    if req.probe_tx_hash.len() != 64 || !req.probe_tx_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "probe_tx_hash must be 64 hex chars",
+        )
+        .into_response();
+    }
+
+    // Derive 20-byte AccountID from signer pubkey — same shape as
+    // the enclave's compute_account_id_from_pubkey, so the enclave's
+    // ct_memcmp will match against this orchestrator-supplied value.
+    let pubkey_bytes = match hex::decode(&binding.signer_pubkey_hex) {
+        Ok(b) if b.len() == 33 => b,
+        _ => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "signer pubkey not 33 bytes",
+            )
+            .into_response()
+        }
+    };
+    let sha = Sha256::digest(&pubkey_bytes);
+    let account_id = Ripemd160::digest(sha);
+    let account_id_hex = hex::encode(account_id);
+
+    match state
+        .perp
+        .register_deposit_binding(
+            &binding.signer_address,
+            &account_id_hex,
+            &req.sender_addr,
+            req.dest_tag,
+            &req.probe_tx_hash,
+            &binding.signed_body_hex,
+            &binding.signature_hex,
+            &binding.signer_pubkey_hex,
+        )
+        .await
+    {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(e) => err(StatusCode::BAD_GATEWAY, &e.to_string()).into_response(),
+    }
+}
 
 async fn submit_order(
     State(state): State<Arc<AppState>>,

@@ -94,6 +94,46 @@ impl PerpClient {
         self.post("/perp/deposit-xrp", body).await
     }
 
+    /// REQ-20-impl R2 commit 2 — register a deposit binding via the
+    /// enclave's `ecall_perp_register_deposit_binding`.
+    ///
+    /// All identity material flows through the existing
+    /// `OrderSignatureBinding` auth surface; the orchestrator computes
+    /// the 20-byte AccountID from the signer pubkey and passes it
+    /// alongside the r-address — the enclave re-derives + constant-time
+    /// compares per design choice (b) of issue #45.
+    ///
+    /// Returns the JSON response from the enclave server, which carries
+    /// the structured DB_* result code via `result_code`/`code` field
+    /// and an optional `bound_at_ms` on success.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_deposit_binding(
+        &self,
+        user_id: &str,
+        user_account_id_hex: &str,
+        sender_addr: &str,
+        dest_tag: u32,
+        probe_tx_hash_hex: &str,
+        signed_body_hex: &str,
+        signature_hex: &str,
+        signer_pubkey_hex: &str,
+    ) -> Result<Value> {
+        self.post(
+            "/perp/deposit-binding",
+            serde_json::json!({
+                "user_id": user_id,
+                "user_account_id_hex": user_account_id_hex,
+                "sender_addr": sender_addr,
+                "dest_tag": dest_tag,
+                "probe_tx_hash_hex": probe_tx_hash_hex,
+                "signed_body_hex": signed_body_hex,
+                "signature_hex": signature_hex,
+                "signer_pubkey_hex": signer_pubkey_hex,
+            }),
+        )
+        .await
+    }
+
     /// Atomic margin check + XRPL withdrawal tx signing.
     #[allow(dead_code)]
     pub async fn withdraw(
