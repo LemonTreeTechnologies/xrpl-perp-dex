@@ -14,12 +14,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/* REQ-20-impl R2 commit 2 — sha2 + ripemd160 for the
- * compute_account_id_from_pubkey derivation in
- * register_deposit_binding handler. Mirror of the enclave-side
- * dbk_compute_account_id at Enclave.cpp (R1 commit 4). */
-use ripemd::Ripemd160;
-use sha2::{Digest, Sha256};
+/* REQ-20-impl R2 commit 4 — derivation moved to auth::pubkey_to_account_id
+ * (centralised helper). Sha256 / Ripemd160 no longer needed here. */
 
 use axum::{
     extract::{Path, Query, State},
@@ -612,9 +608,10 @@ async fn register_deposit_binding(
         .into_response();
     }
 
-    // Derive 20-byte AccountID from signer pubkey — same shape as
-    // the enclave's compute_account_id_from_pubkey, so the enclave's
-    // ct_memcmp will match against this orchestrator-supplied value.
+    // Derive 20-byte AccountID from signer pubkey via the centralised
+    // helper (auth::pubkey_to_account_id). Same shape as the enclave's
+    // compute_account_id_from_pubkey; the enclave's ct_memcmp will match
+    // against this orchestrator-supplied value.
     let pubkey_bytes = match hex::decode(&binding.signer_pubkey_hex) {
         Ok(b) if b.len() == 33 => b,
         _ => {
@@ -625,8 +622,7 @@ async fn register_deposit_binding(
             .into_response()
         }
     };
-    let sha = Sha256::digest(&pubkey_bytes);
-    let account_id = Ripemd160::digest(sha);
+    let account_id = crate::auth::pubkey_to_account_id(&pubkey_bytes);
     let account_id_hex = hex::encode(account_id);
 
     match state
