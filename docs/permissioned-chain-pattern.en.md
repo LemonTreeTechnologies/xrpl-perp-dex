@@ -40,6 +40,50 @@ We do not produce blocks; we do not run consensus on transaction history. The se
 
 This is a deliberate choice: «chain-is-settlement» systems (Bitcoin, Ethereum, Fabric, Corda) own their consensus problem. We delegate it to XRPL, which gains us a battle-tested settlement layer and loses us the optionality to write our own consensus rules. For a perpetuals DEX use case the trade is correct.
 
+## TRUST as a TEE co-processor framing
+
+The stack assembled by the pattern above is sometimes referenced internally as **TRUST** — **Trusted Unchained Settlement**. The acronym is shorthand for the same architecture this document describes; it is included here so future references in technical materials can resolve cleanly.
+
+### Where this sits in the L1 / L2 / L3 vocabulary — it doesn't
+
+L2 (Arbitrum, Optimism, …) means specific things — execution outsourced from L1, L1-verifiable state via fraud or validity proofs, state batched back to L1. We do none of those: the chain (XRPL) does not verify our execution state; we anchor only multisig payments and Domain-field updates. Calling this an L2 sets the wrong expectation. L3 (app-rollup on top of L2) does not fit either.
+
+The closest industry vocabulary is **co-processor** — used by zk teams (Axiom, RISC Zero) for off-chain compute with on-chain anchoring. We are not a zk co-processor; we are a **TEE co-processor**. Structurally a co-processor does **computation**, not block production — which is exactly what TRUST does. Naming it as such avoids the L-tier misframing.
+
+One-line gloss for the section title: **TRUST is a TEE co-processor pattern that adds smart-contract-equivalent programmability to chains without native VMs, settling final state changes via the chain's own multisig primitives.**
+
+### What TRUST adds, in architectural terms
+
+Bringing programmability to chains whose settlement layer does NOT carry a Turing-complete VM (XRPL today; structurally applicable to Bitcoin / Litecoin / other UTXO or amendment-driven chains). The composition is:
+
+- **Native chain primitives** — whatever the underlying chain natively exposes: M-of-N multisig, atomic transactions, an on-chain data field for committing payloads, public verifiable ledger. XRPL gives us `SignerListSet`, escrow accounts, `Payment` with `DestinationTag` / `Memos`, `AccountSet.Domain`. Different on Bitcoin (Script multisig + `OP_RETURN`), different on Cardano, different on Stellar — but the **shape** of «we need these four things» carries.
+- **TEE-attested business logic** — the perpetuals matching engine, vault, settlement math, FROST signing. Runs in SGX today; portable to TDX / SEV-SNP / Nitro in principle, see `EthSignerEnclave/docs/contingency/` in the private repo for the substrate-migration analyses.
+- **Code/operator separation cryptographically enforced** — reproducible-build invariant + Path A migration ceremony, as described above. This is what makes the pattern composable rather than «just a TEE running code».
+
+The result is smart-contract-**equivalent** business logic without smart contracts — execution does the work that a contract would, settlement anchors the state changes on the chain's own primitives, and operators control which code runs without controlling what each individual operation does. The «equivalent» qualifier matters: this is not «behaves like smart contracts». See § «What it costs» below.
+
+### What TRUST adds vs the permissioned-chain pattern
+
+Two extensions over Fabric / Quorum / Corda:
+
+1. **Execution privacy** — transaction content is private from the operators themselves, not just from outsiders. Fabric/Quorum/Corda peers see transaction payloads; TRUST operators see encrypted ciphertext. This is the part of the design that makes a perpetuals exchange usable: positions, pending orders, and live margin are not legible to the operator running the binary.
+2. **Substrate portability in principle** — Fabric is its own chain; Quorum is a Geth fork; Corda has its own network. TRUST's settlement substrate is whatever chain the deployment picks. Today XRPL; the architecture does not require XRPL. See weaknesses below for the gap between «in principle» and «today».
+
+### What it costs (weaknesses, declared honestly)
+
+The pattern is not a strict improvement on either smart-contract DEX or centralized DEX — it is a different point in the trade-off space. The costs are real and should be named.
+
+1. **Substrate portability is aspirational, not factual today.** The current implementation uses XRPL-specific primitives. Porting to Bitcoin requires re-doing the on-chain vocabulary (Script multisig semantics differ from XRPL); porting to other chains requires similar rework. «Any chain» overclaims the current state; the architecture supports it but the code does not yet.
+2. **On-chain composability is lost.** Smart contracts compose with each other — a single transaction can touch Uniswap, Aave, and Compound atomically. TRUST does not. The TEE-attested execution layer cannot be called by other on-chain contracts on the settlement chain, and TRUST cannot call them either. Bridges would be required for any cross-protocol composition.
+3. **Public state auditability is lost.** Smart-contract DEX state is readable by anyone reading the chain. TRUST state is sealed inside the TEE. Users trust attestation + reproducible build rather than direct chain inspection. Different trust model — not «strictly better», not «strictly worse»; different.
+4. **Liveness compound.** Smart contracts on a public chain work as long as the chain works. TRUST works only when **both** the chain is live AND the operator quorum is reachable. Two dependencies in series instead of one.
+5. **MEV is not absent, just relocated.** Public chains face on-chain MEV through transaction ordering observable in the mempool. TRUST faces TEE-internal sequencing fairness — controllable inside the enclave, but a different problem, not a solved one. Sequencer fairness becomes an internal architectural concern.
+6. **Composability between TRUST instances does not work out of the box.** Two TRUST deployments on two different chains do not compose. Bridges or sequential commitment would be required; this is not an existing primitive of the pattern.
+
+### Why declare these costs explicitly
+
+Because the pattern's positioning otherwise reads as «strict improvement over both smart-contract DEX and centralized DEX», which is not true and would not survive technical due diligence. Declaring the costs up front lets the conversation move to «is this trade-off appropriate for the use case» — which is the conversation we want to be having.
+
 ## Current factual state: capability vs deployment
 
 The multi-entity capability is implemented in code; today's three Azure DCsv3 nodes run under a single operator entity for development convenience. The path to onboarding an additional operator entity is the existing operator-onboarding procedure under the existing quorum, plus the new operator independently reproducing the MRENCLAVE before signing. No code change is required to move from one to several distinct operator entities; only the procedural sequence under the quorum and the independent rebuild verification by each new operator.
