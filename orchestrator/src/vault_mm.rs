@@ -138,8 +138,10 @@ pub async fn seed_vault_deposit(perp: &crate::perp_client::PerpClient, config: &
             .unwrap_or_default()
             .as_nanos()
     );
+    // REQ-20-impl R2: vault seed deposit has no DestinationTag — internal
+    // bootstrap path. `config.user_id` IS the credit target; pass None.
     match perp
-        .deposit(&config.user_id, &config.initial_deposit, &tx_hash)
+        .deposit(&config.user_id, &config.initial_deposit, &tx_hash, None)
         .await
     {
         Ok(_) => info!(

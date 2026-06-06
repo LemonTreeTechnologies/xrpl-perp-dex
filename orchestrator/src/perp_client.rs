@@ -36,35 +36,62 @@ impl PerpClient {
     // ── State management ────────────────────────────────────────
 
     /// Credit user margin after verified XRPL deposit (native XRP).
-    pub async fn deposit(&self, user_id: &str, amount: &str, xrpl_tx_hash: &str) -> Result<Value> {
-        self.post(
-            "/perp/deposit",
-            serde_json::json!({
-                "user_id": user_id,
-                "amount": amount,
-                "xrpl_tx_hash": xrpl_tx_hash,
-            }),
-        )
-        .await
+    ///
+    /// REQ-20-impl R2: `sender_addr` is the XRPL `tx.Account` from the
+    /// detected Payment (semantic rename from `user_id` — the enclave
+    /// now routes the credit based on `destination_tag` + bindings).
+    ///
+    /// When `destination_tag` is `Some(t)`, the enclave consults the
+    /// `deposit_bindings` map:
+    ///   - binding for `(sender_addr, t)` found → credit to bound user_id
+    ///   - no binding → credit to `__unclaimed__` (held until the user
+    ///     calls `POST /v1/deposit-binding` per REQ-20 §2.5a)
+    ///
+    /// The HTTP response includes a `credited_user_id` field with the
+    /// resolved target; callers may surface it to logs / DB mirror.
+    pub async fn deposit(
+        &self,
+        sender_addr: &str,
+        amount: &str,
+        xrpl_tx_hash: &str,
+        destination_tag: Option<u32>,
+    ) -> Result<Value> {
+        let mut body = serde_json::json!({
+            "user_id": sender_addr,
+            "amount": amount,
+            "xrpl_tx_hash": xrpl_tx_hash,
+        });
+        if let Some(t) = destination_tag {
+            body["dest_tag"] = serde_json::json!(t);
+        }
+        self.post("/perp/deposit", body).await
     }
 
     /// Credit user XRP collateral (valued at mark_price × 90% haircut).
+    ///
+    /// Same REQ-20-impl R2 plumbing as [`deposit`]; XRP-asset variant.
+    /// Note: per R1 known limitation L-IMPL-1, XRP-asset bindings are
+    /// not yet supported by the enclave's binding-move ecall (it
+    /// operates on `margin_balance` only). XRP-asset probes will
+    /// surface `DB_INVARIANT_VIOLATION` on binding registration until
+    /// follow-up commit adds asset-class indicator to DepositLogEntry.
     #[allow(dead_code)]
     pub async fn deposit_xrp(
         &self,
-        user_id: &str,
+        sender_addr: &str,
         xrp_amount: &str,
         xrpl_tx_hash: &str,
+        destination_tag: Option<u32>,
     ) -> Result<Value> {
-        self.post(
-            "/perp/deposit-xrp",
-            serde_json::json!({
-                "user_id": user_id,
-                "xrp_amount": xrp_amount,
-                "xrpl_tx_hash": xrpl_tx_hash,
-            }),
-        )
-        .await
+        let mut body = serde_json::json!({
+            "user_id": sender_addr,
+            "xrp_amount": xrp_amount,
+            "xrpl_tx_hash": xrpl_tx_hash,
+        });
+        if let Some(t) = destination_tag {
+            body["dest_tag"] = serde_json::json!(t);
+        }
+        self.post("/perp/deposit-xrp", body).await
     }
 
     /// Atomic margin check + XRPL withdrawal tx signing.

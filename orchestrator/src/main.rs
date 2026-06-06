@@ -1792,8 +1792,17 @@ async fn main() -> Result<()> {
         match monitor.scan_deposits(last_ledger).await {
             Ok((deposits, new_ledger)) => {
                 for deposit in &deposits {
+                    // REQ-20-impl R2: thread destination_tag through to
+                    // perp.deposit. Enclave routes the credit per the
+                    // bindings map (REQ-20 §4.2): bound → bound user;
+                    // unbound tag → __unclaimed__; no tag → sender_addr.
                     if let Err(e) = perp
-                        .deposit(&deposit.sender, &deposit.amount, &deposit.tx_hash)
+                        .deposit(
+                            &deposit.sender,
+                            &deposit.amount,
+                            &deposit.tx_hash,
+                            deposit.destination_tag,
+                        )
                         .await
                     {
                         error!(sender = %deposit.sender, "deposit credit failed: {}", e);

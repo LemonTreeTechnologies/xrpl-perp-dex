@@ -17,8 +17,8 @@ pub struct DepositEvent {
     /// XRPL transaction hash (lowercase hex)
     pub tx_hash: String,
     /// XRPL DestinationTag (u32) — identifies the user within the escrow account.
-    /// Currently parsed but not consumed downstream (see DestinationTag scanner bug).
-    #[allow(dead_code)]
+    /// REQ-20-impl R2: consumed by `main.rs` deposit-scan loop; routes the
+    /// credit through the enclave's `deposit_bindings` map per REQ-20 §4.2.
     pub destination_tag: Option<u32>,
 }
 
