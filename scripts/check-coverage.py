@@ -32,12 +32,22 @@ from typing import Dict, Tuple
 # is forever-tracked + forever-monotonic. Files not on this list are still
 # counted in "overall" but won't fail per-file regression on their own.
 TRACKED_PATHS = [
+    # 2026-06-08 expansion: 6 money-touching files added at current %.
+    # Most are at 0.0% — that's the starting ratchet floor. Adding them puts
+    # regression detection in place (any drop below current % fails CI) and
+    # incentivises test addition (number only goes up over time).
+    "orchestrator/src/api.rs",          # HTTP entry: orders, deposit-binding, auth handlers
     "orchestrator/src/auth.rs",
     "orchestrator/src/cli_tools.rs",
+    "orchestrator/src/db.rs",           # PG mirror including deposit_bindings table
     "orchestrator/src/orderbook.rs",
+    "orchestrator/src/perp_client.rs",  # HTTP wire to enclave server
     "orchestrator/src/pool_path_a_client.rs",
     "orchestrator/src/rate_limit.rs",
     "orchestrator/src/shard_router.rs",
+    "orchestrator/src/vault_mm.rs",     # V1 vault state machine (REQ-19)
+    "orchestrator/src/withdrawal.rs",   # multisig payments — real money out
+    "orchestrator/src/xrpl_monitor.rs", # deposit scanner — DestinationTag bug class
 ]
 
 
