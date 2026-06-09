@@ -94,7 +94,9 @@ The auditor's RESP-N PASS verdict should require existence of one such artifact 
 
 This document codifies a discipline that does NOT yet exist as a formal audit rule. The proposed amendment to AUDIT-PROTOCOL:
 
-> **Rule N+1 — Regression Artifact Requirement.** RESP-N PASS verdict requires the dev to point to a regression artifact (unit test, `static_assert`, check script, or coverage-tracked file) that would fail if the bug were silently reintroduced by a future change. The artifact MUST be referenced in `docs/REGRESSION-BIBLIOGRAPHY.md` before RESP-N PASS is recorded. Exception: «no artifact applicable — invariant lives in design layer» with reasoning; auditor judges.
+> **Rule N+1 — Regression Artifact Requirement.** RESP-N PASS verdict requires the dev to point to a regression artifact (unit test, `static_assert`, check script, or coverage-tracked file) that would fail if the bug were silently reintroduced by a future change, **OR a queued task ID for the artifact** with the queued case explicitly marked as a deferred gap in `docs/REGRESSION-BIBLIOGRAPHY.md`. The artifact (or queued-task pointer) MUST be referenced before RESP-N PASS is recorded. Exception: «no artifact applicable — invariant lives in design layer» with reasoning; auditor judges.
+
+*Refinement folded in per PR #24 audit feedback (2026-06-09):* the «queued task ID» branch handles artifacts that are hard to land synchronously with the fix — REQ-18 first-non-debug-build gate set, for example, needs a separate CI infrastructure touch (task #102). Allowing «queued task ID + bibliography gap entry» gives a structured way to honor the rule without blocking the fix on the artifact. The honest gap entries already in §Bibliography (REQ-18, REQ-19, RESP-ACC-1) demonstrate this pattern in practice.
 
 Parallel to the VCE rule (RESP-20.3 §Q5'', also pending formalization). Both rules belong in the same AUDIT-PROTOCOL amendment cycle.
 
