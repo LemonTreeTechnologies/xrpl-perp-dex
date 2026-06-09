@@ -612,15 +612,14 @@ async fn register_deposit_binding(
     // helper (auth::pubkey_to_account_id). Same shape as the enclave's
     // compute_account_id_from_pubkey; the enclave's ct_memcmp will match
     // against this orchestrator-supplied value.
+    // O-R2-1 (RESP PR #22 Info nit): signer_pubkey_hex flows in from the
+    // auth header chain, so it is client-controlled. A bad value is a
+    // client error, not a server failure — map to BAD_REQUEST so
+    // monitoring doesn't spuriously trip the 5xx alarm and clients can
+    // tell their input is the problem.
     let pubkey_bytes = match hex::decode(&binding.signer_pubkey_hex) {
         Ok(b) if b.len() == 33 => b,
-        _ => {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "signer pubkey not 33 bytes",
-            )
-            .into_response()
-        }
+        _ => return err(StatusCode::BAD_REQUEST, "signer pubkey not 33 bytes").into_response(),
     };
     let account_id = crate::auth::pubkey_to_account_id(&pubkey_bytes);
     let account_id_hex = hex::encode(account_id);
@@ -648,7 +647,26 @@ async fn register_deposit_binding(
             // mirror write.
             if let Some(0) = v.get("result_code").and_then(|x| x.as_i64()) {
                 if let Some(db) = &state.db {
-                    let bound_at_ms = v.get("bound_at_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+                    // O-R2-2 (RESP PR #22 Info nit): pair «enclave succeeded»
+                    // with any «schema-version anomaly» so an operator can
+                    // investigate before the row pollutes downstream queries.
+                    // Missing bound_at_ms on a DB_OK response means the enclave
+                    // returned success but its response schema deviated from
+                    // what we wrote against in R1. We still mirror the row
+                    // (the binding IS registered enclave-side), but flag it.
+                    let bound_at_ms_field = v.get("bound_at_ms").and_then(|x| x.as_u64());
+                    let bound_at_ms = match bound_at_ms_field {
+                        Some(v) if v > 0 => v,
+                        _ => {
+                            warn!(
+                                user_id = %binding.signer_address,
+                                sender_addr = %req.sender_addr,
+                                dest_tag = req.dest_tag,
+                                "enclave DB_OK but bound_at_ms missing/zero — possible response-schema drift; mirroring row with bound_at_ms=0"
+                            );
+                            0
+                        }
+                    };
                     db.insert_deposit_binding(
                         &binding.signer_address,
                         &req.sender_addr,
