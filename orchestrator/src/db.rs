@@ -101,6 +101,39 @@ impl Db {
         }
     }
 
+    /// REQ-20-impl R2 commit 3: mirror a deposit binding into the DB
+    /// after the enclave returned DB_OK from
+    /// ecall_perp_register_deposit_binding. The enclave is the source
+    /// of truth; this row is for operator dashboards / audit cross-check.
+    /// ON CONFLICT DO NOTHING handles DB_IDEMPOTENT_OK and replication
+    /// races — never overwrite an existing binding.
+    pub async fn insert_deposit_binding(
+        &self,
+        user_id: &str,
+        sender_addr: &str,
+        dest_tag: u32,
+        bound_at_ms: u64,
+        bound_via_probe_tx_hash: &str,
+    ) {
+        let r = sqlx::query(
+            "INSERT INTO deposit_bindings \
+             (user_id, sender_addr, dest_tag, bound_at_ms, bound_via_probe_tx_hash) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (sender_addr, dest_tag) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(sender_addr)
+        .bind(dest_tag as i64)
+        .bind(bound_at_ms as i64)
+        .bind(bound_via_probe_tx_hash)
+        .execute(&self.pool)
+        .await;
+
+        if let Err(e) = r {
+            error!("pg insert_deposit_binding failed: {}", e);
+        }
+    }
+
     /// Record a withdrawal.
     #[allow(dead_code)]
     pub async fn insert_withdrawal(

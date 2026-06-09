@@ -339,14 +339,34 @@ pub fn verify_request(
     })
 }
 
-/// Derive XRPL r-address from compressed secp256k1 public key bytes.
-/// Used in tests and utilities.
-#[cfg(test)]
-pub fn pubkey_to_xrpl_address(pubkey_bytes: &[u8]) -> String {
+/// REQ-20-impl R2 commit 4: derive the 20-byte XRPL AccountID from a
+/// compressed secp256k1 pubkey. This is `RIPEMD160(SHA256(pubkey))` —
+/// the same shape as the enclave's `dbk_compute_account_id` helper
+/// (Enclave.cpp commit 4) and the canonical XRPL AccountID derivation.
+///
+/// Used by:
+/// - `pubkey_to_xrpl_address` (DRY — base58check encodes this)
+/// - The deposit-binding handler in api.rs to compute the
+///   `user_account_id_hex` claim sent to the enclave's
+///   `ecall_perp_register_deposit_binding`. The enclave re-derives
+///   from the same pubkey and constant-time compares (X-IMPL-2
+///   design (b)).
+pub fn pubkey_to_account_id(pubkey_bytes: &[u8]) -> [u8; 20] {
     let sha256_hash = Sha256::digest(pubkey_bytes);
     let ripemd_hash = Ripemd160::digest(sha256_hash);
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&ripemd_hash);
+    out
+}
+
+/// Derive XRPL r-address from compressed secp256k1 public key bytes.
+/// Used in tests and utilities (production handler uses
+/// `pubkey_to_account_id` directly + the binding's signer_address).
+#[cfg(test)]
+pub fn pubkey_to_xrpl_address(pubkey_bytes: &[u8]) -> String {
+    let account_id = pubkey_to_account_id(pubkey_bytes);
     let mut payload = vec![0x00u8];
-    payload.extend_from_slice(&ripemd_hash);
+    payload.extend_from_slice(&account_id);
     let checksum = Sha256::digest(Sha256::digest(&payload));
     payload.extend_from_slice(&checksum[..4]);
     const XRPL_ALPHABET: &str = "rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
@@ -1129,5 +1149,102 @@ mod tests {
         // O-M2 fix: was 60, narrowed to 30. Test pins the value so a
         // future loosening cannot land silently.
         assert_eq!(MAX_TIMESTAMP_DRIFT_SECS, 30);
+    }
+
+    // ── REQ-20-impl R2 commit 4 — pubkey_to_account_id helper tests ──
+    //
+    // The deposit-binding handler (api.rs register_deposit_binding) and
+    // the enclave's dbk_compute_account_id (Enclave.cpp commit 4) MUST
+    // produce the same 20-byte AccountID from a given compressed pubkey
+    // — that's the load-bearing equality the enclave constant-time
+    // compares (X-IMPL-2 design (b), issue #45). These tests pin the
+    // orchestrator-side derivation against a canonical XRPL test vector
+    // and a self-consistency invariant.
+
+    /// XRPL spec test vector — secp256k1, from cli_tools.rs:2358.
+    /// Same fixture used by `derive_keypair_secp256k1_xrpl_spec_vector`.
+    /// Pubkey 0330...020 → Address rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh.
+    /// AccountID is the RIPEMD160(SHA256(pubkey)) intermediate (20 bytes).
+    #[test]
+    fn pubkey_to_account_id_matches_xrpl_spec_vector() {
+        let pubkey_hex = "0330E7FC9D56BB25D6893BA3F317AE5BCF33B3291BD63DB32654A313222F7FD020";
+        let pubkey_bytes = hex::decode(pubkey_hex).expect("valid hex");
+        assert_eq!(pubkey_bytes.len(), 33, "compressed secp256k1 = 33 bytes");
+
+        let account_id = pubkey_to_account_id(&pubkey_bytes);
+
+        // Verify length contract.
+        assert_eq!(account_id.len(), 20, "AccountID is 20 bytes");
+
+        // Cross-check: address derived from this AccountID via the
+        // existing pubkey_to_xrpl_address path must match the known
+        // XRPL spec address. If pubkey_to_account_id and
+        // pubkey_to_xrpl_address ever diverge, this catches it.
+        let expected_address = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let derived_address = pubkey_to_xrpl_address(&pubkey_bytes);
+        assert_eq!(
+            derived_address, expected_address,
+            "pubkey_to_xrpl_address must match XRPL spec address"
+        );
+    }
+
+    /// Self-consistency: the address-derivation path must use the same
+    /// 20-byte AccountID as `pubkey_to_account_id`. Refactor-regression
+    /// guard so future edits to either helper don't silently diverge.
+    #[test]
+    fn account_id_helper_is_consistent_with_address_derivation() {
+        let (_, _, pubkey_hex, address) = test_keypair();
+        let pubkey_bytes = hex::decode(&pubkey_hex).expect("valid hex");
+
+        let account_id = pubkey_to_account_id(&pubkey_bytes);
+
+        // Re-encode the AccountID through the base58check pipeline and
+        // verify we land on the same address as pubkey_to_xrpl_address.
+        let mut payload = vec![0x00u8];
+        payload.extend_from_slice(&account_id);
+        let checksum = Sha256::digest(Sha256::digest(&payload));
+        payload.extend_from_slice(&checksum[..4]);
+        const XRPL_ALPHABET: &str = "rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
+        let alpha_bytes: &[u8; 58] = XRPL_ALPHABET.as_bytes().try_into().unwrap();
+        let alpha = bs58::Alphabet::new(alpha_bytes).unwrap();
+        let from_account_id = bs58::encode(&payload).with_alphabet(&alpha).into_string();
+
+        assert_eq!(
+            from_account_id, address,
+            "AccountID base58check-encoded must match pubkey_to_xrpl_address output"
+        );
+    }
+
+    /// Different pubkeys MUST produce different AccountIDs. Sanity
+    /// check that the hash chain doesn't have a degenerate collision
+    /// or accidental constant output.
+    #[test]
+    fn different_pubkeys_produce_different_account_ids() {
+        let (_, _, pubkey_hex_a, _) = test_keypair();
+        let (_, _, pubkey_hex_b, _) = test_keypair();
+        let bytes_a = hex::decode(&pubkey_hex_a).unwrap();
+        let bytes_b = hex::decode(&pubkey_hex_b).unwrap();
+
+        let id_a = pubkey_to_account_id(&bytes_a);
+        let id_b = pubkey_to_account_id(&bytes_b);
+
+        assert_ne!(
+            id_a, id_b,
+            "two random pubkeys must hash to distinct AccountIDs"
+        );
+    }
+
+    /// Deterministic: calling twice with the same input MUST return
+    /// the same output. Catches any accidental nondeterminism in the
+    /// hash plumbing.
+    #[test]
+    fn pubkey_to_account_id_is_deterministic() {
+        let (_, _, pubkey_hex, _) = test_keypair();
+        let bytes = hex::decode(&pubkey_hex).unwrap();
+
+        let id_a = pubkey_to_account_id(&bytes);
+        let id_b = pubkey_to_account_id(&bytes);
+
+        assert_eq!(id_a, id_b);
     }
 }
