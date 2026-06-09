@@ -1,11 +1,17 @@
 {
   "files": {
+    "orchestrator/src/api.rs": 0.0,
     "orchestrator/src/auth.rs": 73.13,
     "orchestrator/src/cli_tools.rs": 26.45,
+    "orchestrator/src/db.rs": 0.0,
     "orchestrator/src/orderbook.rs": 89.46,
+    "orchestrator/src/perp_client.rs": 0.0,
     "orchestrator/src/pool_path_a_client.rs": 71.19,
     "orchestrator/src/rate_limit.rs": 91.67,
-    "orchestrator/src/shard_router.rs": 0.0
+    "orchestrator/src/shard_router.rs": 0.0,
+    "orchestrator/src/vault_mm.rs": 17.0,
+    "orchestrator/src/withdrawal.rs": 0.0,
+    "orchestrator/src/xrpl_monitor.rs": 0.0
   },
-  "overall": 34.04
+  "overall": 38.0
 }
