@@ -484,3 +484,42 @@ A: Hyperliquid — свой L1, мы используем существующи
 - 08 — TEE vs Smart Contract Security (Drift hack analysis)
 - 09 — Grant Narrative
 - 10 — Comparison with Hyperliquid
+
+---
+
+## Часть 9: DestinationTag attribution в v1 (контракт)
+
+В v1 deposit scanner читает XRPL поле `DestinationTag`, но правила атрибуции **строже** чем «что в теге, то и юзер». Полный технический контракт — в `frontend-api-guide.md` §4a (английский, canonical source); ниже краткая версия на русском для саппорта.
+
+### 9.1 Что работает в v1
+
+**Self-deposit с тегом** — когда вы отправляете Payment **со своего кошелька** в escrow с `DestinationTag`:
+
+1. Первый deposit с (your_addr, your_tag) попадает во внутренний bucket `__unclaimed__` (не теряется, просто «pending attribution»).
+2. Вы делаете `POST /v1/deposit-binding` с signed body `{sender_addr, dest_tag, probe_tx_hash}`. Эндпоинт аутентифицируется тем же XRPL ECDSA signature, что и остальные authenticated endpoints.
+3. На success биндинг регистрируется, probe credit атомарно переезжает из `__unclaimed__` в ваш `user_id`. Все последующие deposit'ы с `(your_addr, your_tag)` идут напрямую вам.
+
+### 9.2 Что НЕ работает в v1
+
+**Exchange-withdrawal с тегом** (Binance / Bitstamp / Kraken / любой custodial exchange) → deposit лежит в `__unclaimed__` и **не атрибутируется автоматически**. Это by design:
+- Биндинг-церемония требует чтобы prober (вы) и sender (ваш кошелёк) были одним key.
+- Exchange withdrawals подписаны hot wallet биржи, не вами — церемония не может доказать ваше control.
+- Operator-mediated resolution ceremony для exchange case появится в follow-up release (REQ-21).
+
+**Workaround до REQ-21:** выводите с биржи на self-controlled XRPL кошелёк сначала, оттуда отправляйте в escrow с тегом.
+
+### 9.3 Что точно НЕ происходит
+
+- **Нет silent failures.** Funds в `__unclaimed__` tracked, auditable, recoverable через REQ-21 когда он зашипится. Funds не «потеряны»; они «pending attribution».
+- **Нет auto-refund в v1.** Отдельный release добавит автоматический refund-to-sender для старых `__unclaimed__` entries; до этого — manual operator handling.
+
+### 9.4 Support-сценарий: пользователь жалуется на потерянный deposit
+
+1. Уточните: deposit был с self-кошелька или с биржи?
+2. Если **self-кошелёк** — направьте на §4a guide для self-deposit registration flow. Скорее всего не сделали `POST /v1/deposit-binding` после probe.
+3. Если **биржа** — это known v1 limitation. Funds в `__unclaimed__`, не потеряны. Дайте ETA по REQ-21 (когда announce'нули) или предложите workaround §9.2.
+4. Если ETA нет / срочно — escalate до operator quorum для manual resolution (procedure TBD until REQ-21 ships).
+
+### 9.5 Internal note для разработчиков
+
+§4a в `frontend-api-guide.md` — **canonical source of truth** для этой формулировки (§2.5a в REQ-20 spec). Любые изменения user-facing wording начинаются с PR в REQ-20 spec (private repo), потом синхронизируются с production docs. Drift между spec'ой и production wording — security issue (см. REQ-20 §2.5a load-bearing disclosure).
