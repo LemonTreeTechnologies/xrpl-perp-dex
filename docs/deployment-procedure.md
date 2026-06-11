@@ -1,6 +1,10 @@
 # Production Deployment Procedure — 3 Independent Operators
 
-**Status:** Draft for review. Not yet implemented. Document captures the target architecture for production deployment when the FROST 2-of-3 threshold signing setup is operated by three independent persons (working assumption: Andrey, Alex, Tom), each controlling their own SGX node, with no operator having access to anyone else's server.
+**Status:** Draft for review. Not yet implemented. Document captures the target architecture for production deployment when the XRPL SignerList 2-of-3 multisig setup is operated by three independent persons (working assumption: Andrey, Alex, Tom), each controlling their own SGX node, with no operator having access to anyone else's server.
+
+> **⚠ Auditor correction — signing model (2026-06-12, ref issue #49).** The production signing mechanism is **XRPL SignerList M-of-N (2-of-3) INDEPENDENT ECDSA multisig**: each node holds its **own** XRPL signer key, and `ecall_sign_with_pool_account` → DER ECDSA → `Signers[]` → `submit_multisigned`. It is **not** FROST threshold-Schnorr. The FROST / DKG / MuSig machinery present in the shared enclave binary is **latent** (no live consumer in perp-dex; it is Phoenix-BTC lineage). Throughout this document read «FROST quorum / round / health» as the **XRPL 2-of-3 multisig signing quorum**, and the per-node sealed signing secret as the node's **independent XRPL signer key**, not a DKG-produced FROST share.
+>
+> **Mechanism flag (owner decision needed):** §11.7's node-recovery via «fresh 3-party DKG → FROST shares» is **inconsistent** with independent XRPL multisig — for which a dead node recovers by regenerating its **own** signer key (`node-bootstrap`) and `SignerListSet`-swapping it in; **no DKG is required.** Do not treat the §11.7 DKG path as the procedure until the owner confirms the intended mechanism. The audit's verified per-mechanism reality is recorded in the project Architecture Register (`docs/ARCHITECTURE-REGISTER.md`, §A vs §B).
 
 **Russian version:** `deployment-procedure-ru.md`. This document must be kept in sync with the Russian version per the bilingual docs policy.
 
@@ -10,13 +14,13 @@
 
 What we are protecting against, in priority order:
 
-1. **Single rogue operator.** One of the three operators tries to push a malicious binary to their own node and uses it to extract keys, sign unauthorised XRPL transactions, or steal user funds. The 2-of-3 FROST scheme already mitigates the *signing* side of this — one rogue node cannot sign alone — but the *deployment* side must enforce the same property: one rogue operator cannot unilaterally change what runs on the network.
+1. **Single rogue operator.** One of the three operators tries to push a malicious binary to their own node and uses it to extract keys, sign unauthorised XRPL transactions, or steal user funds. The 2-of-3 XRPL multisig already mitigates the *signing* side of this — one rogue node cannot sign alone (the XRPL SignerList requires 2 of 3 independent signatures) — but the *deployment* side must enforce the same property: one rogue operator cannot unilaterally change what runs on the network.
 
 2. **Compromised operator workstation.** An operator's laptop is compromised (malware, stolen credentials, evil maid). The attacker can SSH to that operator's node but should not be able to push a release the other two operators have not approved.
 
 3. **Compromised build environment.** The build machine (or the CI environment) is compromised and produces a binary that does not match the source. This is the SolarWinds scenario.
 
-4. **Compromised hosting provider.** Hetzner / Azure compromises a single VM (or is legally compelled to). The other two nodes must continue safely; the compromised node's attestation should fail and be excluded from the FROST quorum.
+4. **Compromised hosting provider.** Hetzner / Azure compromises a single VM (or is legally compelled to). The other two nodes must continue safely; the compromised node's attestation should fail and be excluded from the XRPL signing quorum.
 
 5. **Coercion of a single operator.** An operator is forced (legal, physical, social) to deploy a specific binary. The 2-of-3 approval requirement ensures this single operator cannot succeed alone.
 
