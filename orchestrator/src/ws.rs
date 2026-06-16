@@ -40,9 +40,11 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
+    http::StatusCode,
     response::IntoResponse,
 };
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -182,8 +184,20 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    // Market-data stream: only the sequencer holds the authoritative book.
+    // Reject the upgrade on validators so nginx routes the WS to the
+    // sequencer (cluster read-consistency, task #113 — mirrors the read
+    // guard in api::require_sequencer_read).
+    if !state.is_sequencer.load(Ordering::Relaxed) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this node is not the sequencer",
+        )
+            .into_response();
+    }
     let rx = state.ws_tx.subscribe();
     ws.on_upgrade(move |socket| client_loop(socket, rx))
+        .into_response()
 }
 
 /// Per-client loop: read from broadcast, filter by subscribed channels,

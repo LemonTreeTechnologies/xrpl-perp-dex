@@ -147,6 +147,28 @@ fn ok<T: Serialize>(data: T) -> (StatusCode, Json<ApiResponse<T>>) {
     )
 }
 
+/// Guard for market-data reads (orderbook / ticker / trades / funding /
+/// markets / ws). Only the sequencer holds the authoritative in-memory order
+/// book; validators replay order batches but do NOT maintain a queryable book,
+/// so a read served by a validator returns stale or empty data. Returning 503
+/// here lets the nginx upstream (`proxy_next_upstream`) route the read to the
+/// sequencer — same pattern as the write guard in `submit_order`.
+///
+/// Cluster read-consistency, task #113. Do NOT remove without first
+/// replicating the full book to validators (see read-consistency note).
+fn require_sequencer_read(state: &AppState) -> Option<axum::response::Response> {
+    if !state.is_sequencer.load(Ordering::Relaxed) {
+        return Some(
+            err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "this node is not the sequencer",
+            )
+            .into_response(),
+        );
+    }
+    None
+}
+
 fn err(code: StatusCode, msg: &str) -> impl IntoResponse {
     (
         code,
@@ -935,8 +957,16 @@ async fn submit_order(
             .into_response()
         }
         Err(e) => {
-            error!("submit_order error: {}", e);
-            err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response()
+            let msg = e.to_string();
+            // Business rejections (e.g. insufficient margin) are client errors,
+            // not server faults — return 400 so the caller sees a clean reason
+            // instead of a 500 (#114).
+            if msg.contains("insufficient margin") {
+                err(StatusCode::BAD_REQUEST, &msg).into_response()
+            } else {
+                error!("submit_order error: {}", e);
+                err(StatusCode::INTERNAL_SERVER_ERROR, &msg).into_response()
+            }
         }
     }
 }
@@ -1267,6 +1297,9 @@ async fn get_orderbook(
     Path(_market): Path<String>,
     Query(params): Query<DepthQuery>,
 ) -> impl IntoResponse {
+    if let Some(resp) = require_sequencer_read(&state) {
+        return resp;
+    }
     let levels = params.levels.unwrap_or(20).min(100); // cap at 100
     let (bids, asks) = state.engine.depth(levels).await;
 
@@ -1290,6 +1323,9 @@ async fn get_ticker(
     State(state): State<Arc<AppState>>,
     Path(_market): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = require_sequencer_read(&state) {
+        return resp;
+    }
     let (bid, ask, mid) = state.engine.ticker().await;
     ok(serde_json::json!({
         "best_bid": bid.map(|p| p.to_string()),
@@ -1303,6 +1339,9 @@ async fn get_trades(
     State(state): State<Arc<AppState>>,
     Path(_market): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = require_sequencer_read(&state) {
+        return resp;
+    }
     let trades = state.engine.recent_trades().await;
     let trades_json: Vec<serde_json::Value> = trades
         .iter()
@@ -1325,6 +1364,9 @@ async fn get_funding(
     State(state): State<Arc<AppState>>,
     Path(_market): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = require_sequencer_read(&state) {
+        return resp;
+    }
     let rate_raw = state.funding_rate.load(Ordering::Relaxed);
     let mark_raw = state.mark_price.load(Ordering::Relaxed);
     let last_ts = state.last_funding_time.load(Ordering::Relaxed);
@@ -1415,6 +1457,9 @@ async fn auth_login(headers: axum::http::HeaderMap) -> impl IntoResponse {
 }
 
 async fn get_markets(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(resp) = require_sequencer_read(&state) {
+        return resp;
+    }
     let mark_raw = state.mark_price.load(Ordering::Relaxed);
     let (bid, ask, _) = state.engine.ticker().await;
 
