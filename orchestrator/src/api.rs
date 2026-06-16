@@ -957,8 +957,16 @@ async fn submit_order(
             .into_response()
         }
         Err(e) => {
-            error!("submit_order error: {}", e);
-            err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response()
+            let msg = e.to_string();
+            // Business rejections (e.g. insufficient margin) are client errors,
+            // not server faults — return 400 so the caller sees a clean reason
+            // instead of a 500 (#114).
+            if msg.contains("insufficient margin") {
+                err(StatusCode::BAD_REQUEST, &msg).into_response()
+            } else {
+                error!("submit_order error: {}", e);
+                err(StatusCode::INTERNAL_SERVER_ERROR, &msg).into_response()
+            }
         }
     }
 }
