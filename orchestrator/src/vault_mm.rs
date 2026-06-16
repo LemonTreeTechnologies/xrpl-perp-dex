@@ -77,6 +77,23 @@ pub struct VaultMmConfig {
 fn default_vault_user_id() -> String {
     "vault:mm".into()
 }
+
+/// The vault user_ids whose resting orders must be cancelled when this node
+/// loses the sequencer role. Derived from the same flags that gate the vault
+/// singletons in `main`, so the two stay in lock-step. On demotion the
+/// singleton aborts the MM loop but leaves the last-placed ladder resting in
+/// the local in-memory book; without cancelling it the ex-sequencer keeps a
+/// fossil ladder (cluster read-consistency, task #113).
+pub fn enabled_vault_user_ids(vault_mm: bool, vault_dn: bool) -> Vec<String> {
+    let mut ids = Vec::new();
+    if vault_mm {
+        ids.push(default_vault_user_id());
+    }
+    if vault_dn {
+        ids.push("vault:dn".to_string());
+    }
+    ids
+}
 fn default_half_spread() -> f64 {
     0.0025
 }
@@ -411,6 +428,24 @@ async fn compute_gross_inventory(perp: &crate::perp_client::PerpClient, user_id:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enabled_vault_user_ids_matches_configured_singletons() {
+        // No vaults → nothing to cancel on demotion.
+        assert!(enabled_vault_user_ids(false, false).is_empty());
+        // Each flag maps to exactly the user_id its singleton trades under.
+        assert_eq!(enabled_vault_user_ids(true, false), vec!["vault:mm"]);
+        assert_eq!(enabled_vault_user_ids(false, true), vec!["vault:dn"]);
+        assert_eq!(
+            enabled_vault_user_ids(true, true),
+            vec!["vault:mm", "vault:dn"]
+        );
+        // Must track the default the MM singleton actually uses.
+        assert_eq!(
+            enabled_vault_user_ids(true, false)[0],
+            default_vault_user_id()
+        );
+    }
 
     #[test]
     fn levels_to_place_empty_inventory_allows_all() {

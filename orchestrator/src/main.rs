@@ -1451,8 +1451,15 @@ async fn main() -> Result<()> {
     let role_rx_vault_mm = role_rx.clone();
     let role_rx_vault_dn = role_rx.clone();
 
-    // Role change watcher — flips is_sequencer AtomicBool
+    // Role change watcher — flips is_sequencer AtomicBool, and on demotion
+    // cancels the vault's resting orders. The vault singleton aborts the MM
+    // loop on demotion but leaves its last-placed ladder resting in this
+    // node's now-stale in-memory book; cancelling it keeps a demoted
+    // ex-sequencer from serving a fossil ladder (cluster read-consistency,
+    // task #113). vault_users is empty when no vault singleton runs here.
     let is_seq_watcher = is_sequencer.clone();
+    let watcher_state = app_state.clone();
+    let vault_users = vault_mm::enabled_vault_user_ids(cli.vault_mm, cli.vault_dn);
     let _role_handle = tokio::spawn(async move {
         while role_rx.changed().await.is_ok() {
             let new_role = *role_rx.borrow();
@@ -1464,6 +1471,16 @@ async fn main() -> Result<()> {
                 election::Role::Validator => {
                     info!("ROLE CHANGE → Validator");
                     is_seq_watcher.store(false, Ordering::Relaxed);
+                    for user in &vault_users {
+                        let cancelled = watcher_state.engine.cancel_all(user).await;
+                        if !cancelled.is_empty() {
+                            info!(
+                                user = %user,
+                                cancelled = cancelled.len(),
+                                "demotion: cancelled vault orders (fossil cleanup)"
+                            );
+                        }
+                    }
                 }
             }
         }
