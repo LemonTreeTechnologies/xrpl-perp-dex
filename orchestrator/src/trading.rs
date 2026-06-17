@@ -136,26 +136,36 @@ impl TradingEngine {
         label: Option<String>,
         close_position_id: Option<u32>,
     ) -> Result<OrderResult> {
-        // Step 0: Pre-check margin in enclave before matching (skip for close orders)
+        // Step 0: Pre-check margin in enclave before matching (skip for close orders).
+        //
+        // Fail-CLOSED (#114): if available margin cannot be determined — account
+        // unknown to the enclave, balance query errored, or the field is
+        // missing/unparseable — REJECT the order. A limit order that finds no
+        // match returns Ok below without ever reaching the enclave
+        // open_position gate, so this pre-check is the ONLY margin guard for a
+        // resting order. The previous best-effort form silently skipped on any
+        // error, letting a zero/unknown-margin account rest orders (200 OK) and
+        // pollute the book.
         if close_position_id.is_none() {
-            let balance = self.perp.get_balance(&user_id).await;
-            if let Ok(bal) = &balance {
-                if let Some(avail_str) = bal["data"]["available_margin"].as_str() {
-                    if let Ok(avail) = avail_str.parse::<FP8>() {
-                        let est_price = if price.raw() > 0 {
-                            price
-                        } else {
-                            FP8::from_f64(1.0)
-                        };
-                        let notional = size * est_price;
-                        let est_margin = FP8(notional.raw() / leverage as i64);
-                        if avail.raw() < est_margin.raw() {
-                            anyhow::bail!(
-                                "insufficient margin: available={avail}, required~={est_margin}"
-                            );
-                        }
-                    }
-                }
+            let balance =
+                self.perp.get_balance(&user_id).await.map_err(|e| {
+                    anyhow::anyhow!("insufficient margin: balance unavailable ({e})")
+                })?;
+            let avail = balance["data"]["available_margin"]
+                .as_str()
+                .and_then(|s| s.parse::<FP8>().ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("insufficient margin: available_margin unreadable")
+                })?;
+            let est_price = if price.raw() > 0 {
+                price
+            } else {
+                FP8::from_f64(1.0)
+            };
+            let notional = size * est_price;
+            let est_margin = FP8(notional.raw() / leverage as i64);
+            if avail.raw() < est_margin.raw() {
+                anyhow::bail!("insufficient margin: available={avail}, required~={est_margin}");
             }
         }
 
