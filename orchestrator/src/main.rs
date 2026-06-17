@@ -1439,6 +1439,9 @@ async fn main() -> Result<()> {
 
     // Clone role_rx for singletons before the watcher consumes it
     let role_rx_vault_mm = role_rx.clone();
+    // Extra clone for the vault order-canceller (task #113, wired at the vault
+    // site below where the vault's user_id is in scope).
+    let role_rx_vault_cancel = role_rx.clone();
 
     // Role change watcher — flips is_sequencer AtomicBool
     let is_seq_watcher = is_sequencer.clone();
@@ -1703,6 +1706,30 @@ async fn main() -> Result<()> {
         };
         vault_mm::seed_vault_deposit(&perp, &vault_config).await;
         let vault_state = app_state.clone();
+
+        // Cancel the vault's resting orders when this node loses the sequencer
+        // role (task #113). The singleton aborts the vAMM loop on demotion but
+        // leaves its last quotes resting in this node's now-stale in-memory
+        // book; cancelling them keeps a demoted ex-sequencer from serving a
+        // fossil ladder. Uses the vault's actual configured user_id.
+        let cancel_user = vault_config.user_id.clone();
+        let cancel_state = app_state.clone();
+        let mut cancel_rx = role_rx_vault_cancel;
+        tokio::spawn(async move {
+            while cancel_rx.changed().await.is_ok() {
+                if *cancel_rx.borrow() == election::Role::Validator {
+                    let cancelled = cancel_state.engine.cancel_all(&cancel_user).await;
+                    if !cancelled.is_empty() {
+                        info!(
+                            user = %cancel_user,
+                            cancelled = cancelled.len(),
+                            "demotion: cancelled vault orders (fossil cleanup)"
+                        );
+                    }
+                }
+            }
+        });
+
         Some(singleton::spawn("vault-mm", role_rx_vault_mm, move || {
             let state = vault_state.clone();
             let cfg = vault_config.clone();
