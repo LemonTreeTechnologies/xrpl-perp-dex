@@ -12,6 +12,7 @@ mod db;
 mod dkg_coordinate;
 mod election;
 mod http_helpers;
+mod membership_canonical;
 mod node_deploy;
 mod orderbook;
 mod p2p;
