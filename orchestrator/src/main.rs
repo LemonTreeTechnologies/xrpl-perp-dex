@@ -14,6 +14,7 @@ mod election;
 mod http_helpers;
 mod membership_canonical;
 mod membership_coordinator;
+mod membership_http;
 mod node_deploy;
 mod orderbook;
 mod p2p;
