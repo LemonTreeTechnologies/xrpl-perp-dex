@@ -136,4 +136,68 @@ mod tests {
             "f5ff6db6d2b6ea958b50a6ac73d5cadf5081e04ae2274925034d6c1021c3b943"
         );
     }
+
+    // E-β1-impl-1 (RESP-β1-impl §7): a SECOND, larger frozen fixture covering a
+    // different count (4 signers), varied weights, and a deliberately UNSORTED
+    // input — so an encoder drift that only manifests for other shapes (sort-tie
+    // ordering, larger sets) is caught. Same literal hex on the enclave side
+    // (tests/test_xrpl_signerlist.cpp). Fixture: signers input order
+    // {0x05 w3, 0x01 w1, 0x09 w7, 0x03 w2} (sorts to 01,03,05,09), quorum 8;
+    // escrow 0xCC*20, epoch 10, prev 0xDD*32.
+    fn fixture2() -> [SignerEntry; 4] {
+        [
+            entry(0x05, 3),
+            entry(0x01, 1),
+            entry(0x09, 7),
+            entry(0x03, 2),
+        ]
+    }
+
+    #[test]
+    fn beta1_fixture2_set_hash_frozen() {
+        assert_eq!(
+            hex(&compute_set_hash(&fixture2(), 8)),
+            "b9d70513831f91261c0e2ab777bf34d60acd5d63142ffaafb3f028ddedfd6bef"
+        );
+        // sort-invariance across the larger unsorted set
+        let sorted = [
+            entry(0x01, 1),
+            entry(0x03, 2),
+            entry(0x05, 3),
+            entry(0x09, 7),
+        ];
+        assert_eq!(
+            compute_set_hash(&fixture2(), 8),
+            compute_set_hash(&sorted, 8)
+        );
+    }
+
+    #[test]
+    fn beta1_fixture2_message_hash_frozen() {
+        let escrow = [0xCCu8; 20];
+        let prev = [0xDDu8; 32];
+        let set_hash = compute_set_hash(&fixture2(), 8);
+        assert_eq!(
+            hex(&compute_membership_message_hash(
+                &escrow, 10, &prev, &set_hash
+            )),
+            "264700b4dcb70ce92dc88dd8b4c10933593db23f9a17eb2b3cadc868e3cf5be8"
+        );
+    }
+
+    #[test]
+    fn beta1_fixture2_epoch_digest_frozen() {
+        let escrow = [0xCCu8; 20];
+        let prev = [0xDDu8; 32];
+        assert_eq!(
+            hex(&compute_epoch_authority_digest(
+                &escrow,
+                10,
+                &prev,
+                &fixture2(),
+                8
+            )),
+            "44981173d6b14e4991ec308f61a1a1e4417f26e3f375b6e19f0509511146ed92"
+        );
+    }
 }
