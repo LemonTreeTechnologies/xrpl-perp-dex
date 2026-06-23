@@ -182,6 +182,58 @@ pub enum SigningMessage {
         signer_account_id_hex: String,
         signer_xrpl_address: String,
     },
+    /// β1 (perp β-retrofit) off-chain membership-epoch authorisation request.
+    /// Mirrors `PathADelegationRequest`: broadcast to all peers, each operator's
+    /// local pool key signs over a LOCALLY re-derived
+    /// `compute_membership_message_hash`. X-C1 parity: the full proposed signer
+    /// set + quorum travel on the wire so every co-signer SEES the membership
+    /// they authorise; the message hash is never trusted from the wire. The
+    /// collected quorum bundle is the SAME wire format the enclave's
+    /// `seal_verify_quorum_bundle` consumes.
+    ///
+    /// `request_id` MUST start with `"beta1-membership-"` so Response routing
+    /// forwards to the membership collector's mpsc (multi-responder), not the
+    /// XRPL multisig oneshot.
+    MembershipEpochRequest {
+        request_id: String,
+        requester_peer_id: String,
+        /// 20-byte escrow AccountID, lowercase hex (no `0x`).
+        escrow_hex: String,
+        proposed_epoch: u64,
+        /// 32-byte hash-chain link to the CURRENT epoch, lowercase hex.
+        prev_epoch_hash_hex: String,
+        /// Full proposed signer set — receiver re-derives `set_hash` (X-C1).
+        new_signers: Vec<MembershipSignerWire>,
+        new_quorum: u32,
+    },
+}
+
+/// One signer in a β1 membership-epoch transition, as carried on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MembershipSignerWire {
+    /// 20-byte XRPL AccountID, lowercase hex (no `0x`).
+    pub account_id_hex: String,
+    pub weight: u32,
+}
+
+/// Decode exactly 20 hex bytes → `[u8; 20]`, or `None` on any malformed input.
+fn decode_20(s: &str) -> Option<[u8; 20]> {
+    let b = hex::decode(s).ok()?;
+    (b.len() == 20).then(|| {
+        let mut a = [0u8; 20];
+        a.copy_from_slice(&b);
+        a
+    })
+}
+
+/// Decode exactly 32 hex bytes → `[u8; 32]`, or `None` on any malformed input.
+fn decode_32(s: &str) -> Option<[u8; 32]> {
+    let b = hex::decode(s).ok()?;
+    (b.len() == 32).then(|| {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&b);
+        a
+    })
 }
 
 /// Events broadcast by sequencer for validator PG replication.
@@ -250,6 +302,27 @@ pub struct PathADelegationRelay {
     /// Channel to receive `SigningMessage::Response` instances as
     /// peers reply. The collector closes the receive end when it has
     /// enough responses or the timeout fires.
+    pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
+}
+
+/// β1 (perp β-retrofit) outbound membership-epoch collection request.
+///
+/// Same multi-receiver shape as `PathADelegationRelay` (M-of-N operators
+/// reply concurrently → mpsc, not oneshot). The `MembershipBundleCollector`
+/// (in `membership_coordinator.rs`) builds one per ceremony from a prepared
+/// `MembershipEpochStatement`, sends it down `set_membership_epoch_channel`,
+/// and receives signed responses on `responses_tx` until quorum or timeout.
+#[derive(Debug)]
+pub struct MembershipEpochRelay {
+    /// Unique per-ceremony id; MUST start with `"beta1-membership-"` so the
+    /// p2p response router forwards replies here, not to the XRPL oneshot map.
+    pub request_id: String,
+    pub escrow: [u8; 20],
+    pub proposed_epoch: u64,
+    pub prev_epoch_hash: [u8; 32],
+    pub new_signers: Vec<crate::membership_canonical::SignerEntry>,
+    pub new_quorum: u32,
+    /// Channel to receive `SigningMessage::Response` instances as peers reply.
     pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
 }
 
@@ -447,6 +520,12 @@ pub struct P2PNode {
     /// In-flight Path A delegation requests; mpsc per-request because
     /// many peers reply concurrently (M-of-N quorum collection).
     pending_path_a_delegation: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
+    /// β1: outbound membership-epoch collection requests from the ceremony
+    /// driver (`MembershipBundleCollector`).
+    membership_epoch_rx: Option<mpsc::Receiver<MembershipEpochRelay>>,
+    /// In-flight β1 membership-epoch requests; mpsc per-request (M-of-N
+    /// operators reply concurrently), mirroring `pending_path_a_delegation`.
+    pending_membership_epoch: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
     /// Channel for outbound state events (sequencer publishes).
     events_publish_rx: Option<mpsc::Receiver<StateEvent>>,
     /// Channel for received state events (validator consumes).
@@ -607,6 +686,8 @@ impl P2PNode {
             pending_signing: HashMap::new(),
             path_a_delegation_rx: None,
             pending_path_a_delegation: HashMap::new(),
+            membership_epoch_rx: None,
+            pending_membership_epoch: HashMap::new(),
             events_publish_rx: None,
             events_inbound_tx: None,
             peer_quote_publish_rx: None,
@@ -703,6 +784,18 @@ impl P2PNode {
     #[allow(dead_code)]
     pub fn set_path_a_delegation_channel(&mut self, rx: mpsc::Receiver<PathADelegationRelay>) {
         self.path_a_delegation_rx = Some(rx);
+    }
+
+    /// β1: wire the membership-epoch ceremony driver's collection channel.
+    /// Caller (the admin change-membership endpoint) sends one
+    /// `MembershipEpochRelay` per ceremony; the run-loop publishes the
+    /// corresponding `MembershipEpochRequest` on the signing topic and forwards
+    /// each peer's `Response` back via the relay's `responses_tx`.
+    ///
+    /// `#[allow(dead_code)]`: the admin endpoint consumer lands in #119(d).
+    #[allow(dead_code)]
+    pub fn set_membership_epoch_channel(&mut self, rx: mpsc::Receiver<MembershipEpochRelay>) {
+        self.membership_epoch_rx = Some(rx);
     }
 
     /// Set events publish channel (sequencer sends events to broadcast).
@@ -1343,6 +1436,107 @@ impl P2PNode {
         }
     }
 
+    /// β1: sign an off-chain membership-epoch transition locally. X-C1: the
+    /// `message_hash` is RE-DERIVED here from the full proposed set + quorum +
+    /// chain-link carried on the wire — never trusted as a hash. The local pool
+    /// key signs the same 32-byte digest `ecall_seal_membership_epoch` will
+    /// reconstruct and verify the collected bundle against.
+    async fn handle_membership_epoch_request(
+        local_signer: &LocalSigner,
+        request_id: &str,
+        escrow: &[u8; 20],
+        proposed_epoch: u64,
+        prev_epoch_hash: &[u8; 32],
+        new_signers: &[crate::membership_canonical::SignerEntry],
+        new_quorum: u32,
+    ) -> SigningMessage {
+        use crate::membership_canonical::{compute_membership_message_hash, compute_set_hash};
+
+        let new_set_hash = compute_set_hash(new_signers, new_quorum);
+        let message_hash =
+            compute_membership_message_hash(escrow, proposed_epoch, prev_epoch_hash, &new_set_hash);
+        let hash_hex = format!("0x{}", hex::encode(message_hash));
+
+        let http = match crate::http_helpers::loopback_http_client(Duration::from_secs(15)) {
+            Ok(c) => c,
+            Err(e) => {
+                return Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("http client: {e}"),
+                )
+            }
+        };
+
+        let sign_url = format!("{}/pool/sign", local_signer.enclave_url);
+        let resp = http
+            .post(&sign_url)
+            .json(&serde_json::json!({
+                "from": local_signer.address,
+                "hash": hash_hex,
+                "session_key": local_signer.session_key,
+            }))
+            .send()
+            .await;
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                return Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("enclave request: {e}"),
+                )
+            }
+        };
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                return Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("enclave response parse: {e}"),
+                )
+            }
+        };
+        if body["status"].as_str() != Some("success") {
+            return Self::membership_sign_error(
+                local_signer,
+                request_id,
+                format!("enclave: {}", body.get("message").unwrap_or(&body)),
+            );
+        }
+
+        let r_hex = body["signature"]["r"].as_str().unwrap_or("");
+        let s_hex = body["signature"]["s"].as_str().unwrap_or("");
+        let r_bytes = hex::decode(r_hex).unwrap_or_default();
+        let s_bytes = hex::decode(s_hex).unwrap_or_default();
+        let der = crate::xrpl_signer::der_encode_signature(&r_bytes, &s_bytes);
+
+        SigningMessage::Response {
+            request_id: request_id.to_string(),
+            signer_xrpl_address: local_signer.xrpl_address.clone(),
+            der_signature: Some(hex::encode_upper(&der)),
+            compressed_pubkey: Some(local_signer.compressed_pubkey.clone()),
+            error: None,
+        }
+    }
+
+    /// Uniform error `Response` for the β1 membership signing path.
+    fn membership_sign_error(
+        local_signer: &LocalSigner,
+        request_id: &str,
+        msg: String,
+    ) -> SigningMessage {
+        SigningMessage::Response {
+            request_id: request_id.to_string(),
+            signer_xrpl_address: local_signer.xrpl_address.clone(),
+            der_signature: None,
+            compressed_pubkey: None,
+            error: Some(msg),
+        }
+    }
+
     async fn handle_signing_request(
         local_signer: &LocalSigner,
         escrow_xrpl_address: Option<&str>,
@@ -1455,6 +1649,7 @@ impl P2PNode {
         let mut election_rx = self.election_outbound_rx.take();
         let mut signing_rx = self.signing_request_rx.take();
         let mut path_a_delegation_rx = self.path_a_delegation_rx.take();
+        let mut membership_epoch_rx = self.membership_epoch_rx.take();
         let mut events_rx = self.events_publish_rx.take();
         let mut peer_quote_rx = self.peer_quote_publish_rx.take();
         let mut share_v2_rx = self.share_v2_publish_rx.take();
@@ -1601,6 +1796,63 @@ impl P2PNode {
                     }
                 }
 
+                // β1: membership-epoch collection (mirrors delegation arm)
+                Some(relay) = async {
+                    match &mut membership_epoch_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<MembershipEpochRelay>>().await,
+                    }
+                } => {
+                    // Local signer is also a co-signer; gossipsub doesn't
+                    // deliver to the publisher, so sign locally too.
+                    if let Some(ref local) = self.local_signer {
+                        let local_response = Self::handle_membership_epoch_request(
+                            local,
+                            &relay.request_id,
+                            &relay.escrow,
+                            relay.proposed_epoch,
+                            &relay.prev_epoch_hash,
+                            &relay.new_signers,
+                            relay.new_quorum,
+                        ).await;
+                        let _ = relay.responses_tx.send(local_response).await;
+                    }
+
+                    let new_signers_wire: Vec<MembershipSignerWire> = relay
+                        .new_signers
+                        .iter()
+                        .map(|s| MembershipSignerWire {
+                            account_id_hex: hex::encode(s.account_id),
+                            weight: s.weight,
+                        })
+                        .collect();
+                    let msg = SigningMessage::MembershipEpochRequest {
+                        request_id: relay.request_id.clone(),
+                        requester_peer_id: self.peer_id.to_string(),
+                        escrow_hex: hex::encode(relay.escrow),
+                        proposed_epoch: relay.proposed_epoch,
+                        prev_epoch_hash_hex: hex::encode(relay.prev_epoch_hash),
+                        new_signers: new_signers_wire,
+                        new_quorum: relay.new_quorum,
+                    };
+                    match self.publish_signing(&msg) {
+                        Ok(_) => {
+                            self.pending_membership_epoch.insert(
+                                relay.request_id, relay.responses_tx);
+                        }
+                        Err(e) => {
+                            warn!("β1 membership-epoch publish failed: {}", e);
+                            let _ = relay.responses_tx.send(SigningMessage::Response {
+                                request_id: relay.request_id,
+                                signer_xrpl_address: String::new(),
+                                der_signature: None,
+                                compressed_pubkey: None,
+                                error: Some(format!("P2P publish failed: {e}")),
+                            }).await;
+                        }
+                    }
+                }
+
                 // Publish state events (sequencer → validators)
                 Some(event) = async {
                     match &mut events_rx {
@@ -1689,6 +1941,8 @@ impl P2PNode {
                     // detection. Collector drops the receive end on timeout
                     // or quorum-met; we GC entries here to bound memory.
                     self.pending_path_a_delegation.retain(|_, tx| !tx.is_closed());
+                    // β1 membership-epoch collectors: same GC.
+                    self.pending_membership_epoch.retain(|_, tx| !tx.is_closed());
                 }
 
                 // Handle swarm events
@@ -1816,6 +2070,13 @@ impl P2PNode {
                                             let _ = tx.send(msg).await;
                                         }
                                     }
+                                } else if request_id.starts_with("beta1-membership-") {
+                                    if let Some(tx) =
+                                        self.pending_membership_epoch.get(&request_id) {
+                                        if let Ok(msg) = serde_json::from_slice::<SigningMessage>(&message.data) {
+                                            let _ = tx.send(msg).await;
+                                        }
+                                    }
                                 } else if let Some(tx) = self.pending_signing.remove(&request_id) {
                                     if let Ok(msg) = serde_json::from_slice::<SigningMessage>(&message.data) {
                                         let _ = tx.send(msg);
@@ -1902,6 +2163,105 @@ impl P2PNode {
                                 ).await;
                                 if let Err(e) = self.publish_signing(&response) {
                                     error!("failed to publish path-a delegation response: {}", e);
+                                }
+                            }
+                            Ok(SigningMessage::MembershipEpochRequest {
+                                request_id,
+                                requester_peer_id,
+                                escrow_hex,
+                                proposed_epoch,
+                                prev_epoch_hash_hex,
+                                new_signers,
+                                new_quorum,
+                            }) => {
+                                // β1: off-chain membership-epoch authorisation
+                                // from a peer's ceremony driver. Sign IF we
+                                // have a local signer (every operator is a
+                                // co-signer); the X-C1 gate is in
+                                // handle_membership_epoch_request, which
+                                // re-derives the message hash locally from the
+                                // full proposed set carried here.
+                                let local_opt = self.local_signer.clone();
+                                let Some(local) = local_opt else {
+                                    continue;
+                                };
+
+                                // X-C1: peer allowlist + rate limit + replay
+                                // guard, mirroring the existing signing paths.
+                                if let Some(ref allow) = self.allowed_signing_peers {
+                                    if !allow.contains(&propagation_source) {
+                                        warn!(
+                                            req_id = %request_id,
+                                            from = %propagation_source,
+                                            "X-C1: β1 membership request from peer outside allowlist — dropped"
+                                        );
+                                        continue;
+                                    }
+                                }
+                                if !self.check_signing_rate(&propagation_source) {
+                                    warn!(req_id = %request_id, "X-C1: β1 membership request rate-limited");
+                                    continue;
+                                }
+                                if !self.mark_signing_request_fresh(&request_id) {
+                                    warn!(req_id = %request_id, "X-C1: duplicate β1 membership request_id — dropped");
+                                    continue;
+                                }
+
+                                let escrow = match decode_20(&escrow_hex) {
+                                    Some(a) => a,
+                                    None => {
+                                        warn!(req_id = %request_id, "β1 membership: bad escrow_hex");
+                                        continue;
+                                    }
+                                };
+                                let prev_epoch_hash = match decode_32(&prev_epoch_hash_hex) {
+                                    Some(a) => a,
+                                    None => {
+                                        warn!(req_id = %request_id, "β1 membership: bad prev_epoch_hash_hex");
+                                        continue;
+                                    }
+                                };
+                                let mut signers =
+                                    Vec::with_capacity(new_signers.len());
+                                let mut bad = false;
+                                for s in &new_signers {
+                                    match decode_20(&s.account_id_hex) {
+                                        Some(account_id) => signers.push(
+                                            crate::membership_canonical::SignerEntry {
+                                                account_id,
+                                                weight: s.weight,
+                                            },
+                                        ),
+                                        None => {
+                                            bad = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if bad {
+                                    warn!(req_id = %request_id, "β1 membership: bad signer account_id_hex");
+                                    continue;
+                                }
+
+                                info!(
+                                    req_id = %request_id,
+                                    from = %requester_peer_id,
+                                    propagation = %propagation_source,
+                                    epoch = proposed_epoch,
+                                    signers = signers.len(),
+                                    "β1 membership-epoch request received — signing locally"
+                                );
+                                let response = Self::handle_membership_epoch_request(
+                                    &local,
+                                    &request_id,
+                                    &escrow,
+                                    proposed_epoch,
+                                    &prev_epoch_hash,
+                                    &signers,
+                                    new_quorum,
+                                ).await;
+                                if let Err(e) = self.publish_signing(&response) {
+                                    error!("failed to publish β1 membership response: {}", e);
                                 }
                             }
                             Err(e) => {
@@ -2868,6 +3228,64 @@ mod tests {
                 assert_eq!(unsigned_tx, good_signerlist_tx());
             }
             _ => panic!("expected Request"),
+        }
+    }
+
+    // ── β1 membership-epoch transport ────────────────────────────
+
+    #[test]
+    fn decode_20_and_32_enforce_exact_length() {
+        assert!(decode_20(&"ab".repeat(20)).is_some());
+        assert!(decode_20(&"ab".repeat(19)).is_none()); // 19 bytes
+        assert!(decode_20(&"ab".repeat(21)).is_none()); // 21 bytes
+        assert!(decode_20("zz").is_none()); // not hex
+        assert!(decode_32(&"cd".repeat(32)).is_some());
+        assert!(decode_32(&"cd".repeat(31)).is_none());
+    }
+
+    /// β1 MembershipEpochRequest survives a serde round-trip with its full
+    /// signer set intact — the wire shape every co-signer re-derives the
+    /// message hash from. A drift in this shape silently breaks the
+    /// membership-change flow, so it is pinned.
+    #[test]
+    fn membership_epoch_request_round_trips() {
+        let req = SigningMessage::MembershipEpochRequest {
+            request_id: "beta1-membership-xyz".into(),
+            requester_peer_id: "peer-A".into(),
+            escrow_hex: "aa".repeat(20),
+            proposed_epoch: 5,
+            prev_epoch_hash_hex: "bb".repeat(32),
+            new_signers: vec![
+                MembershipSignerWire {
+                    account_id_hex: "01".repeat(20),
+                    weight: 1,
+                },
+                MembershipSignerWire {
+                    account_id_hex: "02".repeat(20),
+                    weight: 2,
+                },
+            ],
+            new_quorum: 2,
+        };
+        let wire = serde_json::to_string(&req).expect("serialize");
+        // snake_case tag, per the enum's serde attr.
+        assert!(wire.contains("\"type\":\"membership_epoch_request\""));
+        let parsed: SigningMessage = serde_json::from_str(&wire).expect("deserialize");
+        match parsed {
+            SigningMessage::MembershipEpochRequest {
+                request_id,
+                proposed_epoch,
+                new_signers,
+                new_quorum,
+                ..
+            } => {
+                assert_eq!(request_id, "beta1-membership-xyz");
+                assert_eq!(proposed_epoch, 5);
+                assert_eq!(new_signers.len(), 2);
+                assert_eq!(new_signers[1].weight, 2);
+                assert_eq!(new_quorum, 2);
+            }
+            _ => panic!("expected MembershipEpochRequest"),
         }
     }
 }
