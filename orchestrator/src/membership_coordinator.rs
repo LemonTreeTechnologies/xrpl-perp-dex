@@ -20,7 +20,16 @@
 
 #![allow(dead_code)] // ceremony wiring (relay + enclave call) lands next increment
 
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Context, Result};
+use async_trait::async_trait;
+use tokio::sync::mpsc;
+use tokio::time::timeout;
+use uuid::Uuid;
+
 use crate::membership_canonical::{compute_membership_message_hash, compute_set_hash, SignerEntry};
+use crate::p2p::{MembershipEpochRelay, SigningMessage};
 
 const MAX_SIGNERS: usize = 32; // XRPL SignerList limit (mirrors the enclave)
 
@@ -94,6 +103,261 @@ pub fn prepare_statement(
     })
 }
 
+// ── quorum-bundle codec ──────────────────────────────────────────
+//
+// The collected consent bundle is the SAME wire format the enclave's
+// `seal_verify_quorum_bundle` (path_a.cpp) consumes — shared with Path-A
+// delegation. Kept self-contained here (not coupled to path_a_delegation.rs)
+// and pinned by a frozen golden-bytes test; the enclave verifier is the single
+// source of truth that both Rust encoders must match.
+
+#[derive(Debug)]
+struct QuorumEntry {
+    pk: Vec<u8>,  // 33-byte compressed secp256k1
+    sig: Vec<u8>, // ECDSA-DER, 8..=72 bytes
+}
+
+/// Extract a `(pk, sig)` entry from a peer's signing `Response`, or `None` if
+/// it errored or is structurally malformed (so a bad gossipsub message can't
+/// corrupt the bundle). Signature/membership validity is the enclave's job.
+fn parse_signing_response(msg: &SigningMessage) -> Option<QuorumEntry> {
+    let SigningMessage::Response {
+        der_signature,
+        compressed_pubkey,
+        error,
+        ..
+    } = msg
+    else {
+        return None;
+    };
+    if error.is_some() {
+        return None;
+    }
+    let sig = hex::decode(der_signature.as_ref()?).ok()?;
+    let pk = hex::decode(compressed_pubkey.as_ref()?).ok()?;
+    if pk.len() != 33 || sig.len() < 8 || sig.len() > 72 {
+        return None;
+    }
+    Some(QuorumEntry { pk, sig })
+}
+
+/// Quorum-bundle wire format (LE integers):
+///   u32 version = 1
+///   u32 entry_count
+///   for each: pk_compressed[33] || u8 sig_len(8..=72) || sig[sig_len]
+fn build_quorum_bundle(entries: &[QuorumEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+        out.extend_from_slice(&e.pk);
+        out.push(e.sig.len() as u8);
+        out.extend_from_slice(&e.sig);
+    }
+    out
+}
+
+// ── collector: gather off-chain consent over the libp2p relay ────
+
+/// Collects the single off-chain quorum bundle authorising a prepared
+/// `MembershipEpochStatement`. Trait so the driver can be unit-tested with a
+/// mock (same posture as Path-A's `DelegationCollector`).
+#[async_trait]
+pub trait MembershipBundleCollector: Send + Sync {
+    async fn collect(&self, statement: &MembershipEpochStatement) -> Result<Vec<u8>>;
+}
+
+/// Production collector: pushes one `MembershipEpochRelay` to the p2p run-loop
+/// and accumulates `Response`s (each operator's pool signature over the
+/// statement's `message_hash`) until quorum-many distinct signers reply or the
+/// window closes. Mirrors `LibP2PDelegationCollector`.
+pub struct LibP2PMembershipCollector {
+    relay_tx: mpsc::Sender<MembershipEpochRelay>,
+    timeout: Duration,
+}
+
+impl LibP2PMembershipCollector {
+    /// 30 s default window — operators have already coordinated the change
+    /// out-of-band, so wall-clock is gossipsub propagation + one ecall.
+    pub fn new(relay_tx: mpsc::Sender<MembershipEpochRelay>) -> Self {
+        Self {
+            relay_tx,
+            timeout: Duration::from_secs(30),
+        }
+    }
+
+    pub fn with_timeout(mut self, t: Duration) -> Self {
+        self.timeout = t;
+        self
+    }
+}
+
+#[async_trait]
+impl MembershipBundleCollector for LibP2PMembershipCollector {
+    async fn collect(&self, statement: &MembershipEpochStatement) -> Result<Vec<u8>> {
+        let request_id = format!("beta1-membership-{}", Uuid::new_v4());
+        let (responses_tx, mut responses_rx) = mpsc::channel(32);
+
+        let relay = MembershipEpochRelay {
+            request_id,
+            escrow: statement.escrow,
+            proposed_epoch: statement.proposed_epoch,
+            prev_epoch_hash: statement.prev_epoch_hash,
+            new_signers: statement.new_signers.clone(),
+            new_quorum: statement.new_quorum,
+            responses_tx,
+        };
+        self.relay_tx
+            .send(relay)
+            .await
+            .context("send MembershipEpochRelay to p2p run-loop")?;
+
+        let mut entries: Vec<QuorumEntry> = Vec::new();
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let resp = match timeout(remaining, responses_rx.recv()).await {
+                Ok(Some(m)) => m,
+                Ok(None) => break, // sender dropped
+                Err(_) => break,   // window closed
+            };
+            if let Some(entry) = parse_signing_response(&resp) {
+                // Dedup by pk: the local self-sign + the same operator's
+                // gossipsub round-trip can both land. The enclave dedups too,
+                // but a clean bundle is friendlier to operator logs.
+                if !entries.iter().any(|e| e.pk == entry.pk) {
+                    entries.push(entry);
+                }
+            }
+        }
+
+        if entries.is_empty() {
+            return Err(anyhow!(
+                "collected zero membership-epoch consents within {:?}; \
+                 check the operator quorum is online + gossipsub mesh is healthy",
+                self.timeout
+            ));
+        }
+
+        Ok(build_quorum_bundle(&entries))
+    }
+}
+
+// ── driver: collect consent, then apply on every node ────────────
+
+/// Reads the CURRENT sealed epoch + digest from the local enclave. The driver
+/// needs both to build the next statement (`proposed_epoch = current + 1`,
+/// `prev_epoch_hash = current digest`). Trait for testability.
+#[async_trait]
+pub trait EpochDigestSource: Send + Sync {
+    async fn current_epoch(&self) -> Result<(u64, [u8; 32])>;
+}
+
+/// Applies a `(statement, bundle)` on ONE node (POST the seal-epoch admin
+/// route → that node's enclave `ecall_seal_membership_epoch`, which re-derives
+/// the message hash, verifies the bundle against its CURRENT epoch, and the
+/// monotonic-epoch guard enforces the single-successor (P) half). Trait for
+/// testability.
+#[async_trait]
+pub trait EpochSealSink: Send + Sync {
+    async fn seal_on_node(
+        &self,
+        node_admin_url: &str,
+        statement: &MembershipEpochStatement,
+        bundle: &[u8],
+    ) -> Result<()>;
+}
+
+/// Per-node application result of a membership change.
+#[derive(Debug, Clone)]
+pub struct NodeSealResult {
+    pub node: String,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// Outcome of one membership-change ceremony.
+#[derive(Debug, Clone)]
+pub struct MembershipChangeOutcome {
+    pub proposed_epoch: u64,
+    pub message_hash: [u8; 32],
+    pub bundle_len: usize,
+    pub node_results: Vec<NodeSealResult>,
+}
+
+impl MembershipChangeOutcome {
+    /// True iff every node sealed the new epoch. A partial result means the
+    /// cluster's read-projection of membership is now split — operator must
+    /// retry the failed nodes (the in-enclave monotonic guard makes the retry
+    /// idempotent: a node that already sealed N+1 rejects a second attempt).
+    pub fn all_sealed(&self) -> bool {
+        !self.node_results.is_empty() && self.node_results.iter().all(|r| r.ok)
+    }
+}
+
+/// Run one off-chain membership change end-to-end: read the current epoch from
+/// the local enclave, prepare the single successor statement (P), collect ONE
+/// off-chain quorum bundle over its message hash, and apply that SAME
+/// `(statement, bundle)` on every node. Each node independently verifies the
+/// bundle and enforces monotonic-epoch — so a partial apply is safe (no node
+/// adopts a different set), just incomplete; the caller inspects
+/// `all_sealed()`.
+pub async fn run_membership_change(
+    escrow: [u8; 20],
+    new_signers: Vec<SignerEntry>,
+    new_quorum: u32,
+    digest_src: &dyn EpochDigestSource,
+    collector: &dyn MembershipBundleCollector,
+    seal_sink: &dyn EpochSealSink,
+    nodes: &[String],
+) -> Result<MembershipChangeOutcome> {
+    if nodes.is_empty() {
+        bail!("no cluster nodes given to apply the membership change to");
+    }
+
+    let (current_epoch, current_digest) = digest_src
+        .current_epoch()
+        .await
+        .context("read current epoch digest from local enclave")?;
+
+    let statement = prepare_statement(
+        escrow,
+        current_epoch,
+        current_digest,
+        new_signers,
+        new_quorum,
+    )
+    .map_err(|e| anyhow!("prepare membership statement: {e:?}"))?;
+
+    let bundle = collector
+        .collect(&statement)
+        .await
+        .context("collect off-chain quorum consent")?;
+
+    let mut node_results = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let (ok, error) = match seal_sink.seal_on_node(node, &statement, &bundle).await {
+            Ok(()) => (true, None),
+            Err(e) => (false, Some(e.to_string())),
+        };
+        node_results.push(NodeSealResult {
+            node: node.clone(),
+            ok,
+            error,
+        });
+    }
+
+    Ok(MembershipChangeOutcome {
+        proposed_epoch: statement.proposed_epoch,
+        message_hash: statement.message_hash,
+        bundle_len: bundle.len(),
+        node_results,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +423,262 @@ mod tests {
             prepare_statement(esc, 1, dig, too_many, 1),
             Err(PrepareError::TooManySigners)
         );
+    }
+
+    // ── quorum-bundle codec ──────────────────────────────────────
+
+    #[test]
+    fn build_quorum_bundle_layout() {
+        let entries = vec![QuorumEntry {
+            pk: vec![0x02; 33],
+            sig: vec![0x30, 0x45, 0xAB, 0xCD, 0xEF, 0x01, 0x02, 0x03],
+        }];
+        let b = build_quorum_bundle(&entries);
+        assert_eq!(b.len(), 4 + 4 + 33 + 1 + 8);
+        assert_eq!(&b[..4], &1u32.to_le_bytes()); // version
+        assert_eq!(&b[4..8], &1u32.to_le_bytes()); // entry_count
+        assert_eq!(&b[8..41], &[0x02; 33]); // pk
+        assert_eq!(b[41], 8); // sig_len
+        assert_eq!(
+            &b[42..50],
+            &[0x30, 0x45, 0xAB, 0xCD, 0xEF, 0x01, 0x02, 0x03]
+        );
+    }
+
+    #[test]
+    fn build_quorum_bundle_zero_entries() {
+        let b = build_quorum_bundle(&[]);
+        assert_eq!(b.len(), 8);
+        assert_eq!(&b[4..8], &0u32.to_le_bytes());
+    }
+
+    fn response(sig_hex: Option<&str>, pk_hex: Option<&str>, err: Option<&str>) -> SigningMessage {
+        SigningMessage::Response {
+            request_id: "beta1-membership-test".into(),
+            signer_xrpl_address: "rTest".into(),
+            der_signature: sig_hex.map(String::from),
+            compressed_pubkey: pk_hex.map(String::from),
+            error: err.map(String::from),
+        }
+    }
+
+    #[test]
+    fn parse_signing_response_filters_malformed() {
+        let pk = "02".to_string() + &"AB".repeat(32);
+        let sig = "30".to_string() + &"45".repeat(69);
+        assert!(parse_signing_response(&response(Some(&sig), Some(&pk), None)).is_some());
+        // error response
+        assert!(parse_signing_response(&response(None, None, Some("e"))).is_none());
+        // wrong pk size (32 bytes)
+        let pk32 = "02".to_string() + &"AB".repeat(31);
+        assert!(parse_signing_response(&response(Some(&sig), Some(&pk32), None)).is_none());
+        // sig too short
+        assert!(parse_signing_response(&response(Some("3045"), Some(&pk), None)).is_none());
+    }
+
+    // ── collector ────────────────────────────────────────────────
+
+    fn sample_statement() -> MembershipEpochStatement {
+        prepare_statement(
+            [0xAA; 20],
+            4,
+            [0xBB; 32],
+            vec![entry(0x01, 1), entry(0x02, 2)],
+            2,
+        )
+        .expect("valid")
+    }
+
+    #[tokio::test]
+    async fn collector_times_out_on_zero_responses() {
+        let (relay_tx, mut relay_rx) = mpsc::channel(1);
+        let collector =
+            LibP2PMembershipCollector::new(relay_tx).with_timeout(Duration::from_millis(100));
+        let drain = tokio::spawn(async move {
+            let _relay = relay_rx.recv().await;
+            tokio::time::sleep(Duration::from_secs(1)).await; // hold relay alive
+        });
+        let err = collector
+            .collect(&sample_statement())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("zero membership-epoch consents"), "got: {err}");
+        drain.abort();
+    }
+
+    #[tokio::test]
+    async fn collector_relay_carries_beta1_prefix_and_statement() {
+        let (relay_tx, mut relay_rx) = mpsc::channel(1);
+        let collector =
+            LibP2PMembershipCollector::new(relay_tx).with_timeout(Duration::from_millis(150));
+        let st = sample_statement();
+        let st2 = st.clone();
+        let h = tokio::spawn(async move {
+            let relay = relay_rx.recv().await.unwrap();
+            assert!(relay.request_id.starts_with("beta1-membership-"));
+            assert_eq!(relay.proposed_epoch, st2.proposed_epoch);
+            assert_eq!(relay.escrow, st2.escrow);
+            assert_eq!(relay.prev_epoch_hash, st2.prev_epoch_hash);
+            assert_eq!(relay.new_quorum, st2.new_quorum);
+            assert_eq!(relay.new_signers, st2.new_signers);
+            // drop relay → responses_tx closes → collector returns zero-consent
+        });
+        let _ = collector.collect(&st).await; // errs on zero responses — fine
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn collector_packages_and_dedups_by_pk() {
+        let (relay_tx, mut relay_rx) = mpsc::channel(1);
+        let collector =
+            LibP2PMembershipCollector::new(relay_tx).with_timeout(Duration::from_millis(500));
+        let inject = tokio::spawn(async move {
+            let relay = relay_rx.recv().await.unwrap();
+            let pk = "02".to_string() + &"AB".repeat(32);
+            let sig = "30".to_string() + &"45".repeat(69);
+            for _ in 0..2 {
+                // same pk twice → dedups to a single bundle entry
+                relay
+                    .responses_tx
+                    .send(response(Some(&sig), Some(&pk), None))
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let bundle = collector.collect(&sample_statement()).await.unwrap();
+        assert_eq!(&bundle[4..8], &1u32.to_le_bytes()); // entry_count == 1
+        assert_eq!(bundle.len(), 4 + 4 + 33 + 1 + 70);
+        inject.abort();
+    }
+
+    // ── driver ───────────────────────────────────────────────────
+
+    struct MockDigest(u64, [u8; 32]);
+    #[async_trait]
+    impl EpochDigestSource for MockDigest {
+        async fn current_epoch(&self) -> Result<(u64, [u8; 32])> {
+            Ok((self.0, self.1))
+        }
+    }
+
+    struct MockCollector(Vec<u8>);
+    #[async_trait]
+    impl MembershipBundleCollector for MockCollector {
+        async fn collect(&self, _: &MembershipEpochStatement) -> Result<Vec<u8>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct RecordingSink {
+        fail_nodes: Vec<String>,
+        seen: tokio::sync::Mutex<Vec<(String, u64, Vec<u8>)>>,
+    }
+    impl RecordingSink {
+        fn new(fail_nodes: Vec<String>) -> Self {
+            Self {
+                fail_nodes,
+                seen: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+    #[async_trait]
+    impl EpochSealSink for RecordingSink {
+        async fn seal_on_node(
+            &self,
+            node: &str,
+            st: &MembershipEpochStatement,
+            bundle: &[u8],
+        ) -> Result<()> {
+            self.seen
+                .lock()
+                .await
+                .push((node.to_string(), st.proposed_epoch, bundle.to_vec()));
+            if self.fail_nodes.iter().any(|n| n == node) {
+                bail!("node {node} unreachable");
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn driver_happy_path_seals_all_nodes_with_same_bundle() {
+        let digest = MockDigest(4, [0xBB; 32]);
+        let collector = MockCollector(vec![1, 2, 3]);
+        let sink = RecordingSink::new(vec![]);
+        let nodes = vec!["n1".to_string(), "n2".into(), "n3".into()];
+        let out = run_membership_change(
+            [0xAA; 20],
+            vec![entry(0x01, 1), entry(0x02, 2)],
+            2,
+            &digest,
+            &collector,
+            &sink,
+            &nodes,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.proposed_epoch, 5);
+        // ties the driver to the same frozen cross-language message hash
+        assert_eq!(
+            hex(&out.message_hash),
+            "01ad9ce518f2e5dd4b970fd03746322621311acf1820d6d3f45d5b22f3c2f8f2"
+        );
+        assert_eq!(out.bundle_len, 3);
+        assert!(out.all_sealed());
+
+        let seen = sink.seen.lock().await;
+        assert_eq!(seen.len(), 3);
+        // every node got the SAME (epoch, bundle) — the (P) single-successor
+        assert!(seen
+            .iter()
+            .all(|(_, ep, b)| *ep == 5 && b == &vec![1, 2, 3]));
+    }
+
+    #[tokio::test]
+    async fn driver_reports_partial_failure() {
+        let digest = MockDigest(4, [0xBB; 32]);
+        let collector = MockCollector(vec![9]);
+        let sink = RecordingSink::new(vec!["n2".to_string()]);
+        let nodes = vec!["n1".to_string(), "n2".into(), "n3".into()];
+        let out = run_membership_change(
+            [0xAA; 20],
+            vec![entry(0x01, 1), entry(0x02, 2)],
+            2,
+            &digest,
+            &collector,
+            &sink,
+            &nodes,
+        )
+        .await
+        .unwrap();
+
+        assert!(!out.all_sealed());
+        assert_eq!(out.node_results.iter().filter(|r| r.ok).count(), 2);
+        let failed = out.node_results.iter().find(|r| !r.ok).unwrap();
+        assert_eq!(failed.node, "n2");
+        assert!(failed.error.as_ref().unwrap().contains("unreachable"));
+    }
+
+    #[tokio::test]
+    async fn driver_rejects_empty_node_list() {
+        let digest = MockDigest(4, [0xBB; 32]);
+        let collector = MockCollector(vec![1]);
+        let sink = RecordingSink::new(vec![]);
+        let err = run_membership_change(
+            [0xAA; 20],
+            vec![entry(0x01, 1)],
+            1,
+            &digest,
+            &collector,
+            &sink,
+            &[],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no cluster nodes"), "got: {err}");
     }
 }
