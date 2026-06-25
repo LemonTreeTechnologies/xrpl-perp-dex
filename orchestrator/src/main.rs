@@ -16,6 +16,7 @@ mod membership_canonical;
 mod membership_coordinator;
 mod membership_http;
 mod membership_projection;
+mod membership_sync;
 mod node_deploy;
 mod orderbook;
 mod p2p;
