@@ -12,11 +12,50 @@
 //! (`p2p.rs::validate_signerlist_set_specific`) so every co-signer accepts it:
 //! only the whitelisted top-level fields, `SignerEntries[].SignerEntry.{Account,
 //! SignerWeight}`, sorted by AccountID (XRPL canonical + deterministic hash).
-#![allow(dead_code)] // driver (collect-sign → submit → confirm) lands in β2(c)
+#![allow(dead_code)] // driver (collect-sign → submit → confirm) lands in β2(d)
 
+use anyhow::Result;
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
 use crate::membership_canonical::SignerEntry;
+
+// ── β2 sync-state + projection-confirmation surfaces ─────────────
+//
+// The traits the projection driver (β2(d)) and the sync-before-spend gate
+// (β2(e)) depend on; the HTTP implementations live in membership_http.rs (so
+// the driver is unit-testable with mocks). Mirrors the β1
+// EpochDigestSource/EpochSealSink split.
+
+/// The membership sync state read from a node's enclave (REQ-β2 §3.2):
+/// `in_sync == (projection_confirmed_epoch == authority_epoch)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MembershipSyncState {
+    pub authority_epoch: u64,
+    pub projection_confirmed_epoch: u64,
+    pub in_sync: bool,
+}
+
+/// Reads `ecall_get_membership_sync_state` from an enclave. `Ok(None)` when the
+/// node is not bootstrapped (no sealed epoch yet).
+#[async_trait]
+pub trait SyncStateSource: Send + Sync {
+    async fn sync_state(&self) -> Result<Option<MembershipSyncState>>;
+}
+
+/// Records the on-chain projection confirmation on ONE node's enclave
+/// (`ecall_record_projection_confirmation`).
+#[async_trait]
+pub trait ProjectionConfirmer: Send + Sync {
+    async fn record_confirmation(
+        &self,
+        node_admin_url: &str,
+        escrow: &[u8; 20],
+        signed_xrpl_tx_blob: &[u8],
+        tx_hash: &[u8; 32],
+        ledger_index: u64,
+    ) -> Result<()>;
+}
 
 /// XRPL base58 alphabet (note: distinct from the Bitcoin alphabet).
 const XRPL_ALPHABET: &[u8; 58] = b"rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
