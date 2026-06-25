@@ -12,9 +12,9 @@
 //! (`p2p.rs::validate_signerlist_set_specific`) so every co-signer accepts it:
 //! only the whitelisted top-level fields, `SignerEntries[].SignerEntry.{Account,
 //! SignerWeight}`, sorted by AccountID (XRPL canonical + deterministic hash).
-#![allow(dead_code)] // driver (collect-sign → submit → confirm) lands in β2(d)
+#![allow(dead_code)] // runtime wiring (admin trigger + main.rs) is the β3 deploy increment
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
@@ -118,6 +118,137 @@ pub fn render_signerlist_set(
     })
 }
 
+// ── β2(d) projection driver ──────────────────────────────────────
+
+/// The validated on-chain projection transaction, as needed by
+/// `ecall_record_projection_confirmation`.
+#[derive(Debug, Clone)]
+pub struct ProjectionConfirmedTx {
+    pub signed_tx_blob: Vec<u8>,
+    pub tx_hash: [u8; 32],
+    pub ledger_index: u64,
+}
+
+/// Signs the unsigned `SignerListSet` projection with the cluster's CURRENT
+/// on-chain quorum (the outgoing signers — still on-chain and able to sign),
+/// submits it, and polls XRPL until it is validated on-ledger. Trait so the
+/// driver is unit-testable without a live ledger / relay.
+///
+/// Q-β2-6 (the safe failure mode is load-bearing): the implementation MUST use
+/// a BOUNDED multi-ledger retry-poll, and on confirmation timeout return an
+/// error (NOT a partial success). The driver then records nothing, the epoch
+/// stays projection-UNCONFIRMED (the old set remains the spend basis — safe),
+/// and the operator is surfaced the error. Never auto-retire, never auto-spend
+/// on an unconfirmed set.
+#[async_trait]
+pub trait ProjectionSubmitter: Send + Sync {
+    async fn sign_submit_confirm(
+        &self,
+        unsigned_signerlist_set: &serde_json::Value,
+    ) -> Result<ProjectionConfirmedTx>;
+}
+
+/// Per-node result of recording the projection confirmation.
+#[derive(Debug, Clone)]
+pub struct NodeConfirmResult {
+    pub node: String,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// Outcome of producing + confirming + recording one projection.
+#[derive(Debug, Clone)]
+pub struct ProjectionOutcome {
+    pub tx_hash: [u8; 32],
+    pub ledger_index: u64,
+    pub node_results: Vec<NodeConfirmResult>,
+}
+
+impl ProjectionOutcome {
+    /// True iff every node recorded the projection confirmation. A partial
+    /// result means some nodes still see the transition as pending (their
+    /// sync-before-spend window stays open) — the operator retries those nodes;
+    /// the enclave's idempotency guard (ERR_ALREADY_CONFIRMED) makes the retry
+    /// safe.
+    pub fn all_recorded(&self) -> bool {
+        !self.node_results.is_empty() && self.node_results.iter().all(|r| r.ok)
+    }
+}
+
+/// What to project: the just-sealed authority set + the XRPL tx framing.
+#[derive(Debug, Clone)]
+pub struct ProjectionRequest {
+    pub escrow: [u8; 20],
+    pub sequence: u32,
+    pub fee_drops: u64,
+    pub signers: Vec<SignerEntry>,
+    pub quorum: u32,
+}
+
+/// Produce the XRPL `SignerListSet` projection for the just-sealed authority
+/// epoch and, once it is on-ledger, record the confirmation on every node —
+/// closing the sync-before-spend window (REQ-β2 §2). Pure orchestration over
+/// injected XRPL submit + per-node confirm, so a doomed projection fails before
+/// any node is touched.
+///
+/// Order (sync-before-spend §3.1): the caller has already sealed the authority
+/// epoch (β1). This produces + confirms the projection. The old signers are NOT
+/// retired here — retirement is a separate, sync-gated step (β2(e), X-β2-1).
+pub async fn run_projection(
+    req: &ProjectionRequest,
+    submitter: &dyn ProjectionSubmitter,
+    confirmer: &dyn ProjectionConfirmer,
+    nodes: &[String],
+) -> Result<ProjectionOutcome> {
+    if nodes.is_empty() {
+        bail!("no cluster nodes given to record the projection confirmation on");
+    }
+
+    let unsigned = render_signerlist_set(
+        &req.escrow,
+        req.sequence,
+        req.fee_drops,
+        &req.signers,
+        req.quorum,
+    );
+
+    // Sign with the CURRENT on-chain quorum, submit, and poll until validated.
+    // On timeout this returns Err → we record nothing → epoch stays
+    // projection-UNCONFIRMED (safe) → surfaced to the operator (Q-β2-6).
+    let tx = submitter
+        .sign_submit_confirm(&unsigned)
+        .await
+        .context("sign + submit + confirm the SignerListSet projection")?;
+
+    let mut node_results = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let (ok, error) = match confirmer
+            .record_confirmation(
+                node,
+                &req.escrow,
+                &tx.signed_tx_blob,
+                &tx.tx_hash,
+                tx.ledger_index,
+            )
+            .await
+        {
+            Ok(()) => (true, None),
+            Err(e) => (false, Some(e.to_string())),
+        };
+        node_results.push(NodeConfirmResult {
+            node: node.clone(),
+            ok,
+            error,
+        });
+    }
+
+    Ok(ProjectionOutcome {
+        tx_hash: tx.tx_hash,
+        ledger_index: tx.ledger_index,
+        node_results,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,5 +332,172 @@ mod tests {
         let entries = tx["SignerEntries"].as_array().unwrap();
         assert_eq!(entries[1]["SignerEntry"]["SignerWeight"], 3);
         assert_eq!(tx["SignerQuorum"], 3);
+    }
+
+    // ── β2(d) driver ─────────────────────────────────────────────
+
+    use std::sync::Mutex;
+
+    /// Submitter that returns a fixed confirmed tx and records what it was
+    /// asked to sign (so the test can assert the projection shape reached it).
+    struct OkSubmitter {
+        tx: ProjectionConfirmedTx,
+        seen_unsigned: Mutex<Option<serde_json::Value>>,
+    }
+    #[async_trait]
+    impl ProjectionSubmitter for OkSubmitter {
+        async fn sign_submit_confirm(
+            &self,
+            unsigned: &serde_json::Value,
+        ) -> Result<ProjectionConfirmedTx> {
+            *self.seen_unsigned.lock().unwrap() = Some(unsigned.clone());
+            Ok(self.tx.clone())
+        }
+    }
+
+    /// Submitter that always errors (confirmation timeout / submit failure).
+    struct ErrSubmitter;
+    #[async_trait]
+    impl ProjectionSubmitter for ErrSubmitter {
+        async fn sign_submit_confirm(
+            &self,
+            _: &serde_json::Value,
+        ) -> Result<ProjectionConfirmedTx> {
+            bail!("confirmation timed out after bounded poll")
+        }
+    }
+
+    struct RecordingConfirmer {
+        fail_nodes: Vec<String>,
+        seen: Mutex<Vec<(String, [u8; 32], u64)>>,
+    }
+    impl RecordingConfirmer {
+        fn new(fail_nodes: Vec<String>) -> Self {
+            Self {
+                fail_nodes,
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+    #[async_trait]
+    impl ProjectionConfirmer for RecordingConfirmer {
+        async fn record_confirmation(
+            &self,
+            node: &str,
+            _escrow: &[u8; 20],
+            _blob: &[u8],
+            tx_hash: &[u8; 32],
+            ledger_index: u64,
+        ) -> Result<()> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((node.to_string(), *tx_hash, ledger_index));
+            if self.fail_nodes.iter().any(|n| n == node) {
+                bail!("node {node} unreachable");
+            }
+            Ok(())
+        }
+    }
+
+    fn confirmed_tx() -> ProjectionConfirmedTx {
+        ProjectionConfirmedTx {
+            signed_tx_blob: vec![0x12, 0x34],
+            tx_hash: [0xEE; 32],
+            ledger_index: 9_001,
+        }
+    }
+
+    fn proj_req(signers: &[SignerEntry], quorum: u32) -> ProjectionRequest {
+        ProjectionRequest {
+            escrow: [0xAA; 20],
+            sequence: 1,
+            fee_drops: 12000,
+            signers: signers.to_vec(),
+            quorum,
+        }
+    }
+
+    #[tokio::test]
+    async fn driver_records_on_all_nodes_after_confirmation() {
+        let submitter = OkSubmitter {
+            tx: confirmed_tx(),
+            seen_unsigned: Mutex::new(None),
+        };
+        let confirmer = RecordingConfirmer::new(vec![]);
+        let nodes = vec!["n1".to_string(), "n2".into(), "n3".into()];
+        let signers = [entry(0x01, 1), entry(0x02, 1)];
+
+        let out = run_projection(&proj_req(&signers, 2), &submitter, &confirmer, &nodes)
+            .await
+            .unwrap();
+
+        assert_eq!(out.tx_hash, [0xEE; 32]);
+        assert_eq!(out.ledger_index, 9_001);
+        assert!(out.all_recorded());
+
+        // the projection that reached the submitter is the rendered SignerListSet
+        let seen = submitter.seen_unsigned.lock().unwrap().clone().unwrap();
+        assert_eq!(seen["TransactionType"], "SignerListSet");
+        assert_eq!(seen["SignerQuorum"], 2);
+
+        // every node recorded the SAME (tx_hash, ledger)
+        let rec = confirmer.seen.lock().unwrap();
+        assert_eq!(rec.len(), 3);
+        assert!(rec.iter().all(|(_, h, l)| *h == [0xEE; 32] && *l == 9_001));
+    }
+
+    #[tokio::test]
+    async fn driver_propagates_confirmation_timeout_without_recording() {
+        let submitter = ErrSubmitter;
+        let confirmer = RecordingConfirmer::new(vec![]);
+        let nodes = vec!["n1".to_string()];
+        let signers = [entry(0x01, 1), entry(0x02, 1)];
+
+        let err = run_projection(&proj_req(&signers, 2), &submitter, &confirmer, &nodes)
+            .await
+            .unwrap_err();
+        // full chain (anyhow's Display shows only the outer context).
+        let full = format!("{err:#}");
+        assert!(full.contains("timed out"), "got: {full}");
+        // NOTHING recorded — epoch stays projection-UNCONFIRMED (safe).
+        assert!(confirmer.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn driver_reports_partial_record_failure() {
+        let submitter = OkSubmitter {
+            tx: confirmed_tx(),
+            seen_unsigned: Mutex::new(None),
+        };
+        let confirmer = RecordingConfirmer::new(vec!["n2".to_string()]);
+        let nodes = vec!["n1".to_string(), "n2".into(), "n3".into()];
+        let signers = [entry(0x01, 1), entry(0x02, 1)];
+
+        let out = run_projection(&proj_req(&signers, 2), &submitter, &confirmer, &nodes)
+            .await
+            .unwrap();
+
+        assert!(!out.all_recorded());
+        assert_eq!(out.node_results.iter().filter(|r| r.ok).count(), 2);
+        let failed = out.node_results.iter().find(|r| !r.ok).unwrap();
+        assert_eq!(failed.node, "n2");
+    }
+
+    #[tokio::test]
+    async fn driver_rejects_empty_node_list() {
+        let submitter = OkSubmitter {
+            tx: confirmed_tx(),
+            seen_unsigned: Mutex::new(None),
+        };
+        let confirmer = RecordingConfirmer::new(vec![]);
+        let signers = [entry(0x01, 1)];
+        let err = run_projection(&proj_req(&signers, 1), &submitter, &confirmer, &[])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no cluster nodes"), "got: {err}");
+        // submitter not even called → nothing submitted on an empty cluster
+        assert!(submitter.seen_unsigned.lock().unwrap().is_none());
     }
 }
