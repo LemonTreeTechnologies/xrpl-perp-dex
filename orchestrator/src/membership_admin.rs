@@ -2,10 +2,10 @@
 //!
 //! The single operator-facing entrypoint that drives the whole β flow end to
 //! end on one POST: collect the off-chain quorum's consent for a new signer set
-//! and seal it on every node (β1 `run_membership_change`), then produce + submit
-//! + confirm the XRPL `SignerListSet` projection of that sealed epoch (β2
-//! `run_projection`). Loopback-only admin listener (mirrors
-//! `signerlist_update::spawn_admin_listener`).
+//! and seal it on every node (β1 `run_membership_change`), then produce, submit
+//! and confirm the XRPL `SignerListSet` projection of that sealed epoch (β2
+//! `run_projection`). Loopback-only admin listener (mirrors the
+//! `signerlist_update` admin).
 //!
 //! It composes the already-audited pieces — `LibP2PMembershipCollector`,
 //! `HttpEpochDigestSource`/`HttpEpochSealSink`, `LibP2PProjectionSubmitter`,
