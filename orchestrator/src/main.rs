@@ -884,6 +884,20 @@ async fn main() -> Result<()> {
         path_a_delegation_rx_holder = None;
     }
 
+    // β3.2b: membership-epoch collection channel — same shape as the Path-A
+    // delegation channel. The membership-change admin trigger (β3.2b, next
+    // increment) owns the sender, which drives LibP2PMembershipCollector; the
+    // receiver lives in the p2p run-loop. The sender is HELD ALIVE here (a
+    // dropped sender would make the run-loop's membership arm busy-spin on
+    // recv()→None; an alive-but-idle sender makes it pend, never firing, until
+    // the trigger sends). `_`-prefixed until the trigger threads it.
+    let (membership_epoch_rx_holder, _membership_epoch_tx) = if signers_config.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<p2p::MembershipEpochRelay>(8);
+        (Some(rx), Some(tx))
+    } else {
+        (None, None)
+    };
+
     let peer_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     let maintenance_mode = Arc::new(std::sync::atomic::AtomicBool::new(matches!(
@@ -1352,6 +1366,10 @@ async fn main() -> Result<()> {
         // sender (path_a_delegation_tx); receiver lives here.
         if let Some(rx) = path_a_delegation_rx_holder {
             p2p_node.set_path_a_delegation_channel(rx);
+        }
+        // β3.2b: same wiring for the membership-epoch collection channel.
+        if let Some(rx) = membership_epoch_rx_holder {
+            p2p_node.set_membership_epoch_channel(rx);
         }
         if let Some(ref local) = cfg.local_signer {
             // X-C1 condition C2 (perp RESP-5): enforce loopback on the
