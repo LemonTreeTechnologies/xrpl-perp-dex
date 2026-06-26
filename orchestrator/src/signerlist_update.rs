@@ -210,7 +210,7 @@ async fn fetch_current_signerlist(xrpl_url: &str, escrow: &str) -> Result<(Vec<S
     parse_signer_list_response(&resp)
 }
 
-async fn fetch_account_sequence(xrpl_url: &str, account: &str) -> Result<u32> {
+pub(crate) async fn fetch_account_sequence(xrpl_url: &str, account: &str) -> Result<u32> {
     let client = reqwest::Client::new();
     let resp: serde_json::Value = client
         .post(xrpl_url)
@@ -228,7 +228,10 @@ async fn fetch_account_sequence(xrpl_url: &str, account: &str) -> Result<u32> {
     Ok(seq as u32)
 }
 
-async fn submit_multisigned(xrpl_url: &str, tx_json: &serde_json::Value) -> Result<String> {
+pub(crate) async fn submit_multisigned(
+    xrpl_url: &str,
+    tx_json: &serde_json::Value,
+) -> Result<String> {
     let client = reqwest::Client::new();
     let resp: serde_json::Value = client
         .post(xrpl_url)
@@ -524,11 +527,25 @@ async fn seal_signerlist_after_landed(
 }
 
 async fn poll_validated_tx(xrpl_url: &str, tx_hash: &str) -> Result<(String, u64)> {
+    poll_validated_tx_bounded(xrpl_url, tx_hash, 5, 1500).await
+}
+
+/// β3.2b / X-β3.2-4 (Q-β2-6): bounded multi-ledger poll for a submitted tx's
+/// on-ledger validation. Returns (validated signed tx_blob hex, ledger_index).
+/// The β2 projection uses a LONGER bound than the 5×1.5 s default because a
+/// `SignerListSet` may take several XRPL ledgers; on timeout the caller leaves
+/// the epoch projection-UNCONFIRMED (safe) and surfaces the error.
+pub(crate) async fn poll_validated_tx_bounded(
+    xrpl_url: &str,
+    tx_hash: &str,
+    max_attempts: u32,
+    interval_ms: u64,
+) -> Result<(String, u64)> {
     let client = reqwest::Client::new();
     let mut last_err = String::new();
-    for attempt in 1..=5 {
+    for attempt in 1..=max_attempts {
         if attempt > 1 {
-            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
         }
         let resp: serde_json::Value = client
             .post(xrpl_url)
@@ -558,7 +575,7 @@ async fn poll_validated_tx(xrpl_url: &str, tx_hash: &str) -> Result<(String, u64
             attempt, resp["result"]["validated"], resp["result"]["status"]
         );
     }
-    bail!("tx not validated within 5 attempts: {last_err}")
+    bail!("tx not validated within {max_attempts} attempts: {last_err}")
 }
 
 async fn fetch_enclave_signerlist_version(enclave_url: &str) -> Result<u64> {
