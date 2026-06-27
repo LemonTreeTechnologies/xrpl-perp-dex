@@ -469,6 +469,22 @@ struct RunArgs {
     /// requires the local signer's pool key).
     #[arg(long)]
     migrate_admin_listen: Option<String>,
+
+    /// β3.2b — loopback admin listener for the off-chain membership change.
+    /// Accepts `POST /admin/membership-change`, which drives the whole β flow
+    /// (collect off-chain quorum consent → seal epoch N+1 on every node → XRPL
+    /// SignerListSet projection → per-node confirmation). Loopback-only; only
+    /// the operator initiating the change needs it on. Gated by --signers-config
+    /// (the local pool signer) AND --membership-node-urls.
+    #[arg(long)]
+    membership_admin_listen: Option<String>,
+
+    /// β3.2b — comma-separated enclave admin base URLs of EVERY cluster node
+    /// (e.g. `https://10.0.0.1:9089/v1,https://10.0.0.2:9089/v1,...`). The
+    /// membership-change driver applies the single sealed `(statement, bundle)`
+    /// (the (P) single-successor) + the projection confirmation on each of them.
+    #[arg(long, value_delimiter = ',')]
+    membership_node_urls: Vec<String>,
 }
 
 // ── Funding rate ────────────────────────────────────────────────
@@ -1245,6 +1261,58 @@ async fn main() -> Result<()> {
             None => {
                 warn!(
                     "--signerlist-admin-listen ignored: requires --signers-config (with quorum + signers)"
+                );
+            }
+        }
+    }
+
+    // β3.2b — the off-chain membership-change admin listener. Spawned when
+    // --membership-admin-listen + --signers-config + --membership-node-urls are
+    // all provided. Drives the whole β flow on one POST; shares the libp2p
+    // signing relay (signing_tx) + the membership-epoch collection channel
+    // (_membership_epoch_tx) wired above.
+    if let Some(addr) = cli.membership_admin_listen.clone() {
+        match (
+            signers_config.as_ref(),
+            _membership_epoch_tx.clone(),
+            app_state.signing_tx.clone(),
+        ) {
+            (Some(cfg), Some(membership_epoch_tx), Some(signing_tx))
+                if !cli.membership_node_urls.is_empty() =>
+            {
+                let escrow = crate::xrpl_signer::decode_xrpl_address(&escrow_address)
+                    .context("--membership-admin-listen: escrow address must decode")?;
+                let mut current_signers = Vec::with_capacity(cfg.signers.len());
+                for s in &cfg.signers {
+                    let aid = crate::xrpl_signer::decode_xrpl_address(&s.xrpl_address)
+                        .with_context(|| {
+                            format!("signers_config signer {} invalid r-address", s.xrpl_address)
+                        })?;
+                    current_signers.push((s.xrpl_address.clone(), hex::encode(aid)));
+                }
+                let admin_state = Arc::new(membership_admin::MembershipAdminState {
+                    xrpl_url: cli.xrpl_url.clone(),
+                    escrow,
+                    escrow_r_address: escrow_address.clone(),
+                    enclave_base: cli.enclave_url.clone(),
+                    node_admin_urls: cli.membership_node_urls.clone(),
+                    membership_epoch_tx,
+                    signing_tx,
+                    current_signers,
+                    current_quorum: cfg.quorum as u32,
+                });
+                tokio::spawn(async move {
+                    if let Err(e) = membership_admin::spawn_admin_listener(addr, admin_state).await
+                    {
+                        error!("β membership admin listener exited: {e}");
+                    }
+                });
+                info!("β membership-change admin listener configured");
+            }
+            _ => {
+                warn!(
+                    "--membership-admin-listen ignored: requires --signers-config + \
+                     --membership-node-urls + the libp2p signing relay"
                 );
             }
         }
