@@ -22,7 +22,7 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -271,6 +271,23 @@ pub trait EpochSealSink: Send + Sync {
     ) -> Result<()>;
 }
 
+/// Applies a sealed `(statement, bundle)` across the WHOLE cluster in one shot,
+/// returning one `NodeSealResult` per node. Under the loopback-enclave topology
+/// (X-C1: the enclave admin API is never network-exposed) this is NOT a per-node
+/// HTTP POST to a remote enclave — the production impl (`LibP2PMembershipApplier`)
+/// broadcasts ONE `MembershipApply` over p2p and every node applies it to its
+/// OWN localhost enclave + acks. Each node independently verifies the bundle and
+/// enforces monotonic-epoch, so a partial apply is safe (no node adopts a
+/// different set), just incomplete — the caller inspects `all_sealed()`.
+#[async_trait]
+pub trait ClusterSealApplier: Send + Sync {
+    async fn apply_seal(
+        &self,
+        statement: &MembershipEpochStatement,
+        bundle: &[u8],
+    ) -> Result<Vec<NodeSealResult>>;
+}
+
 /// Per-node application result of a membership change.
 #[derive(Debug, Clone)]
 pub struct NodeSealResult {
@@ -301,23 +318,18 @@ impl MembershipChangeOutcome {
 /// Run one off-chain membership change end-to-end: read the current epoch from
 /// the local enclave, prepare the single successor statement (P), collect ONE
 /// off-chain quorum bundle over its message hash, and apply that SAME
-/// `(statement, bundle)` on every node. Each node independently verifies the
+/// `(statement, bundle)` across the cluster via the `applier` (a single p2p
+/// broadcast under the loopback topology). Each node independently verifies the
 /// bundle and enforces monotonic-epoch — so a partial apply is safe (no node
-/// adopts a different set), just incomplete; the caller inspects
-/// `all_sealed()`.
+/// adopts a different set), just incomplete; the caller inspects `all_sealed()`.
 pub async fn run_membership_change(
     escrow: [u8; 20],
     new_signers: Vec<SignerEntry>,
     new_quorum: u32,
     digest_src: &dyn EpochDigestSource,
     collector: &dyn MembershipBundleCollector,
-    seal_sink: &dyn EpochSealSink,
-    nodes: &[String],
+    applier: &dyn ClusterSealApplier,
 ) -> Result<MembershipChangeOutcome> {
-    if nodes.is_empty() {
-        bail!("no cluster nodes given to apply the membership change to");
-    }
-
     let (current_epoch, current_digest) = digest_src
         .current_epoch()
         .await
@@ -337,18 +349,10 @@ pub async fn run_membership_change(
         .await
         .context("collect off-chain quorum consent")?;
 
-    let mut node_results = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        let (ok, error) = match seal_sink.seal_on_node(node, &statement, &bundle).await {
-            Ok(()) => (true, None),
-            Err(e) => (false, Some(e.to_string())),
-        };
-        node_results.push(NodeSealResult {
-            node: node.clone(),
-            ok,
-            error,
-        });
-    }
+    let node_results = applier
+        .apply_seal(&statement, &bundle)
+        .await
+        .context("apply sealed epoch across the cluster")?;
 
     Ok(MembershipChangeOutcome {
         proposed_epoch: statement.proposed_epoch,
@@ -361,6 +365,7 @@ pub async fn run_membership_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::bail;
 
     fn entry(fill: u8, weight: u32) -> SignerEntry {
         SignerEntry {
@@ -571,34 +576,57 @@ mod tests {
         }
     }
 
-    struct RecordingSink {
+    /// Mock `ClusterSealApplier`: records the SINGLE (statement, bundle) it was
+    /// broadcast (the (P) single-successor — one apply, not per-node) and returns
+    /// a configured per-node result set. `Err(fail_call)` simulates a broadcast
+    /// that never reaches the run-loop.
+    struct MockApplier {
+        nodes: Vec<String>,
         fail_nodes: Vec<String>,
-        seen: tokio::sync::Mutex<Vec<(String, u64, Vec<u8>)>>,
+        fail_call: bool,
+        seen: tokio::sync::Mutex<Option<(u64, Vec<u8>)>>,
     }
-    impl RecordingSink {
-        fn new(fail_nodes: Vec<String>) -> Self {
+    impl MockApplier {
+        fn new(nodes: Vec<String>, fail_nodes: Vec<String>) -> Self {
             Self {
+                nodes,
                 fail_nodes,
-                seen: tokio::sync::Mutex::new(Vec::new()),
+                fail_call: false,
+                seen: tokio::sync::Mutex::new(None),
+            }
+        }
+        fn failing() -> Self {
+            Self {
+                nodes: vec![],
+                fail_nodes: vec![],
+                fail_call: true,
+                seen: tokio::sync::Mutex::new(None),
             }
         }
     }
     #[async_trait]
-    impl EpochSealSink for RecordingSink {
-        async fn seal_on_node(
+    impl ClusterSealApplier for MockApplier {
+        async fn apply_seal(
             &self,
-            node: &str,
             st: &MembershipEpochStatement,
             bundle: &[u8],
-        ) -> Result<()> {
-            self.seen
-                .lock()
-                .await
-                .push((node.to_string(), st.proposed_epoch, bundle.to_vec()));
-            if self.fail_nodes.iter().any(|n| n == node) {
-                bail!("node {node} unreachable");
+        ) -> Result<Vec<NodeSealResult>> {
+            if self.fail_call {
+                bail!("apply broadcast failed");
             }
-            Ok(())
+            *self.seen.lock().await = Some((st.proposed_epoch, bundle.to_vec()));
+            Ok(self
+                .nodes
+                .iter()
+                .map(|n| {
+                    let ok = !self.fail_nodes.iter().any(|f| f == n);
+                    NodeSealResult {
+                        node: n.clone(),
+                        ok,
+                        error: (!ok).then(|| format!("node {n} unreachable")),
+                    }
+                })
+                .collect())
         }
     }
 
@@ -606,16 +634,14 @@ mod tests {
     async fn driver_happy_path_seals_all_nodes_with_same_bundle() {
         let digest = MockDigest(4, [0xBB; 32]);
         let collector = MockCollector(vec![1, 2, 3]);
-        let sink = RecordingSink::new(vec![]);
-        let nodes = vec!["n1".to_string(), "n2".into(), "n3".into()];
+        let applier = MockApplier::new(vec!["n1".into(), "n2".into(), "n3".into()], vec![]);
         let out = run_membership_change(
             [0xAA; 20],
             vec![entry(0x01, 1), entry(0x02, 2)],
             2,
             &digest,
             &collector,
-            &sink,
-            &nodes,
+            &applier,
         )
         .await
         .unwrap();
@@ -628,29 +654,32 @@ mod tests {
         );
         assert_eq!(out.bundle_len, 3);
         assert!(out.all_sealed());
+        assert_eq!(out.node_results.len(), 3);
 
-        let seen = sink.seen.lock().await;
-        assert_eq!(seen.len(), 3);
-        // every node got the SAME (epoch, bundle) — the (P) single-successor
-        assert!(seen
-            .iter()
-            .all(|(_, ep, b)| *ep == 5 && b == &vec![1, 2, 3]));
+        // the cluster was broadcast the SAME (epoch, bundle) ONCE — (P).
+        let seen = self_seen(&applier).await;
+        assert_eq!(seen, (5, vec![1, 2, 3]));
+    }
+
+    async fn self_seen(a: &MockApplier) -> (u64, Vec<u8>) {
+        a.seen.lock().await.clone().expect("apply_seal was called")
     }
 
     #[tokio::test]
     async fn driver_reports_partial_failure() {
         let digest = MockDigest(4, [0xBB; 32]);
         let collector = MockCollector(vec![9]);
-        let sink = RecordingSink::new(vec!["n2".to_string()]);
-        let nodes = vec!["n1".to_string(), "n2".into(), "n3".into()];
+        let applier = MockApplier::new(
+            vec!["n1".into(), "n2".into(), "n3".into()],
+            vec!["n2".into()],
+        );
         let out = run_membership_change(
             [0xAA; 20],
             vec![entry(0x01, 1), entry(0x02, 2)],
             2,
             &digest,
             &collector,
-            &sink,
-            &nodes,
+            &applier,
         )
         .await
         .unwrap();
@@ -663,22 +692,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn driver_rejects_empty_node_list() {
+    async fn driver_propagates_apply_broadcast_failure() {
         let digest = MockDigest(4, [0xBB; 32]);
         let collector = MockCollector(vec![1]);
-        let sink = RecordingSink::new(vec![]);
+        let applier = MockApplier::failing();
         let err = run_membership_change(
             [0xAA; 20],
             vec![entry(0x01, 1)],
             1,
             &digest,
             &collector,
-            &sink,
-            &[],
+            &applier,
         )
         .await
         .unwrap_err()
         .to_string();
-        assert!(err.contains("no cluster nodes"), "got: {err}");
+        assert!(
+            err.contains("apply sealed epoch across the cluster"),
+            "got: {err}"
+        );
     }
 }

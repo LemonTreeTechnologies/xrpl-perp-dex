@@ -14,7 +14,7 @@
 //! SignerWeight}`, sorted by AccountID (XRPL canonical + deterministic hash).
 #![allow(dead_code)] // runtime wiring (admin trigger + main.rs) is the β3 deploy increment
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
@@ -148,6 +148,22 @@ pub trait ProjectionSubmitter: Send + Sync {
     ) -> Result<ProjectionConfirmedTx>;
 }
 
+/// Records the on-chain projection confirmation across the WHOLE cluster in one
+/// shot, returning one `NodeConfirmResult` per node. Under the loopback-enclave
+/// topology (X-C1) this is NOT a per-node HTTP POST to a remote enclave — the
+/// production impl (`LibP2PMembershipApplier`) broadcasts ONE `MembershipApply`
+/// over p2p and every node records on its OWN localhost enclave + acks.
+#[async_trait]
+pub trait ClusterConfirmApplier: Send + Sync {
+    async fn apply_confirmation(
+        &self,
+        escrow: &[u8; 20],
+        signed_xrpl_tx_blob: &[u8],
+        tx_hash: &[u8; 32],
+        ledger_index: u64,
+    ) -> Result<Vec<NodeConfirmResult>>;
+}
+
 /// Per-node result of recording the projection confirmation.
 #[derive(Debug, Clone)]
 pub struct NodeConfirmResult {
@@ -197,13 +213,8 @@ pub struct ProjectionRequest {
 pub async fn run_projection(
     req: &ProjectionRequest,
     submitter: &dyn ProjectionSubmitter,
-    confirmer: &dyn ProjectionConfirmer,
-    nodes: &[String],
+    applier: &dyn ClusterConfirmApplier,
 ) -> Result<ProjectionOutcome> {
-    if nodes.is_empty() {
-        bail!("no cluster nodes given to record the projection confirmation on");
-    }
-
     let unsigned = render_signerlist_set(
         &req.escrow,
         req.sequence,
@@ -220,27 +231,15 @@ pub async fn run_projection(
         .await
         .context("sign + submit + confirm the SignerListSet projection")?;
 
-    let mut node_results = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        let (ok, error) = match confirmer
-            .record_confirmation(
-                node,
-                &req.escrow,
-                &tx.signed_tx_blob,
-                &tx.tx_hash,
-                tx.ledger_index,
-            )
-            .await
-        {
-            Ok(()) => (true, None),
-            Err(e) => (false, Some(e.to_string())),
-        };
-        node_results.push(NodeConfirmResult {
-            node: node.clone(),
-            ok,
-            error,
-        });
-    }
+    let node_results = applier
+        .apply_confirmation(
+            &req.escrow,
+            &tx.signed_tx_blob,
+            &tx.tx_hash,
+            tx.ledger_index,
+        )
+        .await
+        .context("record projection confirmation across the cluster")?;
 
     Ok(ProjectionOutcome {
         tx_hash: tx.tx_hash,
@@ -252,6 +251,7 @@ pub async fn run_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::bail;
 
     fn entry(fill: u8, weight: u32) -> SignerEntry {
         SignerEntry {
@@ -367,36 +367,58 @@ mod tests {
         }
     }
 
-    struct RecordingConfirmer {
+    /// Mock `ClusterConfirmApplier`: records the SINGLE broadcast (tx_hash,
+    /// ledger) and returns a configured per-node result set. `failing()`
+    /// simulates a broadcast that never reaches the run-loop.
+    struct MockConfirmApplier {
+        nodes: Vec<String>,
         fail_nodes: Vec<String>,
-        seen: Mutex<Vec<(String, [u8; 32], u64)>>,
+        fail_call: bool,
+        seen: Mutex<Option<([u8; 32], u64)>>,
     }
-    impl RecordingConfirmer {
-        fn new(fail_nodes: Vec<String>) -> Self {
+    impl MockConfirmApplier {
+        fn new(nodes: Vec<String>, fail_nodes: Vec<String>) -> Self {
             Self {
+                nodes,
                 fail_nodes,
-                seen: Mutex::new(Vec::new()),
+                fail_call: false,
+                seen: Mutex::new(None),
+            }
+        }
+        fn failing() -> Self {
+            Self {
+                nodes: vec![],
+                fail_nodes: vec![],
+                fail_call: true,
+                seen: Mutex::new(None),
             }
         }
     }
     #[async_trait]
-    impl ProjectionConfirmer for RecordingConfirmer {
-        async fn record_confirmation(
+    impl ClusterConfirmApplier for MockConfirmApplier {
+        async fn apply_confirmation(
             &self,
-            node: &str,
             _escrow: &[u8; 20],
             _blob: &[u8],
             tx_hash: &[u8; 32],
             ledger_index: u64,
-        ) -> Result<()> {
-            self.seen
-                .lock()
-                .unwrap()
-                .push((node.to_string(), *tx_hash, ledger_index));
-            if self.fail_nodes.iter().any(|n| n == node) {
-                bail!("node {node} unreachable");
+        ) -> Result<Vec<NodeConfirmResult>> {
+            if self.fail_call {
+                bail!("apply broadcast failed");
             }
-            Ok(())
+            *self.seen.lock().unwrap() = Some((*tx_hash, ledger_index));
+            Ok(self
+                .nodes
+                .iter()
+                .map(|n| {
+                    let ok = !self.fail_nodes.iter().any(|f| f == n);
+                    NodeConfirmResult {
+                        node: n.clone(),
+                        ok,
+                        error: (!ok).then(|| format!("node {n} unreachable")),
+                    }
+                })
+                .collect())
         }
     }
 
@@ -424,44 +446,41 @@ mod tests {
             tx: confirmed_tx(),
             seen_unsigned: Mutex::new(None),
         };
-        let confirmer = RecordingConfirmer::new(vec![]);
-        let nodes = vec!["n1".to_string(), "n2".into(), "n3".into()];
+        let applier = MockConfirmApplier::new(vec!["n1".into(), "n2".into(), "n3".into()], vec![]);
         let signers = [entry(0x01, 1), entry(0x02, 1)];
 
-        let out = run_projection(&proj_req(&signers, 2), &submitter, &confirmer, &nodes)
+        let out = run_projection(&proj_req(&signers, 2), &submitter, &applier)
             .await
             .unwrap();
 
         assert_eq!(out.tx_hash, [0xEE; 32]);
         assert_eq!(out.ledger_index, 9_001);
         assert!(out.all_recorded());
+        assert_eq!(out.node_results.len(), 3);
 
         // the projection that reached the submitter is the rendered SignerListSet
         let seen = submitter.seen_unsigned.lock().unwrap().clone().unwrap();
         assert_eq!(seen["TransactionType"], "SignerListSet");
         assert_eq!(seen["SignerQuorum"], 2);
 
-        // every node recorded the SAME (tx_hash, ledger)
-        let rec = confirmer.seen.lock().unwrap();
-        assert_eq!(rec.len(), 3);
-        assert!(rec.iter().all(|(_, h, l)| *h == [0xEE; 32] && *l == 9_001));
+        // the cluster was broadcast the confirmation ONCE with the same (tx, ledger)
+        assert_eq!(applier.seen.lock().unwrap().unwrap(), ([0xEE; 32], 9_001));
     }
 
     #[tokio::test]
     async fn driver_propagates_confirmation_timeout_without_recording() {
         let submitter = ErrSubmitter;
-        let confirmer = RecordingConfirmer::new(vec![]);
-        let nodes = vec!["n1".to_string()];
+        let applier = MockConfirmApplier::new(vec!["n1".into()], vec![]);
         let signers = [entry(0x01, 1), entry(0x02, 1)];
 
-        let err = run_projection(&proj_req(&signers, 2), &submitter, &confirmer, &nodes)
+        let err = run_projection(&proj_req(&signers, 2), &submitter, &applier)
             .await
             .unwrap_err();
         // full chain (anyhow's Display shows only the outer context).
         let full = format!("{err:#}");
         assert!(full.contains("timed out"), "got: {full}");
         // NOTHING recorded — epoch stays projection-UNCONFIRMED (safe).
-        assert!(confirmer.seen.lock().unwrap().is_empty());
+        assert!(applier.seen.lock().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -470,11 +489,13 @@ mod tests {
             tx: confirmed_tx(),
             seen_unsigned: Mutex::new(None),
         };
-        let confirmer = RecordingConfirmer::new(vec!["n2".to_string()]);
-        let nodes = vec!["n1".to_string(), "n2".into(), "n3".into()];
+        let applier = MockConfirmApplier::new(
+            vec!["n1".into(), "n2".into(), "n3".into()],
+            vec!["n2".into()],
+        );
         let signers = [entry(0x01, 1), entry(0x02, 1)];
 
-        let out = run_projection(&proj_req(&signers, 2), &submitter, &confirmer, &nodes)
+        let out = run_projection(&proj_req(&signers, 2), &submitter, &applier)
             .await
             .unwrap();
 
@@ -485,19 +506,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn driver_rejects_empty_node_list() {
+    async fn driver_propagates_apply_broadcast_failure() {
         let submitter = OkSubmitter {
             tx: confirmed_tx(),
             seen_unsigned: Mutex::new(None),
         };
-        let confirmer = RecordingConfirmer::new(vec![]);
+        let applier = MockConfirmApplier::failing();
         let signers = [entry(0x01, 1)];
-        let err = run_projection(&proj_req(&signers, 1), &submitter, &confirmer, &[])
+        let err = run_projection(&proj_req(&signers, 1), &submitter, &applier)
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("no cluster nodes"), "got: {err}");
-        // submitter not even called → nothing submitted on an empty cluster
-        assert!(submitter.seen_unsigned.lock().unwrap().is_none());
+        assert!(
+            err.contains("record projection confirmation across the cluster"),
+            "got: {err}"
+        );
     }
 }

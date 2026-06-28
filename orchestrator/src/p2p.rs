@@ -206,6 +206,22 @@ pub enum SigningMessage {
         new_signers: Vec<MembershipSignerWire>,
         new_quorum: u32,
     },
+    /// β3.2b apply-broadcast. After the initiator has collected ONE quorum
+    /// bundle (β1) and confirmed ONE projection (β2), it broadcasts the SAME
+    /// apply payload to every node, and each node applies it to its OWN loopback
+    /// enclave. The enclaves are loopback-only (X-C1: `/pool/sign` is never
+    /// network-exposed), so the apply CANNOT be an HTTP POST to a remote
+    /// enclave — it must ride p2p, each node applying locally. This realises the
+    /// cluster-wide (P) single-successor: one bundle, one broadcast, applied
+    /// identically everywhere.
+    ///
+    /// `request_id` MUST start with `"beta-apply-"` so Response (ack) routing
+    /// forwards to the apply collector's mpsc (multi-responder).
+    MembershipApply {
+        request_id: String,
+        requester_peer_id: String,
+        payload: MembershipApplyPayload,
+    },
 }
 
 /// One signer in a β1 membership-epoch transition, as carried on the wire.
@@ -214,6 +230,31 @@ pub struct MembershipSignerWire {
     /// 20-byte XRPL AccountID, lowercase hex (no `0x`).
     pub account_id_hex: String,
     pub weight: u32,
+}
+
+/// β3.2b — what a `MembershipApply` broadcast tells each node to apply to its
+/// LOCAL enclave: either the β1 epoch seal or the β2 projection confirmation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum MembershipApplyPayload {
+    /// Apply `ecall_seal_membership_epoch` locally (the SAME statement + bundle
+    /// on every node — the (P) single-successor).
+    Seal {
+        escrow_hex: String,
+        proposed_epoch: u64,
+        prev_epoch_hash_hex: String,
+        new_signers: Vec<MembershipSignerWire>,
+        new_quorum: u32,
+        quorum_bundle_hex: String,
+    },
+    /// Apply `ecall_record_projection_confirmation` locally (the validated
+    /// SignerListSet projection of the just-sealed epoch).
+    Confirm {
+        escrow_hex: String,
+        signed_xrpl_tx_blob_hex: String,
+        tx_hash_hex: String,
+        ledger_index: u64,
+    },
 }
 
 /// Decode exactly 20 hex bytes → `[u8; 20]`, or `None` on any malformed input.
@@ -323,6 +364,19 @@ pub struct MembershipEpochRelay {
     pub new_signers: Vec<crate::membership_canonical::SignerEntry>,
     pub new_quorum: u32,
     /// Channel to receive `SigningMessage::Response` instances as peers reply.
+    pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
+}
+
+/// β3.2b outbound apply-broadcast. The membership-change driver builds one per
+/// apply step (seal or confirm), sends it down `set_membership_apply_channel`;
+/// the run-loop applies locally + broadcasts `MembershipApply` and forwards each
+/// node's ack `Response` here until all expected nodes ack or the window closes.
+#[derive(Debug)]
+pub struct MembershipApplyRelay {
+    /// Unique id; MUST start with `"beta-apply-"` so ack routing forwards here.
+    pub request_id: String,
+    pub payload: MembershipApplyPayload,
+    /// Channel to receive per-node ack `Response`s.
     pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
 }
 
@@ -526,6 +580,11 @@ pub struct P2PNode {
     /// In-flight β1 membership-epoch requests; mpsc per-request (M-of-N
     /// operators reply concurrently), mirroring `pending_path_a_delegation`.
     pending_membership_epoch: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
+    /// β3.2b: outbound apply-broadcast requests (seal / confirm) from the
+    /// membership-change driver — each node applies to its loopback enclave.
+    membership_apply_rx: Option<mpsc::Receiver<MembershipApplyRelay>>,
+    /// In-flight β3.2b apply broadcasts; mpsc per-request (every node acks).
+    pending_membership_apply: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
     /// Channel for outbound state events (sequencer publishes).
     events_publish_rx: Option<mpsc::Receiver<StateEvent>>,
     /// Channel for received state events (validator consumes).
@@ -688,6 +747,8 @@ impl P2PNode {
             pending_path_a_delegation: HashMap::new(),
             membership_epoch_rx: None,
             pending_membership_epoch: HashMap::new(),
+            membership_apply_rx: None,
+            pending_membership_apply: HashMap::new(),
             events_publish_rx: None,
             events_inbound_tx: None,
             peer_quote_publish_rx: None,
@@ -796,6 +857,15 @@ impl P2PNode {
     #[allow(dead_code)]
     pub fn set_membership_epoch_channel(&mut self, rx: mpsc::Receiver<MembershipEpochRelay>) {
         self.membership_epoch_rx = Some(rx);
+    }
+
+    /// β3.2b: wire the membership-change driver's apply-broadcast channel. The
+    /// driver sends one `MembershipApplyRelay` per apply step (seal / confirm);
+    /// the run-loop applies it to the LOCAL enclave + broadcasts `MembershipApply`
+    /// and forwards each node's ack `Response` back via `responses_tx`.
+    #[allow(dead_code)]
+    pub fn set_membership_apply_channel(&mut self, rx: mpsc::Receiver<MembershipApplyRelay>) {
+        self.membership_apply_rx = Some(rx);
     }
 
     /// Set events publish channel (sequencer sends events to broadcast).
@@ -1537,6 +1607,183 @@ impl P2PNode {
         }
     }
 
+    /// β3.2b: apply a `MembershipApply` broadcast to THIS node's LOCAL enclave
+    /// (the enclaves are loopback-only). Reuses the audited HTTP adapters pointed
+    /// at localhost. The ack is a `Response` with `error: None` on success (the
+    /// apply collector treats `error.is_none()` as applied; distinct from the
+    /// bundle collector which reads `der_signature`).
+    async fn handle_membership_apply(
+        local_signer: &LocalSigner,
+        request_id: &str,
+        payload: &MembershipApplyPayload,
+    ) -> SigningMessage {
+        use crate::membership_canonical::SignerEntry;
+        use crate::membership_coordinator::{prepare_statement, EpochSealSink};
+        use crate::membership_http::{HttpEpochSealSink, HttpProjectionConfirmer};
+        use crate::membership_projection::ProjectionConfirmer;
+
+        // local enclave admin base. local_signer.enclave_url ends in "/v1"; the
+        // membership_http paths re-add "/v1", so strip it to the bare base.
+        let base = local_signer
+            .enclave_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .trim_end_matches('/')
+            .to_string();
+        // X-C1 defense-in-depth: apply ONLY ever targets THIS node's loopback
+        // enclave. A non-loopback base means a misconfigured local_signer — fail
+        // closed rather than POST a seal/confirm to a remote enclave.
+        if let Err(e) = crate::http_helpers::ensure_loopback_url(&base) {
+            return Self::membership_sign_error(
+                local_signer,
+                request_id,
+                format!("apply: non-loopback enclave base: {e}"),
+            );
+        }
+        let client = match crate::http_helpers::loopback_http_client(Duration::from_secs(30)) {
+            Ok(c) => c,
+            Err(e) => {
+                return Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("http client: {e}"),
+                )
+            }
+        };
+
+        let result: anyhow::Result<()> = match payload {
+            MembershipApplyPayload::Seal {
+                escrow_hex,
+                proposed_epoch,
+                prev_epoch_hash_hex,
+                new_signers,
+                new_quorum,
+                quorum_bundle_hex,
+            } => {
+                let escrow = match decode_20(escrow_hex) {
+                    Some(a) => a,
+                    None => {
+                        return Self::membership_sign_error(
+                            local_signer,
+                            request_id,
+                            "apply.seal: bad escrow_hex".into(),
+                        )
+                    }
+                };
+                let prev = match decode_32(prev_epoch_hash_hex) {
+                    Some(a) => a,
+                    None => {
+                        return Self::membership_sign_error(
+                            local_signer,
+                            request_id,
+                            "apply.seal: bad prev_epoch_hash_hex".into(),
+                        )
+                    }
+                };
+                let mut signers = Vec::with_capacity(new_signers.len());
+                for s in new_signers {
+                    match decode_20(&s.account_id_hex) {
+                        Some(account_id) => signers.push(SignerEntry {
+                            account_id,
+                            weight: s.weight,
+                        }),
+                        None => {
+                            return Self::membership_sign_error(
+                                local_signer,
+                                request_id,
+                                "apply.seal: bad signer account_id_hex".into(),
+                            )
+                        }
+                    }
+                }
+                let bundle = match hex::decode(quorum_bundle_hex) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        return Self::membership_sign_error(
+                            local_signer,
+                            request_id,
+                            "apply.seal: bad quorum_bundle_hex".into(),
+                        )
+                    }
+                };
+                // Reconstruct the statement (proposed = current+1 ⇒ current =
+                // proposed-1, current_digest = prev_epoch_hash).
+                let statement = match prepare_statement(
+                    escrow,
+                    proposed_epoch.saturating_sub(1),
+                    prev,
+                    signers,
+                    *new_quorum,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Self::membership_sign_error(
+                            local_signer,
+                            request_id,
+                            format!("apply.seal: prepare {e:?}"),
+                        )
+                    }
+                };
+                HttpEpochSealSink::new(client)
+                    .seal_on_node(&base, &statement, &bundle)
+                    .await
+            }
+            MembershipApplyPayload::Confirm {
+                escrow_hex,
+                signed_xrpl_tx_blob_hex,
+                tx_hash_hex,
+                ledger_index,
+            } => {
+                let escrow = match decode_20(escrow_hex) {
+                    Some(a) => a,
+                    None => {
+                        return Self::membership_sign_error(
+                            local_signer,
+                            request_id,
+                            "apply.confirm: bad escrow_hex".into(),
+                        )
+                    }
+                };
+                let tx_hash = match decode_32(tx_hash_hex) {
+                    Some(a) => a,
+                    None => {
+                        return Self::membership_sign_error(
+                            local_signer,
+                            request_id,
+                            "apply.confirm: bad tx_hash_hex".into(),
+                        )
+                    }
+                };
+                let blob = match hex::decode(signed_xrpl_tx_blob_hex) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        return Self::membership_sign_error(
+                            local_signer,
+                            request_id,
+                            "apply.confirm: bad blob hex".into(),
+                        )
+                    }
+                };
+                HttpProjectionConfirmer::new(client)
+                    .record_confirmation(&base, &escrow, &blob, &tx_hash, *ledger_index)
+                    .await
+            }
+        };
+
+        match result {
+            Ok(()) => SigningMessage::Response {
+                request_id: request_id.to_string(),
+                signer_xrpl_address: local_signer.xrpl_address.clone(),
+                der_signature: None,
+                compressed_pubkey: None,
+                error: None, // ack: applied
+            },
+            Err(e) => {
+                Self::membership_sign_error(local_signer, request_id, format!("apply: {e:#}"))
+            }
+        }
+    }
+
     async fn handle_signing_request(
         local_signer: &LocalSigner,
         escrow_xrpl_address: Option<&str>,
@@ -1650,6 +1897,7 @@ impl P2PNode {
         let mut signing_rx = self.signing_request_rx.take();
         let mut path_a_delegation_rx = self.path_a_delegation_rx.take();
         let mut membership_epoch_rx = self.membership_epoch_rx.take();
+        let mut membership_apply_rx = self.membership_apply_rx.take();
         let mut events_rx = self.events_publish_rx.take();
         let mut peer_quote_rx = self.peer_quote_publish_rx.take();
         let mut share_v2_rx = self.share_v2_publish_rx.take();
@@ -1853,6 +2101,46 @@ impl P2PNode {
                     }
                 }
 
+                // β3.2b: membership-apply broadcast (seal / confirm). One node
+                // collects/assembles, then broadcasts the SAME apply to all so
+                // every node applies it to its OWN loopback enclave + acks.
+                Some(relay) = async {
+                    match &mut membership_apply_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<MembershipApplyRelay>>().await,
+                    }
+                } => {
+                    // The local node is also a member: gossipsub doesn't deliver
+                    // to the publisher, so apply locally too.
+                    if let Some(ref local) = self.local_signer {
+                        let local_ack = Self::handle_membership_apply(
+                            local, &relay.request_id, &relay.payload).await;
+                        let _ = relay.responses_tx.send(local_ack).await;
+                    }
+
+                    let msg = SigningMessage::MembershipApply {
+                        request_id: relay.request_id.clone(),
+                        requester_peer_id: self.peer_id.to_string(),
+                        payload: relay.payload.clone(),
+                    };
+                    match self.publish_signing(&msg) {
+                        Ok(_) => {
+                            self.pending_membership_apply.insert(
+                                relay.request_id, relay.responses_tx);
+                        }
+                        Err(e) => {
+                            warn!("β3.2b membership-apply publish failed: {}", e);
+                            let _ = relay.responses_tx.send(SigningMessage::Response {
+                                request_id: relay.request_id,
+                                signer_xrpl_address: String::new(),
+                                der_signature: None,
+                                compressed_pubkey: None,
+                                error: Some(format!("P2P publish failed: {e}")),
+                            }).await;
+                        }
+                    }
+                }
+
                 // Publish state events (sequencer → validators)
                 Some(event) = async {
                     match &mut events_rx {
@@ -1943,6 +2231,8 @@ impl P2PNode {
                     self.pending_path_a_delegation.retain(|_, tx| !tx.is_closed());
                     // β1 membership-epoch collectors: same GC.
                     self.pending_membership_epoch.retain(|_, tx| !tx.is_closed());
+                    // β3.2b membership-apply collectors: same GC.
+                    self.pending_membership_apply.retain(|_, tx| !tx.is_closed());
                 }
 
                 // Handle swarm events
@@ -2073,6 +2363,13 @@ impl P2PNode {
                                 } else if request_id.starts_with("beta1-membership-") {
                                     if let Some(tx) =
                                         self.pending_membership_epoch.get(&request_id) {
+                                        if let Ok(msg) = serde_json::from_slice::<SigningMessage>(&message.data) {
+                                            let _ = tx.send(msg).await;
+                                        }
+                                    }
+                                } else if request_id.starts_with("beta-apply-") {
+                                    if let Some(tx) =
+                                        self.pending_membership_apply.get(&request_id) {
                                         if let Ok(msg) = serde_json::from_slice::<SigningMessage>(&message.data) {
                                             let _ = tx.send(msg).await;
                                         }
@@ -2262,6 +2559,55 @@ impl P2PNode {
                                 ).await;
                                 if let Err(e) = self.publish_signing(&response) {
                                     error!("failed to publish β1 membership response: {}", e);
+                                }
+                            }
+                            Ok(SigningMessage::MembershipApply {
+                                request_id,
+                                requester_peer_id,
+                                payload,
+                            }) => {
+                                // β3.2b: a membership-apply broadcast from the
+                                // driving node. Apply to THIS node's loopback
+                                // enclave (seal or confirm) and publish an ack.
+                                // handle_membership_apply re-derives every value
+                                // from the carried payload and targets localhost
+                                // only (X-C1 loopback guard inside).
+                                let local_opt = self.local_signer.clone();
+                                let Some(local) = local_opt else {
+                                    continue;
+                                };
+
+                                // X-C1: peer allowlist + rate limit + replay
+                                // guard, mirroring the signing paths.
+                                if let Some(ref allow) = self.allowed_signing_peers {
+                                    if !allow.contains(&propagation_source) {
+                                        warn!(
+                                            req_id = %request_id,
+                                            from = %propagation_source,
+                                            "X-C1: β membership-apply from peer outside allowlist — dropped"
+                                        );
+                                        continue;
+                                    }
+                                }
+                                if !self.check_signing_rate(&propagation_source) {
+                                    warn!(req_id = %request_id, "X-C1: β membership-apply rate-limited");
+                                    continue;
+                                }
+                                if !self.mark_signing_request_fresh(&request_id) {
+                                    warn!(req_id = %request_id, "X-C1: duplicate β membership-apply request_id — dropped");
+                                    continue;
+                                }
+
+                                info!(
+                                    req_id = %request_id,
+                                    from = %requester_peer_id,
+                                    propagation = %propagation_source,
+                                    "β membership-apply received — applying to local enclave"
+                                );
+                                let response = Self::handle_membership_apply(
+                                    &local, &request_id, &payload).await;
+                                if let Err(e) = self.publish_signing(&response) {
+                                    error!("failed to publish β membership-apply ack: {}", e);
                                 }
                             }
                             Err(e) => {
@@ -3286,6 +3632,86 @@ mod tests {
                 assert_eq!(new_quorum, 2);
             }
             _ => panic!("expected MembershipEpochRequest"),
+        }
+    }
+
+    /// β3.2b: the apply-broadcast wire contract (seal + confirm payloads) is the
+    /// cross-node transport for the loopback-enclave apply, so it is pinned.
+    #[test]
+    fn membership_apply_seal_round_trips() {
+        let msg = SigningMessage::MembershipApply {
+            request_id: "beta-apply-xyz".into(),
+            requester_peer_id: "peer-A".into(),
+            payload: MembershipApplyPayload::Seal {
+                escrow_hex: "aa".repeat(20),
+                proposed_epoch: 7,
+                prev_epoch_hash_hex: "bb".repeat(32),
+                new_signers: vec![MembershipSignerWire {
+                    account_id_hex: "01".repeat(20),
+                    weight: 1,
+                }],
+                new_quorum: 1,
+                quorum_bundle_hex: "deadbeef".into(),
+            },
+        };
+        let wire = serde_json::to_string(&msg).expect("serialize");
+        assert!(wire.contains("\"type\":\"membership_apply\""));
+        // payload is internally tagged by `op`.
+        assert!(wire.contains("\"op\":\"seal\""));
+        let parsed: SigningMessage = serde_json::from_str(&wire).expect("deserialize");
+        match parsed {
+            SigningMessage::MembershipApply {
+                request_id,
+                payload,
+                ..
+            } => {
+                assert_eq!(request_id, "beta-apply-xyz");
+                match payload {
+                    MembershipApplyPayload::Seal {
+                        proposed_epoch,
+                        new_quorum,
+                        quorum_bundle_hex,
+                        ..
+                    } => {
+                        assert_eq!(proposed_epoch, 7);
+                        assert_eq!(new_quorum, 1);
+                        assert_eq!(quorum_bundle_hex, "deadbeef");
+                    }
+                    _ => panic!("expected Seal payload"),
+                }
+            }
+            _ => panic!("expected MembershipApply"),
+        }
+    }
+
+    #[test]
+    fn membership_apply_confirm_round_trips() {
+        let msg = SigningMessage::MembershipApply {
+            request_id: "beta-apply-conf".into(),
+            requester_peer_id: "peer-B".into(),
+            payload: MembershipApplyPayload::Confirm {
+                escrow_hex: "aa".repeat(20),
+                signed_xrpl_tx_blob_hex: "1234".into(),
+                tx_hash_hex: "ee".repeat(32),
+                ledger_index: 9_001,
+            },
+        };
+        let wire = serde_json::to_string(&msg).expect("serialize");
+        assert!(wire.contains("\"op\":\"confirm\""));
+        let parsed: SigningMessage = serde_json::from_str(&wire).expect("deserialize");
+        match parsed {
+            SigningMessage::MembershipApply { payload, .. } => match payload {
+                MembershipApplyPayload::Confirm {
+                    tx_hash_hex,
+                    ledger_index,
+                    ..
+                } => {
+                    assert_eq!(tx_hash_hex, "ee".repeat(32));
+                    assert_eq!(ledger_index, 9_001);
+                }
+                _ => panic!("expected Confirm payload"),
+            },
+            _ => panic!("expected MembershipApply"),
         }
     }
 }

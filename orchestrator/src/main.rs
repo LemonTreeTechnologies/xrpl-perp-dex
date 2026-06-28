@@ -13,6 +13,7 @@ mod dkg_coordinate;
 mod election;
 mod http_helpers;
 mod membership_admin;
+mod membership_apply;
 mod membership_canonical;
 mod membership_coordinator;
 mod membership_http;
@@ -916,6 +917,17 @@ async fn main() -> Result<()> {
         (None, None)
     };
 
+    // β3.2b: membership-apply broadcast channel — the seal + projection
+    // confirmation apply-broadcast (each node applies to its OWN loopback
+    // enclave; the enclave admin API is never network-exposed, X-C1). Held alive
+    // alongside the epoch channel; the admin trigger owns the sender.
+    let (membership_apply_rx_holder, _membership_apply_tx) = if signers_config.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<p2p::MembershipApplyRelay>(8);
+        (Some(rx), Some(tx))
+    } else {
+        (None, None)
+    };
+
     let peer_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     let maintenance_mode = Arc::new(std::sync::atomic::AtomicBool::new(matches!(
@@ -1275,9 +1287,10 @@ async fn main() -> Result<()> {
         match (
             signers_config.as_ref(),
             _membership_epoch_tx.clone(),
+            _membership_apply_tx.clone(),
             app_state.signing_tx.clone(),
         ) {
-            (Some(cfg), Some(membership_epoch_tx), Some(signing_tx))
+            (Some(cfg), Some(membership_epoch_tx), Some(membership_apply_tx), Some(signing_tx))
                 if !cli.membership_node_urls.is_empty() =>
             {
                 let escrow = crate::xrpl_signer::decode_xrpl_address(&escrow_address)
@@ -1295,8 +1308,11 @@ async fn main() -> Result<()> {
                     escrow,
                     escrow_r_address: escrow_address.clone(),
                     enclave_base: cli.enclave_url.clone(),
-                    node_admin_urls: cli.membership_node_urls.clone(),
+                    // The roster (--membership-node-urls) declares the cluster;
+                    // its COUNT is the expected ack count for the apply-broadcast.
+                    cluster_size: cli.membership_node_urls.len(),
                     membership_epoch_tx,
+                    membership_apply_tx,
                     signing_tx,
                     current_signers,
                     current_quorum: cfg.quorum as u32,
@@ -1440,6 +1456,11 @@ async fn main() -> Result<()> {
         // β3.2b: same wiring for the membership-epoch collection channel.
         if let Some(rx) = membership_epoch_rx_holder {
             p2p_node.set_membership_epoch_channel(rx);
+        }
+        // β3.2b: and for the membership-apply broadcast channel (seal + confirm
+        // applied on each node's OWN loopback enclave).
+        if let Some(rx) = membership_apply_rx_holder {
+            p2p_node.set_membership_apply_channel(rx);
         }
         if let Some(ref local) = cfg.local_signer {
             // X-C1 condition C2 (perp RESP-5): enforce loopback on the
