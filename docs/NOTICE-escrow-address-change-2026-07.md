@@ -15,7 +15,7 @@ testnet escrow is being **replaced with a fresh account**, not reused.
 **What changes for you:** the **deposit address** for testnet moves.
 
 - OLD (deprecated after cutover): `r3MfCgxJeP8JPpAySgFukoj92kJHnAF11E`
-- NEW: `<NEW_TESTNET_ESCROW_ADDRESS — filled in when escrow-init lands>`
+- NEW: `rfvnJkW3CieJKvPndJirZPfepMD1nhL73q` (live as of 2026-07-06; also served by the API `deposit_address` field)
 
 **What you need to do:**
 1. The deposit address is already served live by the API as the `deposit_address`
@@ -44,7 +44,7 @@ testnet-кластер. Деплой поднимает новую MRENCLAVE →
 **Что меняется:** адрес депозита (deposit address) на testnet.
 
 - СТАРЫЙ (устаревает после cutover): `r3MfCgxJeP8JPpAySgFukoj92kJHnAF11E`
-- НОВЫЙ: `<NEW_TESTNET_ESCROW_ADDRESS — впишется после escrow-init>`
+- НОВЫЙ: `rfvnJkW3CieJKvPndJirZPfepMD1nhL73q` (в проде с 2026-07-06; также отдаётся полем API `deposit_address`)
 
 **Что Тому сделать:** адрес уже отдаётся живьём в поле `deposit_address` статус-ответа
 API — надёжное решение читать его оттуда и не хардкодить; если где-то захардкожен
