@@ -1307,7 +1307,15 @@ async fn main() -> Result<()> {
                     xrpl_url: cli.xrpl_url.clone(),
                     escrow,
                     escrow_r_address: escrow_address.clone(),
-                    enclave_base: cli.enclave_url.clone(),
+                    // `--enclave-url` ends in `/v1`; the membership_http admin paths
+                    // re-add `/v1/admin/...`, so strip it to the bare base (else the
+                    // epoch-digest GET hits `/v1/v1/...` → "Not found").
+                    enclave_base: cli
+                        .enclave_url
+                        .trim_end_matches('/')
+                        .trim_end_matches("/v1")
+                        .trim_end_matches('/')
+                        .to_string(),
                     // The roster (--membership-node-urls) declares the cluster;
                     // its COUNT is the expected ack count for the apply-broadcast.
                     cluster_size: cli.membership_node_urls.len(),
