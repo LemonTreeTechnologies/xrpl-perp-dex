@@ -64,19 +64,31 @@ impl LibP2PProjectionSubmitter {
         self
     }
 
-    /// Collect quorum-many signatures over the unsigned SignerListSet via the
-    /// relay and assemble the multisigned tx (Signers[] sorted by AccountID).
-    /// Split out so the collection/assembly is unit-tested with a mock relay
-    /// (the submit + poll are XRPL IO).
+    /// Collect signatures over the unsigned SignerListSet via the relay and
+    /// assemble the multisigned tx (Signers[] sorted by AccountID). Split out so
+    /// the collection/assembly is unit-tested with a mock relay (the submit +
+    /// poll are XRPL IO).
+    ///
+    /// X-cosig-5 (RESP-β3.1-cosig, Option A logged interim): we collect from
+    /// ALL current signers, not just quorum-many, so EVERY node's key is on the
+    /// projection envelope. This is required because the β3.1 confirmation cosig
+    /// check (`ecall_record_projection_confirmation` step 6(e)) currently demands
+    /// the node's OWN key among the cosigners — so a node whose key is absent
+    /// can never confirm and is stranded in the pending window. Collecting all N
+    /// converges the live cluster today.
+    ///
+    /// KNOWN LIMITATION (removed once Option B — outgoing-quorum cosig in the
+    /// enclave — ships): a node OFFLINE during the projection never gets its key
+    /// on this tx, so it cannot confirm that epoch even after it returns; and
+    /// the on-chain tx is N-of-N rather than M-of-N. This is convergence-only
+    /// (no spend-safety impact) but must not be silently relied upon.
     async fn collect_and_assemble(
         &self,
         unsigned: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let mut collected: Vec<serde_json::Value> = Vec::new();
+        // X-cosig-5 interim: collect ALL signers (no early break at quorum).
         for (xrpl_address, account_id_hex) in &self.current_signers {
-            if collected.len() >= self.quorum as usize {
-                break;
-            }
             let request_id = format!("beta2-proj-{:016x}", rand::random::<u64>());
             let (resp_tx, resp_rx) = oneshot::channel();
             if self
@@ -125,6 +137,18 @@ impl LibP2PProjectionSubmitter {
                 self.quorum
             );
         }
+
+        // X-cosig-5 interim: N-of-N (all available) rather than M-of-N. Logged
+        // so the known limitation is visible in operator logs, not silent.
+        warn!(
+            collected = collected.len(),
+            total = self.current_signers.len(),
+            quorum = self.quorum,
+            "X-cosig-5 interim: projection signed by ALL available signers (N-of-N) \
+             so every node can confirm; an offline-during-projection node still \
+             cannot confirm that epoch — remove once Option B (enclave outgoing-\
+             quorum cosig) ships"
+        );
 
         // XRPL canonical: Signers[] sorted ascending by AccountID.
         collected.sort_by(|a, b| {
@@ -273,6 +297,46 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("of 2 projection signatures"), "got: {err}");
+        responder.abort();
+    }
+
+    /// X-cosig-5 interim: with quorum 2 but 3 signers, collect ALL 3 (not just
+    /// quorum-many) so every node's key lands on the projection envelope and
+    /// every node can pass the β3.1 own-key cosig check.
+    #[tokio::test]
+    async fn collect_and_assemble_gathers_all_n_not_just_quorum() {
+        use crate::membership_projection::account_id_to_r_address;
+        let (tx, mut rx) = mpsc::channel::<SigningRelay>(8);
+        let signers = vec![
+            (account_id_to_r_address(&[0x01; 20]), "01".repeat(20)),
+            (account_id_to_r_address(&[0x02; 20]), "02".repeat(20)),
+            (account_id_to_r_address(&[0x03; 20]), "03".repeat(20)),
+        ];
+        // quorum 2, but 3 signers available → interim must collect all 3.
+        let submitter = LibP2PProjectionSubmitter::new(tx, "http://xrpl".into(), signers, 2);
+
+        let responder = tokio::spawn(async move {
+            while let Some(relay) = rx.recv().await {
+                let _ = relay.response_tx.send(SigningMessage::Response {
+                    request_id: relay.request_id,
+                    signer_xrpl_address: relay.signer_xrpl_address.clone(),
+                    der_signature: Some("30".to_string() + &"45".repeat(35)),
+                    compressed_pubkey: Some("02".to_string() + &"ab".repeat(32)),
+                    error: None,
+                });
+            }
+        });
+
+        let full = submitter
+            .collect_and_assemble(&render_min_signerlist())
+            .await
+            .unwrap();
+        let arr = full["Signers"].as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            3,
+            "interim must collect ALL N signers, not quorum-many"
+        );
         responder.abort();
     }
 }
