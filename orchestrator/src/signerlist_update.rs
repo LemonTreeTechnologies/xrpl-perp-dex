@@ -356,6 +356,14 @@ async fn drive(
                 signer_account_id_hex: hex::encode(account_id),
                 signer_xrpl_address: signer.xrpl_address.clone(),
                 response_tx: resp_tx,
+                // β4 Thread A: these operator-driven SignerListSet paths carry no
+                // β1 quorum bundle, so the enclave's governance signing path now
+                // refuses them — FAIL-CLOSED by design. They are superseded: a
+                // membership change goes through the β flow (seal epoch ->
+                // project -> confirm), and genesis uses the β1-consent +
+                // bootstrap_from_quorum_attestation shape (RESP-β4-threadA-impl.1
+                // option 2) instead of a pre-seal pool-key SignerListSet.
+                quorum_bundle: None,
             })
             .await
             .is_err()
@@ -713,6 +721,14 @@ async fn drive_bootstrap_rotate(
                 signer_account_id_hex: hex::encode(account_id),
                 signer_xrpl_address: signer.xrpl_address.clone(),
                 response_tx: resp_tx,
+                // β4 Thread A: these operator-driven SignerListSet paths carry no
+                // β1 quorum bundle, so the enclave's governance signing path now
+                // refuses them — FAIL-CLOSED by design. They are superseded: a
+                // membership change goes through the β flow (seal epoch ->
+                // project -> confirm), and genesis uses the β1-consent +
+                // bootstrap_from_quorum_attestation shape (RESP-β4-threadA-impl.1
+                // option 2) instead of a pre-seal pool-key SignerListSet.
+                quorum_bundle: None,
             })
             .await
             .is_err()

@@ -303,6 +303,11 @@ pub struct MembershipChangeOutcome {
     pub message_hash: [u8; 32],
     pub bundle_len: usize,
     pub node_results: Vec<NodeSealResult>,
+    /// β4 Thread A (AC-β4-A1): the SAME β1 quorum bundle that authorised this
+    /// epoch, hex-encoded. The β2 projection must forward it to each signer's
+    /// enclave — the governance signing path refuses a SignerListSet without a
+    /// bundle proving the cluster authorised the epoch being projected.
+    pub quorum_bundle_hex: String,
 }
 
 impl MembershipChangeOutcome {
@@ -359,6 +364,7 @@ pub async fn run_membership_change(
         message_hash: statement.message_hash,
         bundle_len: bundle.len(),
         node_results,
+        quorum_bundle_hex: hex::encode(&bundle),
     })
 }
 

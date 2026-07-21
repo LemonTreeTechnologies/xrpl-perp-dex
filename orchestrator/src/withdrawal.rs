@@ -147,6 +147,8 @@ async fn sign_via_p2p(
             signer_account_id_hex: hex::encode(account_id),
             signer_xrpl_address: signer.xrpl_address.clone(),
             response_tx: resp_tx,
+            // Value path: a Payment needs no β1 bundle (β4 Thread A AC-β4-A2).
+            quorum_bundle: None,
         })
         .await
         .map_err(|_| anyhow::anyhow!("P2P signing channel closed"))?;

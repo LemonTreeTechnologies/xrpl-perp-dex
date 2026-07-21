@@ -142,9 +142,13 @@ pub struct ProjectionConfirmedTx {
 /// on an unconfirmed set.
 #[async_trait]
 pub trait ProjectionSubmitter: Send + Sync {
+    /// `quorum_bundle_hex` (β4 Thread A) is forwarded verbatim to the enclave
+    /// governance signing path, which requires it to produce a SignerListSet
+    /// cosignature.
     async fn sign_submit_confirm(
         &self,
         unsigned_signerlist_set: &serde_json::Value,
+        quorum_bundle_hex: &str,
     ) -> Result<ProjectionConfirmedTx>;
 }
 
@@ -199,6 +203,10 @@ pub struct ProjectionRequest {
     pub fee_drops: u64,
     pub signers: Vec<SignerEntry>,
     pub quorum: u32,
+    /// β4 Thread A (AC-β4-A1): the β1 quorum bundle that authorised the epoch
+    /// being projected, hex-encoded. Forwarded to each signer's enclave, whose
+    /// governance signing path refuses a SignerListSet without it.
+    pub quorum_bundle_hex: String,
 }
 
 /// Produce the XRPL `SignerListSet` projection for the just-sealed authority
@@ -227,7 +235,7 @@ pub async fn run_projection(
     // On timeout this returns Err → we record nothing → epoch stays
     // projection-UNCONFIRMED (safe) → surfaced to the operator (Q-β2-6).
     let tx = submitter
-        .sign_submit_confirm(&unsigned)
+        .sign_submit_confirm(&unsigned, &req.quorum_bundle_hex)
         .await
         .context("sign + submit + confirm the SignerListSet projection")?;
 
@@ -343,14 +351,19 @@ mod tests {
     struct OkSubmitter {
         tx: ProjectionConfirmedTx,
         seen_unsigned: Mutex<Option<serde_json::Value>>,
+        /// β4 Thread A: records the bundle the driver forwarded, so a test can
+        /// assert the governance path actually receives it (AC-β4-A1).
+        seen_bundle: Mutex<Option<String>>,
     }
     #[async_trait]
     impl ProjectionSubmitter for OkSubmitter {
         async fn sign_submit_confirm(
             &self,
             unsigned: &serde_json::Value,
+            quorum_bundle_hex: &str,
         ) -> Result<ProjectionConfirmedTx> {
             *self.seen_unsigned.lock().unwrap() = Some(unsigned.clone());
+            *self.seen_bundle.lock().unwrap() = Some(quorum_bundle_hex.to_string());
             Ok(self.tx.clone())
         }
     }
@@ -362,6 +375,7 @@ mod tests {
         async fn sign_submit_confirm(
             &self,
             _: &serde_json::Value,
+            _: &str,
         ) -> Result<ProjectionConfirmedTx> {
             bail!("confirmation timed out after bounded poll")
         }
@@ -437,6 +451,7 @@ mod tests {
             fee_drops: 12000,
             signers: signers.to_vec(),
             quorum,
+            quorum_bundle_hex: "beefcafe".to_string(),
         }
     }
 
@@ -445,6 +460,7 @@ mod tests {
         let submitter = OkSubmitter {
             tx: confirmed_tx(),
             seen_unsigned: Mutex::new(None),
+            seen_bundle: Mutex::new(None),
         };
         let applier = MockConfirmApplier::new(vec!["n1".into(), "n2".into(), "n3".into()], vec![]);
         let signers = [entry(0x01, 1), entry(0x02, 1)];
@@ -488,6 +504,7 @@ mod tests {
         let submitter = OkSubmitter {
             tx: confirmed_tx(),
             seen_unsigned: Mutex::new(None),
+            seen_bundle: Mutex::new(None),
         };
         let applier = MockConfirmApplier::new(
             vec!["n1".into(), "n2".into(), "n3".into()],
@@ -510,6 +527,7 @@ mod tests {
         let submitter = OkSubmitter {
             tx: confirmed_tx(),
             seen_unsigned: Mutex::new(None),
+            seen_bundle: Mutex::new(None),
         };
         let applier = MockConfirmApplier::failing();
         let signers = [entry(0x01, 1)];

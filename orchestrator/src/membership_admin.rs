@@ -164,6 +164,9 @@ async fn drive_change(
         fee_drops: FEE_DROPS,
         signers: new_signers,
         quorum: req.quorum,
+        // β4 Thread A (AC-β4-A1): forward the SAME β1 bundle that just authorised
+        // this epoch — each signer's enclave requires it to cosign the projection.
+        quorum_bundle_hex: change.quorum_bundle_hex.clone(),
     };
     let submitter = LibP2PProjectionSubmitter::new(
         state.signing_tx.clone(),

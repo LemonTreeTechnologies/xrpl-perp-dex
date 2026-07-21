@@ -144,6 +144,14 @@ pub enum SigningMessage {
         /// multi_signing_hash. Must match the receiver's local signer.
         signer_account_id_hex: String,
         signer_xrpl_address: String,
+        /// β4 Thread A (AC-β4-A1): for a `SignerListSet` the enclave's
+        /// governance path REQUIRES the β1 off-chain quorum bundle proving
+        /// the cluster authorised this membership epoch — the receiver
+        /// forwards it verbatim to `/v1/pool/sign/governance-signerlistset`.
+        /// `None` for value (`Payment`) requests, which need no bundle.
+        /// `#[serde(default)]` so a message without the field still decodes.
+        #[serde(default)]
+        quorum_bundle: Option<String>,
     },
     Response {
         request_id: String,
@@ -320,6 +328,11 @@ pub struct SigningRelay {
     pub signer_account_id_hex: String,
     pub signer_xrpl_address: String,
     pub response_tx: tokio::sync::oneshot::Sender<SigningMessage>,
+    /// β4 Thread A (AC-β4-A1): the β1 quorum bundle authorising this membership
+    /// epoch. REQUIRED for a `SignerListSet` (the enclave's governance signing
+    /// path verifies it against the retained outgoing set); `None` for a
+    /// `Payment`, which the value path signs without one.
+    pub quorum_bundle: Option<String>,
 }
 
 /// REQ-8 PRG-2 part 3/4: outbound Path A delegation collection request.
@@ -1805,26 +1818,83 @@ impl P2PNode {
         request_id: &str,
         unsigned_tx: &serde_json::Value,
         signer_account_id_hex: &str,
+        quorum_bundle: Option<&str>,
     ) -> SigningMessage {
-        let hash = match Self::validate_signing_policy(
+        let reject = |msg: String| SigningMessage::Response {
+            request_id: request_id.to_string(),
+            signer_xrpl_address: local_signer.xrpl_address.clone(),
+            der_signature: None,
+            compressed_pubkey: None,
+            error: Some(msg),
+        };
+
+        // The orchestrator-side policy stays as the first line of defence (fail
+        // fast, with a precise reason). Its derived hash is no longer sent
+        // anywhere: since β4 Thread A the ENCLAVE re-derives the signing hash
+        // from the blob below, and the bare hash-signing oracle refuses the
+        // escrow-role key outright (AC-β4-A2).
+        if let Err(e) = Self::validate_signing_policy(
             local_signer,
             escrow_xrpl_address,
             unsigned_tx,
             signer_account_id_hex,
         ) {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(req_id = %request_id, error = %e, "X-C1: signing request rejected by policy");
-                return SigningMessage::Response {
-                    request_id: request_id.to_string(),
-                    signer_xrpl_address: local_signer.xrpl_address.clone(),
-                    der_signature: None,
-                    compressed_pubkey: None,
-                    error: Some(format!("policy: {e}")),
-                };
-            }
+            warn!(req_id = %request_id, error = %e, "X-C1: signing request rejected by policy");
+            return reject(format!("policy: {e}"));
+        }
+
+        // Serialise the transaction exactly as the codec does inside
+        // multi_signing_data (for_signing = true). This is the preimage the
+        // enclave hashes with the SMT prefix and its OWN AccountID — we send the
+        // preimage, never a digest.
+        let tx_obj = match unsigned_tx.as_object() {
+            Some(o) => o,
+            None => return reject("unsigned_tx is not a JSON object".to_string()),
         };
-        let hash_hex = format!("0x{}", hex::encode(hash));
+        let mut blob = Vec::new();
+        if let Err(e) =
+            xrpl_mithril_codec::serializer::serialize_json_object(tx_obj, &mut blob, true)
+        {
+            return reject(format!("serialise for signing failed: {e:?}"));
+        }
+        let tx_blob_hex = hex::encode(&blob);
+
+        // Route by transaction type: value and governance are DISTINCT enclave
+        // paths (AC-β4-A1), and the governance path additionally requires the β1
+        // quorum bundle authorising this membership epoch.
+        let tx_type = tx_obj
+            .get("TransactionType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let (sign_path, sign_body) = match tx_type {
+            "Payment" => (
+                "/pool/sign/withdrawal-payment",
+                serde_json::json!({
+                    "from": local_signer.address,
+                    "session_key": local_signer.session_key,
+                    "tx_blob": tx_blob_hex,
+                }),
+            ),
+            "SignerListSet" => {
+                let Some(bundle) = quorum_bundle else {
+                    return reject(
+                        "SignerListSet request carries no quorum_bundle — the enclave \
+                         governance path requires the β1 bundle for this epoch"
+                            .to_string(),
+                    );
+                };
+                (
+                    "/pool/sign/governance-signerlistset",
+                    serde_json::json!({
+                        "from": local_signer.address,
+                        "session_key": local_signer.session_key,
+                        "tx_blob": tx_blob_hex,
+                        "quorum_bundle": bundle,
+                    }),
+                )
+            }
+            other => return reject(format!("disallowed TransactionType: {other}")),
+        };
         // O-L4: `local_signer.enclave_url` is loopback (the current
         // node's own enclave). The shared factory carries the self-
         // signed-cert relaxation so every loopback-client site reads
@@ -1842,16 +1912,8 @@ impl P2PNode {
             }
         };
 
-        let sign_url = format!("{}/pool/sign", local_signer.enclave_url);
-        let resp = http
-            .post(&sign_url)
-            .json(&serde_json::json!({
-                "from": local_signer.address,
-                "hash": hash_hex,
-                "session_key": local_signer.session_key,
-            }))
-            .send()
-            .await;
+        let sign_url = format!("{}{}", local_signer.enclave_url, sign_path);
+        let resp = http.post(&sign_url).json(&sign_body).send().await;
 
         let resp = match resp {
             Ok(r) => r,
@@ -1980,6 +2042,7 @@ impl P2PNode {
                                 &relay.request_id,
                                 &relay.unsigned_tx,
                                 &relay.signer_account_id_hex,
+                                relay.quorum_bundle.as_deref(),
                             ).await;
                             let _ = relay.response_tx.send(response);
                             continue;
@@ -1992,6 +2055,7 @@ impl P2PNode {
                         unsigned_tx: relay.unsigned_tx,
                         signer_account_id_hex: relay.signer_account_id_hex,
                         signer_xrpl_address: relay.signer_xrpl_address,
+                        quorum_bundle: relay.quorum_bundle,
                     };
                     match self.publish_signing(&msg) {
                         Ok(_) => {
@@ -2296,6 +2360,7 @@ impl P2PNode {
                                 unsigned_tx,
                                 signer_account_id_hex,
                                 signer_xrpl_address,
+                                quorum_bundle,
                             }) => {
                                 // Is this request addressed to our local signer?
                                 // Clone up-front so subsequent borrows can mutate
@@ -2355,6 +2420,7 @@ impl P2PNode {
                                     &request_id,
                                     &unsigned_tx,
                                     &signer_account_id_hex,
+                                    quorum_bundle.as_deref(),
                                 ).await;
                                 if let Err(e) = self.publish_signing(&response) {
                                     error!("failed to publish signing response: {}", e);
@@ -2884,6 +2950,9 @@ mod tests {
     // base58 alphabet check inside multi_signing_hash and blow up the
     // good-tx test before it reaches the assertion.
     const TEST_ESCROW: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+    /// β4 Thread A: stand-in for the β1 quorum bundle the governance signing
+    /// path requires. Opaque to the orchestrator — the ENCLAVE verifies it.
+    const TEST_BUNDLE_HEX: &str = "beefcafe";
     const TEST_DESTINATION: &str = "rN7n7otQDd6FczFgLdSqtcsAUxDkw6fzRH";
     const TEST_ATTACKER: &str = "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe";
 
@@ -3414,37 +3483,72 @@ mod tests {
     use serde_json::Value as JsonValue;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Spawns an axum mock enclave that records each `/v1/pool/sign`
-    /// hit and returns a canned signature envelope. Returns the base
-    /// URL (no `/pool/sign` suffix) and a hit-counter handle.
+    /// β4 Thread A wire contract (AC-β4-A2): the enclave receives the
+    /// for-signing BLOB and re-derives the hash itself — a digest must never
+    /// reach it again. Asserting `hash` is absent turns any regression back to
+    /// hash-on-the-wire into a test failure. `require_bundle` additionally
+    /// enforces AC-β4-A1 on the governance route.
+    fn assert_typed_sign_body(body: &JsonValue, require_bundle: bool) {
+        assert!(
+            body.get("hash").is_none(),
+            "regression: a digest reached the enclave — the typed contract sends tx_blob only"
+        );
+        let blob = body["tx_blob"].as_str().unwrap_or("");
+        assert!(
+            !blob.is_empty() && blob.len() % 2 == 0 && blob.chars().all(|c| c.is_ascii_hexdigit()),
+            "enclave received a malformed tx_blob: {blob}"
+        );
+        if require_bundle {
+            assert!(
+                body["quorum_bundle"]
+                    .as_str()
+                    .is_some_and(|b| !b.is_empty()),
+                "governance signing must carry the β1 quorum bundle"
+            );
+        }
+    }
+
+    fn canned_signature() -> Json<JsonValue> {
+        Json(serde_json::json!({
+            "status": "success",
+            "signature": {
+                // Deterministic 32-byte r/s — the tests assert on the DER bytes.
+                "r": "11".repeat(32),
+                "s": "22".repeat(32),
+            }
+        }))
+    }
+
+    /// Spawns an axum mock enclave exposing the two typed signing routes,
+    /// recording each hit and returning a canned signature envelope. Returns
+    /// the base URL (no route suffix) and a hit-counter handle.
     async fn spawn_mock_enclave() -> (String, std::sync::Arc<AtomicUsize>) {
         let hits = std::sync::Arc::new(AtomicUsize::new(0));
-        let hits_for_route = hits.clone();
-        let app = Router::new().route(
-            "/v1/pool/sign",
-            post(move |Json(body): Json<JsonValue>| {
-                let hits = hits_for_route.clone();
-                async move {
-                    hits.fetch_add(1, Ordering::SeqCst);
-                    // Sanity: production sends `from`, `hash`,
-                    // `session_key`. Hash is `0x` + 64 hex.
-                    let hash = body["hash"].as_str().unwrap_or("");
-                    assert!(
-                        hash.starts_with("0x") && hash.len() == 66,
-                        "enclave received malformed hash: {hash}"
-                    );
-                    Json(serde_json::json!({
-                        "status": "success",
-                        "signature": {
-                            // Deterministic 32-byte r/s — the tests
-                            // assert on the resulting DER bytes.
-                            "r": "11".repeat(32),
-                            "s": "22".repeat(32),
-                        }
-                    }))
-                }
-            }),
-        );
+        let hits_value = hits.clone();
+        let hits_gov = hits.clone();
+        let app = Router::new()
+            .route(
+                "/v1/pool/sign/withdrawal-payment",
+                post(move |Json(body): Json<JsonValue>| {
+                    let hits = hits_value.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        assert_typed_sign_body(&body, false);
+                        canned_signature()
+                    }
+                }),
+            )
+            .route(
+                "/v1/pool/sign/governance-signerlistset",
+                post(move |Json(body): Json<JsonValue>| {
+                    let hits = hits_gov.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        assert_typed_sign_body(&body, true);
+                        canned_signature()
+                    }
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -3465,6 +3569,7 @@ mod tests {
             "wire-signerlist-1",
             &good_signerlist_tx(),
             &signer_acct_id_hex(),
+            Some(TEST_BUNDLE_HEX),
         )
         .await;
 
@@ -3508,6 +3613,7 @@ mod tests {
             "wire-signerlist-quorum1",
             &tx,
             &signer_acct_id_hex(),
+            Some(TEST_BUNDLE_HEX),
         )
         .await;
 
@@ -3545,6 +3651,7 @@ mod tests {
             "wire-signerlist-attacker",
             &tx,
             &signer_acct_id_hex(),
+            Some(TEST_BUNDLE_HEX),
         )
         .await;
 
@@ -3576,6 +3683,7 @@ mod tests {
             unsigned_tx: good_signerlist_tx(),
             signer_account_id_hex: signer_acct_id_hex(),
             signer_xrpl_address: test_local_signer().xrpl_address,
+            quorum_bundle: Some(TEST_BUNDLE_HEX.to_string()),
         };
         let wire = serde_json::to_string(&req).expect("serialize");
         let parsed: SigningMessage = serde_json::from_str(&wire).expect("deserialize");
@@ -3583,10 +3691,14 @@ mod tests {
             SigningMessage::Request {
                 request_id,
                 unsigned_tx,
+                quorum_bundle,
                 ..
             } => {
                 assert_eq!(request_id, "rt-1");
                 assert_eq!(unsigned_tx, good_signerlist_tx());
+                // β4 Thread A: the β1 bundle must survive the wire — without it
+                // the receiver's enclave refuses to cosign the SignerListSet.
+                assert_eq!(quorum_bundle.as_deref(), Some(TEST_BUNDLE_HEX));
             }
             _ => panic!("expected Request"),
         }

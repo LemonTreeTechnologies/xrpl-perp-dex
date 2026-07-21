@@ -77,6 +77,7 @@ impl LibP2PProjectionSubmitter {
     async fn collect_and_assemble(
         &self,
         unsigned: &serde_json::Value,
+        quorum_bundle_hex: &str,
     ) -> Result<serde_json::Value> {
         let mut collected: Vec<serde_json::Value> = Vec::new();
         for (xrpl_address, account_id_hex) in &self.current_signers {
@@ -93,6 +94,10 @@ impl LibP2PProjectionSubmitter {
                     signer_account_id_hex: account_id_hex.clone(),
                     signer_xrpl_address: xrpl_address.clone(),
                     response_tx: resp_tx,
+                    // β4 Thread A (AC-β4-A1): the governance signing path in each
+                    // signer's enclave requires the β1 bundle that authorised the
+                    // epoch we are projecting.
+                    quorum_bundle: Some(quorum_bundle_hex.to_string()),
                 })
                 .await
                 .is_err()
@@ -160,8 +165,11 @@ impl ProjectionSubmitter for LibP2PProjectionSubmitter {
     async fn sign_submit_confirm(
         &self,
         unsigned_signerlist_set: &serde_json::Value,
+        quorum_bundle_hex: &str,
     ) -> Result<ProjectionConfirmedTx> {
-        let full_tx = self.collect_and_assemble(unsigned_signerlist_set).await?;
+        let full_tx = self
+            .collect_and_assemble(unsigned_signerlist_set, quorum_bundle_hex)
+            .await?;
 
         let tx_hash_hex = submit_multisigned(&self.xrpl_url, &full_tx)
             .await
@@ -237,7 +245,7 @@ mod tests {
         });
 
         let full = submitter
-            .collect_and_assemble(&render_min_signerlist())
+            .collect_and_assemble(&render_min_signerlist(), "beefcafe")
             .await
             .unwrap();
         let arr = full["Signers"].as_array().unwrap();
@@ -274,7 +282,7 @@ mod tests {
         });
 
         let err = submitter
-            .collect_and_assemble(&render_min_signerlist())
+            .collect_and_assemble(&render_min_signerlist(), "beefcafe")
             .await
             .unwrap_err()
             .to_string();
@@ -313,7 +321,7 @@ mod tests {
         });
 
         let full = submitter
-            .collect_and_assemble(&render_min_signerlist())
+            .collect_and_assemble(&render_min_signerlist(), "beefcafe")
             .await
             .unwrap();
         let arr = full["Signers"].as_array().unwrap();
