@@ -1420,17 +1420,13 @@ impl P2PNode {
         mrenclave_new: &[u8; 32],
         ceremony_nonce: &[u8; 32],
     ) -> SigningMessage {
-        use sha2::{Digest, Sha256};
-        const DOMAIN: &[u8] = b"PATHA_DELEGATION_v1";
-
-        // X-C1: re-derive hash LOCALLY. Never trust a hash on the wire.
-        let mut hasher = Sha256::new();
-        hasher.update(DOMAIN);
-        hasher.update(mrenclave_new);
-        hasher.update(ceremony_nonce);
-        let hash = hasher.finalize();
-        let hash_hex = format!("0x{}", hex::encode(hash));
-
+        // β4 Thread A site D (RESP-β4 AC-β4-A2): the ENCLAVE re-derives the
+        // delegation cover SHA-256("PATHA_DELEGATION_v1" || mrenclave_new ||
+        // ceremony_nonce) from these raw bytes. We no longer compute a hash here
+        // and hand it to a bare signing oracle — that oracle now REFUSES the
+        // escrow-role key. X-C1's "never trust a hash on the wire" is therefore
+        // enforced inside the enclave, not merely re-derived by the (untrusted)
+        // orchestrator.
         let http = match crate::http_helpers::loopback_http_client(Duration::from_secs(15)) {
             Ok(c) => c,
             Err(e) => {
@@ -1444,13 +1440,14 @@ impl P2PNode {
             }
         };
 
-        let sign_url = format!("{}/pool/sign", local_signer.enclave_url);
+        let sign_url = format!("{}/pool/sign/patha-delegation", local_signer.enclave_url);
         let resp = http
             .post(&sign_url)
             .json(&serde_json::json!({
                 "from": local_signer.address,
-                "hash": hash_hex,
                 "session_key": local_signer.session_key,
+                "mrenclave_new": hex::encode(mrenclave_new),
+                "ceremony_nonce": hex::encode(ceremony_nonce),
             }))
             .send()
             .await;
@@ -1520,12 +1517,26 @@ impl P2PNode {
         new_signers: &[crate::membership_canonical::SignerEntry],
         new_quorum: u32,
     ) -> SigningMessage {
-        use crate::membership_canonical::{compute_membership_message_hash, compute_set_hash};
-
-        let new_set_hash = compute_set_hash(new_signers, new_quorum);
-        let message_hash =
-            compute_membership_message_hash(escrow, proposed_epoch, prev_epoch_hash, &new_set_hash);
-        let hash_hex = format!("0x{}", hex::encode(message_hash));
+        // β4 Thread A site C (RESP-β4 AC-β4-A2): the ENCLAVE re-derives the
+        // domain-separated consent hash itself (compute_membership_message_hash
+        // over compute_set_hash) from the structured fields below. We no longer
+        // compute a digest here and hand it to a bare signing oracle — that oracle
+        // now REFUSES the escrow-role key. X-C1's "never trust a hash on the wire"
+        // is thus enforced inside the enclave, not merely re-derived by the
+        // (untrusted) orchestrator.
+        //
+        // `signers` goes as a JSON array of {account_id, weight} — identical to the
+        // seal-epoch body — and the enclave server packs it via pack_signers(), so
+        // the sealed_signer_entry_t layout never crosses the language boundary.
+        let signers_json: Vec<serde_json::Value> = new_signers
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "account_id": hex::encode(s.account_id),
+                    "weight": s.weight,
+                })
+            })
+            .collect();
 
         let http = match crate::http_helpers::loopback_http_client(Duration::from_secs(15)) {
             Ok(c) => c,
@@ -1538,13 +1549,17 @@ impl P2PNode {
             }
         };
 
-        let sign_url = format!("{}/pool/sign", local_signer.enclave_url);
+        let sign_url = format!("{}/admin/signerlist/sign-consent", local_signer.enclave_url);
         let resp = http
             .post(&sign_url)
             .json(&serde_json::json!({
                 "from": local_signer.address,
-                "hash": hash_hex,
                 "session_key": local_signer.session_key,
+                "escrow_account_id": hex::encode(escrow),
+                "signers": signers_json,
+                "quorum_threshold": new_quorum,
+                "proposed_epoch": proposed_epoch,
+                "prev_epoch_hash": hex::encode(prev_epoch_hash),
             }))
             .send()
             .await;
