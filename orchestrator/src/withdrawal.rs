@@ -16,7 +16,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
-use xrpl_mithril_codec::signing;
 
 use crate::p2p::{SigningMessage, SigningRelay};
 use crate::xrpl_signer;
@@ -79,18 +78,28 @@ pub struct SignersConfig {
 
 /// Ask a remote enclave to ECDSA-sign a 32-byte hash.
 /// Returns (DER signature hex uppercase, compressed pubkey hex uppercase).
+/// β4 Thread A (AC-β4-A2): sends the for-signing BLOB, never a digest — the
+/// enclave re-derives the hash itself and refuses anything that is not a
+/// `Payment`. (The bare hash-signing oracle refuses the escrow-role key
+/// outright, so a digest here would simply be rejected.)
 async fn sign_with_enclave(
     http: &reqwest::Client,
     signer: &SignerConfig,
-    hash: &[u8; 32],
+    tx_map: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(String, String)> {
-    let hash_hex = format!("0x{}", hex::encode(hash));
+    let mut blob = Vec::new();
+    xrpl_mithril_codec::serializer::serialize_json_object(tx_map, &mut blob, true)
+        .map_err(|e| anyhow::anyhow!("serialise for signing failed: {e:?}"))?;
+
     let resp: serde_json::Value = http
-        .post(format!("{}/pool/sign", signer.enclave_url))
+        .post(format!(
+            "{}/pool/sign/withdrawal-payment",
+            signer.enclave_url
+        ))
         .json(&serde_json::json!({
             "from": signer.address,
-            "hash": hash_hex,
             "session_key": signer.session_key,
+            "tx_blob": hex::encode(&blob),
         }))
         .timeout(std::time::Duration::from_secs(30))
         .send()
@@ -192,16 +201,56 @@ pub async fn process_withdrawal(
         "processing multisig withdrawal"
     );
 
-    // Step 1: Margin check in local enclave — deducts balance if sufficient.
+    // Step 1: autofill + build the unsigned Payment, BEFORE the margin check.
+    //
+    // β4 Thread A (AC-β4-A2): the margin-check ecall signs the transaction
+    // BLOB, so the tx must exist first. This also restores the atomicity the
+    // ecall was designed for: it used to be handed a DUMMY all-zero hash (the
+    // real signatures being collected separately below), which both subverted
+    // "check and sign" and is now impossible — the escrow-role key refuses to
+    // sign a bare hash at all. Nothing here depends on the margin result: the
+    // sequence is an XRPL read and the rest comes from the request/config.
+    let sequence = fetch_account_sequence(xrpl_url, escrow_address)
+        .await
+        .unwrap_or(1);
+
+    // Fee for multisig = base_fee * (1 + N_signers). Use generous fee.
+    let fee = format!("{}", 12 * (1 + signers_config.quorum as u64));
+    let mut tx_json = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": escrow_address,
+        "Destination": req.destination,
+        "Amount": format!("{}", (req.amount.parse::<f64>().unwrap_or(0.0) * 1_000_000.0) as u64),
+        "Fee": fee,
+        "Sequence": sequence,
+        "SigningPubKey": ""
+    });
+    if let Some(tag) = req.destination_tag {
+        tx_json["DestinationTag"] = serde_json::json!(tag);
+    }
+    let tx_map = tx_json.as_object().context("tx_json is not an object")?;
+
+    info!(
+        sequence,
+        fee = %fee,
+        signers = signers_config.signers.len(),
+        quorum = signers_config.quorum,
+        "built unsigned multisig Payment tx"
+    );
+
+    // Step 2: Margin check in local enclave — deducts balance if sufficient.
     // The local_signer is the credentials of THIS orchestrator's enclave, which
-    // holds the user's deposit state. We pass a dummy hash because the actual
-    // multisig signing is done per-signer below via remote enclave calls.
+    // holds the user's deposit state. The signature it returns is this node's
+    // own cosignature over the Payment; the quorum signatures are collected
+    // per-signer below, so it is not consumed here.
     let local = signers_config
         .local_signer
         .as_ref()
         .or_else(|| signers_config.signers.first())
         .context("no signers configured (need local_signer or at least one signer)")?;
-    let dummy_hash = "0".repeat(64);
+    let mut margin_blob = Vec::new();
+    xrpl_mithril_codec::serializer::serialize_json_object(tx_map, &mut margin_blob, true)
+        .map_err(|e| anyhow::anyhow!("serialise for signing failed: {e:?}"))?;
     let local_session_key = local.session_key.trim_start_matches("0x");
     let margin_result = perp
         .withdraw(
@@ -209,7 +258,7 @@ pub async fn process_withdrawal(
             &req.amount,
             &local.address,
             local_session_key,
-            &dummy_hash,
+            &hex::encode(&margin_blob),
         )
         .await;
 
@@ -241,37 +290,7 @@ pub async fn process_withdrawal(
         }
     }
 
-    // Step 2: Autofill — get account sequence from XRPL
-    let sequence = fetch_account_sequence(xrpl_url, escrow_address)
-        .await
-        .unwrap_or(1);
-
-    // Step 3: Build unsigned Payment tx (SigningPubKey="" signals multisig)
-    // Fee for multisig = base_fee * (1 + N_signers). Use generous fee.
-    let fee = format!("{}", 12 * (1 + signers_config.quorum as u64));
-    let mut tx_json = serde_json::json!({
-        "TransactionType": "Payment",
-        "Account": escrow_address,
-        "Destination": req.destination,
-        "Amount": format!("{}", (req.amount.parse::<f64>().unwrap_or(0.0) * 1_000_000.0) as u64),
-        "Fee": fee,
-        "Sequence": sequence,
-        "SigningPubKey": ""
-    });
-    if let Some(tag) = req.destination_tag {
-        tx_json["DestinationTag"] = serde_json::json!(tag);
-    }
-    let tx_map = tx_json.as_object().context("tx_json is not an object")?;
-
-    info!(
-        sequence,
-        fee = %fee,
-        signers = signers_config.signers.len(),
-        quorum = signers_config.quorum,
-        "built unsigned multisig Payment tx"
-    );
-
-    // Step 4: Collect signatures from quorum signers.
+    // Step 3: Collect signatures from quorum signers.
     //
     // O-L4 known gap: each `signer.enclave_url` points at a cross-VM
     // peer enclave that currently serves a self-signed cert, so we
@@ -300,16 +319,13 @@ pub async fn process_withdrawal(
         };
 
         // Use P2P relay if available, otherwise fall back to direct HTTP.
-        // P2P path sends the full tx and lets the receiver derive the hash
-        // (see X-C1 comment on `sign_via_p2p`). HTTP fallback still needs
-        // the hash locally because it POSTs directly to `/pool/sign`.
+        // Both paths now send the full tx / its for-signing serialization and
+        // let the ENCLAVE derive the hash (β4 Thread A AC-β4-A2) — neither ever
+        // puts a digest on the wire.
         let sign_result = if let Some(stx) = signing_tx {
             sign_via_p2p(stx, signer, &tx_json, &account_id, 30).await
         } else {
-            let hash = signing::multi_signing_hash(tx_map, &account_id).map_err(|e| {
-                anyhow::anyhow!("multi_signing_hash for {} failed: {:?}", signer.name, e)
-            })?;
-            sign_with_enclave(&http, signer, &hash).await
+            sign_with_enclave(&http, signer, tx_map).await
         };
 
         match sign_result {

@@ -136,13 +136,16 @@ impl PerpClient {
 
     /// Atomic margin check + XRPL withdrawal tx signing.
     #[allow(dead_code)]
+    /// β4 Thread A (AC-β4-A2): `tx_blob` is the for-signing serialization of the
+    /// Payment — the enclave re-derives the signing hash itself and refuses any
+    /// non-Payment. A bare hash is no longer accepted here.
     pub async fn withdraw(
         &self,
         user_id: &str,
         amount: &str,
         escrow_account_id: &str,
         session_key: &str,
-        tx_hash: &str,
+        tx_blob: &str,
     ) -> Result<Value> {
         self.post(
             "/perp/withdraw",
@@ -151,7 +154,7 @@ impl PerpClient {
                 "amount": amount,
                 "escrow_account_id": escrow_account_id,
                 "session_key": session_key,
-                "tx_hash": tx_hash,
+                "tx_blob": tx_blob,
             }),
         )
         .await
