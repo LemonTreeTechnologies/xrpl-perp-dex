@@ -3766,6 +3766,48 @@ mod tests {
         }
     }
 
+    /// β4 Thread A (AC-β4-A1, RESP-β4-impl §5): a SignerListSet request WITHOUT
+    /// the β1 quorum bundle must be refused here — before the enclave is touched
+    /// — rather than failing opaquely inside it. Asserts the enclave saw zero
+    /// hits, so the rejection is genuinely local.
+    #[tokio::test]
+    async fn wire_signerlist_without_bundle_rejected_before_enclave() {
+        let (base_url, hits) = spawn_mock_enclave().await;
+        let mut signer = test_local_signer();
+        signer.enclave_url = base_url;
+
+        let resp = P2PNode::handle_signing_request(
+            &signer,
+            Some(TEST_ESCROW),
+            "wire-signerlist-no-bundle",
+            &good_signerlist_tx(),
+            &signer_acct_id_hex(),
+            None, // governance request with no bundle
+        )
+        .await;
+
+        match resp {
+            SigningMessage::Response {
+                der_signature,
+                error,
+                ..
+            } => {
+                assert!(der_signature.is_none(), "must not produce a signature");
+                let err = error.expect("expected a rejection");
+                assert!(
+                    err.contains("quorum_bundle"),
+                    "error should name the missing bundle, got: {err}"
+                );
+            }
+            _ => panic!("expected Response"),
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the enclave must not be contacted for a bundle-less SignerListSet"
+        );
+    }
+
     #[tokio::test]
     async fn signing_message_round_trips_signerlist_through_serde() {
         // Locks the wire contract: the `SigningMessage::Request`
