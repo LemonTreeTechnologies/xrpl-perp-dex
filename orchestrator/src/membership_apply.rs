@@ -26,7 +26,9 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::membership_coordinator::{ClusterSealApplier, MembershipEpochStatement, NodeSealResult};
+use crate::membership_coordinator::{
+    ClusterGenesisApplier, ClusterSealApplier, MembershipEpochStatement, NodeSealResult,
+};
 use crate::membership_projection::{ClusterConfirmApplier, NodeConfirmResult};
 use crate::p2p::{
     MembershipApplyPayload, MembershipApplyRelay, MembershipSignerWire, SigningMessage,
@@ -164,6 +166,53 @@ impl ClusterSealApplier for LibP2PMembershipApplier {
             prev_epoch_hash_hex: hex::encode(statement.prev_epoch_hash),
             new_signers,
             new_quorum: statement.new_quorum,
+            quorum_bundle_hex: hex::encode(bundle),
+        };
+        let acks = self.broadcast_and_collect(payload).await?;
+        let ok_count = acks.iter().filter(|a| a.ok).count();
+        let mut out: Vec<NodeSealResult> = acks
+            .into_iter()
+            .map(|a| NodeSealResult {
+                node: a.node,
+                ok: a.ok,
+                error: a.error,
+            })
+            .collect();
+        if let Some(msg) = self.shortfall_error(ok_count) {
+            out.push(NodeSealResult {
+                node: "<cluster>".into(),
+                ok: false,
+                error: Some(msg),
+            });
+        }
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl ClusterGenesisApplier for LibP2PMembershipApplier {
+    /// β4 Thread A genesis: one broadcast, every node bootstraps its OWN enclave
+    /// from the founding attestation and acks — the same (P) single-successor
+    /// shape as `apply_seal`, so genesis cannot fork the cluster either.
+    async fn apply_genesis(
+        &self,
+        statement: &MembershipEpochStatement,
+        bundle: &[u8],
+    ) -> Result<Vec<NodeSealResult>> {
+        let signers: Vec<MembershipSignerWire> = statement
+            .new_signers
+            .iter()
+            .map(|s| MembershipSignerWire {
+                account_id_hex: hex::encode(s.account_id),
+                weight: s.weight,
+            })
+            .collect();
+        let payload = MembershipApplyPayload::Bootstrap {
+            escrow_hex: hex::encode(statement.escrow),
+            epoch: statement.proposed_epoch,
+            prev_epoch_hash_hex: hex::encode(statement.prev_epoch_hash),
+            signers,
+            quorum: statement.new_quorum,
             quorum_bundle_hex: hex::encode(bundle),
         };
         let acks = self.broadcast_and_collect(payload).await?;

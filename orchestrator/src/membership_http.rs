@@ -21,13 +21,16 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 
-use crate::membership_coordinator::{EpochDigestSource, EpochSealSink, MembershipEpochStatement};
+use crate::membership_coordinator::{
+    EpochDigestSource, EpochSealSink, GenesisBootstrapSink, MembershipEpochStatement,
+};
 use crate::membership_projection::{MembershipSyncState, ProjectionConfirmer, SyncStateSource};
 
 const EPOCH_DIGEST_PATH: &str = "/v1/admin/signerlist/epoch-digest";
 const SEAL_EPOCH_PATH: &str = "/v1/admin/signerlist/seal-epoch";
 const SYNC_STATE_PATH: &str = "/v1/admin/signerlist/sync-state";
 const RECORD_CONFIRMATION_PATH: &str = "/v1/admin/signerlist/record-projection-confirmation";
+const BOOTSTRAP_ATTESTED_PATH: &str = "/v1/admin/signerlist/bootstrap-attested";
 
 // ── pure contract (testable without IO) ──────────────────────────
 
@@ -51,6 +54,41 @@ fn build_seal_request(statement: &MembershipEpochStatement, bundle: &[u8]) -> se
         "signers": signers,
         "quorum_threshold": statement.new_quorum,
         "proposed_epoch": statement.proposed_epoch,
+    })
+}
+
+/// β4 Thread A genesis (RESP-β4-threadA-impl.1 option 2): build the
+/// bootstrap-attested POST body. Field names MUST match
+/// `signerlist_handler.cpp::handleBootstrapFromQuorumAttestation`.
+///
+/// At genesis the ATTESTING set IS the AUTHORITY set, and the epoch is sealed
+/// already in-sync (`confirmed_epoch == authority_epoch`) because there is no
+/// prior projection to catch up to. Both are derived here rather than taken as
+/// parameters, so a caller cannot express a mismatch.
+fn build_bootstrap_attested_request(
+    statement: &MembershipEpochStatement,
+    bundle: &[u8],
+) -> serde_json::Value {
+    let signers: Vec<serde_json::Value> = statement
+        .new_signers
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "account_id": hex::encode(s.account_id),
+                "weight": s.weight,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "escrow_account_id": hex::encode(statement.escrow),
+        "authority_signers": signers,
+        "authority_quorum": statement.new_quorum,
+        "authority_epoch": statement.proposed_epoch,
+        "confirmed_epoch": statement.proposed_epoch,
+        "prev_epoch_hash": hex::encode(statement.prev_epoch_hash),
+        "attesting_signers": signers,
+        "attesting_quorum": statement.new_quorum,
+        "quorum_bundle": hex::encode(bundle),
     })
 }
 
@@ -176,6 +214,46 @@ impl EpochSealSink for HttpEpochSealSink {
             .await
             .with_context(|| format!("POST seal-epoch to {node_admin_url}"))?;
         let body: serde_json::Value = resp.json().await.context("seal-epoch response body")?;
+        parse_seal_response(&body)
+    }
+}
+
+/// β4 Thread A genesis: POSTs `bootstrap-attested` to a node's enclave admin route.
+pub struct HttpGenesisBootstrapSink {
+    client: reqwest::Client,
+}
+
+impl HttpGenesisBootstrapSink {
+    pub fn new(client: reqwest::Client) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl GenesisBootstrapSink for HttpGenesisBootstrapSink {
+    async fn bootstrap_on_node(
+        &self,
+        node_admin_url: &str,
+        statement: &MembershipEpochStatement,
+        bundle: &[u8],
+    ) -> Result<()> {
+        let url = format!(
+            "{}{}",
+            node_admin_url.trim_end_matches('/'),
+            BOOTSTRAP_ATTESTED_PATH
+        );
+        let req = build_bootstrap_attested_request(statement, bundle);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&req)
+            .send()
+            .await
+            .with_context(|| format!("POST bootstrap-attested to {node_admin_url}"))?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("bootstrap-attested response body")?;
         parse_seal_response(&body)
     }
 }
@@ -343,6 +421,26 @@ mod tests {
             2,
         )
         .expect("valid")
+    }
+
+    /// β4 Thread A genesis: the bootstrap-attested body must (a) use the enclave
+    /// handler's field names, (b) carry the ATTESTING set identical to the
+    /// AUTHORITY set, and (c) seal already in-sync. (b)+(c) are derived, never
+    /// caller-supplied, so a mismatch is unrepresentable on the wire.
+    #[test]
+    fn bootstrap_attested_request_is_self_attesting_and_in_sync() {
+        let st = prepare_statement([0xAA; 20], 0, [0u8; 32], vec![entry(0x01, 1)], 1).expect("ok");
+        let body = build_bootstrap_attested_request(&st, &[0xBE, 0xEF]);
+
+        assert_eq!(body["escrow_account_id"], "aa".repeat(20));
+        assert_eq!(body["prev_epoch_hash"], "00".repeat(32));
+        assert_eq!(body["quorum_bundle"], "beef");
+        assert_eq!(body["authority_epoch"], 1);
+        // in-sync at genesis: there is no prior projection to catch up to
+        assert_eq!(body["confirmed_epoch"], body["authority_epoch"]);
+        // self-attesting: the founding members attest their own founding epoch
+        assert_eq!(body["attesting_signers"], body["authority_signers"]);
+        assert_eq!(body["attesting_quorum"], body["authority_quorum"]);
     }
 
     #[test]

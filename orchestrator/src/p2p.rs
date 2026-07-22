@@ -263,6 +263,23 @@ pub enum MembershipApplyPayload {
         tx_hash_hex: String,
         ledger_index: u64,
     },
+    /// β4 Thread A genesis (RESP-β4-threadA-impl.1 option 2): apply
+    /// `ecall_bootstrap_from_quorum_attestation` locally — seal epoch 1 from the
+    /// β1 quorum attestation, with NO pre-seal XRPL SignerListSet signature
+    /// (which the retired bare oracle can no longer produce).
+    ///
+    /// One signer set travels: at genesis the ATTESTING set IS the AUTHORITY set
+    /// (the founding members attest their own founding epoch — self-authorising,
+    /// which is exactly 6(e)'s incoming-quorum strength, no more). The receiver
+    /// passes it as both, so the wire cannot express a mismatch.
+    Bootstrap {
+        escrow_hex: String,
+        epoch: u64,
+        prev_epoch_hash_hex: String,
+        signers: Vec<MembershipSignerWire>,
+        quorum: u32,
+        quorum_bundle_hex: String,
+    },
 }
 
 /// Decode exactly 20 hex bytes → `[u8; 20]`, or `None` on any malformed input.
@@ -1646,7 +1663,9 @@ impl P2PNode {
         payload: &MembershipApplyPayload,
     ) -> SigningMessage {
         use crate::membership_canonical::SignerEntry;
-        use crate::membership_coordinator::{prepare_statement, EpochSealSink};
+        use crate::membership_coordinator::{
+            prepare_statement, EpochSealSink, GenesisBootstrapSink,
+        };
         use crate::membership_http::{HttpEpochSealSink, HttpProjectionConfirmer};
         use crate::membership_projection::ProjectionConfirmer;
 
@@ -1754,6 +1773,83 @@ impl P2PNode {
                 };
                 HttpEpochSealSink::new(client)
                     .seal_on_node(&base, &statement, &bundle)
+                    .await
+            }
+            MembershipApplyPayload::Bootstrap {
+                escrow_hex,
+                epoch,
+                prev_epoch_hash_hex,
+                signers,
+                quorum,
+                quorum_bundle_hex,
+            } => {
+                let escrow = match decode_20(escrow_hex) {
+                    Some(a) => a,
+                    None => {
+                        return Self::membership_sign_error(
+                            local_signer,
+                            request_id,
+                            "apply.bootstrap: bad escrow_hex".into(),
+                        )
+                    }
+                };
+                let prev = match decode_32(prev_epoch_hash_hex) {
+                    Some(a) => a,
+                    None => {
+                        return Self::membership_sign_error(
+                            local_signer,
+                            request_id,
+                            "apply.bootstrap: bad prev_epoch_hash_hex".into(),
+                        )
+                    }
+                };
+                let mut entries = Vec::with_capacity(signers.len());
+                for s in signers {
+                    match decode_20(&s.account_id_hex) {
+                        Some(account_id) => entries.push(SignerEntry {
+                            account_id,
+                            weight: s.weight,
+                        }),
+                        None => {
+                            return Self::membership_sign_error(
+                                local_signer,
+                                request_id,
+                                "apply.bootstrap: bad signer account_id_hex".into(),
+                            )
+                        }
+                    }
+                }
+                let bundle = match hex::decode(quorum_bundle_hex) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        return Self::membership_sign_error(
+                            local_signer,
+                            request_id,
+                            "apply.bootstrap: bad quorum_bundle hex".into(),
+                        )
+                    }
+                };
+                // X-C1: re-derive the statement LOCALLY from the carried fields
+                // (same discipline as the seal arm) — the founding epoch is 1, so
+                // current_epoch = epoch-1 = 0 and current_digest = prev (zero).
+                let statement = match prepare_statement(
+                    escrow,
+                    epoch.saturating_sub(1),
+                    prev,
+                    entries,
+                    *quorum,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Self::membership_sign_error(
+                            local_signer,
+                            request_id,
+                            format!("apply.bootstrap: prepare {e:?}"),
+                        )
+                    }
+                };
+                crate::membership_http::HttpGenesisBootstrapSink::new(client)
+                    .bootstrap_on_node(&base, &statement, &bundle)
                     .await
             }
             MembershipApplyPayload::Confirm {

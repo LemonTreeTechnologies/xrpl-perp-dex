@@ -271,6 +271,20 @@ pub trait EpochSealSink: Send + Sync {
     ) -> Result<()>;
 }
 
+/// β4 Thread A genesis (RESP-β4-threadA-impl.1 option 2): seal the FOUNDING
+/// epoch on one node from the β1 quorum attestation, instead of an XRPL
+/// SignerListSet cosigned pre-seal by the escrow pool key — which the retired
+/// bare oracle can no longer produce. Same loopback discipline as `EpochSealSink`.
+#[async_trait]
+pub trait GenesisBootstrapSink: Send + Sync {
+    async fn bootstrap_on_node(
+        &self,
+        node_admin_url: &str,
+        statement: &MembershipEpochStatement,
+        bundle: &[u8],
+    ) -> Result<()>;
+}
+
 /// Applies a sealed `(statement, bundle)` across the WHOLE cluster in one shot,
 /// returning one `NodeSealResult` per node. Under the loopback-enclave topology
 /// (X-C1: the enclave admin API is never network-exposed) this is NOT a per-node
@@ -282,6 +296,18 @@ pub trait EpochSealSink: Send + Sync {
 #[async_trait]
 pub trait ClusterSealApplier: Send + Sync {
     async fn apply_seal(
+        &self,
+        statement: &MembershipEpochStatement,
+        bundle: &[u8],
+    ) -> Result<Vec<NodeSealResult>>;
+}
+
+/// β4 Thread A genesis: applies the FOUNDING epoch across the whole cluster in
+/// one broadcast (same loopback topology as `ClusterSealApplier` — each node
+/// bootstraps its OWN enclave and acks).
+#[async_trait]
+pub trait ClusterGenesisApplier: Send + Sync {
+    async fn apply_genesis(
         &self,
         statement: &MembershipEpochStatement,
         bundle: &[u8],
@@ -358,6 +384,59 @@ pub async fn run_membership_change(
         .apply_seal(&statement, &bundle)
         .await
         .context("apply sealed epoch across the cluster")?;
+
+    Ok(MembershipChangeOutcome {
+        proposed_epoch: statement.proposed_epoch,
+        message_hash: statement.message_hash,
+        bundle_len: bundle.len(),
+        node_results,
+        quorum_bundle_hex: hex::encode(&bundle),
+    })
+}
+
+/// β4 Thread A genesis (RESP-β4-threadA-impl.1 option 2) — found the cluster's
+/// FIRST epoch without any pre-seal XRPL signature.
+///
+/// Since the retire, the escrow pool key cannot sign a bare hash, and the
+/// governance path needs a sealed authority that does not exist yet at genesis.
+/// So the founding members instead attest their own founding epoch with the β1
+/// consent bundle, and each enclave seals it via
+/// `ecall_bootstrap_from_quorum_attestation`.
+///
+/// The statement is the ordinary β1 one with `current_epoch = 0` and a zero
+/// `prev_epoch_hash`, which yields `proposed_epoch = 1` and the exact message
+/// hash the enclave recomputes — no genesis-specific canonical encoding exists,
+/// and none should.
+///
+/// Honest bound (auditor §5): attesting == authority == the operator-supplied
+/// set, so this is SELF-AUTHORISING — it equals 6(e)'s incoming-quorum strength
+/// and no more. Epoch-1 authenticity still rests on the escrow master key and
+/// the DCAP mesh, not on this bundle.
+pub async fn run_genesis_bootstrap(
+    escrow: [u8; 20],
+    genesis_signers: Vec<SignerEntry>,
+    genesis_quorum: u32,
+    collector: &dyn MembershipBundleCollector,
+    applier: &dyn ClusterGenesisApplier,
+) -> Result<MembershipChangeOutcome> {
+    let statement = prepare_statement(
+        escrow,
+        /* current_epoch */ 0,
+        /* current_epoch_digest */ [0u8; 32],
+        genesis_signers,
+        genesis_quorum,
+    )
+    .map_err(|e| anyhow!("prepare genesis statement: {e:?}"))?;
+
+    let bundle = collector
+        .collect(&statement)
+        .await
+        .context("collect founding-quorum consent")?;
+
+    let node_results = applier
+        .apply_genesis(&statement, &bundle)
+        .await
+        .context("bootstrap the founding epoch across the cluster")?;
 
     Ok(MembershipChangeOutcome {
         proposed_epoch: statement.proposed_epoch,
@@ -611,6 +690,19 @@ mod tests {
         }
     }
     #[async_trait]
+    impl ClusterGenesisApplier for MockApplier {
+        async fn apply_genesis(
+            &self,
+            st: &MembershipEpochStatement,
+            bundle: &[u8],
+        ) -> Result<Vec<NodeSealResult>> {
+            // Same bookkeeping as apply_seal so the genesis tests can assert on
+            // exactly what was broadcast.
+            self.apply_seal(st, bundle).await
+        }
+    }
+
+    #[async_trait]
     impl ClusterSealApplier for MockApplier {
         async fn apply_seal(
             &self,
@@ -665,6 +757,62 @@ mod tests {
         // the cluster was broadcast the SAME (epoch, bundle) ONCE — (P).
         let seen = self_seen(&applier).await;
         assert_eq!(seen, (5, vec![1, 2, 3]));
+    }
+
+    /// β4 Thread A genesis (RESP-β4-threadA-impl.1 option 2): the founding epoch
+    /// is 1 over a ZERO prev-hash, and it is broadcast once like any other apply.
+    /// Genesis must reuse the ordinary β1 canonical encoding — a genesis-specific
+    /// message hash would silently diverge from what the enclave recomputes.
+    #[tokio::test]
+    async fn genesis_driver_founds_epoch_one_over_zero_prev_hash() {
+        let collector = MockCollector(vec![7, 7, 7]);
+        let applier = MockApplier::new(vec!["n1".into(), "n2".into(), "n3".into()], vec![]);
+
+        let out = run_genesis_bootstrap(
+            [0xAA; 20],
+            vec![entry(0x01, 1), entry(0x02, 2)],
+            2,
+            &collector,
+            &applier,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.proposed_epoch, 1, "genesis founds epoch 1");
+        assert!(out.all_sealed());
+        // Same canonical encoding as a normal transition: epoch 1, prev = 0.
+        let expected = compute_membership_message_hash(
+            &[0xAA; 20],
+            1,
+            &[0u8; 32],
+            &compute_set_hash(&[entry(0x01, 1), entry(0x02, 2)], 2),
+        );
+        assert_eq!(out.message_hash, expected);
+        // one broadcast, carrying the founding epoch + the collected bundle
+        let seen = self_seen(&applier).await;
+        assert_eq!(seen, (1, vec![7, 7, 7]));
+    }
+
+    /// A genesis set that cannot reach its own quorum must be refused BEFORE any
+    /// consent is collected — the enclave would reject it anyway, but a cluster
+    /// must never be founded on an unusable set.
+    #[tokio::test]
+    async fn genesis_driver_rejects_unreachable_quorum() {
+        let collector = MockCollector(vec![1]);
+        let applier = MockApplier::new(vec!["n1".into()], vec![]);
+        let err = run_genesis_bootstrap(
+            [0xAA; 20],
+            vec![entry(0x01, 1), entry(0x02, 1)],
+            99, // > sum of weights
+            &collector,
+            &applier,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("prepare genesis statement"),
+            "got: {err}"
+        );
     }
 
     async fn self_seen(a: &MockApplier) -> (u64, Vec<u8>) {
