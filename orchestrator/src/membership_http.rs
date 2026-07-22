@@ -31,6 +31,9 @@ const SEAL_EPOCH_PATH: &str = "/v1/admin/signerlist/seal-epoch";
 const SYNC_STATE_PATH: &str = "/v1/admin/signerlist/sync-state";
 const RECORD_CONFIRMATION_PATH: &str = "/v1/admin/signerlist/record-projection-confirmation";
 const BOOTSTRAP_ATTESTED_PATH: &str = "/v1/admin/signerlist/bootstrap-attested";
+/* β4 Thread B — governed MRENCLAVE allowlist */
+const MRENCLAVES_STATUS_PATH: &str = "/v1/admin/mrenclaves/status";
+const MRENCLAVES_GOVERN_PATH: &str = "/v1/admin/mrenclaves/govern";
 
 // ── pure contract (testable without IO) ──────────────────────────
 
@@ -214,6 +217,122 @@ impl EpochSealSink for HttpEpochSealSink {
             .await
             .with_context(|| format!("POST seal-epoch to {node_admin_url}"))?;
         let body: serde_json::Value = resp.json().await.context("seal-epoch response body")?;
+        parse_seal_response(&body)
+    }
+}
+
+/// β4 Thread B: reads the local enclave's allowlist head (the epoch + digest the
+/// next operation must chain onto). The enclave reports the IMPLICIT genesis
+/// state when nothing has been governed yet, so the first operation chains
+/// naturally off epoch 0 without a special case here.
+pub struct HttpAllowlistStatusSource {
+    client: reqwest::Client,
+    enclave_base: String,
+}
+
+impl HttpAllowlistStatusSource {
+    pub fn new(client: reqwest::Client, enclave_base: String) -> Self {
+        Self {
+            client,
+            enclave_base,
+        }
+    }
+}
+
+#[async_trait]
+impl crate::mrenclave_governance::AllowlistStatusSource for HttpAllowlistStatusSource {
+    async fn current(&self) -> Result<(u64, [u8; 32])> {
+        let url = format!(
+            "{}{}",
+            self.enclave_base.trim_end_matches('/'),
+            MRENCLAVES_STATUS_PATH
+        );
+        let body: serde_json::Value = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("GET mrenclaves/status")?
+            .json()
+            .await
+            .context("mrenclaves/status response body")?;
+        if body["status"].as_str() != Some("ok") {
+            bail!(
+                "mrenclaves/status error: {}",
+                body.get("message").unwrap_or(&body)
+            );
+        }
+        let epoch = body["allowlist_epoch"]
+            .as_u64()
+            .context("mrenclaves/status: missing allowlist_epoch")?;
+        let digest_hex = body["allowlist_digest"]
+            .as_str()
+            .context("mrenclaves/status: missing allowlist_digest")?;
+        let bytes = hex::decode(digest_hex).context("mrenclaves/status: bad digest hex")?;
+        if bytes.len() != 32 {
+            bail!(
+                "mrenclaves/status: digest must be 32 bytes, got {}",
+                bytes.len()
+            );
+        }
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&bytes);
+        Ok((epoch, digest))
+    }
+}
+
+/// β4 Thread B: applies one allowlist operation on a node's enclave.
+pub struct HttpGovernSink {
+    client: reqwest::Client,
+}
+
+impl HttpGovernSink {
+    pub fn new(client: reqwest::Client) -> Self {
+        Self { client }
+    }
+
+    /// Field names MUST match `signerlist_handler.cpp::handleGovernTrustedMrenclaves`.
+    /// `repro_bundle` is omitted entirely for a veto — the enclave requires it
+    /// only for an admit.
+    pub fn build_request(
+        op: &crate::mrenclave_governance::GovernanceOp,
+        quorum_bundle: &[u8],
+        repro_bundle: &[u8],
+    ) -> serde_json::Value {
+        let mut req = serde_json::json!({
+            "op": op.op,
+            "mrenclave": hex::encode(op.mrenclave),
+            "escrow_account_id": hex::encode(op.escrow),
+            "proposed_epoch": op.proposed_epoch,
+            "prev_allowlist_hash": hex::encode(op.prev_allowlist_hash),
+            "quorum_bundle": hex::encode(quorum_bundle),
+        });
+        if !repro_bundle.is_empty() {
+            req["repro_bundle"] = serde_json::json!(hex::encode(repro_bundle));
+        }
+        req
+    }
+
+    pub async fn govern_on_node(
+        &self,
+        node_admin_url: &str,
+        op: &crate::mrenclave_governance::GovernanceOp,
+        quorum_bundle: &[u8],
+        repro_bundle: &[u8],
+    ) -> Result<()> {
+        let url = format!(
+            "{}{}",
+            node_admin_url.trim_end_matches('/'),
+            MRENCLAVES_GOVERN_PATH
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .json(&Self::build_request(op, quorum_bundle, repro_bundle))
+            .send()
+            .await
+            .with_context(|| format!("POST mrenclaves/govern to {node_admin_url}"))?;
+        let body: serde_json::Value = resp.json().await.context("govern response body")?;
         parse_seal_response(&body)
     }
 }

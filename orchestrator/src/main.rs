@@ -20,6 +20,7 @@ mod membership_http;
 mod membership_projection;
 mod membership_submit;
 mod membership_sync;
+mod mrenclave_governance;
 mod node_deploy;
 mod orderbook;
 mod p2p;
