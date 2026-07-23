@@ -65,6 +65,9 @@ pub struct MembershipAdminState {
     /// SignerListSet (sync-before-spend: still on-chain through the window).
     pub current_signers: Vec<(String, String)>,
     pub current_quorum: u32,
+    /// β4 Thread B: drives `LibP2PGovernanceBundleCollector` (the governance +
+    /// reproducible-build bundles for a trusted-MRENCLAVE allowlist op).
+    pub mrenclave_governance_tx: mpsc::Sender<crate::p2p::MrenclaveGovernanceRelay>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -224,9 +227,109 @@ async fn handle_membership_change(
     }
 }
 
+// ── β4 Thread B — trusted-MRENCLAVE allowlist governance trigger ────────────
+
+#[derive(Debug, Deserialize)]
+pub struct MrenclaveGovernRequest {
+    /// "add" or "remove".
+    pub op: String,
+    /// 64-char hex of the 32-byte target measurement.
+    pub mrenclave: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MrenclaveGovernResponse {
+    pub status: String,
+    pub allowlist_epoch: u64,
+    pub repro_signers: usize,
+    pub applied_nodes: usize,
+    pub message: String,
+}
+
+async fn drive_govern(
+    state: &MembershipAdminState,
+    req: MrenclaveGovernRequest,
+) -> Result<MrenclaveGovernResponse> {
+    use crate::mrenclave_governance::{
+        run_mrenclave_governance, LibP2PGovernanceBundleCollector, OP_ADD, OP_REMOVE,
+    };
+
+    let op = match req.op.as_str() {
+        "add" => OP_ADD,
+        "remove" => OP_REMOVE,
+        other => bail!("unknown op {other:?} (expected \"add\" or \"remove\")"),
+    };
+    let mrenclave_v = hex::decode(&req.mrenclave).context("mrenclave not hex")?;
+    if mrenclave_v.len() != 32 {
+        bail!("mrenclave must be 32 bytes, got {}", mrenclave_v.len());
+    }
+    let mut mrenclave = [0u8; 32];
+    mrenclave.copy_from_slice(&mrenclave_v);
+
+    // The allowlist head is read from the LOCAL enclave; the collector gathers
+    // the operator quorum's signatures over the p2p relay; the applier broadcasts
+    // the ONE resulting operation to every node's loopback enclave.
+    let client = admin_http_client()?;
+    let status_src =
+        crate::membership_http::HttpAllowlistStatusSource::new(client, state.enclave_base.clone());
+    let collector = LibP2PGovernanceBundleCollector::new(state.mrenclave_governance_tx.clone());
+    let applier =
+        LibP2PMembershipApplier::new(state.membership_apply_tx.clone(), state.cluster_size);
+
+    let outcome = run_mrenclave_governance(
+        op,
+        mrenclave,
+        state.escrow,
+        &status_src,
+        &collector,
+        &applier,
+    )
+    .await?;
+
+    let applied = outcome.node_results.iter().filter(|r| r.ok).count();
+    Ok(MrenclaveGovernResponse {
+        status: if outcome.all_applied() {
+            "ok"
+        } else {
+            "partial_apply"
+        }
+        .into(),
+        allowlist_epoch: outcome.allowlist_epoch,
+        repro_signers: outcome.repro_signers,
+        applied_nodes: applied,
+        message: if outcome.all_applied() {
+            format!("{} applied on all {} nodes", req.op, applied)
+        } else {
+            format!(
+                "{} applied on {applied}/{} nodes; retry (enclave ops are idempotent)",
+                req.op, state.cluster_size
+            )
+        },
+    })
+}
+
+async fn handle_govern(
+    State(state): State<Arc<MembershipAdminState>>,
+    Json(req): Json<MrenclaveGovernRequest>,
+) -> impl IntoResponse {
+    info!(op = %req.op, mrenclave = %req.mrenclave, "β4 mrenclave-governance requested");
+    match drive_govern(&state, req).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(e) => {
+            warn!(error = %e, "β4 mrenclave-governance failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"status": "error", "message": format!("{e:#}")})),
+            )
+                .into_response()
+        }
+    }
+}
+
 pub fn router(state: Arc<MembershipAdminState>) -> Router {
     Router::new()
         .route("/admin/membership-change", post(handle_membership_change))
+        .route("/admin/mrenclave-govern", post(handle_govern))
         .with_state(state)
 }
 

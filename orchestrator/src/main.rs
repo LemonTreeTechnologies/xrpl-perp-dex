@@ -929,6 +929,15 @@ async fn main() -> Result<()> {
         (None, None)
     };
 
+    // β4 Thread B: governance/repro bundle collection channel (the operator
+    // trigger owns the sender). Same held-alive posture as the epoch channel.
+    let (mrenclave_governance_rx_holder, _mrenclave_governance_tx) = if signers_config.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<p2p::MrenclaveGovernanceRelay>(8);
+        (Some(rx), Some(tx))
+    } else {
+        (None, None)
+    };
+
     let peer_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     let maintenance_mode = Arc::new(std::sync::atomic::AtomicBool::new(matches!(
@@ -1290,10 +1299,15 @@ async fn main() -> Result<()> {
             _membership_epoch_tx.clone(),
             _membership_apply_tx.clone(),
             app_state.signing_tx.clone(),
+            _mrenclave_governance_tx.clone(),
         ) {
-            (Some(cfg), Some(membership_epoch_tx), Some(membership_apply_tx), Some(signing_tx))
-                if !cli.membership_node_urls.is_empty() =>
-            {
+            (
+                Some(cfg),
+                Some(membership_epoch_tx),
+                Some(membership_apply_tx),
+                Some(signing_tx),
+                Some(mrenclave_governance_tx),
+            ) if !cli.membership_node_urls.is_empty() => {
                 let escrow = crate::xrpl_signer::decode_xrpl_address(&escrow_address)
                     .context("--membership-admin-listen: escrow address must decode")?;
                 let mut current_signers = Vec::with_capacity(cfg.signers.len());
@@ -1325,6 +1339,7 @@ async fn main() -> Result<()> {
                     signing_tx,
                     current_signers,
                     current_quorum: cfg.quorum as u32,
+                    mrenclave_governance_tx,
                 });
                 tokio::spawn(async move {
                     if let Err(e) = membership_admin::spawn_admin_listener(addr, admin_state).await
@@ -1470,6 +1485,10 @@ async fn main() -> Result<()> {
         // applied on each node's OWN loopback enclave).
         if let Some(rx) = membership_apply_rx_holder {
             p2p_node.set_membership_apply_channel(rx);
+        }
+        // β4 Thread B: the governance/repro bundle collection channel.
+        if let Some(rx) = mrenclave_governance_rx_holder {
+            p2p_node.set_mrenclave_governance_channel(rx);
         }
         if let Some(ref local) = cfg.local_signer {
             // X-C1 condition C2 (perp RESP-5): enforce loopback on the
