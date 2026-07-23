@@ -214,6 +214,29 @@ pub enum SigningMessage {
         new_signers: Vec<MembershipSignerWire>,
         new_quorum: u32,
     },
+    /// β4 Thread B — an operator-quorum request to authorise a MRENCLAVE
+    /// allowlist operation (governance) OR to attest a reproducible build
+    /// (repro). Same multi-responder shape as `MembershipEpochRequest`: each
+    /// operator's local pool key signs over a message its OWN enclave re-derives
+    /// from the STRUCTURED fields below (never a wire-supplied digest). The two
+    /// `kind`s sign different messages, which is why one variant carries the
+    /// union of fields and the receiver selects the enclave route by `kind`.
+    ///
+    /// `request_id` MUST start with `"mrenclave-gov-"` so the response router
+    /// forwards replies to the governance collector's mpsc.
+    MrenclaveGovernanceRequest {
+        request_id: String,
+        requester_peer_id: String,
+        kind: MrenclaveSignKind,
+        /// 32-byte target measurement, lowercase hex.
+        mrenclave_hex: String,
+        /// Governance only (ignored for repro): 1=add, 2=remove.
+        op: u8,
+        /// Governance only: the allowlist epoch this operation proposes.
+        proposed_epoch: u64,
+        /// Governance only: 32-byte chain link to the current allowlist head.
+        prev_allowlist_hash_hex: String,
+    },
     /// β3.2b apply-broadcast. After the initiator has collected ONE quorum
     /// bundle (β1) and confirmed ONE projection (β2), it broadcasts the SAME
     /// apply payload to every node, and each node applies it to its OWN loopback
@@ -393,6 +416,37 @@ pub struct MembershipEpochRelay {
     pub prev_epoch_hash: [u8; 32],
     pub new_signers: Vec<crate::membership_canonical::SignerEntry>,
     pub new_quorum: u32,
+    /// Channel to receive `SigningMessage::Response` instances as peers reply.
+    pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
+}
+
+/// β4 Thread B — which message a `MrenclaveGovernanceRequest` asks the receiver
+/// to sign. The two sign DIFFERENT preimages on different enclave routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MrenclaveSignKind {
+    /// Sign {op, mrenclave, epoch, prev_allowlist_hash} — the cluster's
+    /// authorisation of the allowlist operation.
+    Governance,
+    /// Sign the measurement alone — "I rebuilt this binary bit-identically".
+    Repro,
+}
+
+/// β4 Thread B outbound governance/repro collection request. Same multi-receiver
+/// shape as `MembershipEpochRelay`; the `LibP2PGovernanceBundleCollector` builds
+/// one per operation, sends it down `set_mrenclave_governance_channel`, and
+/// receives signed responses until quorum or timeout. `op`/`proposed_epoch`/
+/// `prev_allowlist_hash` are unused for `kind == Repro`.
+#[derive(Debug)]
+pub struct MrenclaveGovernanceRelay {
+    /// Unique id; MUST start with `"mrenclave-gov-"` so the response router
+    /// forwards replies here, not to the XRPL oneshot map.
+    pub request_id: String,
+    pub kind: MrenclaveSignKind,
+    pub mrenclave: [u8; 32],
+    pub op: u8,
+    pub proposed_epoch: u64,
+    pub prev_allowlist_hash: [u8; 32],
     /// Channel to receive `SigningMessage::Response` instances as peers reply.
     pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
 }
@@ -610,6 +664,9 @@ pub struct P2PNode {
     /// In-flight β1 membership-epoch requests; mpsc per-request (M-of-N
     /// operators reply concurrently), mirroring `pending_path_a_delegation`.
     pending_membership_epoch: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
+    // β4 Thread B — governed MRENCLAVE allowlist collection
+    mrenclave_governance_rx: Option<mpsc::Receiver<MrenclaveGovernanceRelay>>,
+    pending_mrenclave_governance: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
     /// β3.2b: outbound apply-broadcast requests (seal / confirm) from the
     /// membership-change driver — each node applies to its loopback enclave.
     membership_apply_rx: Option<mpsc::Receiver<MembershipApplyRelay>>,
@@ -777,6 +834,8 @@ impl P2PNode {
             pending_path_a_delegation: HashMap::new(),
             membership_epoch_rx: None,
             pending_membership_epoch: HashMap::new(),
+            mrenclave_governance_rx: None,
+            pending_mrenclave_governance: HashMap::new(),
             membership_apply_rx: None,
             pending_membership_apply: HashMap::new(),
             events_publish_rx: None,
@@ -887,6 +946,17 @@ impl P2PNode {
     #[allow(dead_code)]
     pub fn set_membership_epoch_channel(&mut self, rx: mpsc::Receiver<MembershipEpochRelay>) {
         self.membership_epoch_rx = Some(rx);
+    }
+
+    /// β4 Thread B: the governance/repro collection channel. Wired in main.rs
+    /// with the operator trigger route (the next increment; same deferred
+    /// deploy-wiring split β1's set_membership_epoch_channel used).
+    #[allow(dead_code)]
+    pub fn set_mrenclave_governance_channel(
+        &mut self,
+        rx: mpsc::Receiver<MrenclaveGovernanceRelay>,
+    ) {
+        self.mrenclave_governance_rx = Some(rx);
     }
 
     /// β3.2b: wire the membership-change driver's apply-broadcast channel. The
@@ -1637,6 +1707,97 @@ impl P2PNode {
         }
     }
 
+    /// β4 Thread B: sign a governance operation or a reproducible-build
+    /// attestation on the LOCAL enclave's typed route. Which route (and which
+    /// body) is selected by `kind`; the enclave re-derives the domain-separated
+    /// message from these structured fields, so nothing is trusted from the wire.
+    /// Reuses `membership_sign_error` — the Response shape is identical.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_mrenclave_governance_request(
+        local_signer: &LocalSigner,
+        request_id: &str,
+        kind: MrenclaveSignKind,
+        mrenclave: &[u8; 32],
+        op: u8,
+        proposed_epoch: u64,
+        prev_allowlist_hash: &[u8; 32],
+    ) -> SigningMessage {
+        let http = match crate::http_helpers::loopback_http_client(Duration::from_secs(15)) {
+            Ok(c) => c,
+            Err(e) => {
+                return Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("http client: {e}"),
+                )
+            }
+        };
+
+        let (path, body) = match kind {
+            MrenclaveSignKind::Governance => (
+                "/admin/mrenclaves/sign-governance",
+                serde_json::json!({
+                    "from": local_signer.address,
+                    "session_key": local_signer.session_key,
+                    "op": op,
+                    "mrenclave": hex::encode(mrenclave),
+                    "proposed_epoch": proposed_epoch,
+                    "prev_allowlist_hash": hex::encode(prev_allowlist_hash),
+                }),
+            ),
+            MrenclaveSignKind::Repro => (
+                "/admin/mrenclaves/sign-repro-proof",
+                serde_json::json!({
+                    "from": local_signer.address,
+                    "session_key": local_signer.session_key,
+                    "mrenclave": hex::encode(mrenclave),
+                }),
+            ),
+        };
+
+        let sign_url = format!("{}{}", local_signer.enclave_url, path);
+        let resp = match http.post(&sign_url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("enclave request: {e}"),
+                )
+            }
+        };
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                return Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("enclave response parse: {e}"),
+                )
+            }
+        };
+        if body["status"].as_str() != Some("success") {
+            return Self::membership_sign_error(
+                local_signer,
+                request_id,
+                format!("enclave: {}", body.get("message").unwrap_or(&body)),
+            );
+        }
+
+        let r_hex = body["signature"]["r"].as_str().unwrap_or("");
+        let s_hex = body["signature"]["s"].as_str().unwrap_or("");
+        let r_bytes = hex::decode(r_hex).unwrap_or_default();
+        let s_bytes = hex::decode(s_hex).unwrap_or_default();
+        let der = crate::xrpl_signer::der_encode_signature(&r_bytes, &s_bytes);
+        SigningMessage::Response {
+            request_id: request_id.to_string(),
+            signer_xrpl_address: local_signer.xrpl_address.clone(),
+            der_signature: Some(hex::encode_upper(&der)),
+            compressed_pubkey: Some(local_signer.compressed_pubkey.clone()),
+            error: None,
+        }
+    }
+
     /// Uniform error `Response` for the β1 membership signing path.
     fn membership_sign_error(
         local_signer: &LocalSigner,
@@ -2070,6 +2231,7 @@ impl P2PNode {
         let mut signing_rx = self.signing_request_rx.take();
         let mut path_a_delegation_rx = self.path_a_delegation_rx.take();
         let mut membership_epoch_rx = self.membership_epoch_rx.take();
+        let mut mrenclave_governance_rx = self.mrenclave_governance_rx.take();
         let mut membership_apply_rx = self.membership_apply_rx.take();
         let mut events_rx = self.events_publish_rx.take();
         let mut peer_quote_rx = self.peer_quote_publish_rx.take();
@@ -2276,6 +2438,56 @@ impl P2PNode {
                     }
                 }
 
+                // β4 Thread B: broadcast a governance/repro signing request to the
+                // operator quorum; each signs on its OWN enclave typed route.
+                Some(relay) = async {
+                    match &mut mrenclave_governance_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<MrenclaveGovernanceRelay>>().await,
+                    }
+                } => {
+                    // Local signer is a co-signer too; gossipsub doesn't deliver
+                    // to the publisher, so sign locally as well.
+                    if let Some(ref local) = self.local_signer {
+                        let local_response = Self::handle_mrenclave_governance_request(
+                            local,
+                            &relay.request_id,
+                            relay.kind,
+                            &relay.mrenclave,
+                            relay.op,
+                            relay.proposed_epoch,
+                            &relay.prev_allowlist_hash,
+                        ).await;
+                        let _ = relay.responses_tx.send(local_response).await;
+                    }
+
+                    let msg = SigningMessage::MrenclaveGovernanceRequest {
+                        request_id: relay.request_id.clone(),
+                        requester_peer_id: self.peer_id.to_string(),
+                        kind: relay.kind,
+                        mrenclave_hex: hex::encode(relay.mrenclave),
+                        op: relay.op,
+                        proposed_epoch: relay.proposed_epoch,
+                        prev_allowlist_hash_hex: hex::encode(relay.prev_allowlist_hash),
+                    };
+                    match self.publish_signing(&msg) {
+                        Ok(_) => {
+                            self.pending_mrenclave_governance.insert(
+                                relay.request_id, relay.responses_tx);
+                        }
+                        Err(e) => {
+                            warn!("β4 mrenclave-governance publish failed: {}", e);
+                            let _ = relay.responses_tx.send(SigningMessage::Response {
+                                request_id: relay.request_id,
+                                signer_xrpl_address: String::new(),
+                                der_signature: None,
+                                compressed_pubkey: None,
+                                error: Some(format!("P2P publish failed: {e}")),
+                            }).await;
+                        }
+                    }
+                }
+
                 // β3.2b: membership-apply broadcast (seal / confirm). One node
                 // collects/assembles, then broadcasts the SAME apply to all so
                 // every node applies it to its OWN loopback enclave + acks.
@@ -2406,6 +2618,7 @@ impl P2PNode {
                     self.pending_path_a_delegation.retain(|_, tx| !tx.is_closed());
                     // β1 membership-epoch collectors: same GC.
                     self.pending_membership_epoch.retain(|_, tx| !tx.is_closed());
+                    self.pending_mrenclave_governance.retain(|_, tx| !tx.is_closed());
                     // β3.2b membership-apply collectors: same GC.
                     self.pending_membership_apply.retain(|_, tx| !tx.is_closed());
                 }
@@ -2540,6 +2753,13 @@ impl P2PNode {
                                 } else if request_id.starts_with("beta1-membership-") {
                                     if let Some(tx) =
                                         self.pending_membership_epoch.get(&request_id) {
+                                        if let Ok(msg) = serde_json::from_slice::<SigningMessage>(&message.data) {
+                                            let _ = tx.send(msg).await;
+                                        }
+                                    }
+                                } else if request_id.starts_with("mrenclave-gov-") {
+                                    if let Some(tx) =
+                                        self.pending_mrenclave_governance.get(&request_id) {
                                         if let Ok(msg) = serde_json::from_slice::<SigningMessage>(&message.data) {
                                             let _ = tx.send(msg).await;
                                         }
@@ -2736,6 +2956,76 @@ impl P2PNode {
                                 ).await;
                                 if let Err(e) = self.publish_signing(&response) {
                                     error!("failed to publish β1 membership response: {}", e);
+                                }
+                            }
+                            Ok(SigningMessage::MrenclaveGovernanceRequest {
+                                request_id,
+                                requester_peer_id,
+                                kind,
+                                mrenclave_hex,
+                                op,
+                                proposed_epoch,
+                                prev_allowlist_hash_hex,
+                            }) => {
+                                // β4 Thread B: a governance/repro signing request
+                                // from a peer's governance driver. Sign IF we have
+                                // a local signer; the enclave re-derives the
+                                // domain-separated message from the structured
+                                // fields, so nothing is trusted from the wire.
+                                let local_opt = self.local_signer.clone();
+                                let Some(local) = local_opt else {
+                                    continue;
+                                };
+                                if let Some(ref allow) = self.allowed_signing_peers {
+                                    if !allow.contains(&propagation_source) {
+                                        warn!(
+                                            req_id = %request_id,
+                                            from = %propagation_source,
+                                            "X-C1: β4 mrenclave-gov request from peer outside allowlist — dropped"
+                                        );
+                                        continue;
+                                    }
+                                }
+                                if !self.check_signing_rate(&propagation_source) {
+                                    warn!(req_id = %request_id, "X-C1: β4 mrenclave-gov request rate-limited");
+                                    continue;
+                                }
+                                if !self.mark_signing_request_fresh(&request_id) {
+                                    warn!(req_id = %request_id, "X-C1: duplicate β4 mrenclave-gov request_id — dropped");
+                                    continue;
+                                }
+                                let mrenclave = match decode_32(&mrenclave_hex) {
+                                    Some(a) => a,
+                                    None => {
+                                        warn!(req_id = %request_id, "β4 mrenclave-gov: bad mrenclave_hex");
+                                        continue;
+                                    }
+                                };
+                                let prev_allowlist_hash = match decode_32(&prev_allowlist_hash_hex) {
+                                    Some(a) => a,
+                                    None => {
+                                        warn!(req_id = %request_id, "β4 mrenclave-gov: bad prev_allowlist_hash_hex");
+                                        continue;
+                                    }
+                                };
+                                info!(
+                                    req_id = %request_id,
+                                    from = %requester_peer_id,
+                                    propagation = %propagation_source,
+                                    ?kind,
+                                    "β4 mrenclave-governance request received — signing locally"
+                                );
+                                let response = Self::handle_mrenclave_governance_request(
+                                    &local,
+                                    &request_id,
+                                    kind,
+                                    &mrenclave,
+                                    op,
+                                    proposed_epoch,
+                                    &prev_allowlist_hash,
+                                ).await;
+                                if let Err(e) = self.publish_signing(&response) {
+                                    error!("failed to publish β4 mrenclave-gov response: {}", e);
                                 }
                             }
                             Ok(SigningMessage::MembershipApply {

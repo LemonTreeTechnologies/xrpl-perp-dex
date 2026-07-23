@@ -158,6 +158,141 @@ pub async fn run_mrenclave_governance(
     })
 }
 
+/// libp2p implementation of `GovernanceBundleCollector`: broadcasts one
+/// `MrenclaveGovernanceRelay` per bundle and gathers signed responses until the
+/// timeout, deduping by public key. Same shape and rationale as
+/// `LibP2PMembershipCollector` / `LibP2PDelegationCollector`.
+pub struct LibP2PGovernanceBundleCollector {
+    relay_tx: tokio::sync::mpsc::Sender<crate::p2p::MrenclaveGovernanceRelay>,
+    timeout: std::time::Duration,
+}
+
+impl LibP2PGovernanceBundleCollector {
+    pub fn new(relay_tx: tokio::sync::mpsc::Sender<crate::p2p::MrenclaveGovernanceRelay>) -> Self {
+        Self {
+            relay_tx,
+            timeout: std::time::Duration::from_secs(30),
+        }
+    }
+
+    pub fn with_timeout(mut self, t: std::time::Duration) -> Self {
+        self.timeout = t;
+        self
+    }
+
+    /// Broadcast one relay of the given kind and collect the quorum bundle plus
+    /// the number of DISTINCT signers. The wire bundle format is the SAME one
+    /// `seal_verify_quorum_bundle` consumes, so the enclave verifies it directly.
+    async fn collect(
+        &self,
+        kind: crate::p2p::MrenclaveSignKind,
+        mrenclave: &[u8; 32],
+        op: u8,
+        proposed_epoch: u64,
+        prev_allowlist_hash: &[u8; 32],
+    ) -> Result<(Vec<u8>, usize)> {
+        use uuid::Uuid;
+        let request_id = format!("mrenclave-gov-{}", Uuid::new_v4());
+        let (responses_tx, mut responses_rx) = tokio::sync::mpsc::channel(32);
+
+        self.relay_tx
+            .send(crate::p2p::MrenclaveGovernanceRelay {
+                request_id,
+                kind,
+                mrenclave: *mrenclave,
+                op,
+                proposed_epoch,
+                prev_allowlist_hash: *prev_allowlist_hash,
+                responses_tx,
+            })
+            .await
+            .context("send MrenclaveGovernanceRelay to p2p run-loop")?;
+
+        // (compressed_pubkey, DER signature) per distinct responder.
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let resp = match tokio::time::timeout(remaining, responses_rx.recv()).await {
+                Ok(Some(m)) => m,
+                _ => break,
+            };
+            if let crate::p2p::SigningMessage::Response {
+                der_signature: Some(der_hex),
+                compressed_pubkey: Some(pk_hex),
+                error: None,
+                ..
+            } = resp
+            {
+                let pk = hex::decode(&pk_hex).unwrap_or_default();
+                let der = hex::decode(&der_hex).unwrap_or_default();
+                if pk.len() == 33 && !der.is_empty() && !entries.iter().any(|(p, _)| *p == pk) {
+                    entries.push((pk, der));
+                }
+            }
+        }
+
+        if entries.is_empty() {
+            bail!(
+                "collected zero allowlist-governance responses within {:?}; \
+                 check the operator quorum is online + the gossipsub mesh is healthy",
+                self.timeout
+            );
+        }
+
+        let distinct = entries.len();
+        Ok((build_quorum_bundle(&entries), distinct))
+    }
+}
+
+/// Encode the collected (pubkey, signature) pairs into the quorum-bundle wire
+/// format the enclave's `seal_verify_quorum_bundle` consumes:
+///   u32 version=1 || u32 count || { pk[33] || u8 sig_len || sig[sig_len] }…
+/// (little-endian, matching `membership_coordinator::build_quorum_bundle`).
+fn build_quorum_bundle(entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (pk, sig) in entries {
+        out.extend_from_slice(pk);
+        out.push(sig.len() as u8);
+        out.extend_from_slice(sig);
+    }
+    out
+}
+
+#[async_trait]
+impl GovernanceBundleCollector for LibP2PGovernanceBundleCollector {
+    async fn collect_governance(&self, op: &GovernanceOp) -> Result<Vec<u8>> {
+        let (bundle, _) = self
+            .collect(
+                crate::p2p::MrenclaveSignKind::Governance,
+                &op.mrenclave,
+                op.op,
+                op.proposed_epoch,
+                &op.prev_allowlist_hash,
+            )
+            .await?;
+        Ok(bundle)
+    }
+
+    async fn collect_repro(&self, mrenclave: &[u8; 32]) -> Result<(Vec<u8>, usize)> {
+        // op/epoch/prev are irrelevant to a repro signature (bound to the
+        // measurement only) — pass zeros; the receiver ignores them for Repro.
+        self.collect(
+            crate::p2p::MrenclaveSignKind::Repro,
+            mrenclave,
+            0,
+            0,
+            &[0u8; 32],
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
