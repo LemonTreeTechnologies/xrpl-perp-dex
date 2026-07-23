@@ -30,6 +30,7 @@ use crate::membership_coordinator::{
     ClusterGenesisApplier, ClusterSealApplier, MembershipEpochStatement, NodeSealResult,
 };
 use crate::membership_projection::{ClusterConfirmApplier, NodeConfirmResult};
+use crate::mrenclave_governance::{ClusterGovernApplier, GovernanceOp};
 use crate::p2p::{
     MembershipApplyPayload, MembershipApplyRelay, MembershipSignerWire, SigningMessage,
 };
@@ -214,6 +215,48 @@ impl ClusterGenesisApplier for LibP2PMembershipApplier {
             signers,
             quorum: statement.new_quorum,
             quorum_bundle_hex: hex::encode(bundle),
+        };
+        let acks = self.broadcast_and_collect(payload).await?;
+        let ok_count = acks.iter().filter(|a| a.ok).count();
+        let mut out: Vec<NodeSealResult> = acks
+            .into_iter()
+            .map(|a| NodeSealResult {
+                node: a.node,
+                ok: a.ok,
+                error: a.error,
+            })
+            .collect();
+        if let Some(msg) = self.shortfall_error(ok_count) {
+            out.push(NodeSealResult {
+                node: "<cluster>".into(),
+                ok: false,
+                error: Some(msg),
+            });
+        }
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl ClusterGovernApplier for LibP2PMembershipApplier {
+    /// β4 Thread B: one broadcast, every node applies the SAME allowlist
+    /// operation to its OWN loopback enclave and acks — the enclave admin API is
+    /// loopback-only (X-C1), so this cannot be a per-node HTTP POST to remote
+    /// enclaves; it rides the apply-broadcast like seal/genesis/confirm.
+    async fn apply_govern(
+        &self,
+        op: &GovernanceOp,
+        quorum_bundle: &[u8],
+        repro_bundle: &[u8],
+    ) -> Result<Vec<NodeSealResult>> {
+        let payload = MembershipApplyPayload::GovernMrenclave {
+            op_code: op.op,
+            mrenclave_hex: hex::encode(op.mrenclave),
+            escrow_hex: hex::encode(op.escrow),
+            proposed_epoch: op.proposed_epoch,
+            prev_allowlist_hash_hex: hex::encode(op.prev_allowlist_hash),
+            quorum_bundle_hex: hex::encode(quorum_bundle),
+            repro_bundle_hex: hex::encode(repro_bundle),
         };
         let acks = self.broadcast_and_collect(payload).await?;
         let ok_count = acks.iter().filter(|a| a.ok).count();

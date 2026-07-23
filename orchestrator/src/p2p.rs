@@ -303,6 +303,22 @@ pub enum MembershipApplyPayload {
         quorum: u32,
         quorum_bundle_hex: String,
     },
+    /// β4 Thread B: apply `ecall_govern_trusted_mrenclaves` locally — admit or
+    /// veto a measurement on the allowlist. Same reason as the others ride the
+    /// apply-broadcast: the enclave admin API is loopback-only (X-C1), so the
+    /// driving node cannot POST govern to remote enclaves; it broadcasts the ONE
+    /// operation and every node applies it to its OWN localhost enclave + acks.
+    /// `repro_bundle_hex` is empty for a veto.
+    GovernMrenclave {
+        // NB: field is `op_code`, not `op` — the enum's serde tag is "op".
+        op_code: u8,
+        mrenclave_hex: String,
+        escrow_hex: String,
+        proposed_epoch: u64,
+        prev_allowlist_hash_hex: String,
+        quorum_bundle_hex: String,
+        repro_bundle_hex: String,
+    },
 }
 
 /// Decode exactly 20 hex bytes → `[u8; 20]`, or `None` on any malformed input.
@@ -2011,6 +2027,76 @@ impl P2PNode {
                 };
                 crate::membership_http::HttpGenesisBootstrapSink::new(client)
                     .bootstrap_on_node(&base, &statement, &bundle)
+                    .await
+            }
+            MembershipApplyPayload::GovernMrenclave {
+                op_code,
+                mrenclave_hex,
+                escrow_hex,
+                proposed_epoch,
+                prev_allowlist_hash_hex,
+                quorum_bundle_hex,
+                repro_bundle_hex,
+            } => {
+                let mrenclave = match decode_32(mrenclave_hex) {
+                    Some(a) => a,
+                    None => {
+                        return Self::membership_sign_error(
+                            local_signer,
+                            request_id,
+                            "apply.govern: bad mrenclave_hex".into(),
+                        )
+                    }
+                };
+                let escrow = match decode_20(escrow_hex) {
+                    Some(a) => a,
+                    None => {
+                        return Self::membership_sign_error(
+                            local_signer,
+                            request_id,
+                            "apply.govern: bad escrow_hex".into(),
+                        )
+                    }
+                };
+                let prev = match decode_32(prev_allowlist_hash_hex) {
+                    Some(a) => a,
+                    None => {
+                        return Self::membership_sign_error(
+                            local_signer,
+                            request_id,
+                            "apply.govern: bad prev_allowlist_hash_hex".into(),
+                        )
+                    }
+                };
+                let quorum_bundle = match hex::decode(quorum_bundle_hex) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        return Self::membership_sign_error(
+                            local_signer,
+                            request_id,
+                            "apply.govern: bad quorum_bundle hex".into(),
+                        )
+                    }
+                };
+                let repro_bundle = match hex::decode(repro_bundle_hex) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        return Self::membership_sign_error(
+                            local_signer,
+                            request_id,
+                            "apply.govern: bad repro_bundle hex".into(),
+                        )
+                    }
+                };
+                let govop = crate::mrenclave_governance::GovernanceOp {
+                    op: *op_code,
+                    mrenclave,
+                    escrow,
+                    proposed_epoch: *proposed_epoch,
+                    prev_allowlist_hash: prev,
+                };
+                crate::membership_http::HttpGovernSink::new(client)
+                    .govern_on_node(&base, &govop, &quorum_bundle, &repro_bundle)
                     .await
             }
             MembershipApplyPayload::Confirm {
