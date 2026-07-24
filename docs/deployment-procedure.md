@@ -1,6 +1,15 @@
 # Production Deployment Procedure — 3 Independent Operators
 
-**Status:** Draft for review. Not yet implemented. Document captures the target architecture for production deployment when the FROST 2-of-3 threshold signing setup is operated by three independent persons (working assumption: Andrey, Alex, Tom), each controlling their own SGX node, with no operator having access to anyone else's server.
+**Status:** Draft for review. Not yet implemented. Document captures the target architecture for production deployment when the XRPL SignerList 2-of-3 multisig setup is operated by three independent persons (working assumption: Andrey, Alex, Tom), each controlling their own SGX node, with no operator having access to anyone else's server.
+
+> **⚠ Auditor clarification — two distinct 2-of-3 mechanisms (2026-06-12, ref issue #49).** This document uses «FROST» as a blanket label, but the cluster runs **two separate** 2-of-3 mechanisms. Read them apart (verified against the REQ-8/10/12 audit cycle + the FROST/Path-A commit history):
+>
+> 1. **XRPL settlement signing = XRPL SignerList 2-of-3 INDEPENDENT ECDSA multisig.** Each node holds its **own** XRPL signer key; `ecall_sign_with_pool_account` → DER ECDSA → `Signers[]` → `submit_multisigned`. The keys are the per-operator `account_pool` keys; the **FROST group key is NOT on the XRPL SignerList** (REQ-12 §3.5). **This is the quorum the threat model below refers to** — it authorises XRPL transactions and excludes a compromised node. It is *not* a FROST aggregate signature.
+> 2. **FROST 2-of-3 threshold-Schnorr is a separate, live facility** — an in-memory DKG group (`frost_groups[]` + `active_frost_group`), re-shared between nodes over libp2p on restart and migrated across an MRENCLAVE bump as **Path A section 2** (Path A was in fact built to transport this share — commit `a6bbbb6`). Its signing semantics are exercised in the vault/Taproot layer, **not** in XRPL settlement (REQ-12 §3, pattern 5.42). It is **not latent** — it is simply a different layer from the on-chain XRPL quorum.
+>
+> **§11.7 recovery is correct as written.** A permanently-dead node must restore **both**: its XRPL signer key (`node-bootstrap` + `SignerListSet`-swap — mechanism 1) **and** its FROST share (fresh 3-party DKG — mechanism 2). The two steps rebuild different mechanisms; they are neither redundant nor inconsistent. *(Minor wording nit only: §11.7's «continues signing with 2-of-2» should read «2 of the 3 SignerList entries still meet quorum 2».)*
+>
+> Per-mechanism verified reality: project Architecture Register `docs/ARCHITECTURE-REGISTER.md` (§A live invariants vs §B aspirational).
 
 **Russian version:** `deployment-procedure-ru.md`. This document must be kept in sync with the Russian version per the bilingual docs policy.
 
@@ -10,13 +19,13 @@
 
 What we are protecting against, in priority order:
 
-1. **Single rogue operator.** One of the three operators tries to push a malicious binary to their own node and uses it to extract keys, sign unauthorised XRPL transactions, or steal user funds. The 2-of-3 FROST scheme already mitigates the *signing* side of this — one rogue node cannot sign alone — but the *deployment* side must enforce the same property: one rogue operator cannot unilaterally change what runs on the network.
+1. **Single rogue operator.** One of the three operators tries to push a malicious binary to their own node and uses it to extract keys, sign unauthorised XRPL transactions, or steal user funds. The 2-of-3 XRPL multisig already mitigates the *signing* side of this — one rogue node cannot sign alone (the XRPL SignerList requires 2 of 3 independent signatures) — but the *deployment* side must enforce the same property: one rogue operator cannot unilaterally change what runs on the network.
 
 2. **Compromised operator workstation.** An operator's laptop is compromised (malware, stolen credentials, evil maid). The attacker can SSH to that operator's node but should not be able to push a release the other two operators have not approved.
 
 3. **Compromised build environment.** The build machine (or the CI environment) is compromised and produces a binary that does not match the source. This is the SolarWinds scenario.
 
-4. **Compromised hosting provider.** Hetzner / Azure compromises a single VM (or is legally compelled to). The other two nodes must continue safely; the compromised node's attestation should fail and be excluded from the FROST quorum.
+4. **Compromised hosting provider.** Hetzner / Azure compromises a single VM (or is legally compelled to). The other two nodes must continue safely; the compromised node's attestation should fail and be excluded from the XRPL signing quorum.
 
 5. **Coercion of a single operator.** An operator is forced (legal, physical, social) to deploy a specific binary. The 2-of-3 approval requirement ensures this single operator cannot succeed alone.
 
