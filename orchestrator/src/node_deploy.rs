@@ -494,6 +494,40 @@ pub async fn deploy_local_side_by_side(
     })
 }
 
+/// REQ-β4.2 Part C — reset the NEW enclave to empty after a dry-run rehearsal,
+/// so the subsequent REAL ceremony starts clean. A dry-run's import populated
+/// `{DEPLOY_DIR_NEW}/accounts` and loaded that state into NEW's memory; stop
+/// NEW, clear the scratch sealed files, restart so it boots empty — the same
+/// empty NEW the side-by-side deploy produced. OLD is NEVER touched (it stayed
+/// byte-for-byte inert through the dry-run — the export skipped the durable
+/// nonce record + pending-migration arming). Only the NEW side is reset.
+pub async fn reset_new_side_after_dry_run() -> Result<()> {
+    let accounts_dir = format!("{DEPLOY_DIR_NEW}/accounts");
+    info!("dry-run cleanup: stopping {ENCLAVE_UNIT_NEW} to reset NEW to empty state");
+    sudo_systemctl(&["stop", ENCLAVE_UNIT_NEW]).await?;
+
+    // The accounts/ subdir holds ONLY sealed migration state (config.json,
+    // perp.pem etc. live one level up in perp-next/). Remove every file in it —
+    // the rehearsal's resealed import — leaving an empty dir for the real run.
+    let mut removed = 0usize;
+    if let Ok(entries) = std::fs::read_dir(&accounts_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                std::fs::remove_file(&p)
+                    .with_context(|| format!("remove dry-run scratch file {p:?}"))?;
+                removed += 1;
+            }
+        }
+    }
+    info!(
+        removed_files = removed,
+        "dry-run cleanup: cleared NEW scratch accounts; restarting {ENCLAVE_UNIT_NEW}"
+    );
+    sudo_systemctl(&["start", ENCLAVE_UNIT_NEW]).await?;
+    Ok(())
+}
+
 // ── Pre-flight helpers ────────────────────────────────────────────
 
 async fn preflight_old_running() -> Result<()> {

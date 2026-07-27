@@ -150,24 +150,40 @@ async fn handle_migrate_state(
 
     match driver.run(&params).await {
         Ok(success) => {
-            if success.dry_run {
+            let status: &'static str = if success.dry_run {
                 info!(
                     mrenclave_new = %success.mrenclave_new_hex,
                     ceremony_nonce = %success.ceremony_nonce_hex,
                     "admin: DRY-RUN PASS — export+import+durability rehearsed, OLD NOT retired \
-                     (point of no return not crossed). Real ceremony is cleared to run."
+                     (point of no return not crossed)."
                 );
+                // Part C: reset NEW to empty so the REAL ceremony starts clean
+                // (the rehearsal's import populated + loaded NEW's state). OLD
+                // stayed byte-for-byte inert through the dry-run.
+                match crate::node_deploy::reset_new_side_after_dry_run().await {
+                    Ok(()) => {
+                        info!("admin: NEW reset to empty — real ceremony is cleared to run");
+                        "dry-run-ok"
+                    }
+                    Err(e) => {
+                        error!(error = %e, "admin: DRY-RUN PASSED but NEW-reset FAILED — operator \
+                            MUST clear perp-next/accounts + restart perp-dex-enclave-next before \
+                            the real ceremony");
+                        "dry-run-ok-reset-failed"
+                    }
+                }
             } else {
                 info!(
                     mrenclave_new = %success.mrenclave_new_hex,
                     ceremony_nonce = %success.ceremony_nonce_hex,
                     "admin: ceremony succeeded — OLD retired, operator runs promotion sequence next"
                 );
-            }
+                "ok"
+            };
             (
                 StatusCode::OK,
                 Json(MigrateStateResponse {
-                    status: if success.dry_run { "dry-run-ok" } else { "ok" },
+                    status,
                     ceremony_nonce_hex: success.ceremony_nonce_hex,
                     mrenclave_new_hex: success.mrenclave_new_hex,
                     manifest_hash_hex: success.manifest_hash_hex,
