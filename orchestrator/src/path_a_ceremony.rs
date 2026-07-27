@@ -41,6 +41,16 @@ pub struct CeremonyParams {
     pub old_api_base: String,
     /// Base URL of NEW's enclave REST API (typically https://localhost:9089).
     pub new_api_base: String,
+    /// REQ-β4.2 (OPS gate, `feedback_rehearse_before_irreversible`): when true,
+    /// rehearse the failure-prone middle — export → import → durability — and
+    /// STOP before step 6 (OLD sealing its retired-marker, the point of no
+    /// return). Proves the migration works on the REAL state without ever
+    /// retiring OLD; the real run is gated on a dry-run PASS. NOTE: full
+    /// OLD-inertness (export skipping the durable recent-nonce record) and the
+    /// NEW-reset land with the paired enclave increment; until then a dry-run
+    /// uses a fresh nonce (so it never blocks the real run — different nonce)
+    /// and the operator clears perp-next/accounts before the real ceremony.
+    pub dry_run: bool,
 }
 
 /// Outputs the driver returns on successful ceremony completion.
@@ -52,6 +62,10 @@ pub struct CeremonySuccess {
     /// Useful in operator logs for cross-correlation against OLD's
     /// retired-marker forensic record.
     pub manifest_hash_hex: String,
+    /// True if this was a dry-run rehearsal that stopped before step 6:
+    /// export + import + durability were exercised, but OLD was NOT retired
+    /// (no point of no return crossed). False for a completed real ceremony.
+    pub dry_run: bool,
 }
 
 /// Phase the ceremony is currently in. Used for operator visibility
@@ -84,6 +98,10 @@ pub enum CeremonyState {
     /// sealed marker); NEW is the active enclave. Operator should
     /// run promotion sequence per docs/path-a-runbook.
     Succeeded,
+    /// Dry-run rehearsal complete (REQ-β4.2) — export + import + durability all
+    /// passed and OLD was NOT retired (step 6 deliberately skipped). No point of
+    /// no return crossed; safe to proceed to the real ceremony (gated on this).
+    DryRunComplete,
     /// Ceremony aborted. Distinct from Idle so an admin-status endpoint
     /// can distinguish «never started» from «started and rolled back».
     Failed,
@@ -303,7 +321,23 @@ impl<A: EnclaveApi> CeremonyDriver<A> {
             .await?;
         let completion_la_report = vec_to_array_432(completion_la_report_vec)?;
 
+        // REQ-β4.2 dry-run gate: the entire failure-prone path is now proven on
+        // the REAL state — export (capacity), import (decrypt + reseal), M3
+        // durability self-check. STOP here. OLD is NEVER asked to seal its
+        // retired-marker (step 6), so no point of no return is crossed and the
+        // rehearsal is safe. The real run is gated on this outcome.
+        if params.dry_run {
+            self.state = CeremonyState::DryRunComplete;
+            return Ok(CeremonySuccess {
+                ceremony_nonce_hex: hex_encode(&ceremony_nonce),
+                mrenclave_new_hex: hex_encode(&mrenclave_new),
+                manifest_hash_hex: hex_encode(&manifest_hash),
+                dry_run: true,
+            });
+        }
+
         // Step 6: OLD verifies completion + transitions to retired.
+        // ⚠ POINT OF NO RETURN — reached only on a real (non-dry-run) ceremony.
         self.state = CeremonyState::ConfirmationRequested;
         self.api
             .verify_import_confirmation(
@@ -320,6 +354,7 @@ impl<A: EnclaveApi> CeremonyDriver<A> {
             ceremony_nonce_hex: hex_encode(&ceremony_nonce),
             mrenclave_new_hex: hex_encode(&mrenclave_new),
             manifest_hash_hex: hex_encode(&manifest_hash),
+            dry_run: false,
         })
     }
 }
@@ -567,6 +602,7 @@ mod tests {
             expected_mrenclave_new: "00".repeat(32),
             old_api_base: "https://localhost:9088".into(),
             new_api_base: "https://localhost:9089".into(),
+            dry_run: false,
         }
     }
 
@@ -594,6 +630,34 @@ mod tests {
         assert_eq!(calls[4], "export_state");
         assert_eq!(calls[5], "import_state");
         assert_eq!(calls[6], "verify_import_confirmation");
+    }
+
+    #[tokio::test]
+    async fn dry_run_stops_before_step6_retire() {
+        // OPS-AM-1 core: a dry-run exercises export + import + durability on the
+        // real path but must NEVER reach step 6 (OLD sealing its retired-marker
+        // — the point of no return).
+        let mock = happy_path_mock();
+        let calls = mock.calls.clone();
+        let mut driver = CeremonyDriver::new(mock);
+        let params = CeremonyParams {
+            dry_run: true,
+            ..happy_params()
+        };
+        let result = driver.run(&params).await.unwrap();
+
+        assert!(result.dry_run, "outcome must be flagged as a dry-run");
+        assert_eq!(driver.state(), CeremonyState::DryRunComplete);
+
+        let calls = calls.lock().unwrap().clone();
+        // Steps 1-5 run (through import); step 6 must NOT: 6 calls, not 7.
+        assert_eq!(calls.len(), 6, "dry-run runs 6 API calls, not 7: {calls:?}");
+        assert_eq!(calls[4], "export_state");
+        assert_eq!(calls[5], "import_state");
+        assert!(
+            !calls.iter().any(|c| c == "verify_import_confirmation"),
+            "POINT OF NO RETURN: verify_import_confirmation must NEVER fire in a dry-run"
+        );
     }
 
     #[tokio::test]

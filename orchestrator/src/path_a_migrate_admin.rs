@@ -57,6 +57,12 @@ pub struct MigrateStateRequest {
     /// Defaults to 30s if omitted (LibP2PDelegationCollector default).
     #[serde(default)]
     pub delegation_timeout_secs: Option<u64>,
+    /// REQ-β4.2 (RESP-β4.2 Q-β4.2-2): same route + flag, NOT a separate route
+    /// (OPS-AM-2 fidelity — the dry-run must exercise the identical code). When
+    /// true, rehearse export → import → durability and STOP before OLD retires
+    /// (the point of no return). Defaults to false (a real ceremony).
+    #[serde(default)]
+    pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,6 +71,9 @@ pub struct MigrateStateResponse {
     pub ceremony_nonce_hex: String,
     pub mrenclave_new_hex: String,
     pub manifest_hash_hex: String,
+    /// True if this was a dry-run rehearsal (OLD NOT retired). The operator UI
+    /// must show "ready to migrate" only after a dry-run PASS (OPS-AM-5).
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +95,7 @@ fn state_label(s: CeremonyState) -> &'static str {
         CeremonyState::ImportRequested => "import_requested",
         CeremonyState::ConfirmationRequested => "confirmation_requested",
         CeremonyState::Succeeded => "succeeded",
+        CeremonyState::DryRunComplete => "dry_run_complete",
         CeremonyState::Failed => "failed",
     }
 }
@@ -130,26 +140,38 @@ async fn handle_migrate_state(
 
     let api = ComposedEnclaveApi { http, delegation };
     let mut driver = CeremonyDriver::new(api);
+    let dry_run = req.dry_run.unwrap_or(false);
     let params = CeremonyParams {
         expected_mrenclave_new: req.expected_mrenclave_new,
         old_api_base: old_base,
         new_api_base: new_base,
+        dry_run,
     };
 
     match driver.run(&params).await {
         Ok(success) => {
-            info!(
-                mrenclave_new = %success.mrenclave_new_hex,
-                ceremony_nonce = %success.ceremony_nonce_hex,
-                "admin: ceremony succeeded — OLD retired, operator runs promotion sequence next"
-            );
+            if success.dry_run {
+                info!(
+                    mrenclave_new = %success.mrenclave_new_hex,
+                    ceremony_nonce = %success.ceremony_nonce_hex,
+                    "admin: DRY-RUN PASS — export+import+durability rehearsed, OLD NOT retired \
+                     (point of no return not crossed). Real ceremony is cleared to run."
+                );
+            } else {
+                info!(
+                    mrenclave_new = %success.mrenclave_new_hex,
+                    ceremony_nonce = %success.ceremony_nonce_hex,
+                    "admin: ceremony succeeded — OLD retired, operator runs promotion sequence next"
+                );
+            }
             (
                 StatusCode::OK,
                 Json(MigrateStateResponse {
-                    status: "ok",
+                    status: if success.dry_run { "dry-run-ok" } else { "ok" },
                     ceremony_nonce_hex: success.ceremony_nonce_hex,
                     mrenclave_new_hex: success.mrenclave_new_hex,
                     manifest_hash_hex: success.manifest_hash_hex,
+                    dry_run: success.dry_run,
                 }),
             )
                 .into_response()
