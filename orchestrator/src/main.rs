@@ -24,6 +24,7 @@ mod mrenclave_governance;
 mod node_deploy;
 mod orderbook;
 mod p2p;
+mod path_a_capacity;
 mod path_a_ceremony;
 mod path_a_delegation;
 mod path_a_http_client;
@@ -339,6 +340,18 @@ enum Command {
         /// (commit 11).
         #[arg(long, default_value_t = false)]
         side_by_side: bool,
+    },
+
+    /// REQ-β4.2 — Path A pre-flight capacity check (the STATIC half of the
+    /// operator-safety gate). Reads the node's sealed state and STOPs, BEFORE
+    /// any «go», if it exceeds a migration capacity limit (export buffer,
+    /// enclave heap peak, manifest / per-shard file counts). Run this — and the
+    /// `--dry-run` rehearsal — before driving the ceremony. Read-only; exits
+    /// non-zero on breach. Thresholds are fixed invariants, not tunable.
+    MigratePreflight {
+        /// Path to the OLD enclave's sealed-state dir (e.g. ~/perp/accounts).
+        #[arg(long)]
+        accounts_dir: PathBuf,
     },
 }
 
@@ -756,6 +769,15 @@ async fn main() -> Result<()> {
                 println!("  backup_suffix: {}", result.backup_suffix);
             }
             return Ok(());
+        }
+        Some(Command::MigratePreflight { accounts_dir }) => {
+            // Read-only static-sufficiency gate. Renders the table (both
+            // outcomes) inside assess_and_gate; exits non-zero on any breach so
+            // the operator flow cannot proceed past a state that cannot migrate.
+            match path_a_capacity::assess_and_gate(&accounts_dir) {
+                Ok(_) => return Ok(()),
+                Err(_) => std::process::exit(1),
+            }
         }
         Some(Command::OperatorAdd {
             enclave_url,
