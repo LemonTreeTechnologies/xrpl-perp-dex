@@ -129,6 +129,9 @@ struct ExportStateRequest<'a> {
     ceremony_nonce_hex: &'a str,
     peer_pk_compressed_hex: &'a str,
     delegation_bundle_hex: &'a str,
+    /// REQ-β4.2 dry-run: server defaults to false when the field is absent, but
+    /// we send it explicitly so a rehearsal is unambiguous on the wire.
+    dry_run: bool,
 }
 
 #[derive(Deserialize)]
@@ -302,6 +305,7 @@ impl EnclaveApi for HttpEnclaveApi {
         ceremony_nonce: &[u8; 32],
         peer_pk_compressed: &[u8; 33],
         delegation_bundle: &[u8],
+        dry_run: bool,
     ) -> Result<ExportResult> {
         let url = format!("{old_base}/v1/path-a/export-state");
         let ti_new_hex = hex_lower(target_info_of_new);
@@ -317,6 +321,7 @@ impl EnclaveApi for HttpEnclaveApi {
             ceremony_nonce_hex: &nonce_hex,
             peer_pk_compressed_hex: &peer_pk_hex,
             delegation_bundle_hex: &delegation_hex,
+            dry_run,
         };
         let resp: ExportStateResponse = self
             .client

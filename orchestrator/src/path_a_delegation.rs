@@ -187,6 +187,7 @@ where
         ceremony_nonce: &[u8; 32],
         peer_pk_compressed: &[u8; 33],
         delegation_bundle: &[u8],
+        dry_run: bool,
     ) -> Result<crate::path_a_ceremony::ExportResult> {
         self.http
             .export_state(
@@ -197,6 +198,7 @@ where
                 ceremony_nonce,
                 peer_pk_compressed,
                 delegation_bundle,
+                dry_run,
             )
             .await
     }

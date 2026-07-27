@@ -157,6 +157,10 @@ pub trait EnclaveApi: Send + Sync {
         ceremony_nonce: &[u8; 32],
         peer_pk_compressed: &[u8; 33],
         delegation_bundle: &[u8],
+        // REQ-β4.2: when true the OLD enclave produces the ciphertext + LA
+        // report but skips the durable nonce record + pending-migration arming
+        // (OPS-AM-1 inertness). The dry-run ceremony passes params.dry_run here.
+        dry_run: bool,
     ) -> Result<ExportResult>;
 
     /// POST /v1/path-a/import-state on NEW. Returns the completion
@@ -282,6 +286,7 @@ impl<A: EnclaveApi> CeremonyDriver<A> {
                 &ceremony_nonce,
                 &peer_pk,
                 &delegation_bundle,
+                params.dry_run,
             )
             .await?;
 
@@ -526,6 +531,7 @@ mod tests {
             _ceremony_nonce: &[u8; 32],
             _peer_pk_compressed: &[u8; 33],
             _delegation_bundle: &[u8],
+            _dry_run: bool,
         ) -> Result<ExportResult> {
             record(&self.calls, "export_state");
             maybe_fail(self.fail_on_step, "export_state")?;
