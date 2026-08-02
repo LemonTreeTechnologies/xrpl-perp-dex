@@ -29,7 +29,9 @@ use tracing::{info, warn};
 
 use crate::membership_apply::LibP2PMembershipApplier;
 use crate::membership_canonical::SignerEntry;
-use crate::membership_coordinator::{run_membership_change, LibP2PMembershipCollector};
+use crate::membership_coordinator::{
+    run_genesis_bootstrap, run_membership_change, LibP2PMembershipCollector,
+};
 use crate::membership_http::HttpEpochDigestSource;
 use crate::membership_projection::{run_projection, ProjectionRequest};
 use crate::membership_submit::LibP2PProjectionSubmitter;
@@ -227,6 +229,103 @@ async fn handle_membership_change(
     }
 }
 
+// ── β4 Thread A — genesis bootstrap trigger (seal the founding epoch 1) ──────
+//
+// β3.2 live-wiring for the genesis case (#122): `drive_change` above is
+// transitions-only (it reads the CURRENT epoch digest and requires an already
+// sealed epoch). A fresh cluster has no epoch 0 to transition from, so genesis
+// takes the self-authorising path `run_genesis_bootstrap` →
+// `ecall_bootstrap_from_quorum_attestation`: the founding members attest their
+// own founding epoch (attesting set == authority set). Composes the SAME
+// already-audited pieces (`LibP2PMembershipCollector`, `LibP2PMembershipApplier`
+// via `apply_genesis`) — plumbing, not new logic. No XRPL projection: the
+// initial `SignerListSet` is already on-chain (escrow-init, master-signed); this
+// only seals epoch 1 as each enclave's version=1 baseline so the cluster can
+// cosign thereafter.
+async fn drive_genesis(
+    state: &MembershipAdminState,
+    req: MembershipChangeRequest,
+) -> Result<MembershipChangeResponse> {
+    if state.cluster_size == 0 {
+        bail!("cluster_size is zero — no nodes to bootstrap");
+    }
+    // Decode the founding r-addresses → the sealed-form signer set (equal weight).
+    let mut genesis_signers: Vec<SignerEntry> = Vec::with_capacity(req.new_signers.len());
+    for addr in &req.new_signers {
+        let account_id =
+            decode_xrpl_address(addr).with_context(|| format!("invalid r-address {addr}"))?;
+        genesis_signers.push(SignerEntry {
+            account_id,
+            weight: 1,
+        });
+    }
+
+    // Founding-quorum consent (collector) → seal epoch 1 on every node via the
+    // p2p apply-broadcast (applier.apply_genesis). Same X-C1 topology as a
+    // transition: each node seals its OWN loopback enclave and acks.
+    let collector = LibP2PMembershipCollector::new(state.membership_epoch_tx.clone());
+    let applier =
+        LibP2PMembershipApplier::new(state.membership_apply_tx.clone(), state.cluster_size);
+    let outcome = run_genesis_bootstrap(
+        state.escrow,
+        genesis_signers,
+        req.quorum,
+        &collector,
+        &applier,
+    )
+    .await
+    .context("β4 genesis bootstrap (collect founding consent + seal epoch 1 across the cluster)")?;
+
+    let sealed_nodes = outcome.node_results.iter().filter(|r| r.ok).count();
+    Ok(MembershipChangeResponse {
+        status: if outcome.all_sealed() {
+            "ok".into()
+        } else {
+            "partial_seal".into()
+        },
+        proposed_epoch: outcome.proposed_epoch,
+        message_hash_hex: hex::encode(outcome.message_hash),
+        sealed_nodes,
+        // Genesis performs NO projection: the SignerListSet is already on-chain.
+        projection_tx_hash_hex: None,
+        projection_ledger_index: None,
+        confirmed_nodes: 0,
+        message: if outcome.all_sealed() {
+            format!(
+                "genesis epoch {} sealed on all {sealed_nodes} nodes; SignerListSet already \
+                 on-chain (escrow-init) — cluster can now cosign",
+                outcome.proposed_epoch
+            )
+        } else {
+            "genesis sealed on a subset of nodes — retry the failed nodes \
+             (bootstrap is idempotent under the (P) single-successor guard)"
+                .into()
+        },
+    })
+}
+
+async fn handle_membership_genesis(
+    State(state): State<Arc<MembershipAdminState>>,
+    Json(req): Json<MembershipChangeRequest>,
+) -> impl IntoResponse {
+    info!(
+        size = req.new_signers.len(),
+        quorum = req.quorum,
+        "β4 genesis bootstrap requested"
+    );
+    match drive_genesis(&state, req).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(e) => {
+            warn!(error = %e, "β4 genesis bootstrap failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"status": "error", "message": format!("{e:#}")})),
+            )
+                .into_response()
+        }
+    }
+}
+
 // ── β4 Thread B — trusted-MRENCLAVE allowlist governance trigger ────────────
 
 #[derive(Debug, Deserialize)]
@@ -329,6 +428,7 @@ async fn handle_govern(
 pub fn router(state: Arc<MembershipAdminState>) -> Router {
     Router::new()
         .route("/admin/membership-change", post(handle_membership_change))
+        .route("/admin/membership-genesis", post(handle_membership_genesis))
         .route("/admin/mrenclave-govern", post(handle_govern))
         .with_state(state)
 }
