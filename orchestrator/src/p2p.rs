@@ -490,17 +490,23 @@ pub struct LocalSigner {
     pub xrpl_address: String,
 }
 
+/// Canonicalize a session key to bare lowercase hex (strip an optional `0x`).
+/// GEN-3-R1 (RESP-β4-B-genesis-impl): the single normalization point. The enclave
+/// has two decoders — `from_hex` (bare-only; the typed-sign routes, where a `0x`
+/// mis-lengths the 32-byte key, fails `typed_sign_preamble`, and stalled genesis
+/// with "refused (malformed set or invalid input)") and `hex_str_to_bytes`
+/// (0x-tolerant; /pool/sign). Bare hex satisfies BOTH, so canonicalizing to bare
+/// is always safe. Config / node-bootstrap op-JSON store session_key 0x-prefixed.
+pub fn canonical_session_key(s: &str) -> &str {
+    s.strip_prefix("0x").unwrap_or(s)
+}
+
 impl LocalSigner {
-    /// The session key as bare lowercase hex (no `0x`). The enclave's typed-sign
-    /// admin routes decode it with `from_hex`, which expects NO `0x` prefix — a
-    /// prefixed value mis-lengths the 32-byte key and fails `typed_sign_preamble`
-    /// (server rejects with "refused (malformed set or invalid input)", never
-    /// reaching the enclave). Config / node-bootstrap op-JSON store session_key
-    /// 0x-prefixed, so strip it at every typed-sign call site.
+    /// The session key as bare hex for the enclave's typed-sign routes. Idempotent:
+    /// `set_local_signer` already canonicalizes at the boundary, so this is a
+    /// documenting accessor (defense in depth) over [`canonical_session_key`].
     pub fn session_key_hex(&self) -> &str {
-        self.session_key
-            .strip_prefix("0x")
-            .unwrap_or(&self.session_key)
+        canonical_session_key(&self.session_key)
     }
 }
 
@@ -1054,7 +1060,12 @@ impl P2PNode {
     }
 
     /// Set local signer credentials for handling incoming signing requests.
-    pub fn set_local_signer(&mut self, signer: LocalSigner) {
+    pub fn set_local_signer(&mut self, mut signer: LocalSigner) {
+        // GEN-3-R1 (RESP-β4-B-genesis-impl): canonicalize session_key to bare hex
+        // at this SINGLE boundary, so a future `from_hex` route can't re-introduce
+        // the 0-consents stall even via a direct `.session_key` read. See
+        // [`canonical_session_key`].
+        signer.session_key = canonical_session_key(&signer.session_key).to_string();
         info!(xrpl_addr = %signer.xrpl_address, "P2P signing relay: local signer configured");
         self.local_signer = Some(signer);
     }
@@ -4393,5 +4404,15 @@ mod tests {
             ..signer
         };
         assert_eq!(bare.session_key_hex(), "deadbeef");
+    }
+
+    /// GEN-3-R1: the single normalization function — the class fix that both the
+    /// boundary (`set_local_signer`, which stores the result so a later direct
+    /// `.session_key` read is also bare) and the accessor (`session_key_hex`) call.
+    #[test]
+    fn canonical_session_key_normalizes_and_is_idempotent() {
+        assert_eq!(canonical_session_key("0x5bb00f4c"), "5bb00f4c"); // strip
+        assert_eq!(canonical_session_key("5bb00f4c"), "5bb00f4c"); // already bare
+        assert_eq!(canonical_session_key(""), ""); // empty, no panic
     }
 }
