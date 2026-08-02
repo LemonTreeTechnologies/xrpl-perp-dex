@@ -490,6 +490,20 @@ pub struct LocalSigner {
     pub xrpl_address: String,
 }
 
+impl LocalSigner {
+    /// The session key as bare lowercase hex (no `0x`). The enclave's typed-sign
+    /// admin routes decode it with `from_hex`, which expects NO `0x` prefix — a
+    /// prefixed value mis-lengths the 32-byte key and fails `typed_sign_preamble`
+    /// (server rejects with "refused (malformed set or invalid input)", never
+    /// reaching the enclave). Config / node-bootstrap op-JSON store session_key
+    /// 0x-prefixed, so strip it at every typed-sign call site.
+    pub fn session_key_hex(&self) -> &str {
+        self.session_key
+            .strip_prefix("0x")
+            .unwrap_or(&self.session_key)
+    }
+}
+
 // ── Path A: peer DCAP quote exchange ────────────────────────────
 
 /// Path A peer-quote announcement. Published by each operator on ECDH
@@ -1561,7 +1575,7 @@ impl P2PNode {
             .post(&sign_url)
             .json(&serde_json::json!({
                 "from": local_signer.address,
-                "session_key": local_signer.session_key,
+                "session_key": local_signer.session_key_hex(),
                 "mrenclave_new": hex::encode(mrenclave_new),
                 "ceremony_nonce": hex::encode(ceremony_nonce),
             }))
@@ -1670,7 +1684,7 @@ impl P2PNode {
             .post(&sign_url)
             .json(&serde_json::json!({
                 "from": local_signer.address,
-                "session_key": local_signer.session_key,
+                "session_key": local_signer.session_key_hex(),
                 "escrow_account_id": hex::encode(escrow),
                 "signers": signers_json,
                 "quorum_threshold": new_quorum,
@@ -1754,7 +1768,7 @@ impl P2PNode {
                 "/admin/mrenclaves/sign-governance",
                 serde_json::json!({
                     "from": local_signer.address,
-                    "session_key": local_signer.session_key,
+                    "session_key": local_signer.session_key_hex(),
                     "op": op,
                     "mrenclave": hex::encode(mrenclave),
                     "proposed_epoch": proposed_epoch,
@@ -1765,7 +1779,7 @@ impl P2PNode {
                 "/admin/mrenclaves/sign-repro-proof",
                 serde_json::json!({
                     "from": local_signer.address,
-                    "session_key": local_signer.session_key,
+                    "session_key": local_signer.session_key_hex(),
                     "mrenclave": hex::encode(mrenclave),
                 }),
             ),
@@ -2214,7 +2228,7 @@ impl P2PNode {
                 "/pool/sign/withdrawal-payment",
                 serde_json::json!({
                     "from": local_signer.address,
-                    "session_key": local_signer.session_key,
+                    "session_key": local_signer.session_key_hex(),
                     "tx_blob": tx_blob_hex,
                 }),
             ),
@@ -2230,7 +2244,7 @@ impl P2PNode {
                     "/pool/sign/governance-signerlistset",
                     serde_json::json!({
                         "from": local_signer.address,
-                        "session_key": local_signer.session_key,
+                        "session_key": local_signer.session_key_hex(),
                         "tx_blob": tx_blob_hex,
                         "quorum_bundle": bundle,
                     }),
@@ -4354,5 +4368,30 @@ mod tests {
             },
             _ => panic!("expected MembershipApply"),
         }
+    }
+
+    /// REGRESSION (β4-B genesis, 2026-08-02): the enclave typed-sign routes decode
+    /// `session_key` with `from_hex`, which expects NO `0x` prefix. Config /
+    /// node-bootstrap op-JSON store it 0x-prefixed. `session_key_hex()` MUST strip
+    /// the prefix — otherwise the server rejects every membership consent with
+    /// "refused (malformed set or invalid input)" (the key mis-lengths past 32
+    /// bytes and fails `typed_sign_preamble` before the ecall), the collector
+    /// gathers 0 consents, and the whole β membership / genesis flow stalls.
+    #[test]
+    fn session_key_hex_strips_0x_prefix() {
+        let signer = LocalSigner {
+            enclave_url: "https://localhost:9088/v1".into(),
+            address: "0x85f9".into(),
+            session_key: "0x5bb00f4c".into(),
+            compressed_pubkey: String::new(),
+            xrpl_address: String::new(),
+        };
+        assert_eq!(signer.session_key_hex(), "5bb00f4c");
+        // Idempotent when already bare (no double-strip, no panic).
+        let bare = LocalSigner {
+            session_key: "deadbeef".into(),
+            ..signer
+        };
+        assert_eq!(bare.session_key_hex(), "deadbeef");
     }
 }
