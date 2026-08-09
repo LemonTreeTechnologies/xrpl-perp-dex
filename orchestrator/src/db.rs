@@ -16,6 +16,34 @@ pub struct Db {
     pool: PgPool,
 }
 
+/// REQ-β3.2c-impl (D-1/D-2): the retained current-epoch membership tuple a
+/// `source` node needs to serve a joining `newcomer` (X-β3.2-3). All hex is
+/// lowercase, no `0x`. Signer sets are packed EXACTLY as the enclave/Deliver
+/// wire — `count * 24` bytes, each entry `account_id[20] || weight_be[4]` — so
+/// the source handler can hand these straight to `bootstrap-bundle-export` and
+/// into `BootstrapMessage::Deliver` without re-encoding.
+///
+/// `authority_*` is the set the current epoch installed (M — the enclave's
+/// sealed set). `attesting_*` is the OUTGOING (M-1) set whose quorum signed the
+/// M transition (at genesis attesting == authority — self-authorising). This is
+/// a replica of enclave-verified state: the newcomer re-verifies the M-1 quorum
+/// and the escrow-bound hash in-enclave on import, so a tampered row can only
+/// fail an export, never forge a membership.
+#[derive(Debug, Clone)]
+pub struct CurrentMembershipBundle {
+    pub escrow_hex: String,
+    pub authority_epoch: u64,
+    pub confirmed_epoch: u64,
+    pub prev_epoch_hash_hex: String,
+    pub authority_signers_hex: String,
+    pub authority_signer_count: u32,
+    pub authority_quorum: u32,
+    pub attesting_signers_hex: String,
+    pub attesting_signer_count: u32,
+    pub attesting_quorum: u32,
+    pub quorum_bundle_hex: String,
+}
+
 impl Db {
     /// Connect to PostgreSQL. Returns None if connection fails (pg is optional).
     pub async fn connect(database_url: &str) -> Option<Self> {
@@ -446,6 +474,122 @@ impl Db {
                 })
             })
             .collect()
+    }
+
+    /// REQ-β3.2c-impl (D-1 PERSIST): replace the single retained current-epoch
+    /// membership tuple. Called at each successful `Seal`/`Bootstrap` apply so
+    /// that any in-sync node — including one restarted after the change — can
+    /// serve a joining newcomer (`bootstrap-bundle-export`). Fire-and-forget +
+    /// log, like every other replica write here: a persist failure must never
+    /// block the seal (the enclave's sealed state stays canonical); it only
+    /// means this node cannot SERVE a join until the next change re-populates.
+    pub async fn upsert_current_membership_bundle(&self, b: &CurrentMembershipBundle) {
+        let r = sqlx::query(
+            "INSERT INTO current_membership_bundle \
+             (id, escrow_hex, authority_epoch, confirmed_epoch, prev_epoch_hash_hex, \
+              authority_signers_hex, authority_signer_count, authority_quorum, \
+              attesting_signers_hex, attesting_signer_count, attesting_quorum, \
+              quorum_bundle_hex, updated_at) \
+             VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW()) \
+             ON CONFLICT (id) DO UPDATE SET \
+              escrow_hex = EXCLUDED.escrow_hex, \
+              authority_epoch = EXCLUDED.authority_epoch, \
+              confirmed_epoch = EXCLUDED.confirmed_epoch, \
+              prev_epoch_hash_hex = EXCLUDED.prev_epoch_hash_hex, \
+              authority_signers_hex = EXCLUDED.authority_signers_hex, \
+              authority_signer_count = EXCLUDED.authority_signer_count, \
+              authority_quorum = EXCLUDED.authority_quorum, \
+              attesting_signers_hex = EXCLUDED.attesting_signers_hex, \
+              attesting_signer_count = EXCLUDED.attesting_signer_count, \
+              attesting_quorum = EXCLUDED.attesting_quorum, \
+              quorum_bundle_hex = EXCLUDED.quorum_bundle_hex, \
+              updated_at = NOW()",
+        )
+        .bind(&b.escrow_hex)
+        .bind(b.authority_epoch as i64)
+        .bind(b.confirmed_epoch as i64)
+        .bind(&b.prev_epoch_hash_hex)
+        .bind(&b.authority_signers_hex)
+        .bind(b.authority_signer_count as i32)
+        .bind(b.authority_quorum as i32)
+        .bind(&b.attesting_signers_hex)
+        .bind(b.attesting_signer_count as i32)
+        .bind(b.attesting_quorum as i32)
+        .bind(&b.quorum_bundle_hex)
+        .execute(&self.pool)
+        .await;
+
+        match r {
+            Ok(_) => info!(
+                epoch = b.authority_epoch,
+                "retained current membership bundle (epoch {})", b.authority_epoch
+            ),
+            Err(e) => error!("pg upsert_current_membership_bundle failed: {}", e),
+        }
+    }
+
+    /// REQ-β3.2c-impl: load the single retained current-epoch membership tuple,
+    /// or `None` if this node has never persisted one (fresh DB) or on any read
+    /// error. The `source` handler uses this to decide whether it can serve a
+    /// join; `warn` (not `error`) on a read failure — absence is a normal state.
+    pub async fn load_current_membership_bundle(&self) -> Option<CurrentMembershipBundle> {
+        let row = sqlx::query_as::<
+            _,
+            (
+                String,
+                i64,
+                i64,
+                String,
+                String,
+                i32,
+                i32,
+                String,
+                i32,
+                i32,
+                String,
+            ),
+        >(
+            "SELECT escrow_hex, authority_epoch, confirmed_epoch, prev_epoch_hash_hex, \
+              authority_signers_hex, authority_signer_count, authority_quorum, \
+              attesting_signers_hex, attesting_signer_count, attesting_quorum, \
+              quorum_bundle_hex \
+             FROM current_membership_bundle WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await;
+
+        match row {
+            Ok(Some((
+                escrow_hex,
+                authority_epoch,
+                confirmed_epoch,
+                prev_epoch_hash_hex,
+                authority_signers_hex,
+                authority_signer_count,
+                authority_quorum,
+                attesting_signers_hex,
+                attesting_signer_count,
+                attesting_quorum,
+                quorum_bundle_hex,
+            ))) => Some(CurrentMembershipBundle {
+                escrow_hex,
+                authority_epoch: authority_epoch as u64,
+                confirmed_epoch: confirmed_epoch as u64,
+                prev_epoch_hash_hex,
+                authority_signers_hex,
+                authority_signer_count: authority_signer_count as u32,
+                authority_quorum: authority_quorum as u32,
+                attesting_signers_hex,
+                attesting_signer_count: attesting_signer_count as u32,
+                attesting_quorum: attesting_quorum as u32,
+                quorum_bundle_hex,
+            }),
+            Ok(None) => None,
+            Err(e) => {
+                warn!("pg load_current_membership_bundle failed: {}", e);
+                None
+            }
+        }
     }
 
     /// Query funding payment history for a user.

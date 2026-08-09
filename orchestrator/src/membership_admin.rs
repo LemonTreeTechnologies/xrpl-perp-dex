@@ -35,7 +35,7 @@ use crate::membership_coordinator::{
 use crate::membership_http::HttpEpochDigestSource;
 use crate::membership_projection::{run_projection, ProjectionRequest};
 use crate::membership_submit::LibP2PProjectionSubmitter;
-use crate::p2p::{MembershipApplyRelay, MembershipEpochRelay, SigningRelay};
+use crate::p2p::{MembershipApplyRelay, MembershipEpochRelay, MembershipSignerWire, SigningRelay};
 use crate::signerlist_update::fetch_account_sequence;
 use crate::xrpl_signer::decode_xrpl_address;
 
@@ -130,8 +130,21 @@ async fn drive_change(
     //    enclave admin API is loopback-only, X-C1 — each node seals locally).
     let digest_src = HttpEpochDigestSource::new(client, state.enclave_base.clone());
     let collector = LibP2PMembershipCollector::new(state.membership_epoch_tx.clone());
+    // D-2 (REQ-β3.2c): hand the applier this node's OUTGOING (M-1) set — its own
+    // current on-chain signer set — so the `Seal` payload carries it and every
+    // node retains the complete `(authority, attesting, bundle)` tuple for later
+    // serving a joining newcomer. Equal-weight (1 each), the cluster convention.
+    let attesting_signers: Vec<MembershipSignerWire> = state
+        .current_signers
+        .iter()
+        .map(|(_r_addr, account_id_hex)| MembershipSignerWire {
+            account_id_hex: account_id_hex.clone(),
+            weight: 1,
+        })
+        .collect();
     let applier =
-        LibP2PMembershipApplier::new(state.membership_apply_tx.clone(), state.cluster_size);
+        LibP2PMembershipApplier::new(state.membership_apply_tx.clone(), state.cluster_size)
+            .with_attesting(attesting_signers, state.current_quorum);
     let change = run_membership_change(
         state.escrow,
         new_signers.clone(),

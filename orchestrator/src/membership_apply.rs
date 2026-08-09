@@ -54,6 +54,13 @@ pub struct LibP2PMembershipApplier {
     /// retry safe).
     expected_nodes: usize,
     timeout: Duration,
+    /// REQ-β3.2c-impl (D-2): the OUTGOING (M-1) attesting set + quorum this
+    /// driving node holds (its own current on-chain signer set). Carried into
+    /// the `Seal` payload so every node persists the complete retention tuple.
+    /// Empty by default (the confirm-only / test paths don't need it); the β1
+    /// admin driver sets it from `current_signers` via `with_attesting`.
+    attesting_signers: Vec<MembershipSignerWire>,
+    attesting_quorum: u32,
 }
 
 impl LibP2PMembershipApplier {
@@ -64,11 +71,22 @@ impl LibP2PMembershipApplier {
             apply_tx,
             expected_nodes: expected_nodes.max(1),
             timeout: Duration::from_secs(45),
+            attesting_signers: Vec::new(),
+            attesting_quorum: 0,
         }
     }
 
     pub fn with_timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
+        self
+    }
+
+    /// REQ-β3.2c-impl (D-2): supply the OUTGOING (M-1) set whose quorum signs
+    /// the transition, so `apply_seal` can widen the `Seal` payload with it and
+    /// every node retains the complete `(authority, attesting, bundle)` tuple.
+    pub fn with_attesting(mut self, signers: Vec<MembershipSignerWire>, quorum: u32) -> Self {
+        self.attesting_signers = signers;
+        self.attesting_quorum = quorum;
         self
     }
 
@@ -168,6 +186,10 @@ impl ClusterSealApplier for LibP2PMembershipApplier {
             new_signers,
             new_quorum: statement.new_quorum,
             quorum_bundle_hex: hex::encode(bundle),
+            // D-2: the outgoing (M-1) set this node holds — carried so every node
+            // retains the complete tuple. Empty on the test/confirm paths.
+            attesting_signers: self.attesting_signers.clone(),
+            attesting_quorum: self.attesting_quorum,
         };
         let acks = self.broadcast_and_collect(payload).await?;
         let ok_count = acks.iter().filter(|a| a.ok).count();

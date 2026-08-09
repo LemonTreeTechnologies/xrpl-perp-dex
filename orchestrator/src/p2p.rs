@@ -277,6 +277,20 @@ pub enum MembershipApplyPayload {
         new_signers: Vec<MembershipSignerWire>,
         new_quorum: u32,
         quorum_bundle_hex: String,
+        /// REQ-β3.2c-impl (D-2, RESP-β3.2c Q2 "widen the wire"): the OUTGOING
+        /// (M-1) set whose quorum SIGNED this M transition — carried so every
+        /// node can persist the COMPLETE retention tuple from the apply alone
+        /// (no chaining across transitions, no init-from-sealed-state endpoint).
+        /// A retention CONVENIENCE only: on a join the newcomer re-verifies the
+        /// M-1 quorum sigs against whatever attesting set it is given, so a wrong
+        /// set here can at worst make a later export fail — never forge a
+        /// membership. `#[serde(default)]` for rolling safety: an older node's
+        /// Seal without these deserializes to an empty attesting set (that node
+        /// just cannot serve a join until the next change re-populates its row).
+        #[serde(default)]
+        attesting_signers: Vec<MembershipSignerWire>,
+        #[serde(default)]
+        attesting_quorum: u32,
     },
     /// Apply `ecall_record_projection_confirmation` locally (the validated
     /// SignerListSet projection of the just-sealed epoch).
@@ -339,6 +353,49 @@ fn decode_32(s: &str) -> Option<[u8; 32]> {
         a.copy_from_slice(&b);
         a
     })
+}
+
+/// REQ-β3.2c-impl: pack a signer set into the orchestrator-internal wire the
+/// retention row + `BootstrapMessage::Deliver` share — `count * 24` bytes, each
+/// entry `account_id[20] || weight_be[4]`, hex. This form is INTERNAL to the
+/// orchestrator: the enclave's `bootstrap-bundle-{export,import}` routes take a
+/// JSON `[{account_id, weight}]` array, so the source/newcomer handlers convert
+/// at the HTTP boundary and the endianness here is a free choice (big-endian for
+/// readability). Entries that are not exactly 20 bytes (never produced by our
+/// own `hex::encode` of an AccountID) are skipped; the count travels separately
+/// so a reader can detect any packed/count mismatch.
+pub(crate) fn pack_membership_signers(signers: &[MembershipSignerWire]) -> String {
+    let mut out = Vec::with_capacity(signers.len() * 24);
+    for s in signers {
+        match hex::decode(&s.account_id_hex) {
+            Ok(b) if b.len() == 20 => {
+                out.extend_from_slice(&b);
+                out.extend_from_slice(&s.weight.to_be_bytes());
+            }
+            _ => continue,
+        }
+    }
+    hex::encode(out)
+}
+
+/// REQ-β3.2c-impl: inverse of [`pack_membership_signers`] — unpack the
+/// orchestrator-internal `count * 24`-byte wire (`account_id[20] || weight_be[4]`,
+/// hex) back into structured signer entries. The join-brain uses this to turn a
+/// retained tuple / `Deliver`'s packed sets into the `[{account_id, weight}]` JSON
+/// arrays the enclave's bootstrap-bundle routes expect. A trailing partial record
+/// (never produced by [`pack_membership_signers`]) is ignored.
+pub(crate) fn unpack_membership_signers(packed_hex: &str) -> Vec<MembershipSignerWire> {
+    let bytes = match hex::decode(packed_hex) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    bytes
+        .chunks_exact(24)
+        .map(|c| MembershipSignerWire {
+            account_id_hex: hex::encode(&c[0..20]),
+            weight: u32::from_be_bytes([c[20], c[21], c[22], c[23]]),
+        })
+        .collect()
 }
 
 /// Events broadcast by sequencer for validator PG replication.
@@ -535,6 +592,15 @@ pub enum PeerQuoteMessage {
         /// Announcement wall-clock (sender side). Used only for staleness
         /// log filtering; the enclave uses its own `now_ts` on verify.
         timestamp: u64,
+        /// REQ-β3.2c-impl (X-β3.2c-7): the sender's CURRENT sealed membership
+        /// epoch (0 if not yet bootstrapped). A joining newcomer records this for
+        /// peers whose quote VERIFIES, and uses the max across verified peers as
+        /// its independent "current epoch" reference to reject a stale bundle.
+        /// Orchestrator-level plaintext claim (host untrusted) — safe under the
+        /// max rule (see `bootstrap_join::ObservedPeerEpochs`). `#[serde(default)]`
+        /// so an older node's Announce (no epoch) deserializes to 0.
+        #[serde(default)]
+        authority_epoch: u64,
     },
 }
 
@@ -563,6 +629,56 @@ pub enum ShareEnvelopeV2Message {
         /// Sealed envelope as returned by
         /// `POST /v1/pool/frost/share-export-v2`.
         envelope: ShareEnvelopeV2,
+    },
+}
+
+/// β3.2c / #127 / X-β3.2-3: DCAP-authenticated new-node bootstrap over gossip.
+/// A fresh node (no sealed membership) publishes `Request`; an in-sync source
+/// node responds with `Deliver` — the current membership statement plus the
+/// bootstrap bundle ECDH-sealed for the requester (wrapped by the source's
+/// enclave via `bootstrap-bundle-export`, unwrapped + bootstrapped by the
+/// newcomer's enclave via `bootstrap-bundle-import`). `recipient_pubkey` is a
+/// broadcast-filter hint only; security comes from the AEAD + the sender/
+/// recipient peer-attest-cache checks the enclaves enforce (A-PA-1 parity).
+/// All hex is lowercase, no `0x` prefix.
+// Deliver is intentionally much larger than Request (it carries the full
+// membership statement + ECIES envelope). These are low-frequency gossip
+// messages (a join happens rarely), so the size asymmetry is fine — boxing the
+// variant would only add indirection to the wire type for no real benefit.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BootstrapMessage {
+    Request {
+        /// 33-byte compressed secp256k1 ECDH identity pubkey of the newcomer.
+        requester_pubkey: String,
+        shard_id: u32,
+        /// 32-byte group_id hex.
+        group_id: String,
+    },
+    Deliver {
+        /// Broadcast filter: the newcomer's ECDH pubkey the envelope is sealed for.
+        recipient_pubkey: String,
+        shard_id: u32,
+        group_id: String,
+        // --- membership statement the newcomer bootstraps to (public) ---
+        escrow_account_id: String,
+        /// Packed authority signer entries (count * 24 bytes), hex.
+        authority_signers: String,
+        authority_signer_count: u32,
+        authority_quorum: u32,
+        authority_epoch: u64,
+        confirmed_epoch: u64,
+        prev_epoch_hash: String,
+        attesting_signers: String,
+        attesting_signer_count: u32,
+        attesting_quorum: u32,
+        // --- ECDH-sealed bootstrap-bundle envelope ---
+        ceremony_nonce: String,
+        iv: String,
+        ct: String,
+        tag: String,
+        sender_pk: String,
     },
 }
 
@@ -656,6 +772,7 @@ const SIGNING_TOPIC: &str = "perp-dex/signing";
 const EVENTS_TOPIC: &str = "perp-dex/events";
 const PEER_QUOTE_TOPIC: &str = "perp-dex/path-a/peer-quote";
 const SHARE_V2_TOPIC: &str = "perp-dex/path-a/share-v2";
+const BOOTSTRAP_TOPIC: &str = "perp-dex/path-a/bootstrap";
 const DKG_STEP_TOPIC: &str = "perp-dex/cluster/dkg-step";
 
 #[derive(NetworkBehaviour)]
@@ -674,6 +791,7 @@ pub struct P2PNode {
     events_topic: gossipsub::IdentTopic,
     peer_quote_topic: gossipsub::IdentTopic,
     share_v2_topic: gossipsub::IdentTopic,
+    bootstrap_topic: gossipsub::IdentTopic,
     /// Phase 2.1c-D: DKG ceremony coordination (leader-driven, libp2p).
     dkg_step_topic: gossipsub::IdentTopic,
     /// Channel to send received batches to the orchestrator (validator).
@@ -718,9 +836,18 @@ pub struct P2PNode {
     peer_quote_inbound_tx: Option<mpsc::Sender<PeerQuoteMessage>>,
     /// Path A: outbound v2 share envelopes (published by share-export task).
     share_v2_publish_rx: Option<mpsc::Receiver<ShareEnvelopeV2Message>>,
+    /// β3.2c: outbound bootstrap Request/Deliver (published by the join task).
+    bootstrap_publish_rx: Option<mpsc::Receiver<BootstrapMessage>>,
     /// Path A: received share envelopes forwarded to import task
     /// (only messages matching `local_ecdh_pubkey` are delivered — hint-only).
     share_v2_inbound_tx: Option<mpsc::Sender<ShareEnvelopeV2Message>>,
+    /// β3.2c: received bootstrap Request/Deliver forwarded to the join task.
+    bootstrap_inbound_tx: Option<mpsc::Sender<BootstrapMessage>>,
+    /// REQ-β3.2c-impl (D-1 PERSIST): optional DB handle to retain the current
+    /// membership tuple at each successful Seal/Bootstrap apply, so any in-sync
+    /// node — including one restarted after the change — can serve a joining
+    /// newcomer. `None` disables retention (pg is optional; never blocks a seal).
+    db: Option<crate::db::Db>,
     /// Phase 2.1c-D: outbound DKG ceremony coordination messages
     /// (published by leader admin route + each follower's step handler).
     dkg_step_publish_rx: Option<mpsc::Receiver<DkgStepMessage>>,
@@ -849,6 +976,7 @@ impl P2PNode {
         let events_topic = gossipsub::IdentTopic::new(EVENTS_TOPIC);
         let peer_quote_topic = gossipsub::IdentTopic::new(PEER_QUOTE_TOPIC);
         let share_v2_topic = gossipsub::IdentTopic::new(SHARE_V2_TOPIC);
+        let bootstrap_topic = gossipsub::IdentTopic::new(BOOTSTRAP_TOPIC);
         let dkg_step_topic = gossipsub::IdentTopic::new(DKG_STEP_TOPIC);
 
         let mut node = P2PNode {
@@ -859,6 +987,7 @@ impl P2PNode {
             events_topic,
             peer_quote_topic,
             share_v2_topic,
+            bootstrap_topic,
             dkg_step_topic,
             batch_tx,
             publish_rx: None,
@@ -880,6 +1009,9 @@ impl P2PNode {
             peer_quote_inbound_tx: None,
             share_v2_publish_rx: None,
             share_v2_inbound_tx: None,
+            bootstrap_publish_rx: None,
+            bootstrap_inbound_tx: None,
+            db: None,
             dkg_step_publish_rx: None,
             dkg_step_inbound_tx: None,
             local_ecdh_pubkey: None,
@@ -927,6 +1059,11 @@ impl P2PNode {
             .gossipsub
             .subscribe(&node.share_v2_topic)
             .context("failed to subscribe to share-v2 topic")?;
+        node.swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&node.bootstrap_topic)
+            .context("failed to subscribe to bootstrap topic")?;
         node.swarm
             .behaviour_mut()
             .gossipsub
@@ -1036,6 +1173,92 @@ impl P2PNode {
     /// forwarded to (consumer calls `/v1/pool/frost/share-import-v2`).
     pub fn set_share_v2_inbound_channel(&mut self, tx: mpsc::Sender<ShareEnvelopeV2Message>) {
         self.share_v2_inbound_tx = Some(tx);
+    }
+
+    /// β3.2c: set the channel the join task uses to publish bootstrap
+    /// Request/Deliver messages onto the mesh.
+    pub fn set_bootstrap_publish_channel(&mut self, rx: mpsc::Receiver<BootstrapMessage>) {
+        self.bootstrap_publish_rx = Some(rx);
+    }
+
+    /// β3.2c: set the channel received bootstrap Request/Deliver messages are
+    /// forwarded to (the join task drives export on Request / import on Deliver).
+    pub fn set_bootstrap_inbound_channel(&mut self, tx: mpsc::Sender<BootstrapMessage>) {
+        self.bootstrap_inbound_tx = Some(tx);
+    }
+
+    /// REQ-β3.2c-impl (D-1 PERSIST): give this node a DB handle so it retains the
+    /// current membership tuple at each successful Seal/Bootstrap apply. Optional
+    /// — without it retention is disabled (pg is optional) and this node cannot
+    /// serve a join, but seals still succeed (the enclave stays canonical).
+    pub fn set_db_handle(&mut self, db: crate::db::Db) {
+        self.db = Some(db);
+    }
+
+    /// REQ-β3.2c-impl (D-1/D-2): after a SUCCESSFUL Seal/Bootstrap apply, replace
+    /// this node's retained current-epoch membership tuple so it can later serve
+    /// a joining newcomer (`bootstrap-bundle-export`). No-op if the payload
+    /// carries no membership tuple (Confirm / GovernMrenclave). At genesis
+    /// (Bootstrap) attesting == authority (self-authorising). `confirmed_epoch`
+    /// is stored = authority_epoch optimistically: the D-5 sync-gate re-checks the
+    /// LIVE enclave sync-state at SERVE time, so a node not actually in-sync will
+    /// not serve regardless.
+    ///
+    /// Takes `&Db` (Send+Sync), NOT `&self`: the run-loop future is `tokio::spawn`
+    /// -ed and `P2PNode` is not `Sync`, so holding `&self` across the upsert
+    /// `.await` would make that future non-Send. The caller pulls the db ref.
+    async fn persist_retention(db: &crate::db::Db, payload: &MembershipApplyPayload) {
+        let tuple = match payload {
+            MembershipApplyPayload::Seal {
+                escrow_hex,
+                proposed_epoch,
+                prev_epoch_hash_hex,
+                new_signers,
+                new_quorum,
+                quorum_bundle_hex,
+                attesting_signers,
+                attesting_quorum,
+            } => crate::db::CurrentMembershipBundle {
+                escrow_hex: escrow_hex.clone(),
+                authority_epoch: *proposed_epoch,
+                confirmed_epoch: *proposed_epoch,
+                prev_epoch_hash_hex: prev_epoch_hash_hex.clone(),
+                authority_signers_hex: pack_membership_signers(new_signers),
+                authority_signer_count: new_signers.len() as u32,
+                authority_quorum: *new_quorum,
+                attesting_signers_hex: pack_membership_signers(attesting_signers),
+                attesting_signer_count: attesting_signers.len() as u32,
+                attesting_quorum: *attesting_quorum,
+                quorum_bundle_hex: quorum_bundle_hex.clone(),
+            },
+            MembershipApplyPayload::Bootstrap {
+                escrow_hex,
+                epoch,
+                prev_epoch_hash_hex,
+                signers,
+                quorum,
+                quorum_bundle_hex,
+            } => {
+                // Genesis is self-authorising: attesting == authority == signers.
+                let packed = pack_membership_signers(signers);
+                crate::db::CurrentMembershipBundle {
+                    escrow_hex: escrow_hex.clone(),
+                    authority_epoch: *epoch,
+                    confirmed_epoch: *epoch,
+                    prev_epoch_hash_hex: prev_epoch_hash_hex.clone(),
+                    authority_signers_hex: packed.clone(),
+                    authority_signer_count: signers.len() as u32,
+                    authority_quorum: *quorum,
+                    attesting_signers_hex: packed,
+                    attesting_signer_count: signers.len() as u32,
+                    attesting_quorum: *quorum,
+                    quorum_bundle_hex: quorum_bundle_hex.clone(),
+                }
+            }
+            // Confirm / GovernMrenclave carry no membership tuple to retain.
+            _ => return,
+        };
+        db.upsert_current_membership_bundle(&tuple).await;
     }
 
     /// Phase 2.1c-D: set the channel that DKG ceremony coordination
@@ -1908,6 +2131,10 @@ impl P2PNode {
                 new_signers,
                 new_quorum,
                 quorum_bundle_hex,
+                // attesting_* is a retention convenience persisted at the call
+                // site (persist_retention_if_membership); the seal ecall re-uses
+                // this node's own sealed set as attesting, so it's unused here.
+                ..
             } => {
                 let escrow = match decode_20(escrow_hex) {
                     Some(a) => a,
@@ -2347,6 +2574,7 @@ impl P2PNode {
         let mut events_rx = self.events_publish_rx.take();
         let mut peer_quote_rx = self.peer_quote_publish_rx.take();
         let mut share_v2_rx = self.share_v2_publish_rx.take();
+        let mut bootstrap_rx = self.bootstrap_publish_rx.take();
         let mut dkg_step_rx = self.dkg_step_publish_rx.take();
 
         let orders_topic_hash = self.orders_topic.hash();
@@ -2355,6 +2583,7 @@ impl P2PNode {
         let events_topic_hash = self.events_topic.hash();
         let peer_quote_topic_hash = self.peer_quote_topic.hash();
         let share_v2_topic_hash = self.share_v2_topic.hash();
+        let bootstrap_topic_hash = self.bootstrap_topic.hash();
         let dkg_step_topic_hash = self.dkg_step_topic.hash();
 
         let mut signing_cleanup = tokio::time::interval(Duration::from_secs(5));
@@ -2613,6 +2842,16 @@ impl P2PNode {
                     if let Some(ref local) = self.local_signer {
                         let local_ack = Self::handle_membership_apply(
                             local, &relay.request_id, &relay.payload).await;
+                        // REQ-β3.2c-impl (D-1): retain the current membership tuple
+                        // ONLY after this node's own enclave accepted the apply, so
+                        // it can later serve a joining newcomer. The driving node
+                        // retains here (gossipsub does not deliver to the publisher,
+                        // so it won't also hit the inbound site below).
+                        if matches!(&local_ack, SigningMessage::Response { error: None, .. }) {
+                            if let Some(db) = self.db.as_ref() {
+                                Self::persist_retention(db, &relay.payload).await;
+                            }
+                        }
                         let _ = relay.responses_tx.send(local_ack).await;
                     }
 
@@ -2650,6 +2889,21 @@ impl P2PNode {
                         if let Err(e) = self.swarm.behaviour_mut().gossipsub
                             .publish(self.events_topic.clone(), data) {
                             warn!("events publish failed: {}", e);
+                        }
+                    }
+                }
+
+                // β3.2c: publish own bootstrap Request/Deliver
+                Some(msg) = async {
+                    match &mut bootstrap_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<BootstrapMessage>>().await,
+                    }
+                } => {
+                    if let Ok(data) = serde_json::to_vec(&msg) {
+                        if let Err(e) = self.swarm.behaviour_mut().gossipsub
+                            .publish(self.bootstrap_topic.clone(), data) {
+                            warn!("bootstrap publish failed: {}", e);
                         }
                     }
                 }
@@ -3184,6 +3438,15 @@ impl P2PNode {
                                 );
                                 let response = Self::handle_membership_apply(
                                     &local, &request_id, &payload).await;
+                                // REQ-β3.2c-impl (D-1): retain the current membership
+                                // tuple ONLY after this node's enclave accepted the
+                                // apply, so any in-sync node (not just the driver) can
+                                // serve a joining newcomer.
+                                if matches!(&response, SigningMessage::Response { error: None, .. }) {
+                                    if let Some(db) = self.db.as_ref() {
+                                        Self::persist_retention(db, &payload).await;
+                                    }
+                                }
                                 if let Err(e) = self.publish_signing(&response) {
                                     error!("failed to publish β membership-apply ack: {}", e);
                                 }
@@ -3268,6 +3531,23 @@ impl P2PNode {
                             }
                             Err(e) => {
                                 warn!("invalid share-v2 from {}: {}", propagation_source, e);
+                            }
+                        }
+                    } else if message.topic == bootstrap_topic_hash {
+                        // β3.2c: forward bootstrap Request/Deliver to the join task,
+                        // which drives export (Request) or import (Deliver) against
+                        // the local enclave. The enclave enforces the peer-attest +
+                        // AEAD binding, so this path carries no trust of its own.
+                        match serde_json::from_slice::<BootstrapMessage>(&message.data) {
+                            Ok(msg) => {
+                                if let Some(ref tx) = self.bootstrap_inbound_tx {
+                                    if let Err(e) = tx.send(msg).await {
+                                        error!("failed to forward bootstrap msg: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("invalid bootstrap msg from {}: {}", propagation_source, e);
                             }
                         }
                     } else if message.topic == dkg_step_topic_hash {
@@ -4318,6 +4598,13 @@ mod tests {
                 }],
                 new_quorum: 1,
                 quorum_bundle_hex: "deadbeef".into(),
+                // REQ-β3.2c-impl (D-2): the outgoing (M-1) attesting set rides
+                // the wire so every node retains the complete tuple.
+                attesting_signers: vec![MembershipSignerWire {
+                    account_id_hex: "02".repeat(20),
+                    weight: 1,
+                }],
+                attesting_quorum: 1,
             },
         };
         let wire = serde_json::to_string(&msg).expect("serialize");
@@ -4337,17 +4624,50 @@ mod tests {
                         proposed_epoch,
                         new_quorum,
                         quorum_bundle_hex,
+                        attesting_signers,
+                        attesting_quorum,
                         ..
                     } => {
                         assert_eq!(proposed_epoch, 7);
                         assert_eq!(new_quorum, 1);
                         assert_eq!(quorum_bundle_hex, "deadbeef");
+                        // D-2: the attesting (M-1) set round-trips on the wire.
+                        assert_eq!(attesting_signers.len(), 1);
+                        assert_eq!(attesting_signers[0].account_id_hex, "02".repeat(20));
+                        assert_eq!(attesting_quorum, 1);
                     }
                     _ => panic!("expected Seal payload"),
                 }
             }
             _ => panic!("expected MembershipApply"),
         }
+    }
+
+    #[test]
+    fn membership_signers_pack_unpack_round_trips() {
+        let signers = vec![
+            MembershipSignerWire {
+                account_id_hex: "01".repeat(20),
+                weight: 1,
+            },
+            MembershipSignerWire {
+                account_id_hex: "ab".repeat(20),
+                weight: 7,
+            },
+        ];
+        let packed = pack_membership_signers(&signers);
+        // count * 24 bytes, hex → count * 48 hex chars.
+        assert_eq!(packed.len(), 2 * 24 * 2);
+        let back = unpack_membership_signers(&packed);
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].account_id_hex, "01".repeat(20));
+        assert_eq!(back[0].weight, 1);
+        assert_eq!(back[1].account_id_hex, "ab".repeat(20));
+        assert_eq!(back[1].weight, 7);
+        // empty round-trips to empty; malformed unpacks to empty (never panics).
+        assert!(pack_membership_signers(&[]).is_empty());
+        assert!(unpack_membership_signers("").is_empty());
+        assert!(unpack_membership_signers("zz").is_empty());
     }
 
     #[test]

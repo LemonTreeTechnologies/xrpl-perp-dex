@@ -138,3 +138,25 @@ CREATE TABLE IF NOT EXISTS price_candles (
     UNIQUE(market, timestamp_epoch)
 );
 CREATE INDEX IF NOT EXISTS idx_candles_market ON price_candles(market, timestamp_epoch DESC);
+
+-- REQ-β3.2c-impl (D-1 PERSIST): the current-epoch membership tuple a `source`
+-- node serves to a joining `newcomer` (X-β3.2-3). Single row (id=1), replaced on
+-- each Seal/Bootstrap apply. Replica of enclave-verified state — the newcomer
+-- re-verifies the M-1 quorum + escrow-bound hash in-enclave on import, so a
+-- tampered row can only fail an export, never forge membership.
+-- See migrations/004_current_membership_bundle.sql for the full rationale.
+CREATE TABLE IF NOT EXISTS current_membership_bundle (
+    id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    escrow_hex VARCHAR(40) NOT NULL,
+    authority_epoch BIGINT NOT NULL,
+    confirmed_epoch BIGINT NOT NULL,
+    prev_epoch_hash_hex VARCHAR(64) NOT NULL,
+    authority_signers_hex TEXT NOT NULL,
+    authority_signer_count INTEGER NOT NULL,
+    authority_quorum INTEGER NOT NULL,
+    attesting_signers_hex TEXT NOT NULL,
+    attesting_signer_count INTEGER NOT NULL,
+    attesting_quorum INTEGER NOT NULL,
+    quorum_bundle_hex TEXT NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);

@@ -6,6 +6,8 @@
 
 mod api;
 mod auth;
+mod bootstrap_http;
+mod bootstrap_join;
 mod cli_tools;
 mod commitment;
 mod db;
@@ -1078,6 +1080,13 @@ async fn main() -> Result<()> {
     // Spawn Path A peer-quote verifier — received announcements are
     // passed to /v1/pool/attest/verify-peer-quote to populate the
     // enclave's attest cache.
+    // REQ-β3.2c-impl (X-β3.2c-7): shared record of each DCAP-verified peer's
+    // advertised current epoch. Written by the peer-quote verifier below (ONLY on
+    // a verified quote), read by the newcomer join-brain as its independent
+    // "current epoch" reference to reject a stale bundle. Held here so the join
+    // task (wired next) shares the same instance the verifier populates.
+    let observed_epochs = Arc::new(bootstrap_join::ObservedPeerEpochs::new());
+    let observed_for_verifier = observed_epochs.clone();
     let verifier_client = pool_path_a_client::PoolPathAClient::new(&cli.enclave_url)?;
     let _peer_quote_verifier = tokio::spawn(async move {
         while let Some(p2p::PeerQuoteMessage::Announce {
@@ -1086,6 +1095,7 @@ async fn main() -> Result<()> {
             group_id,
             quote,
             timestamp: _,
+            authority_epoch,
         }) = peer_quote_in_rx.recv().await
         {
             let now_ts = std::time::SystemTime::now()
@@ -1097,7 +1107,11 @@ async fn main() -> Result<()> {
                 .await
             {
                 Ok(Some(mre)) => {
-                    info!(peer_pubkey = %peer_pubkey, mrenclave = %mre, "verified peer quote")
+                    // X-β3.2c-7: record the epoch ONLY for a peer whose quote
+                    // verified (admit()-passed → in peer_attest_cache), so a
+                    // debug / wrong-MRENCLAVE peer cannot inject an epoch.
+                    observed_for_verifier.record(&peer_pubkey, authority_epoch);
+                    info!(peer_pubkey = %peer_pubkey, mrenclave = %mre, epoch = authority_epoch, "verified peer quote")
                 }
                 Ok(None) => {
                     warn!(peer_pubkey = %peer_pubkey, "peer quote verification refused (403)")
@@ -1146,6 +1160,19 @@ async fn main() -> Result<()> {
         let pub_tx = peer_quote_pub_tx.clone();
         let shard_id = group.shard_id;
         let group_id = group.group_id_hex.clone();
+        // X-β3.2c-7: announce THIS node's current sealed epoch so joining
+        // newcomers get an independent epoch reference. Sourced from the LOCAL
+        // admin epoch-digest (loopback, X-C1); a fresh / not-yet-bootstrapped node
+        // reports 0, which the newcomer's max-over-verified-peers rule harmlessly
+        // ignores. group.enclave_url ends in "/v1"; the digest source re-adds it.
+        let epoch_admin_base = group
+            .enclave_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .trim_end_matches('/')
+            .to_string();
+        let epoch_client = http_helpers::loopback_http_client(Duration::from_secs(30))?;
+        let epoch_src = membership_http::HttpEpochDigestSource::new(epoch_client, epoch_admin_base);
         let _announcer = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(PEER_QUOTE_INTERVAL_SECS));
             loop {
@@ -1175,12 +1202,22 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 };
+                // X-β3.2c-7: our current sealed epoch (0 if not bootstrapped).
+                let authority_epoch = {
+                    use membership_coordinator::EpochDigestSource;
+                    epoch_src
+                        .current_epoch()
+                        .await
+                        .map(|(e, _digest)| e)
+                        .unwrap_or(0)
+                };
                 let msg = p2p::PeerQuoteMessage::Announce {
                     peer_pubkey: my_pk,
                     shard_id,
                     group_id: group_id.clone(),
                     quote,
                     timestamp: now_ts,
+                    authority_epoch,
                 };
                 if pub_tx.send(msg).await.is_err() {
                     warn!(shard_id, "announcer channel closed — exiting");
@@ -1272,6 +1309,70 @@ async fn main() -> Result<()> {
         }
     } else {
         info!("DKG coordinator dormant: no --signers-config");
+    }
+
+    // REQ-β3.2c-impl: the newcomer join-brain — one task per node. An existing
+    // member serves joins (source role); a fresh node joins (newcomer role) until
+    // it seals, then becomes source-capable. Gated on the same config as
+    // membership (escrow + signers_config + local_signer) plus a configured
+    // Path-A group for the shard/group identity. The orchestrator is UNTRUSTED —
+    // every security property is enforced by the enclave on import.
+    if let (Some(cfg), Some(group)) = (
+        signers_config.as_ref(),
+        shard_router.path_a_groups().first(),
+    ) {
+        if let Some(local) = cfg.local_signer.as_ref() {
+            let join_ecdh = match pool_path_a_client::PoolPathAClient::new(&cli.enclave_url)?
+                .ecdh_pubkey()
+                .await
+            {
+                Ok(pk) => pk.to_lowercase(),
+                Err(e) => {
+                    warn!("join-brain: fetch local ECDH pubkey failed ({e}); join-brain disabled");
+                    String::new()
+                }
+            };
+            match (
+                crate::xrpl_signer::decode_xrpl_address(&escrow_address),
+                crate::xrpl_signer::decode_xrpl_address(&local.xrpl_address),
+            ) {
+                (Ok(escrow), Ok(my_aid)) if !join_ecdh.is_empty() => {
+                    let (bootstrap_pub_tx, bootstrap_pub_rx) =
+                        tokio::sync::mpsc::channel::<p2p::BootstrapMessage>(32);
+                    let (bootstrap_in_tx, bootstrap_in_rx) =
+                        tokio::sync::mpsc::channel::<p2p::BootstrapMessage>(32);
+                    p2p_node.set_bootstrap_publish_channel(bootstrap_pub_rx);
+                    p2p_node.set_bootstrap_inbound_channel(bootstrap_in_tx);
+                    // --enclave-url ends in /v1; the bootstrap-bundle + sync-state
+                    // admin routes re-add it, so strip to the bare loopback base.
+                    let enclave_admin_base = cli
+                        .enclave_url
+                        .trim_end_matches('/')
+                        .trim_end_matches("/v1")
+                        .trim_end_matches('/')
+                        .to_string();
+                    let brain = bootstrap_join::JoinBrain {
+                        db: db.clone(),
+                        observed: observed_epochs.clone(),
+                        client: http_helpers::loopback_http_client(Duration::from_secs(30))?,
+                        enclave_admin_base,
+                        escrow_hex: hex::encode(escrow),
+                        shard_id: group.shard_id,
+                        group_id_hex: group.group_id_hex.to_lowercase(),
+                        my_ecdh_pk: join_ecdh,
+                        my_account_id_hex: hex::encode(my_aid),
+                        publish_tx: bootstrap_pub_tx,
+                    };
+                    tokio::spawn(async move {
+                        bootstrap_join::run_join_brain(brain, bootstrap_in_rx).await;
+                    });
+                    info!(shard_id = group.shard_id, "β3.2c join-brain spawned");
+                }
+                _ => warn!(
+                    "join-brain disabled: escrow/local r-address decode failed or ECDH pubkey unavailable"
+                ),
+            }
+        }
     }
 
     // Phase 2.2-C — SignerListSet governance admin listener. Only
@@ -1507,6 +1608,14 @@ async fn main() -> Result<()> {
         // applied on each node's OWN loopback enclave).
         if let Some(rx) = membership_apply_rx_holder {
             p2p_node.set_membership_apply_channel(rx);
+        }
+        // REQ-β3.2c-impl (D-1 PERSIST): give the p2p node the DB handle so it
+        // retains the current membership tuple at each successful Seal/Bootstrap
+        // apply — any in-sync node (including one restarted after the change) can
+        // then serve a joining newcomer. Optional: no DB → retention disabled,
+        // but seals still succeed (the enclave's sealed state stays canonical).
+        if let Some(ref db_handle) = db {
+            p2p_node.set_db_handle(db_handle.clone());
         }
         // β4 Thread B: the governance/repro bundle collection channel.
         if let Some(rx) = mrenclave_governance_rx_holder {
