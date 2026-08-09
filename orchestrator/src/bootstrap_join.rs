@@ -157,6 +157,14 @@ const ELECTION_JITTER: Duration = Duration::from_secs(3);
 /// After this many unanswered `Request`s (~ MAX * 30 s) the newcomer HALTS for
 /// the operator rather than silently give up on a security-relevant join (D-4).
 const MAX_REQUEST_RETRIES: u32 = 20;
+/// Post-bootstrap sync-drift self-check cadence (hardening RESP-β3.2c-impl A):
+/// even after sealing, a node compares its epoch to the verified-peer mesh.
+const DRIFT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+/// A sealed epoch behind the mesh for longer than this is flagged as a likely
+/// eclipse-sealed stale membership. A merely-lagging node catches up within
+/// seconds via the Seal apply, so a persistent lag is the eclipse-to-stale
+/// residual RESP-β3.2c-impl recorded, not a normal transition.
+const DRIFT_HALT_AFTER: Duration = Duration::from_secs(120);
 
 /// Everything the join-brain task needs. The orchestrator is UNTRUSTED — none of
 /// this grants trust; the enclave enforces source posture + M-1 quorum + escrow
@@ -194,6 +202,14 @@ fn now_unix() -> u64 {
 async fn query_bootstrapped(brain: &JoinBrain) -> bool {
     let src = HttpEpochDigestSource::new(brain.client.clone(), brain.enclave_admin_base.clone());
     src.current_epoch().await.is_ok()
+}
+
+/// This node's current sealed authority epoch, or `None` if it is not
+/// bootstrapped / the enclave is unreachable. Drives the post-bootstrap
+/// sync-drift self-check (hardening RESP-β3.2c-impl A).
+async fn current_sealed_epoch(brain: &JoinBrain) -> Option<u64> {
+    let src = HttpEpochDigestSource::new(brain.client.clone(), brain.enclave_admin_base.clone());
+    src.current_epoch().await.ok().map(|(e, _digest)| e)
 }
 
 /// Source role, gate + load: return `(retained tuple, my election rank)` iff this
@@ -390,6 +406,10 @@ pub async fn run_join_brain(brain: JoinBrain, mut inbound_rx: mpsc::Receiver<Boo
     let mut served: HashSet<String> = HashSet::new();
     // Non-primary delayed serves: requester → time it becomes due.
     let mut pending_serves: HashMap<String, Instant> = HashMap::new();
+    // Hardening A (post-bootstrap sync-drift self-check) state.
+    let mut last_drift_check: Option<Instant> = None;
+    let mut drift_since: Option<Instant> = None;
+    let mut drift_flagged = false;
 
     info!(
         bootstrapped,
@@ -410,6 +430,11 @@ pub async fn run_join_brain(brain: JoinBrain, mut inbound_rx: mpsc::Receiver<Boo
                             || !group_id.eq_ignore_ascii_case(&brain.group_id_hex)
                             || requester_pubkey.eq_ignore_ascii_case(&brain.my_ecdh_pk)
                         {
+                            continue;
+                        }
+                        // Hardening A: a drift-flagged (likely eclipse-stale) node
+                        // must NOT serve — it could hand out a stale bundle.
+                        if drift_flagged {
                             continue;
                         }
                         match source_prepare(&brain).await {
@@ -485,6 +510,10 @@ pub async fn run_join_brain(brain: JoinBrain, mut inbound_rx: mpsc::Receiver<Boo
                     if served.contains(&requester) {
                         continue;
                     }
+                    // Hardening A: a drift-flagged node drops its pending serves.
+                    if drift_flagged {
+                        continue;
+                    }
                     if let Some((tuple, _rank)) = source_prepare(&brain).await {
                         source_serve(&brain, &requester, &tuple).await;
                         served.insert(requester);
@@ -509,6 +538,42 @@ pub async fn run_join_brain(brain: JoinBrain, mut inbound_rx: mpsc::Receiver<Boo
                                     "join-brain: join did not complete after {MAX_REQUEST_RETRIES} Requests — HALT for operator (never silently give up on a membership join)"
                                 );
                                 halted = true;
+                            }
+                        }
+                    }
+                }
+
+                // Hardening A (RESP-β3.2c-impl): post-bootstrap sync-drift
+                // self-check. An eclipse-sealed stale node does NOT self-recover
+                // (a bootstrapped node stops acting as a newcomer, and it missed
+                // the intermediate Seal applies), so it must self-flag: while
+                // bootstrapped, compare our sealed epoch to the verified-peer
+                // mesh; if we stay BEHIND for > DRIFT_HALT_AFTER, loudly flag +
+                // stop serving. A merely-lagging node catches up in seconds via
+                // the Seal apply, so only a persistent lag trips this.
+                if bootstrapped {
+                    let check_due = last_drift_check
+                        .is_none_or(|t| now.duration_since(t) >= DRIFT_CHECK_INTERVAL);
+                    if check_due {
+                        last_drift_check = Some(now);
+                        if let (Some(reference), Some(mine)) = (
+                            brain.observed.max_fresh(PEER_EPOCH_TTL),
+                            current_sealed_epoch(&brain).await,
+                        ) {
+                            if mine < reference {
+                                let since = *drift_since.get_or_insert(now);
+                                if now.duration_since(since) >= DRIFT_HALT_AFTER && !drift_flagged {
+                                    error!(
+                                        sealed = mine, mesh = reference,
+                                        "join-brain: post-bootstrap sync-drift — sealed epoch has been BEHIND the verified-peer mesh for >{}s; this node likely eclipse-sealed a stale membership. Halting source role — operator wipe/re-join required.",
+                                        DRIFT_HALT_AFTER.as_secs()
+                                    );
+                                    drift_flagged = true;
+                                }
+                            } else {
+                                // Caught up (== reference, or ahead) → clear.
+                                drift_since = None;
+                                drift_flagged = false;
                             }
                         }
                     }
