@@ -168,6 +168,38 @@ impl OrderBook {
         self.asks.keys().next().map(|&p| FP8(p))
     }
 
+    /// #114 (reserve-at-placement): the total initial margin RESERVED by this
+    /// user's currently-resting orders on both sides of the book. The enclave's
+    /// `available_margin` only nets out OPEN positions — resting orders are
+    /// orchestrator-side and invisible to it — so without subtracting this, a
+    /// funded account could rest many orders that each individually pass the
+    /// point-in-time pre-check yet together exceed its margin. Per-order margin
+    /// mirrors the enclave's initial-margin gate: `notional / leverage`
+    /// (`remaining * price / leverage`). Reduce-only orders free margin rather
+    /// than requiring it, so they are excluded (over-inclusion would only make
+    /// the guard MORE conservative — the fail-closed direction — so this stays
+    /// safe even for the close-order edge that rests without `reduce_only`).
+    pub fn user_reserved_margin(&self, user_id: &str) -> FP8 {
+        let sum_level = |acc: FP8, level: &PriceLevel| -> FP8 {
+            level
+                .orders
+                .iter()
+                .filter(|o| o.user_id == user_id && !o.reduce_only && o.leverage > 0)
+                .fold(acc, |a, o| {
+                    let notional = o.remaining() * o.price;
+                    a + FP8(notional.raw() / o.leverage as i64)
+                })
+        };
+        let mut reserved = FP8::ZERO;
+        for level in self.bids.values() {
+            reserved = sum_level(reserved, level);
+        }
+        for level in self.asks.values() {
+            reserved = sum_level(reserved, level);
+        }
+        reserved
+    }
+
     /// Mid price.
     pub fn mid_price(&self) -> Option<FP8> {
         match (self.best_bid(), self.best_ask()) {
@@ -659,6 +691,73 @@ mod tests {
         assert_eq!(order.status, OrderStatus::Open);
         assert_eq!(ob.best_bid(), Some(FP8::from_f64(0.55)));
         assert_eq!(ob.best_ask(), None);
+    }
+
+    #[test]
+    fn user_reserved_margin_sums_resting_orders() {
+        let mut ob = book();
+        // alice rests a buy: notional 100*0.55 = 55, / leverage 5 = 11 reserved.
+        ob.submit_order(
+            "alice".into(),
+            Side::Long,
+            OrderType::Limit,
+            FP8::from_f64(0.55),
+            FP8::from_f64(100.0),
+            5,
+            TimeInForce::Gtc,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(ob.user_reserved_margin("alice"), FP8::from_f64(11.0));
+        assert_eq!(ob.user_reserved_margin("bob"), FP8::ZERO);
+
+        // alice rests a sell on the other side (0.60 > best_bid 0.55, no match):
+        // notional 50*0.60 = 30, /5 = 6 → total 17 across both sides.
+        ob.submit_order(
+            "alice".into(),
+            Side::Short,
+            OrderType::Limit,
+            FP8::from_f64(0.60),
+            FP8::from_f64(50.0),
+            5,
+            TimeInForce::Gtc,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(ob.user_reserved_margin("alice"), FP8::from_f64(17.0));
+
+        // a reduce-only order frees margin rather than requiring it → excluded.
+        ob.submit_order(
+            "alice".into(),
+            Side::Short,
+            OrderType::Limit,
+            FP8::from_f64(0.70),
+            FP8::from_f64(40.0),
+            5,
+            TimeInForce::Gtc,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(ob.user_reserved_margin("alice"), FP8::from_f64(17.0));
+
+        // another user's resting order is not attributed to alice.
+        ob.submit_order(
+            "bob".into(),
+            Side::Long,
+            OrderType::Limit,
+            FP8::from_f64(0.50),
+            FP8::from_f64(100.0),
+            5,
+            TimeInForce::Gtc,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(ob.user_reserved_margin("alice"), FP8::from_f64(17.0));
+        assert_eq!(ob.user_reserved_margin("bob"), FP8::from_f64(10.0));
     }
 
     #[test]

@@ -132,42 +132,60 @@ impl TradingEngine {
         client_order_id: Option<String>,
         close_position_id: Option<u32>,
     ) -> Result<OrderResult> {
-        // Step 0: Pre-check margin in enclave before matching (skip for close orders).
+        // Step 0a: fetch available margin from the enclave BEFORE matching (skip
+        // for close orders). Async — no book lock held here.
         //
         // Fail-CLOSED (#114): if available margin cannot be determined — account
         // unknown to the enclave, balance query errored, or the field is
-        // missing/unparseable — REJECT the order. A limit order that finds no
-        // match returns Ok below without ever reaching the enclave
-        // open_position gate (Step 2), so this pre-check is the ONLY margin
-        // guard for a resting order. The previous best-effort form silently
-        // skipped on any error, letting a zero/unknown-margin account rest
-        // orders (200 OK) and pollute the book.
-        if close_position_id.is_none() {
+        // missing/unparseable — REJECT the order. `available_margin` nets out
+        // this user's OPEN positions only; resting orders are orchestrator-side
+        // and invisible to the enclave, so they are accounted for under the lock
+        // in Step 0b.
+        let avail = if close_position_id.is_none() {
             let balance =
                 self.perp.get_balance(&user_id).await.map_err(|e| {
                     anyhow::anyhow!("insufficient margin: balance unavailable ({e})")
                 })?;
-            let avail = balance["data"]["available_margin"]
-                .as_str()
-                .and_then(|s| s.parse::<FP8>().ok())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("insufficient margin: available_margin unreadable")
-                })?;
-            let est_price = if price.raw() > 0 {
-                price
-            } else {
-                FP8::from_f64(1.0)
-            };
-            let notional = size * est_price;
-            let est_margin = FP8(notional.raw() / leverage as i64);
-            if avail.raw() < est_margin.raw() {
-                anyhow::bail!("insufficient margin: available={avail}, required~={est_margin}");
-            }
-        }
+            Some(
+                balance["data"]["available_margin"]
+                    .as_str()
+                    .and_then(|s| s.parse::<FP8>().ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("insufficient margin: available_margin unreadable")
+                    })?,
+            )
+        } else {
+            None
+        };
 
-        // Step 1: Match on the order book
+        // Step 1: under the book lock — reserve-at-placement margin check (#114)
+        // then match/rest. Both under the SAME lock so no order can slip in
+        // between the check and the submit (no TOCTOU on the reservation).
         let (mut order, trades, stp_cancelled) = {
             let mut book = self.book.lock().await;
+            if let Some(avail) = avail {
+                // A limit order that finds no match returns Ok below WITHOUT ever
+                // reaching the enclave open_position gate (Step 2), so this is the
+                // ONLY margin guard for a resting order — and it must net out the
+                // margin this user has already committed to OTHER resting orders,
+                // else a funded account could rest many orders each individually
+                // passing a point-in-time check but together over-committing.
+                let est_price = if price.raw() > 0 {
+                    price
+                } else {
+                    FP8::from_f64(1.0)
+                };
+                let notional = size * est_price;
+                let required = FP8(notional.raw() / leverage as i64);
+                let reserved = book.user_reserved_margin(&user_id);
+                let free = FP8(avail.raw() - reserved.raw());
+                if free.raw() < required.raw() {
+                    anyhow::bail!(
+                        "insufficient margin: available={avail}, reserved={reserved}, \
+                         free={free}, required~={required}"
+                    );
+                }
+            }
             book.submit_order(
                 user_id,
                 side,
@@ -451,5 +469,122 @@ impl TradingEngine {
     pub async fn ticker(&self) -> (Option<FP8>, Option<FP8>, Option<FP8>) {
         let book = self.book.lock().await;
         (book.best_bid(), book.best_ask(), book.mid_price())
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orderbook::OrderType;
+    use axum::{routing::get, Json, Router};
+    use serde_json::json;
+
+    /// Spawn a loopback mock enclave whose `/v1/perp/balance` returns a fixed
+    /// `available_margin`. Returns the base URL (with the `/v1` the client expects).
+    async fn spawn_mock_enclave(available_margin: &str) -> String {
+        let avail = available_margin.to_string();
+        let app = Router::new().route(
+            "/v1/perp/balance",
+            get(move || {
+                let avail = avail.clone();
+                async move {
+                    Json(json!({
+                        "status": "success",
+                        "data": {
+                            "available_margin": avail,
+                            "margin_balance": avail,
+                            "positions": []
+                        }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/v1")
+    }
+
+    fn engine(base: &str) -> TradingEngine {
+        TradingEngine::new("XRP-USD-PERP", PerpClient::new(base).unwrap(), "test-peer")
+    }
+
+    // #114: an account with zero available margin must NOT be able to rest a
+    // limit order (a resting order never reaches the enclave open_position gate,
+    // so the orchestrator pre-check is its only guard — and it must fail closed).
+    #[tokio::test]
+    async fn unfunded_account_cannot_rest_a_limit_order() {
+        let base = spawn_mock_enclave("0.00000000").await;
+        let eng = engine(&base);
+        let res = eng
+            .submit_order(
+                "broke".into(),
+                Side::Long,
+                OrderType::Limit,
+                FP8::from_f64(0.55),
+                FP8::from_f64(100.0),
+                5,
+                TimeInForce::Gtc,
+                false,
+                None,
+            )
+            .await;
+        assert!(
+            res.is_err(),
+            "unfunded account must be rejected, got {res:?}"
+        );
+        assert!(res.unwrap_err().to_string().contains("insufficient margin"));
+    }
+
+    // #114 (reserve-at-placement): available=20; each order needs 100*0.55/5 = 11.
+    // The first rests (11 ≤ 20). The second must be rejected: only 20-11 = 9 is
+    // free once the first order's margin is reserved — even though a point-in-time
+    // read of `available_margin` (which the enclave computes from OPEN positions
+    // only, ignoring resting orders) still says 20.
+    #[tokio::test]
+    async fn resting_orders_reserve_margin_so_second_order_is_rejected() {
+        let base = spawn_mock_enclave("20.00000000").await;
+        let eng = engine(&base);
+        let first = eng
+            .submit_order(
+                "whale".into(),
+                Side::Long,
+                OrderType::Limit,
+                FP8::from_f64(0.55),
+                FP8::from_f64(100.0),
+                5,
+                TimeInForce::Gtc,
+                false,
+                None,
+            )
+            .await
+            .expect("first order should rest");
+        assert!(first.trades.is_empty(), "first order should rest, not fill");
+
+        let second = eng
+            .submit_order(
+                "whale".into(),
+                Side::Long,
+                OrderType::Limit,
+                FP8::from_f64(0.55),
+                FP8::from_f64(100.0),
+                5,
+                TimeInForce::Gtc,
+                false,
+                None,
+            )
+            .await;
+        assert!(
+            second.is_err(),
+            "second order must be rejected — first order's margin is reserved: {second:?}"
+        );
+        assert!(second
+            .unwrap_err()
+            .to_string()
+            .contains("insufficient margin"));
     }
 }
