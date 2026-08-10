@@ -40,7 +40,9 @@ tower-http = { version = "0.6", features = ["cors"] }
 libp2p = { version = "0.56", default-features = false, features = ["gossipsub", "tcp", "noise", "yamux", "tokio", "macros", "identify"] }
 
 # Ethereum (Sepolia CommitmentRegistry submission)
-ethers = { version = "2", features = ["abigen"] }
+# #131: alloy replaces the frozen ethers-rs stack (43-crate ethereum tail).
+# tx-construction/query only; signing lives in the enclave.
+alloy = { version = "1", features = ["providers", "contract", "sol-types", "network", "signer-local", "reqwest"] }
 
 # XRPL binary codec + tx building
 xrpl-mithril-codec = "0.3"

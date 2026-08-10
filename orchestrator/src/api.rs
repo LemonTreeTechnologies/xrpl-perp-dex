@@ -414,18 +414,22 @@ async fn attestation_quote(
 /// Get latest state commitment info (for on-chain verification).
 /// Public endpoint — no auth needed.
 async fn attestation_commitment() -> impl IntoResponse {
+    // #131: retargeted Ethereum-Sepolia → Base-Sepolia; V4 → ReservesRegistry.
+    // The registry address is operator config (set once deployed, chunk 4) — the
+    // artifact is honestly proof-of-LIABILITIES + inclusion, not proof-of-reserves.
     ok(serde_json::json!({
-        "registry": crate::commitment::REGISTRY_ADDRESS,
-        "network": "sepolia",
-        "description": "CommitmentRegistryV4 — TEE-signed state proofs",
+        "network": "base-sepolia",
+        "chain_id": crate::commitment::BASE_SEPOLIA_CHAIN_ID,
+        "registry": serde_json::Value::Null,
+        "artifact": "proof-of-liabilities + inclusion (enclave-signed merkle root, in-TEE internal-solvency assertion)",
+        "description": "ReservesRegistry — periodic, 2-of-3-Safe-gated, monotonic-epoch liabilities root",
         "how_to_verify": {
-            "1": "Query this endpoint or the contract directly on Sepolia",
-            "2": "Verify ECDSA signature matches attested enclave address",
-            "3": "Verify Merkle root against published state",
-            "4": "Use /v1/attestation/quote to verify enclave identity (DCAP)"
+            "1": "Read latestReserves() on the ReservesRegistry (Base-Sepolia)",
+            "2": "Verify your account's inclusion via the Q-22 merkle proof against latestRoot",
+            "3": "Use /v1/attestation/quote to verify enclave identity (DCAP)"
         },
-        "contract_abi": "commit(bytes32 marketId, bytes32 root, bytes32 snapshotHash, uint8 v, bytes32 r, bytes32 s)",
-        "etherscan": format!("https://sepolia.etherscan.io/address/{}", crate::commitment::REGISTRY_ADDRESS),
+        "contract_abi": "publishReserves(uint64 epoch, bytes32 root, bytes32 snapshotHash)",
+        "basescan": "https://sepolia.basescan.org/",
     })).into_response()
 }
 
