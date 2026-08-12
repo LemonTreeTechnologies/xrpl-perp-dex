@@ -160,6 +160,39 @@ impl PerpClient {
         .await
     }
 
+    /// #131 Tier-1 reserves commit — the sequencer's enclave computes the
+    /// proof-of-liabilities root over its sealed state and signs the Gnosis-Safe
+    /// EIP-712 tx-hash for `publishReserves`. Returns 500 if custody < liabilities.
+    /// `account_id` keeps its `0x` (the enclave requires the 42-char form); the
+    /// `session_key` and the two addresses are sent 0x-stripped (canonical, matching
+    /// the enclave hex parser + the typed-sign session-key discipline).
+    #[allow(dead_code)] // wired by the 3d publisher
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reserves_commit(
+        &self,
+        account_id: &str,
+        session_key: &str,
+        epoch: u64,
+        safe_address: &str,
+        chain_id: u64,
+        registry_address: &str,
+        safe_nonce: u64,
+    ) -> Result<Value> {
+        self.post(
+            "/perp/reserves-commit",
+            serde_json::json!({
+                "account_id": account_id,
+                "session_key": session_key.trim_start_matches("0x"),
+                "epoch": epoch,
+                "safe_address": safe_address.trim_start_matches("0x"),
+                "chain_id": chain_id,
+                "registry_address": registry_address.trim_start_matches("0x"),
+                "safe_nonce": safe_nonce,
+            }),
+        )
+        .await
+    }
+
     /// Query user margin, positions, unrealized PnL.
     pub async fn get_balance(&self, user_id: &str) -> Result<Value> {
         self.get(&format!("/perp/balance?user_id={user_id}")).await
