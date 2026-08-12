@@ -34,6 +34,7 @@ sol! {
 
 /// The latest reserves commitment as read from the on-chain registry.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // consumed by the 3d publisher + attestation endpoint
 pub struct LatestReserves {
     pub epoch: u64,
     pub root: [u8; 32],
@@ -44,6 +45,7 @@ pub struct LatestReserves {
 
 /// Read the latest published reserves root from `ReservesRegistry` on Base-Sepolia.
 /// `rpc_url` + `registry` come from operator config. Read-only (no signer).
+#[allow(dead_code)] // wired by the 3d publisher
 pub async fn query_latest_reserves(rpc_url: &str, registry: &str) -> Result<LatestReserves> {
     let addr: Address = registry.parse().context("invalid registry address")?;
     let provider = ProviderBuilder::new()
@@ -69,6 +71,7 @@ pub async fn query_latest_reserves(rpc_url: &str, registry: &str) -> Result<Late
 /// the 2-of-3 Safe execTransaction wraps (chunk 5); returning the calldata keeps
 /// this module signer-free — the enclave-produced root goes in, the Safe (not this
 /// orchestrator) authorises the send.
+#[allow(dead_code)] // wired by the 3d publisher (Safe execTransaction data)
 pub fn encode_publish_reserves(epoch: u64, root: [u8; 32], snapshot_hash: [u8; 32]) -> Vec<u8> {
     use alloy::sol_types::SolCall;
     ReservesRegistry::publishReservesCall {
