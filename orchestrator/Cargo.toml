@@ -2,6 +2,11 @@
 name = "perp-dex-orchestrator"
 version = "0.1.0"
 edition = "2021"
+# Team toolchain baseline (matches .github/workflows/check.yml dtolnay/rust-toolchain@1.88.0).
+# resolver = "3" makes cargo MSRV-aware so `alloy` is held at a 1.88-compatible
+# release instead of auto-jumping to a version whose MSRV outruns CI (#131 chunk-2 regression).
+rust-version = "1.88"
+resolver = "3"
 description = "Orchestrator for Perp DEX on XRPL with SGX enclave"
 
 [dependencies]
