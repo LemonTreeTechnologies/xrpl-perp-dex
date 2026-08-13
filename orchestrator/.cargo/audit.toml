@@ -1,0 +1,26 @@
+# cargo-audit config — #131 AC-CHUNK3-5 RUSTSEC gate.
+#
+# `cargo check`/`clippy` do NOT surface RustSec advisories (they are Cargo.lock
+# scans). This config makes `cargo audit` a CI gate that FAILS on any NEW/unlisted
+# vulnerability (regression protection) while documenting the current, pre-existing
+# transitive-dep tail. Each ignore below is either unfixable on our rustc-1.88
+# baseline or in an unused dependency; revisit on the noted trigger.
+#
+# Unmaintained/yanked-crate warnings (core2, derivative, paste, event-listener,
+# lru, spin, …) are informational — the gate is not run with `--deny warnings`.
+
+[advisories]
+ignore = [
+    # hickory-proto 0.25 (via libp2p DNS resolver) — NSEC3 closest-encloser
+    # unbounded loop. No fixed upgrade available. Revisit on a libp2p bump.
+    "RUSTSEC-2026-0118",
+    # hickory-proto 0.25 — O(n^2) name compression on message encoding. Fix is
+    # hickory 0.26.1, blocked by libp2p 0.56's pin. Revisit on a libp2p bump.
+    "RUSTSEC-2026-0119",
+    # rsa 0.9 Marvin timing side-channel — reached only via sqlx-mysql, which we do
+    # NOT use (postgres only). Droppable by feature-gating sqlx off mysql (forward).
+    "RUSTSEC-2023-0071",
+    # ruint 1.17 — incorrect Uint shift overflow flags. Fix is ruint 1.20, whose
+    # MSRV (rustc 1.90) exceeds our 1.88 CI baseline. Revisit on a toolchain bump.
+    "RUSTSEC-2026-0220",
+]

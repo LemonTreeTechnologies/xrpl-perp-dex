@@ -1,0 +1,34 @@
+name: cargo-audit
+
+# #131 AC-CHUNK3-5 — RustSec advisory gate on the orchestrator dependency tree
+# (alloy + the full tree). `cargo check`/`clippy` do NOT surface RUSTSEC advisories
+# — they are source lints, not Cargo.lock advisory scans. This job FAILS on any
+# NEW/unlisted vulnerability (regression protection); the known, pre-existing
+# transitive-dep exceptions are documented + justified in
+# orchestrator/.cargo/audit.toml. The weekly schedule catches advisories published
+# after a lock is frozen.
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - 'feat/**'
+      - 'audit/**'
+      - 'infra/**'
+  pull_request:
+  schedule:
+    - cron: '0 6 * * 1' # Mondays 06:00 UTC
+
+jobs:
+  audit:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit
+        working-directory: orchestrator
+        run: cargo audit
