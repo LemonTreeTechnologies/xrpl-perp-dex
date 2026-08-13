@@ -36,6 +36,7 @@ mod perp_client;
 mod pool_path_a_client;
 mod price_feed;
 mod rate_limit;
+mod reserves_publisher; // #131 3d — Tier-1 reserves publisher
 pub mod shard_router;
 mod signerlist_update;
 mod singleton;
@@ -1976,6 +1977,12 @@ async fn main() -> Result<()> {
         Instant::now() - Duration::from_secs(cli.liquidation_interval + 1);
     let mut last_funding_instant = Instant::now();
     let mut last_state_save = Instant::now();
+    // #131 3d — Tier-1 reserves publisher (opt-in via RESERVES_PUBLISH; sequencer-only).
+    let reserves_publisher_cfg = reserves_publisher::ReservesPublisherConfig::from_env();
+    if reserves_publisher_cfg.is_some() {
+        info!("reserves publisher ENABLED (Tier-1 single attested-enclave, sequencer-only)");
+    }
+    let mut last_reserves_commit = Instant::now();
 
     let price_interval = Duration::from_secs(cli.price_interval);
     let liquidation_interval = Duration::from_secs(cli.liquidation_interval);
@@ -2191,6 +2198,34 @@ async fn main() -> Result<()> {
                 Err(e) => error!("funding application failed: {}", e),
             }
             last_funding_instant = Instant::now();
+        }
+
+        // #131 3d — Tier-1 reserves commit (sequencer-only region; opt-in). The
+        // sequencer enclave computes + signs the liabilities root; this only relays
+        // the owner signature to the Safe and pays gas (AC-R2-1).
+        if let Some(rcfg) = reserves_publisher_cfg.as_ref() {
+            if last_reserves_commit.elapsed() >= Duration::from_secs(rcfg.interval_secs) {
+                match signers_config
+                    .as_ref()
+                    .and_then(|c| c.local_signer.as_ref())
+                {
+                    Some(signer) => {
+                        match reserves_publisher::run_reserves_commit_once(
+                            rcfg,
+                            &perp,
+                            &signer.address,
+                            &signer.session_key,
+                        )
+                        .await
+                        {
+                            Ok(tx) => info!(tx = %tx, "reserves-commit published to Base-Sepolia"),
+                            Err(e) => warn!("reserves-commit skipped/failed: {}", e),
+                        }
+                    }
+                    None => warn!("reserves-commit enabled but no local_signer in signers_config"),
+                }
+                last_reserves_commit = Instant::now();
+            }
         }
 
         // State save (every 5 minutes)

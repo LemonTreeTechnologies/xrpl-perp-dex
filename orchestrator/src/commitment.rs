@@ -13,8 +13,14 @@
 //! RPC URL + registry address are operator config (never hardcoded) — the RPC
 //! embeds an API key.
 
-use alloy::primitives::{Address, FixedBytes};
+// The Gnosis-Safe execTransaction ABI has 11 params (fixed by the contract) and the
+// submit helper mirrors it — clippy's arg-count lint is spurious for an external ABI.
+#![allow(clippy::too_many_arguments)]
+
+use alloy::network::EthereumWallet;
+use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::providers::ProviderBuilder;
+use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use anyhow::{Context, Result};
 
@@ -29,6 +35,21 @@ sol! {
             uint64 epoch, bytes32 root, bytes32 snapshotHash, uint64 committedAt, address committer
         );
         function authority() external view returns (address);
+    }
+}
+
+sol! {
+    #[sol(rpc)]
+    contract GnosisSafe {
+        function nonce() external view returns (uint256);
+        // Gnosis Safe v1.3.0/1.4.1 — the enclave signs the SafeTxHash; this orchestrator
+        // only relays the owner signature + pays gas (AC-R2-1). operation=0 (CALL),
+        // gas fields 0, gasToken/refundReceiver = zero address.
+        function execTransaction(
+            address to, uint256 value, bytes data, uint8 operation,
+            uint256 safeTxGas, uint256 baseGas, uint256 gasPrice,
+            address gasToken, address refundReceiver, bytes signatures
+        ) external payable returns (bool success);
     }
 }
 
@@ -80,6 +101,75 @@ pub fn encode_publish_reserves(epoch: u64, root: [u8; 32], snapshot_hash: [u8; 3
         snapshotHash: FixedBytes::<32>::from(snapshot_hash),
     }
     .abi_encode()
+}
+
+/// Read the Safe's current on-chain nonce — the value the enclave must bind into
+/// the SafeTxHash it signs. Read-only (no signer).
+#[allow(dead_code)] // wired by the 3d publisher
+pub async fn query_safe_nonce(rpc_url: &str, safe: &str) -> Result<u64> {
+    let safe_addr: Address = safe.parse().context("invalid safe address")?;
+    let provider = ProviderBuilder::new()
+        .connect(rpc_url)
+        .await
+        .context("connect Base-Sepolia RPC")?;
+    let s = GnosisSafe::new(safe_addr, &provider);
+    let n = s.nonce().call().await.context("safe.nonce()")?;
+    Ok(n.to::<u64>())
+}
+
+/// Submit the enclave-signed `publishReserves` via the Safe (1-of-1 at Tier-1).
+///
+/// `owner_sig` is the enclave's 65-byte `[r‖s‖v]` over the SafeTxHash (v ∈ {27,28}),
+/// which is exactly the Safe's expected ECDSA owner-signature encoding. `gas_key` is
+/// a gas-paying EOA private key (hex) — NOT the enclave key: it is only `msg.sender`
+/// for `execTransaction` and pays Base-Sepolia gas; the Safe verifies the owner sig,
+/// so this orchestrator can never forge the authorised call (AC-R2-1).
+#[allow(dead_code)] // wired by the 3d publisher
+pub async fn submit_reserves_via_safe(
+    rpc_url: &str,
+    gas_key: &str,
+    safe: &str,
+    registry: &str,
+    epoch: u64,
+    root: [u8; 32],
+    snapshot_hash: [u8; 32],
+    owner_sig: [u8; 65],
+) -> Result<String> {
+    let safe_addr: Address = safe.parse().context("invalid safe address")?;
+    let registry_addr: Address = registry.parse().context("invalid registry address")?;
+    let signer: PrivateKeySigner = gas_key
+        .trim_start_matches("0x")
+        .parse()
+        .context("parse gas EOA key")?;
+    let provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(signer))
+        .connect(rpc_url)
+        .await
+        .context("connect Base-Sepolia RPC (wallet)")?;
+
+    let data = encode_publish_reserves(epoch, root, snapshot_hash);
+    let s = GnosisSafe::new(safe_addr, &provider);
+    let pending = s
+        .execTransaction(
+            registry_addr,                   // to = ReservesRegistry
+            U256::ZERO,                      // value
+            Bytes::from(data),               // data = publishReserves(epoch, root, snapshot)
+            0u8,                             // operation = CALL
+            U256::ZERO,                      // safeTxGas
+            U256::ZERO,                      // baseGas
+            U256::ZERO,                      // gasPrice
+            Address::ZERO,                   // gasToken
+            Address::ZERO,                   // refundReceiver
+            Bytes::from(owner_sig.to_vec()), // signatures = enclave r‖s‖v
+        )
+        .send()
+        .await
+        .context("send Safe execTransaction")?;
+    let receipt = pending
+        .get_receipt()
+        .await
+        .context("await execTransaction receipt")?;
+    Ok(format!("{:#x}", receipt.transaction_hash))
 }
 
 #[cfg(test)]
