@@ -5,6 +5,16 @@
 > is **Tier-2**, gated on full-state replication (AC-R2-3). "Reserves" (assets ≥
 > liabilities) needs a Tier-2 XRPL-balance attestation. See
 > `docs/audit/RESP-commitment-r2-state-replication-gap.md`.
+>
+> **Not a solvency proof (AC-E1-6).** Until **AC-R1-5b** (PnL-counterparty
+> conservation) and **AC-F8-4** (perp-only ring-fenced reset) land, the published
+> `(epoch, root, snapshot)` MUST NOT be represented — in any deck, doc, or on-chain
+> consumer — as proof that the book is solvent. It authenticates *who signed* and
+> *the structure of the liabilities*, not that assets back them. Only the
+> over-stated-liabilities direction fails safe (`custody_ok` false-refuses → no
+> publish); an under-statement could publish a root that *looks* solvent but isn't
+> — exactly what AC-R1-5b closes. The on-chain contract is named `ReservesRegistry`
+> for deployment reasons; the name is not the claim.
 
 ## What it does
 The **sequencer's enclave** — the sole holder of authoritative perp state —
