@@ -253,6 +253,35 @@ pub enum SigningMessage {
         requester_peer_id: String,
         payload: MembershipApplyPayload,
     },
+    /// #131 AC-BASE — an operator-quorum request to co-sign the one-time custody
+    /// baseline. The initiator broadcasts the escrow figure it read at a pinned
+    /// validated ledger `L`; each receiver INDEPENDENTLY re-queries its OWN
+    /// (distinct) XRPL source AT `ledger_index = L` and REFUSES to sign unless its
+    /// `(L, rlusd, xrp)` matches exactly (RESP-commitment-baseline-p2p-relay
+    /// C-Q1.1/1.2/1.3) — so a collected 2-of-3 proves ≥2 operators INDEPENDENTLY
+    /// observed the same escrow, not N nodes trusting one broadcast figure. The
+    /// message hash is never on the wire; every field the enclave hashes travels
+    /// structured and the receiver re-derives + signs from its OWN re-queried figure.
+    ///
+    /// `request_id` MUST start with `"reserves-baseline-"` so the response router
+    /// forwards replies to the baseline collector's mpsc.
+    ReservesBaselineRequest {
+        request_id: String,
+        requester_peer_id: String,
+        /// 20-byte escrow AccountID, lowercase hex (no `0x`).
+        escrow_hex: String,
+        /// 20-byte RLUSD issuer AccountID, lowercase hex — PINNED in the hash
+        /// (anti fake-issuer), so a receiver on a different issuer never co-signs.
+        rlusd_issuer_hex: String,
+        /// The pinned validated ledger the figure was read at; receivers re-query
+        /// AT this exact ledger (C-Q1.2, no tolerance window).
+        ledger_index: u64,
+        /// Initiator-observed escrow RLUSD (FP8); the receiver refuses unless its
+        /// OWN re-query at L equals this.
+        escrow_rlusd: i64,
+        /// Initiator-observed escrow XRP (FP8 = drops·100).
+        escrow_xrp: i64,
+    },
 }
 
 /// One signer in a β1 membership-epoch transition, as carried on the wire.
@@ -535,6 +564,41 @@ pub struct MembershipApplyRelay {
     pub payload: MembershipApplyPayload,
     /// Channel to receive per-node ack `Response`s.
     pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
+}
+
+/// #131 AC-BASE outbound baseline-collection request. The ceremony driver builds one
+/// (the initiator's figure read at the pinned validated ledger `L`), sends it down
+/// `set_reserves_baseline_channel`; the run-loop signs locally (if this node's escrow
+/// matches) AND broadcasts `ReservesBaselineRequest`, forwarding each node's
+/// `Response` here until quorum or timeout. Mirrors `MrenclaveGovernanceRelay`.
+#[derive(Debug)]
+pub struct ReservesBaselineRelay {
+    /// Unique id; MUST start with `"reserves-baseline-"` so response routing forwards here.
+    pub request_id: String,
+    pub escrow: [u8; 20],
+    pub rlusd_issuer: [u8; 20],
+    pub ledger_index: u64,
+    pub escrow_rlusd: i64,
+    pub escrow_xrp: i64,
+    /// Channel to receive `SigningMessage::Response` instances as peers reply.
+    pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
+}
+
+/// #131 AC-BASE per-node receiver config: the LOCAL escrow + issuer this node will
+/// co-sign a baseline for, and this node's OWN (distinct — C-Q1.1) XRPL endpoint used
+/// to independently re-query the escrow at the pinned ledger. `None` on a node = it
+/// never contributes a baseline signature (fail-closed).
+#[derive(Debug, Clone)]
+pub struct ReservesBaselineNodeConfig {
+    /// Escrow classic r-address this node's enclave holds custody for.
+    pub escrow_r: String,
+    /// RLUSD issuer classic r-address (pinned in the hash).
+    pub rlusd_issuer_r: String,
+    /// This node's OWN XRPL JSON-RPC endpoint — MUST be distinct from peers' (the
+    /// diversity that makes ≥2 signatures ≥2 independent observations, C-Q1.1).
+    pub xrpl_endpoint: String,
+    /// This node's shard_id (0 on single-shard testnet); bound into the hash.
+    pub shard_id: u32,
 }
 
 /// Local signer credentials — used to handle incoming signing requests.
@@ -821,6 +885,9 @@ pub struct P2PNode {
     // β4 Thread B — governed MRENCLAVE allowlist collection
     mrenclave_governance_rx: Option<mpsc::Receiver<MrenclaveGovernanceRelay>>,
     pending_mrenclave_governance: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
+    // #131 AC-BASE — one-time custody-baseline collection (mirrors β4 Thread B)
+    reserves_baseline_rx: Option<mpsc::Receiver<ReservesBaselineRelay>>,
+    pending_reserves_baseline: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
     /// β3.2b: outbound apply-broadcast requests (seal / confirm) from the
     /// membership-change driver — each node applies to its loopback enclave.
     membership_apply_rx: Option<mpsc::Receiver<MembershipApplyRelay>>,
@@ -859,6 +926,9 @@ pub struct P2PNode {
     local_ecdh_pubkey: Option<String>,
     /// Local signer credentials for handling incoming signing requests.
     local_signer: Option<LocalSigner>,
+    /// #131 AC-BASE: this node's baseline receiver config (local escrow/issuer + its
+    /// OWN distinct XRPL endpoint). `None` = never co-sign a baseline (fail-closed).
+    reserves_baseline_config: Option<ReservesBaselineNodeConfig>,
     /// X-C1: escrow r-address that the local enclave is allowed to sign
     /// withdrawals *from*. Incoming signing requests whose `unsigned_tx.Account`
     /// doesn't match are rejected. `None` = fail-closed (reject every
@@ -1001,6 +1071,8 @@ impl P2PNode {
             pending_membership_epoch: HashMap::new(),
             mrenclave_governance_rx: None,
             pending_mrenclave_governance: HashMap::new(),
+            reserves_baseline_rx: None,
+            pending_reserves_baseline: HashMap::new(),
             membership_apply_rx: None,
             pending_membership_apply: HashMap::new(),
             events_publish_rx: None,
@@ -1016,6 +1088,7 @@ impl P2PNode {
             dkg_step_inbound_tx: None,
             local_ecdh_pubkey: None,
             local_signer: None,
+            reserves_baseline_config: None,
             escrow_xrpl_address: None,
             allowed_signing_peers: None,
             recent_signing_requests: HashMap::new(),
@@ -1130,6 +1203,13 @@ impl P2PNode {
         rx: mpsc::Receiver<MrenclaveGovernanceRelay>,
     ) {
         self.mrenclave_governance_rx = Some(rx);
+    }
+
+    /// #131 AC-BASE: the baseline-collection channel. Wired in main.rs alongside the
+    /// operator admin route, same deferred deploy-wiring split governance used.
+    #[allow(dead_code)]
+    pub fn set_reserves_baseline_channel(&mut self, rx: mpsc::Receiver<ReservesBaselineRelay>) {
+        self.reserves_baseline_rx = Some(rx);
     }
 
     /// β3.2b: wire the membership-change driver's apply-broadcast channel. The
@@ -1300,6 +1380,19 @@ impl P2PNode {
     pub fn set_escrow_address(&mut self, escrow: String) {
         info!(escrow = %escrow, "P2P signing relay: escrow address configured");
         self.escrow_xrpl_address = Some(escrow);
+    }
+
+    /// #131 AC-BASE: install this node's baseline receiver config (local escrow/issuer
+    /// r-addresses + its OWN distinct XRPL endpoint). Without it, this node never
+    /// contributes a baseline signature (fail-closed).
+    #[allow(dead_code)]
+    pub fn set_reserves_baseline_config(&mut self, cfg: ReservesBaselineNodeConfig) {
+        info!(
+            escrow = %cfg.escrow_r,
+            endpoint = %cfg.xrpl_endpoint,
+            "P2P: reserves-baseline receiver config set"
+        );
+        self.reserves_baseline_config = Some(cfg);
     }
 
     /// X-C1: set the peer allowlist for signing requests. Any peer not
@@ -2062,6 +2155,156 @@ impl P2PNode {
         }
     }
 
+    /// #131 AC-BASE receiver: independently confirm the broadcast escrow figure and
+    /// co-sign the custody baseline. Load-bearing order (RESP C-Q1.3): re-query OUR OWN
+    /// XRPL AT the pinned ledger `L` and REFUSE on any mismatch BEFORE signing; the
+    /// hash the enclave signs is derived from THIS node's re-queried figure, never the
+    /// broadcast. Returns `None` iff the baseline is not for this node's escrow/issuer
+    /// (silently skip); a figure mismatch or local error returns an error `Response`
+    /// (the collector ignores `error: Some`, so a divergent node contributes nothing).
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_reserves_baseline_request(
+        cfg: &ReservesBaselineNodeConfig,
+        local_signer: &LocalSigner,
+        request_id: &str,
+        escrow: &[u8; 20],
+        rlusd_issuer: &[u8; 20],
+        ledger_index: u64,
+        escrow_rlusd: i64,
+        escrow_xrp: i64,
+    ) -> Option<SigningMessage> {
+        // (a) Is this baseline for OUR escrow + issuer? Decode local config r-addresses
+        // and compare to the broadcast AccountIDs. A mismatch = not for us / wrong
+        // issuer → silently skip (gossipsub broadcast, like the governance signer check).
+        let local_escrow = crate::xrpl_signer::decode_xrpl_address(&cfg.escrow_r).ok()?;
+        let local_issuer = crate::xrpl_signer::decode_xrpl_address(&cfg.rlusd_issuer_r).ok()?;
+        if &local_escrow != escrow || &local_issuer != rlusd_issuer {
+            return None;
+        }
+
+        // (b) C-Q1.2/1.3 — INDEPENDENTLY re-query OUR OWN (distinct) XRPL source AT the
+        // pinned ledger L, exact match. Any error or disagreement ⇒ REFUSE before sign.
+        let observed = match crate::reserves_baseline::query_escrow_balances_at_ledger(
+            &cfg.xrpl_endpoint,
+            &cfg.escrow_r,
+            &cfg.rlusd_issuer_r,
+            ledger_index,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(req_id = %request_id, "#131 reserves-baseline: re-query at L failed — refuse: {e}");
+                return Some(Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("re-query at L={ledger_index} failed: {e}"),
+                ));
+            }
+        };
+        if !crate::reserves_baseline::figure_matches(
+            &observed,
+            ledger_index,
+            escrow_rlusd,
+            escrow_xrp,
+        ) {
+            warn!(
+                req_id = %request_id,
+                own_rlusd = observed.rlusd_fp8, own_xrp = observed.xrp_fp8,
+                bcast_rlusd = escrow_rlusd, bcast_xrp = escrow_xrp, ledger = ledger_index,
+                "#131 reserves-baseline: OWN figure disagrees with broadcast at L — REFUSE (C-Q1.3)"
+            );
+            return Some(Self::membership_sign_error(
+                local_signer,
+                request_id,
+                "re-queried escrow figure disagrees with broadcast — refuse (C-Q1.3)".to_string(),
+            ));
+        }
+
+        // (c) Sign on the LOCAL loopback enclave over OUR re-queried figure.
+        let http = match crate::http_helpers::loopback_http_client(Duration::from_secs(20)) {
+            Ok(c) => c,
+            Err(e) => {
+                return Some(Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("http client: {e}"),
+                ))
+            }
+        };
+        let sign_url = format!("{}/perp/reserves-baseline/sign", local_signer.enclave_url);
+        let body = serde_json::json!({
+            "account_id": local_signer.address,
+            "session_key": local_signer.session_key_hex(),
+            "ledger_index": ledger_index,
+            "escrow_account": hex::encode(escrow),
+            "rlusd_issuer": hex::encode(rlusd_issuer),
+            "escrow_rlusd": observed.rlusd_fp8,
+            "escrow_xrp": observed.xrp_fp8,
+        });
+        let resp = match http.post(&sign_url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return Some(Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("enclave request: {e}"),
+                ))
+            }
+        };
+        let rbody: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                return Some(Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("enclave response parse: {e}"),
+                ))
+            }
+        };
+        if rbody["status"].as_str() != Some("success") {
+            return Some(Self::membership_sign_error(
+                local_signer,
+                request_id,
+                format!("enclave: {}", rbody.get("message").unwrap_or(&rbody)),
+            ));
+        }
+        let r_hex = rbody["signature"]["r"].as_str().unwrap_or("");
+        let s_hex = rbody["signature"]["s"].as_str().unwrap_or("");
+        let v = rbody["signature"]["v"].as_u64().unwrap_or(0) as u8;
+
+        // (d) Q2 self-validating recovery: recover (pubkey, DER) from (r,s,v) against
+        // the hash we re-derive from OUR figure. A wrong hash ⇒ recovery fails ⇒ drop.
+        let hash = crate::reserves_baseline::baseline_message_hash(
+            cfg.shard_id,
+            ledger_index,
+            escrow,
+            rlusd_issuer,
+            observed.rlusd_fp8,
+            observed.xrp_fp8,
+        );
+        let (pk, der) =
+            match crate::reserves_baseline::recover_pubkey_and_der(r_hex, s_hex, v, &hash) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Some(Self::membership_sign_error(
+                        local_signer,
+                        request_id,
+                        format!("pubkey recovery failed: {e}"),
+                    ))
+                }
+            };
+
+        // (e) Contribute the recovered pubkey + DER — the exact entry the bundle carries.
+        Some(SigningMessage::Response {
+            request_id: request_id.to_string(),
+            signer_xrpl_address: local_signer.xrpl_address.clone(),
+            der_signature: Some(hex::encode_upper(&der)),
+            compressed_pubkey: Some(hex::encode(&pk)),
+            error: None,
+        })
+    }
+
     /// Uniform error `Response` for the β1 membership signing path.
     fn membership_sign_error(
         local_signer: &LocalSigner,
@@ -2570,6 +2813,7 @@ impl P2PNode {
         let mut path_a_delegation_rx = self.path_a_delegation_rx.take();
         let mut membership_epoch_rx = self.membership_epoch_rx.take();
         let mut mrenclave_governance_rx = self.mrenclave_governance_rx.take();
+        let mut reserves_baseline_rx = self.reserves_baseline_rx.take();
         let mut membership_apply_rx = self.membership_apply_rx.take();
         let mut events_rx = self.events_publish_rx.take();
         let mut peer_quote_rx = self.peer_quote_publish_rx.take();
@@ -2817,6 +3061,55 @@ impl P2PNode {
                         }
                         Err(e) => {
                             warn!("β4 mrenclave-governance publish failed: {}", e);
+                            let _ = relay.responses_tx.send(SigningMessage::Response {
+                                request_id: relay.request_id,
+                                signer_xrpl_address: String::new(),
+                                der_signature: None,
+                                compressed_pubkey: None,
+                                error: Some(format!("P2P publish failed: {e}")),
+                            }).await;
+                        }
+                    }
+                }
+
+                // #131 AC-BASE: broadcast a custody-baseline signing request to the
+                // operator quorum; each receiver independently re-queries its OWN XRPL
+                // source at the pinned ledger and refuses on mismatch before signing.
+                Some(relay) = async {
+                    match &mut reserves_baseline_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<ReservesBaselineRelay>>().await,
+                    }
+                } => {
+                    // The initiator is a co-signer too (gossipsub doesn't self-deliver):
+                    // sign locally via the SAME independent-re-query receiver path.
+                    if let (Some(cfg), Some(local)) =
+                        (self.reserves_baseline_config.clone(), self.local_signer.clone())
+                    {
+                        if let Some(local_response) = Self::handle_reserves_baseline_request(
+                            &cfg, &local, &relay.request_id, &relay.escrow, &relay.rlusd_issuer,
+                            relay.ledger_index, relay.escrow_rlusd, relay.escrow_xrp,
+                        ).await {
+                            let _ = relay.responses_tx.send(local_response).await;
+                        }
+                    }
+
+                    let msg = SigningMessage::ReservesBaselineRequest {
+                        request_id: relay.request_id.clone(),
+                        requester_peer_id: self.peer_id.to_string(),
+                        escrow_hex: hex::encode(relay.escrow),
+                        rlusd_issuer_hex: hex::encode(relay.rlusd_issuer),
+                        ledger_index: relay.ledger_index,
+                        escrow_rlusd: relay.escrow_rlusd,
+                        escrow_xrp: relay.escrow_xrp,
+                    };
+                    match self.publish_signing(&msg) {
+                        Ok(_) => {
+                            self.pending_reserves_baseline.insert(
+                                relay.request_id, relay.responses_tx);
+                        }
+                        Err(e) => {
+                            warn!("#131 reserves-baseline publish failed: {}", e);
                             let _ = relay.responses_tx.send(SigningMessage::Response {
                                 request_id: relay.request_id,
                                 signer_xrpl_address: String::new(),
@@ -3136,6 +3429,13 @@ impl P2PNode {
                                             let _ = tx.send(msg).await;
                                         }
                                     }
+                                } else if request_id.starts_with("reserves-baseline-") {
+                                    if let Some(tx) =
+                                        self.pending_reserves_baseline.get(&request_id) {
+                                        if let Ok(msg) = serde_json::from_slice::<SigningMessage>(&message.data) {
+                                            let _ = tx.send(msg).await;
+                                        }
+                                    }
                                 } else if let Some(tx) = self.pending_signing.remove(&request_id) {
                                     if let Ok(msg) = serde_json::from_slice::<SigningMessage>(&message.data) {
                                         let _ = tx.send(msg);
@@ -3391,6 +3691,72 @@ impl P2PNode {
                                 ).await;
                                 if let Err(e) = self.publish_signing(&response) {
                                     error!("failed to publish β4 mrenclave-gov response: {}", e);
+                                }
+                            }
+                            Ok(SigningMessage::ReservesBaselineRequest {
+                                request_id,
+                                requester_peer_id,
+                                escrow_hex,
+                                rlusd_issuer_hex,
+                                ledger_index,
+                                escrow_rlusd,
+                                escrow_xrp,
+                            }) => {
+                                // #131 AC-BASE: a baseline co-sign request from a peer's
+                                // ceremony driver. Independently re-query + refuse on
+                                // mismatch BEFORE signing (C-Q1.3); the enclave hash is
+                                // re-derived from OUR figure, nothing trusted from wire.
+                                let cfg_opt = self.reserves_baseline_config.clone();
+                                let local_opt = self.local_signer.clone();
+                                let (Some(cfg), Some(local)) = (cfg_opt, local_opt) else {
+                                    continue;
+                                };
+                                if let Some(ref allow) = self.allowed_signing_peers {
+                                    if !allow.contains(&propagation_source) {
+                                        warn!(
+                                            req_id = %request_id,
+                                            from = %propagation_source,
+                                            "X-C1: #131 reserves-baseline request from peer outside allowlist — dropped"
+                                        );
+                                        continue;
+                                    }
+                                }
+                                if !self.check_signing_rate(&propagation_source) {
+                                    warn!(req_id = %request_id, "X-C1: #131 reserves-baseline request rate-limited");
+                                    continue;
+                                }
+                                if !self.mark_signing_request_fresh(&request_id) {
+                                    warn!(req_id = %request_id, "X-C1: duplicate #131 reserves-baseline request_id — dropped");
+                                    continue;
+                                }
+                                let escrow = match decode_20(&escrow_hex) {
+                                    Some(a) => a,
+                                    None => {
+                                        warn!(req_id = %request_id, "#131 reserves-baseline: bad escrow_hex");
+                                        continue;
+                                    }
+                                };
+                                let rlusd_issuer = match decode_20(&rlusd_issuer_hex) {
+                                    Some(a) => a,
+                                    None => {
+                                        warn!(req_id = %request_id, "#131 reserves-baseline: bad rlusd_issuer_hex");
+                                        continue;
+                                    }
+                                };
+                                info!(
+                                    req_id = %request_id,
+                                    from = %requester_peer_id,
+                                    propagation = %propagation_source,
+                                    ledger = ledger_index,
+                                    "#131 reserves-baseline request received — independently re-querying"
+                                );
+                                if let Some(response) = Self::handle_reserves_baseline_request(
+                                    &cfg, &local, &request_id, &escrow, &rlusd_issuer,
+                                    ledger_index, escrow_rlusd, escrow_xrp,
+                                ).await {
+                                    if let Err(e) = self.publish_signing(&response) {
+                                        error!("failed to publish #131 reserves-baseline response: {}", e);
+                                    }
                                 }
                             }
                             Ok(SigningMessage::MembershipApply {
