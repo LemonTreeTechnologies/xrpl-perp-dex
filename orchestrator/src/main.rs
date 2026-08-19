@@ -36,6 +36,7 @@ mod perp_client;
 mod pool_path_a_client;
 mod price_feed;
 mod rate_limit;
+mod reserves_baseline; // AC-BASE — one-time custody-baseline ceremony (hash + recovery + bundle)
 mod reserves_publisher; // #131 3d — Tier-1 reserves publisher
 pub mod shard_router;
 mod signerlist_update;

@@ -193,6 +193,62 @@ impl PerpClient {
         .await
     }
 
+    /// AC-BASE: this node attests the opening escrow figure (issuer/account-pinned
+    /// message signed in-enclave). Returns {signature:{r,s,v}}.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reserves_baseline_sign(
+        &self,
+        account_id: &str,
+        session_key: &str,
+        ledger_index: u64,
+        escrow_account: &str,
+        rlusd_issuer: &str,
+        escrow_rlusd: i64,
+        escrow_xrp: i64,
+    ) -> Result<Value> {
+        self.post(
+            "/perp/reserves-baseline/sign",
+            serde_json::json!({
+                "account_id": account_id,
+                "session_key": session_key.trim_start_matches("0x"),
+                "ledger_index": ledger_index,
+                "escrow_account": escrow_account.trim_start_matches("0x"),
+                "rlusd_issuer": rlusd_issuer.trim_start_matches("0x"),
+                "escrow_rlusd": escrow_rlusd,
+                "escrow_xrp": escrow_xrp,
+            }),
+        )
+        .await
+    }
+
+    /// AC-BASE: apply the one-time baseline — verify the 2-of-3 quorum over the pinned
+    /// message, seed custody := attested escrow, seal the one-shot marker.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reserves_baseline_apply(
+        &self,
+        ledger_index: u64,
+        escrow_account: &str,
+        rlusd_issuer: &str,
+        escrow_rlusd: i64,
+        escrow_xrp: i64,
+        host_timestamp_ms: u64,
+        quorum_bundle_hex: &str,
+    ) -> Result<Value> {
+        self.post(
+            "/perp/reserves-baseline/apply",
+            serde_json::json!({
+                "ledger_index": ledger_index,
+                "escrow_account": escrow_account.trim_start_matches("0x"),
+                "rlusd_issuer": rlusd_issuer.trim_start_matches("0x"),
+                "escrow_rlusd": escrow_rlusd,
+                "escrow_xrp": escrow_xrp,
+                "host_timestamp_ms": host_timestamp_ms,
+                "quorum_bundle": quorum_bundle_hex.trim_start_matches("0x"),
+            }),
+        )
+        .await
+    }
+
     /// Query user margin, positions, unrealized PnL.
     pub async fn get_balance(&self, user_id: &str) -> Result<Value> {
         self.get(&format!("/perp/balance?user_id={user_id}")).await
