@@ -373,6 +373,17 @@ struct RunArgs {
     #[arg(long)]
     escrow_address: Option<String>,
 
+    /// #131 AC-BASE: RLUSD issuer classic r-address, PINNED into the custody
+    /// baseline hash. Required for this node to co-sign a baseline; without it
+    /// the node never contributes a baseline signature (fail-closed).
+    #[arg(long)]
+    rlusd_issuer: Option<String>,
+
+    /// #131 AC-BASE: this node's shard_id, bound into the baseline hash.
+    /// Single-shard testnet = 0.
+    #[arg(long, default_value_t = 0)]
+    shard_id: u32,
+
     /// Path to escrow config JSON file (fallback for --escrow-address)
     #[arg(long, default_value = "/tmp/perp-9088/escrow_account.json")]
     escrow_config: PathBuf,
@@ -963,6 +974,14 @@ async fn main() -> Result<()> {
     } else {
         (None, None)
     };
+    // #131 AC-BASE: one-time custody-baseline collection channel (mirror β4 Thread B;
+    // the operator trigger owns the sender via the admin route).
+    let (reserves_baseline_rx_holder, _reserves_baseline_tx) = if signers_config.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<p2p::ReservesBaselineRelay>(8);
+        (Some(rx), Some(tx))
+    } else {
+        (None, None)
+    };
 
     let peer_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
@@ -1425,6 +1444,7 @@ async fn main() -> Result<()> {
             _membership_apply_tx.clone(),
             app_state.signing_tx.clone(),
             _mrenclave_governance_tx.clone(),
+            _reserves_baseline_tx.clone(),
         ) {
             (
                 Some(cfg),
@@ -1432,6 +1452,7 @@ async fn main() -> Result<()> {
                 Some(membership_apply_tx),
                 Some(signing_tx),
                 Some(mrenclave_governance_tx),
+                Some(reserves_baseline_tx),
             ) if !cli.membership_node_urls.is_empty() => {
                 let escrow = crate::xrpl_signer::decode_xrpl_address(&escrow_address)
                     .context("--membership-admin-listen: escrow address must decode")?;
@@ -1465,6 +1486,7 @@ async fn main() -> Result<()> {
                     current_signers,
                     current_quorum: cfg.quorum as u32,
                     mrenclave_governance_tx,
+                    reserves_baseline_tx,
                 });
                 tokio::spawn(async move {
                     if let Err(e) = membership_admin::spawn_admin_listener(addr, admin_state).await
@@ -1623,6 +1645,10 @@ async fn main() -> Result<()> {
         if let Some(rx) = mrenclave_governance_rx_holder {
             p2p_node.set_mrenclave_governance_channel(rx);
         }
+        // #131 AC-BASE: the one-time custody-baseline collection channel.
+        if let Some(rx) = reserves_baseline_rx_holder {
+            p2p_node.set_reserves_baseline_channel(rx);
+        }
         if let Some(ref local) = cfg.local_signer {
             // X-C1 condition C2 (perp RESP-5): enforce loopback on the
             // enclave URL the signing relay will hit. signers_config is
@@ -1660,6 +1686,23 @@ async fn main() -> Result<()> {
             p2p_node.set_escrow_address(cfg.escrow_address.clone());
         } else {
             warn!("X-C1: signers-config has no escrow_address — all incoming P2P signing requests will be rejected");
+        }
+
+        // #131 AC-BASE: this node's baseline receiver config. Reuses local_signer
+        // (set above) for identity; its OWN --xrpl-url is the DISTINCT source it
+        // independently re-queries at the pinned ledger (C-Q1.1). Fail-closed unless
+        // both --rlusd-issuer and the escrow are configured.
+        if let Some(ref issuer) = cli.rlusd_issuer {
+            if !cfg.escrow_address.is_empty() {
+                p2p_node.set_reserves_baseline_config(p2p::ReservesBaselineNodeConfig {
+                    escrow_r: cfg.escrow_address.clone(),
+                    rlusd_issuer_r: issuer.clone(),
+                    xrpl_endpoint: cli.xrpl_url.clone(),
+                    shard_id: cli.shard_id,
+                });
+            }
+        } else {
+            warn!("#131 AC-BASE: --rlusd-issuer not set — this node will not co-sign a custody baseline");
         }
     }
 

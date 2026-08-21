@@ -15,11 +15,9 @@
 //! independent-confirm → diversity-assert → apply). The p2p relay itself lives in
 //! `p2p.rs` (`ReservesBaselineRelay`, `handle_reserves_baseline_request`).
 //!
-//! NOTE: the live admin-trigger route + per-node config wiring (RLUSD issuer + the
-//! ceremony roster of node-pubkey→endpoint) land with the β8→β9 migration deploy prep,
-//! where the ceremony runs post-migration on the real cluster; until then these
-//! `pub` helpers are exercised by unit tests and dead-code-allowed.
-#![allow(dead_code)]
+//! The live admin-trigger (`POST /admin/reserves-baseline`) + per-node config
+//! (`--rlusd-issuer`, `--shard-id`) are wired in `main.rs` / `membership_admin.rs`; the
+//! ceremony runs post-β8→β9-migration on the real cluster.
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -92,17 +90,6 @@ pub fn build_quorum_bundle(entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
         out.extend_from_slice(sig);
     }
     out
-}
-
-/// Decode a 20-byte hex (0x-optional) into a fixed array.
-pub fn hex20(s: &str) -> Result<[u8; 20]> {
-    let v = hex::decode(s.trim_start_matches("0x")).context("hex20 decode")?;
-    if v.len() != 20 {
-        bail!("expected 20 bytes, got {}", v.len());
-    }
-    let mut a = [0u8; 20];
-    a.copy_from_slice(&v);
-    Ok(a)
 }
 
 /// Parse an XRPL decimal amount string ("100.50") into the perp FP8 unit (1.0 =
@@ -383,6 +370,9 @@ impl LibP2PReservesBaselineCollector {
         }
     }
 
+    /// Override the collection window (default 30s). Kept for parity with the other
+    /// libp2p collectors + integration-test control; the admin driver uses the default.
+    #[allow(dead_code)]
     pub fn with_timeout(mut self, t: std::time::Duration) -> Self {
         self.timeout = t;
         self
