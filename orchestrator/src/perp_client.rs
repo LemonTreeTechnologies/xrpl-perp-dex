@@ -256,6 +256,18 @@ impl PerpClient {
         .await
     }
 
+    /// #131 AC-R1/D-2 C-R2: seed the enclave's deposit replay watermark. Advance-only
+    /// (the enclave takes max), so calling it at startup with the persisted last-scanned
+    /// ledger high-water makes the sealed watermark durable across a /tmp loss and closes
+    /// the β8→β9 migration-boundary window (where the enclave watermark loads as 0).
+    pub async fn set_deposit_watermark(&self, ledger_index: u64) -> Result<Value> {
+        self.post(
+            "/perp/set-deposit-watermark",
+            serde_json::json!({ "ledger_index": ledger_index }),
+        )
+        .await
+    }
+
     /// Query user margin, positions, unrealized PnL.
     pub async fn get_balance(&self, user_id: &str) -> Result<Value> {
         self.get(&format!("/perp/balance?user_id={user_id}")).await

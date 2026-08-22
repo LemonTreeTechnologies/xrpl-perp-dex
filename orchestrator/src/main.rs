@@ -2013,6 +2013,18 @@ async fn main() -> Result<()> {
         .unwrap_or(0);
     if last_ledger > 0 {
         info!(last_ledger, "resumed from persisted ledger index");
+        // #131 AC-R1/D-2 C-R2: seed the enclave's sealed replay watermark from the
+        // persisted high-water (advance-only, sequencer-only — deposits are sequencer
+        // work). Makes the watermark durable across a later /tmp loss and closes the
+        // β8→β9 migration boundary where the enclave watermark loads as 0. Best-effort:
+        // the enclave already holds the sealed value; a failed seed just skips this
+        // belt-and-suspenders advance.
+        if is_sequencer.load(Ordering::Relaxed) {
+            match perp.set_deposit_watermark(last_ledger as u64).await {
+                Ok(_) => info!(last_ledger, "seeded enclave deposit watermark (D-2 C-R2)"),
+                Err(e) => warn!("deposit watermark seed skipped: {e}"),
+            }
+        }
     }
     let mut current_price: f64 = 0.0;
 
