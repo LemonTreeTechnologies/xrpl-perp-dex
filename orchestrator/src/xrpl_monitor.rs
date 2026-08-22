@@ -20,6 +20,10 @@ pub struct DepositEvent {
     /// REQ-20-impl R2: consumed by `main.rs` deposit-scan loop; routes the
     /// credit through the enclave's `deposit_bindings` map per REQ-20 §4.2.
     pub destination_tag: Option<u32>,
+    /// #131 AC-R1/D-2: the XRPL validated ledger this deposit landed in. Passed to
+    /// the enclave deposit ecall, which refuses a ledger below its monotonic
+    /// watermark — a structural (buffer-size-independent) replay guard.
+    pub ledger_index: u64,
 }
 
 /// Monitors XRPL ledger for incoming deposits to an escrow account.
@@ -176,16 +180,22 @@ impl XrplMonitor {
                 "deposit detected"
             );
 
+            // #131 AC-R1/D-2: the deposit's own validated ledger (0 if the field is
+            // absent — the enclave then refuses it once the watermark advances, which
+            // is the fail-safe direction).
+            let deposit_ledger = tx["ledger_index"].as_u64().unwrap_or(0);
+
             deposits.push(DepositEvent {
                 sender,
                 amount: fp8_amount,
                 tx_hash: tx_hash[..64.min(tx_hash.len())].to_string(),
                 destination_tag,
+                ledger_index: deposit_ledger,
             });
 
             // Track highest ledger index
-            if let Some(idx) = tx["ledger_index"].as_u64() {
-                new_ledger = new_ledger.max(idx as u32);
+            if deposit_ledger > 0 {
+                new_ledger = new_ledger.max(deposit_ledger as u32);
             }
         }
 

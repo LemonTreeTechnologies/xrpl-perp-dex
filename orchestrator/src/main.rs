@@ -2143,6 +2143,7 @@ async fn main() -> Result<()> {
                             &deposit.amount,
                             &deposit.tx_hash,
                             deposit.destination_tag,
+                            deposit.ledger_index,
                         )
                         .await
                     {

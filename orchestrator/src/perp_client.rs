@@ -55,11 +55,15 @@ impl PerpClient {
         amount: &str,
         xrpl_tx_hash: &str,
         destination_tag: Option<u32>,
+        ledger_index: u64,
     ) -> Result<Value> {
         let mut body = serde_json::json!({
             "user_id": sender_addr,
             "amount": amount,
             "xrpl_tx_hash": xrpl_tx_hash,
+            // #131 AC-R1/D-2: the deposit's XRPL validated ledger — the enclave
+            // refuses a ledger below its monotonic watermark (replay guard).
+            "ledger_index": ledger_index,
         });
         if let Some(t) = destination_tag {
             body["dest_tag"] = serde_json::json!(t);
@@ -82,11 +86,14 @@ impl PerpClient {
         xrp_amount: &str,
         xrpl_tx_hash: &str,
         destination_tag: Option<u32>,
+        ledger_index: u64,
     ) -> Result<Value> {
         let mut body = serde_json::json!({
             "user_id": sender_addr,
             "xrp_amount": xrp_amount,
             "xrpl_tx_hash": xrpl_tx_hash,
+            // #131 AC-R1/D-2 replay guard — see `deposit`.
+            "ledger_index": ledger_index,
         });
         if let Some(t) = destination_tag {
             body["dest_tag"] = serde_json::json!(t);
