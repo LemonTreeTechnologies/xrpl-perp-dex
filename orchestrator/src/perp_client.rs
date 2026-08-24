@@ -79,7 +79,6 @@ impl PerpClient {
     /// operates on `margin_balance` only). XRP-asset probes will
     /// surface `DB_INVARIANT_VIOLATION` on binding registration until
     /// follow-up commit adds asset-class indicator to DepositLogEntry.
-    #[allow(dead_code)]
     pub async fn deposit_xrp(
         &self,
         sender_addr: &str,

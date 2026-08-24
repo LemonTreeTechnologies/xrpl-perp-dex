@@ -24,6 +24,13 @@ pub struct DepositEvent {
     /// the enclave deposit ecall, which refuses a ledger below its monotonic
     /// watermark — a structural (buffer-size-independent) replay guard.
     pub ledger_index: u64,
+    /// #131 AC-R1 (option-A): true if this was a NATIVE XRP payment (drops), false if
+    /// an issued currency (RLUSD). The scanner routes XRP → `deposit_xrp` (credits
+    /// `xrp_balance`, an XRP liability matching the XRP escrow custody) and issued
+    /// currency → `deposit` (RLUSD margin). Previously ALL deposits went to the RLUSD
+    /// route, mis-crediting XRP payments as RLUSD margin — the per-asset custody/
+    /// liability mismatch the reserves ceremony surfaced.
+    pub is_xrp: bool,
 }
 
 /// Monitors XRPL ledger for incoming deposits to an escrow account.
@@ -185,12 +192,18 @@ impl XrplMonitor {
             // is the fail-safe direction).
             let deposit_ledger = tx["ledger_index"].as_u64().unwrap_or(0);
 
+            // #131 AC-R1 (option-A) asset routing: native XRP (drops) is a scalar;
+            // issued currency (RLUSD) is an object. Route XRP → xrp_balance so the
+            // liability's asset matches the XRP escrow custody.
+            let is_xrp = !amount.is_object();
+
             deposits.push(DepositEvent {
                 sender,
                 amount: fp8_amount,
                 tx_hash: tx_hash[..64.min(tx_hash.len())].to_string(),
                 destination_tag,
                 ledger_index: deposit_ledger,
+                is_xrp,
             });
 
             // Track highest ledger index

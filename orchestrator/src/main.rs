@@ -2149,8 +2149,11 @@ async fn main() -> Result<()> {
                     // perp.deposit. Enclave routes the credit per the
                     // bindings map (REQ-20 §4.2): bound → bound user;
                     // unbound tag → __unclaimed__; no tag → sender_addr.
-                    if let Err(e) = perp
-                        .deposit(
+                    // #131 AC-R1 (option-A): route by asset so the credited liability's
+                    // asset matches the escrow custody — native XRP → xrp_balance
+                    // (XRP liability), issued currency → margin_balance (RLUSD liability).
+                    let credit_result = if deposit.is_xrp {
+                        perp.deposit_xrp(
                             &deposit.sender,
                             &deposit.amount,
                             &deposit.tx_hash,
@@ -2158,8 +2161,18 @@ async fn main() -> Result<()> {
                             deposit.ledger_index,
                         )
                         .await
-                    {
-                        error!(sender = %deposit.sender, "deposit credit failed: {}", e);
+                    } else {
+                        perp.deposit(
+                            &deposit.sender,
+                            &deposit.amount,
+                            &deposit.tx_hash,
+                            deposit.destination_tag,
+                            deposit.ledger_index,
+                        )
+                        .await
+                    };
+                    if let Err(e) = credit_result {
+                        error!(sender = %deposit.sender, is_xrp = deposit.is_xrp, "deposit credit failed: {}", e);
                     } else {
                         if let Some(db) = &app_state.db {
                             db.insert_deposit(
