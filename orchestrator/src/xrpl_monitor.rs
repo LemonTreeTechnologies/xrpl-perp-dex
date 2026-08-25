@@ -38,6 +38,12 @@ pub struct XrplMonitor {
     client: reqwest::Client,
     rpc_url: String,
     escrow_address: String,
+    /// #131 AC-R1: XRPL senders whose Payments to the escrow are OPERATOR CAPITAL
+    /// (funding the escrow's on-chain operational fees), NOT user deposits. Their
+    /// payments increase custody (the escrow balance the baseline attests) but are
+    /// NOT credited to any user, so they are not a liability — the honest way for the
+    /// operator to keep the escrow solvent against its own SignerListSet fee spend.
+    operator_capital: std::collections::HashSet<String>,
 }
 
 /// JSON-RPC request wrapper.
@@ -53,7 +59,15 @@ impl XrplMonitor {
             client: reqwest::Client::new(),
             rpc_url: rpc_url.to_string(),
             escrow_address: escrow_address.to_string(),
+            operator_capital: std::collections::HashSet::new(),
         }
+    }
+
+    /// #131 AC-R1: register operator-capital sender addresses (see the field doc).
+    /// Payments to the escrow from these senders are NOT credited as user deposits.
+    pub fn with_operator_capital(mut self, addrs: impl IntoIterator<Item = String>) -> Self {
+        self.operator_capital = addrs.into_iter().collect();
+        self
     }
 
     /// Scan for new deposits since `last_ledger`.
@@ -171,6 +185,14 @@ impl XrplMonitor {
                 Some(s) => s.to_string(),
                 None => continue,
             };
+
+            // #131 AC-R1: an operator-capital sender's payment funds the escrow
+            // (custody) but is NOT a user deposit → skip crediting. It still raised the
+            // escrow balance the baseline attests, so it is over-custody, not a liability.
+            if self.operator_capital.contains(&sender) {
+                info!(sender = %sender, "operator-capital payment to escrow — custody, not credited");
+                continue;
+            }
 
             let tx_hash = match tx["hash"].as_str() {
                 Some(h) => h.to_lowercase(),

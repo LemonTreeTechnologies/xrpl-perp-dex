@@ -858,7 +858,23 @@ async fn main() -> Result<()> {
     // Initialize clients
     let perp = PerpClient::new(&cli.enclave_url)?;
     let perp_for_api = PerpClient::new(&cli.enclave_url)?;
-    let monitor = XrplMonitor::new(&cli.xrpl_url, &escrow_address);
+    // #131 AC-R1: operator-capital senders (env OPERATOR_CAPITAL_SENDERS, comma-separated
+    // XRPL r-addresses). Their payments to the escrow fund its on-chain operational fees
+    // (SignerListSet multisig) and count as CUSTODY, not user deposits/liabilities.
+    let operator_capital: Vec<String> = std::env::var("OPERATOR_CAPITAL_SENDERS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !operator_capital.is_empty() {
+        info!(
+            count = operator_capital.len(),
+            "operator-capital senders configured (payments = custody, not credited)"
+        );
+    }
+    let monitor =
+        XrplMonitor::new(&cli.xrpl_url, &escrow_address).with_operator_capital(operator_capital);
     let http_client = reqwest::Client::new();
 
     // Try to load persisted state
