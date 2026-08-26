@@ -123,6 +123,15 @@ impl XrplMonitor {
             let tx = &tx_entry["tx"];
             let meta = &tx_entry["meta"];
 
+            // #131 AC-R1 scan-progress: advance the high-water for EVERY scanned tx —
+            // deposit, non-deposit (e.g. SignerListSet), or operator-capital — so
+            // last_ledger never stalls on a tx that is filtered out or skipped below
+            // (which would re-scan it forever and block detection of any later deposit).
+            // The credit decision below is independent of this progress marker.
+            if let Some(idx) = tx["ledger_index"].as_u64() {
+                new_ledger = new_ledger.max(idx as u32);
+            }
+
             // Only successful Payment transactions to our escrow address
             if meta["TransactionResult"].as_str() != Some("tesSUCCESS") {
                 continue;
@@ -227,11 +236,7 @@ impl XrplMonitor {
                 ledger_index: deposit_ledger,
                 is_xrp,
             });
-
-            // Track highest ledger index
-            if deposit_ledger > 0 {
-                new_ledger = new_ledger.max(deposit_ledger as u32);
-            }
+            // (new_ledger high-water is advanced at the top of the loop for every tx.)
         }
 
         Ok((deposits, new_ledger))
