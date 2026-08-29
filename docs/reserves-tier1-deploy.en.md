@@ -15,6 +15,17 @@
 > publish); an under-statement could publish a root that *looks* solvent but isn't
 > — exactly what AC-R1-5b closes. The on-chain contract is named `ReservesRegistry`
 > for deployment reasons; the name is not the claim.
+>
+> **Operator-capital exclusion is DECLARED, not proven (reserves-input attestation).**
+> The v2 `snapshot` commits a canonical hash of the operator-DECLARED operator-capital
+> excluded-senders (whose escrow payments count as custody, not liabilities). This is
+> **tamper-EVIDENT** — the exclusion is committed on-chain, unchangeable-after-the-fact
+> and attributable, so a wrongly-excluded user deposit or a silently-changed exclusion
+> policy is **detectable** by the affected user or any watcher. It is **NOT
+> tamper-PROOF**: the enclave commits the host's *declared* set at publish time and does
+> **NOT** independently verify it against the raw XRPL deposits — that is **AC-BASE-2″
+> in-enclave SPV**, which remains the mainnet backing gate. **This disclosure does NOT
+> establish backing; it makes the exclusion auditable.**
 
 ## What it does
 The **sequencer's enclave** — the sole holder of authoritative perp state —
