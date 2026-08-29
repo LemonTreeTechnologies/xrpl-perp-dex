@@ -61,10 +61,16 @@ pub mod limits {
     pub const SEAL_HEADER_MIN: u64 = 520;
     pub const SEAL_HEADER_MAX: u64 = 640;
     /// Golden perp-meta plaintext sizes — MIRROR of the enclave static_asserts in
-    /// `EthSignerEnclave/Enclave/perp_meta_schema.h` (β7=88, β8=120). Keep in
-    /// lockstep with that header (its static_asserts are the authoritative freeze).
+    /// `EthSignerEnclave/Enclave/perp_meta_schema.h` (β7=88, β8=120, β9=128, β10=136).
+    /// Keep in lockstep with that header (its static_asserts are the authoritative
+    /// freeze). Any known-legacy size is migratable (the current enclave's schema-aware
+    /// load upgrades it in place); the current size is a no-op; anything else STOPs.
     pub const PERP_META_LEGACY_B7_LEN: u64 = 88;
     pub const PERP_META_B8_LEN: u64 = 120;
+    /// β9 = β8 + 8 (D-2 last_credited_ledger watermark).
+    pub const PERP_META_B9_LEN: u64 = 128;
+    /// β10 = β9 + 8 (#131 AC-BASE-3″ baseline_epoch) — the current schema.
+    pub const PERP_META_B10_LEN: u64 = 136;
 }
 
 /// One limit check with the numbers behind the verdict.
@@ -110,8 +116,8 @@ pub struct CapacityReport {
     /// shard_id → number of perp-state sealed files in that shard.
     pub perp_files_by_shard: BTreeMap<u32, u64>,
     pub checks: Vec<CapacityCheck>,
-    /// AC-E1-3: per-shard perp-meta schema findings (β7 88B → migratable, β8 120B
-    /// → already migrated, anything else → non-migratable / STOP).
+    /// AC-E1-3: per-shard perp-meta schema findings (β7 88B / β8 120B / β9 128B →
+    /// migratable, β10 136B → already current, anything else → non-migratable / STOP).
     pub perp_meta_findings: Vec<MetaSchemaFinding>,
 }
 
@@ -119,15 +125,21 @@ pub struct CapacityReport {
 /// plaintext length, decided BEFORE the irreversible ceremony.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetaSchema {
-    /// == 88: the β7 pre-#131 schema. Expected on a node about to migrate; the β8
-    /// enclave's schema-aware load (Option A) upgrades it in place. Migratable.
+    /// == 88: the β7 pre-#131 schema. The current enclave's schema-aware load upgrades
+    /// it in place. Migratable.
     LegacyB7,
-    /// == 120: already the β8 schema (already migrated, or a fresh β8 node).
-    /// Not a blocker — the migration/load is a no-op for the schema.
+    /// == 120: the β8 schema (custody ledger, no watermark). Schema-aware load upgrades
+    /// it in place. Migratable.
     AlreadyB8,
-    /// Any other length, an unreadable header, or a size that doesn't reconcile
-    /// with the file. The β8 load HARD-FAILS this (AC-CHUNK3-3) — so promoting a
-    /// node in this state would strand it. STOP before the point of no return.
+    /// == 128: the β9 schema (D-2 watermark, no baseline_epoch). Schema-aware load
+    /// upgrades it into β10 (LEGACY_B9 → zero-fill baseline_epoch). Migratable — this is
+    /// the OLD size for a β9→β10 migration.
+    LegacyB9,
+    /// == 136: already the β10 (current) schema. Not a blocker — the load is a no-op.
+    AlreadyB10,
+    /// Any other length, an unreadable header, or a size that doesn't reconcile with the
+    /// file. The current enclave load HARD-FAILS this (AC-CHUNK3-3) — so promoting a node
+    /// in this state would strand it. STOP before the point of no return.
     Unknown,
 }
 
@@ -188,6 +200,8 @@ fn classify_perp_meta(payload_len: Option<u64>) -> MetaSchema {
     match payload_len {
         Some(limits::PERP_META_LEGACY_B7_LEN) => MetaSchema::LegacyB7,
         Some(limits::PERP_META_B8_LEN) => MetaSchema::AlreadyB8,
+        Some(limits::PERP_META_B9_LEN) => MetaSchema::LegacyB9,
+        Some(limits::PERP_META_B10_LEN) => MetaSchema::AlreadyB10,
         _ => MetaSchema::Unknown,
     }
 }
@@ -282,9 +296,9 @@ pub fn assess_accounts_dir(accounts_dir: &Path) -> Result<CapacityReport> {
             limits::PERP_STATE_MAX_FILES_PER_SHARD,
             "files",
         ),
-        // AC-E1-3: any perp-meta of an unrecognized schema (not β7-88 nor β8-120)
-        // would HARD-FAIL the β8 load (AC-CHUNK3-3) and strand the promoted node.
-        // Must be 0 before the ceremony.
+        // AC-E1-3: any perp-meta of an unrecognized schema (not β7-88 / β8-120 / β9-128
+        // / β10-136) would HARD-FAIL the current load (AC-CHUNK3-3) and strand the
+        // promoted node. Must be 0 before the ceremony.
         CapacityCheck::new(
             "perp-meta schema (β3.2a): non-migratable metas",
             unmigratable_metas,
@@ -339,9 +353,17 @@ pub fn render(report: &CapacityReport) -> String {
     } else {
         for f in &report.perp_meta_findings {
             let verdict = match f.schema {
-                MetaSchema::LegacyB7 => "β7 (88B) → migratable: β8 load upgrades it in place",
-                MetaSchema::AlreadyB8 => "β8 (120B) → already migrated schema (no-op)",
-                MetaSchema::Unknown => "UNKNOWN size → NON-migratable — β8 load HARD-FAILS (STOP)",
+                MetaSchema::LegacyB7 => "β7 (88B) → migratable: current load upgrades it in place",
+                MetaSchema::AlreadyB8 => {
+                    "β8 (120B) → migratable: current load upgrades it in place"
+                }
+                MetaSchema::LegacyB9 => {
+                    "β9 (128B) → migratable: β10 load zero-fills baseline_epoch (LEGACY_B9)"
+                }
+                MetaSchema::AlreadyB10 => "β10 (136B) → already current schema (no-op)",
+                MetaSchema::Unknown => {
+                    "UNKNOWN size → NON-migratable — current load HARD-FAILS (STOP)"
+                }
             };
             let len_s = match f.payload_len {
                 Some(n) => format!("{n}B"),
@@ -457,6 +479,38 @@ mod tests {
         let r = assess_accounts_dir(d).unwrap();
         assert!(r.ok(), "β8 meta must pass: {}", render(&r));
         assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB8);
+        assert!(meta_check(&r).ok);
+    }
+
+    #[test]
+    fn perp_meta_b9_is_migratable() {
+        // #131 AC-BASE-3″: a node about to migrate β9→β10 carries a 128-byte β9 meta →
+        // migratable (β10's LEGACY_B9 load zero-fills baseline_epoch). Must NOT STOP.
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        write_file(d, "signer_list.sealed", 2256);
+        write_sealed_meta(d, "s0_perp_meta.sealed", limits::PERP_META_B9_LEN);
+        write_file(d, "s0_perp_users_0.sealed", 20560);
+        let r = assess_accounts_dir(d).unwrap();
+        assert!(
+            r.ok(),
+            "β9 meta must pass (β9→β10 migratable): {}",
+            render(&r)
+        );
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::LegacyB9);
+        assert_eq!(r.perp_meta_findings[0].payload_len, Some(128));
+        assert!(meta_check(&r).ok);
+    }
+
+    #[test]
+    fn perp_meta_already_b10_is_ok() {
+        // A 136-byte β10 meta (already current, or re-run after migration) is not a blocker.
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        write_sealed_meta(d, "s0_perp_meta.sealed", limits::PERP_META_B10_LEN);
+        let r = assess_accounts_dir(d).unwrap();
+        assert!(r.ok(), "β10 meta must pass: {}", render(&r));
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB10);
         assert!(meta_check(&r).ok);
     }
 
