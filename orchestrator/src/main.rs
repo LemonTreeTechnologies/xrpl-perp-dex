@@ -873,6 +873,21 @@ async fn main() -> Result<()> {
             "operator-capital senders configured (payments = custody, not credited)"
         );
     }
+    // #131 AC-BASE reserves-input attestation: decode the operator-capital r-addresses to
+    // 20-byte XRPL AccountIDs (hex) ONCE, for the reserves-commit v2 snapshot commitment.
+    // SAME config that governs the scanner exclusion, so the committed set matches what is
+    // actually excluded. A malformed r-address is surfaced here and dropped from the set.
+    let operator_capital_account_ids: Vec<String> = operator_capital
+        .iter()
+        .filter_map(|r| match crate::xrpl_signer::decode_xrpl_address(r) {
+            Ok(id) => Some(hex::encode(id)),
+            Err(e) => {
+                warn!(addr = %r, error = %e,
+                    "operator-capital r-address failed to decode — dropped from the attested set");
+                None
+            }
+        })
+        .collect();
     let monitor =
         XrplMonitor::new(&cli.xrpl_url, &escrow_address).with_operator_capital(operator_capital);
     let http_client = reqwest::Client::new();
@@ -2301,6 +2316,7 @@ async fn main() -> Result<()> {
                             &perp,
                             &signer.address,
                             &signer.session_key,
+                            &operator_capital_account_ids,
                         )
                         .await
                         {

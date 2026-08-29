@@ -174,6 +174,13 @@ impl PerpClient {
     /// the enclave hex parser + the typed-sign session-key discipline).
     #[allow(dead_code)] // wired by the 3d publisher
     #[allow(clippy::too_many_arguments)]
+    /// `excluded_account_ids` (#131 AC-BASE reserves-input attestation): the
+    /// operator-capital senders as 20-byte XRPL AccountID hex strings (NOT r-addresses).
+    /// The enclave canonically hashes them (sort+dedup) and commits the hash into the v2
+    /// snapshot, so the on-chain custody≥liabilities claim discloses the declared
+    /// exclusion set (tamper-EVIDENT, not SPV-verified). Empty slice → the enclave's
+    /// empty-set sentinel.
+    #[allow(clippy::too_many_arguments)]
     pub async fn reserves_commit(
         &self,
         account_id: &str,
@@ -183,6 +190,7 @@ impl PerpClient {
         chain_id: u64,
         registry_address: &str,
         safe_nonce: u64,
+        excluded_account_ids: &[String],
     ) -> Result<Value> {
         self.post(
             "/perp/reserves-commit",
@@ -194,6 +202,7 @@ impl PerpClient {
                 "chain_id": chain_id,
                 "registry_address": registry_address.trim_start_matches("0x"),
                 "safe_nonce": safe_nonce,
+                "excluded_account_ids": excluded_account_ids,
             }),
         )
         .await

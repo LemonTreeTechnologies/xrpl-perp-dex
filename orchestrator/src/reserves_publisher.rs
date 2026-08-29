@@ -78,6 +78,7 @@ pub async fn run_reserves_commit_once(
     perp: &PerpClient,
     account_id: &str,
     session_key: &str,
+    excluded_account_ids: &[String],
 ) -> Result<String> {
     let latest = commitment::query_latest_reserves(&cfg.rpc_url, &cfg.registry)
         .await
@@ -96,6 +97,7 @@ pub async fn run_reserves_commit_once(
             cfg.chain_id,
             &cfg.registry,
             safe_nonce,
+            excluded_account_ids,
         )
         .await
         .context("enclave reserves_commit (under-custody or signing error)")?;
