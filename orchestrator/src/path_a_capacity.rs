@@ -130,7 +130,7 @@ pub enum MetaSchema {
     LegacyB7,
     /// == 120: the β8 schema (custody ledger, no watermark). Schema-aware load upgrades
     /// it in place. Migratable.
-    AlreadyB8,
+    LegacyB8,
     /// == 128: the β9 schema (D-2 watermark, no baseline_epoch). Schema-aware load
     /// upgrades it into β10 (LEGACY_B9 → zero-fill baseline_epoch). Migratable — this is
     /// the OLD size for a β9→β10 migration.
@@ -199,7 +199,7 @@ fn read_sealed_payload_len(path: &Path) -> Option<u64> {
 fn classify_perp_meta(payload_len: Option<u64>) -> MetaSchema {
     match payload_len {
         Some(limits::PERP_META_LEGACY_B7_LEN) => MetaSchema::LegacyB7,
-        Some(limits::PERP_META_B8_LEN) => MetaSchema::AlreadyB8,
+        Some(limits::PERP_META_B8_LEN) => MetaSchema::LegacyB8,
         Some(limits::PERP_META_B9_LEN) => MetaSchema::LegacyB9,
         Some(limits::PERP_META_B10_LEN) => MetaSchema::AlreadyB10,
         _ => MetaSchema::Unknown,
@@ -354,9 +354,7 @@ pub fn render(report: &CapacityReport) -> String {
         for f in &report.perp_meta_findings {
             let verdict = match f.schema {
                 MetaSchema::LegacyB7 => "β7 (88B) → migratable: current load upgrades it in place",
-                MetaSchema::AlreadyB8 => {
-                    "β8 (120B) → migratable: current load upgrades it in place"
-                }
+                MetaSchema::LegacyB8 => "β8 (120B) → migratable: current load upgrades it in place",
                 MetaSchema::LegacyB9 => {
                     "β9 (128B) → migratable: β10 load zero-fills baseline_epoch (LEGACY_B9)"
                 }
@@ -478,7 +476,7 @@ mod tests {
         write_sealed_meta(d, "s0_perp_meta.sealed", limits::PERP_META_B8_LEN);
         let r = assess_accounts_dir(d).unwrap();
         assert!(r.ok(), "β8 meta must pass: {}", render(&r));
-        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB8);
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::LegacyB8);
         assert!(meta_check(&r).ok);
     }
 
