@@ -460,12 +460,14 @@ pub struct BaselineNode {
 /// RESP-#103 C-Q1.1 diversity bookkeeping: map each accepted bundle pubkey to its
 /// roster endpoint and assert the accepted quorum spans ≥`quorum` DISTINCT sources. A
 /// pubkey not in the roster is rejected (an unknown signer must not count toward
-/// diversity). Returns the distinct-source count.
+/// diversity). Returns the DISTINCT source fingerprints (first-seen order) — #131 AC-BASE
+/// (b) records these in the sealed baseline marker so the "N independent observations"
+/// claim is auditable.
 pub fn assert_bundle_diversity(
     accepted_pubkeys: &[Vec<u8>],
     roster: &[BaselineNode],
     quorum: usize,
-) -> Result<usize> {
+) -> Result<Vec<String>> {
     let mut fps = Vec::with_capacity(accepted_pubkeys.len());
     for pk in accepted_pubkeys {
         let pk_hex = hex::encode(pk);
@@ -480,7 +482,9 @@ pub fn assert_bundle_diversity(
             ),
         }
     }
-    assert_distinct_sources(&fps, quorum)
+    assert_distinct_sources(&fps, quorum)?; // enforce ≥quorum DISTINCT sources
+    let mut seen = std::collections::HashSet::new();
+    Ok(fps.into_iter().filter(|f| seen.insert(f.clone())).collect())
 }
 
 /// #131 AC-BASE ceremony driver. Reads the escrow at the current validated ledger
@@ -535,7 +539,10 @@ pub async fn run_reserves_baseline_ceremony(
     }
 
     // C-Q1.1 diversity: the accepted quorum must span ≥quorum distinct XRPL sources.
-    let distinct = assert_bundle_diversity(&pubkeys, roster, quorum)?;
+    // #131 AC-BASE (b): the distinct source fingerprints are recorded in the sealed
+    // baseline marker (auditable "N independent observations"; host-declared disclosure).
+    let source_fingerprints = assert_bundle_diversity(&pubkeys, roster, quorum)?;
+    let distinct = source_fingerprints.len();
 
     // Apply on the LOCAL sequencer enclave (loopback). This is NOT a p2p apply-broadcast
     // (governance's shape) — the baseline marker is sealed on the sequencer that holds
@@ -550,6 +557,7 @@ pub async fn run_reserves_baseline_ceremony(
             base.xrp_fp8,
             host_timestamp_ms,
             &hex::encode(&bundle),
+            &source_fingerprints,
         )
         .await?;
 
@@ -710,7 +718,7 @@ mod tests {
         ];
         // accepted 2-of-3 from nodes A + B (distinct endpoints) → passes, 2 sources
         let ab = vec![hex::decode("02aa").unwrap(), hex::decode("02bb").unwrap()];
-        assert_eq!(assert_bundle_diversity(&ab, &roster, 2).unwrap(), 2);
+        assert_eq!(assert_bundle_diversity(&ab, &roster, 2).unwrap().len(), 2);
         // accepted 2 from nodes A + C which SHARE one endpoint → refuse (Q5 diversity)
         let ac = vec![hex::decode("02aa").unwrap(), hex::decode("02cc").unwrap()];
         assert!(assert_bundle_diversity(&ac, &roster, 2).is_err());

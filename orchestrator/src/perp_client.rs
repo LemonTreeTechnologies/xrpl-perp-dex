@@ -239,6 +239,12 @@ impl PerpClient {
     /// AC-BASE: apply the one-time baseline — verify the 2-of-3 quorum over the pinned
     /// message, seed custody := attested escrow, seal the one-shot marker.
     #[allow(clippy::too_many_arguments)]
+    /// `source_fingerprints` (#131 AC-BASE (b)): the accepted distinct XRPL observation
+    /// source fingerprints as 8-byte hex strings (orch `endpoint_fingerprint`). Recorded
+    /// in the sealed baseline marker so the "N INDEPENDENT observations" claim is
+    /// auditable (host-DECLARED source diversity — a disclosure, not proof). Empty →
+    /// none recorded (backward-compatible).
+    #[allow(clippy::too_many_arguments)]
     pub async fn reserves_baseline_apply(
         &self,
         ledger_index: u64,
@@ -248,6 +254,7 @@ impl PerpClient {
         escrow_xrp: i64,
         host_timestamp_ms: u64,
         quorum_bundle_hex: &str,
+        source_fingerprints: &[String],
     ) -> Result<Value> {
         self.post(
             "/perp/reserves-baseline/apply",
@@ -259,6 +266,7 @@ impl PerpClient {
                 "escrow_xrp": escrow_xrp,
                 "host_timestamp_ms": host_timestamp_ms,
                 "quorum_bundle": quorum_bundle_hex.trim_start_matches("0x"),
+                "source_fingerprints": source_fingerprints,
             }),
         )
         .await
