@@ -26,6 +26,15 @@
 > **NOT** independently verify it against the raw XRPL deposits — that is **AC-BASE-2″
 > in-enclave SPV**, which remains the mainnet backing gate. **This disclosure does NOT
 > establish backing; it makes the exclusion auditable.**
+>
+> **Baseline observation sources are DECLARED, not proven (source-diversity attestation).**
+> The sealed baseline marker records the accepted per-observation XRPL **source
+> fingerprints** the quorum spanned, so the "N INDEPENDENT observations" claim is
+> auditable from the marker. This attests **source diversity** (a different property from
+> the exclusion above), and it is likewise **host-DECLARED, not proven** — the distinctness
+> was enforced at ceremony time, but the recorded fingerprints are what the orch reports,
+> not an in-enclave proof. An observation quorum is **not** backing; **AC-BASE-2″ SPV
+> remains the mainnet gate.**
 
 ## What it does
 The **sequencer's enclave** — the sole holder of authoritative perp state —
