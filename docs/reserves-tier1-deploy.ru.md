@@ -25,7 +25,7 @@
 > наблюдателем. Это **НЕ tamper-PROOF**: энклейв коммитит *декларированный* хостом набор на
 > момент публикации и **НЕ** верифицирует его против сырых XRPL-депозитов — это **AC-BASE-2″
 > in-enclave SPV**, который остаётся mainnet-гейтом обеспечения. **Эта disclosure НЕ
-> устанавливает backing; она делает исключение аудируемым.**
+> устанавливает backing; она делает исключение аудируемым.** Тот же excluded_senders_hash коммитится и в one-shot baseline-маркере (baseline засеивает custody := escrow, включающий operator-capital).
 >
 > **Источники наблюдений baseline ДЕКЛАРИРУЮТСЯ, не доказываются (source-diversity attestation).**
 > Sealed baseline-маркер записывает принятые per-observation XRPL **source-fingerprints**,

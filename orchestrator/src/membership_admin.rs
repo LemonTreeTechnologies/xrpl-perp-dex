@@ -73,6 +73,10 @@ pub struct MembershipAdminState {
     /// #131 AC-BASE: drives `LibP2PReservesBaselineCollector` (the one-time
     /// custody-baseline 2-of-3 ceremony).
     pub reserves_baseline_tx: mpsc::Sender<crate::p2p::ReservesBaselineRelay>,
+    /// #131 AC-BASE (a): the operator-capital excluded senders as 20-byte XRPL AccountID
+    /// hex (decoded from OPERATOR_CAPITAL_SENDERS — the SAME config the scanner uses),
+    /// committed into the baseline marker's excluded_senders_hash.
+    pub operator_capital_account_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -506,6 +510,7 @@ async fn drive_reserves_baseline(
         &roster,
         req.quorum,
         host_ts,
+        &state.operator_capital_account_ids,
     )
     .await?;
     Ok(ReservesBaselineResponse {

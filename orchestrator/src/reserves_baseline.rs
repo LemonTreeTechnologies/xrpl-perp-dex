@@ -503,6 +503,7 @@ pub async fn run_reserves_baseline_ceremony(
     roster: &[BaselineNode],
     quorum: usize,
     host_timestamp_ms: u64,
+    excluded_account_ids: &[String],
 ) -> Result<serde_json::Value> {
     // C-Q1.1 pre-flight: every configured node MUST point at a distinct XRPL source.
     let endpoints: Vec<String> = roster.iter().map(|n| n.xrpl_endpoint.clone()).collect();
@@ -558,6 +559,7 @@ pub async fn run_reserves_baseline_ceremony(
             host_timestamp_ms,
             &hex::encode(&bundle),
             &source_fingerprints,
+            excluded_account_ids,
         )
         .await?;
 

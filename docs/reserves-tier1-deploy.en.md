@@ -25,7 +25,7 @@
 > tamper-PROOF**: the enclave commits the host's *declared* set at publish time and does
 > **NOT** independently verify it against the raw XRPL deposits — that is **AC-BASE-2″
 > in-enclave SPV**, which remains the mainnet backing gate. **This disclosure does NOT
-> establish backing; it makes the exclusion auditable.**
+> establish backing; it makes the exclusion auditable.** The same excluded_senders_hash is also committed in the one-shot baseline marker (the baseline seeds custody := escrow, which includes operator-capital).
 >
 > **Baseline observation sources are DECLARED, not proven (source-diversity attestation).**
 > The sealed baseline marker records the accepted per-observation XRPL **source

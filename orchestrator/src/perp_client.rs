@@ -255,6 +255,7 @@ impl PerpClient {
         host_timestamp_ms: u64,
         quorum_bundle_hex: &str,
         source_fingerprints: &[String],
+        excluded_account_ids: &[String],
     ) -> Result<Value> {
         self.post(
             "/perp/reserves-baseline/apply",
@@ -267,6 +268,7 @@ impl PerpClient {
                 "host_timestamp_ms": host_timestamp_ms,
                 "quorum_bundle": quorum_bundle_hex.trim_start_matches("0x"),
                 "source_fingerprints": source_fingerprints,
+                "excluded_account_ids": excluded_account_ids,
             }),
         )
         .await

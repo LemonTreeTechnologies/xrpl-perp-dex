@@ -1518,6 +1518,7 @@ async fn main() -> Result<()> {
                     current_quorum: cfg.quorum as u32,
                     mrenclave_governance_tx,
                     reserves_baseline_tx,
+                    operator_capital_account_ids: operator_capital_account_ids.clone(),
                 });
                 tokio::spawn(async move {
                     if let Err(e) = membership_admin::spawn_admin_listener(addr, admin_state).await
