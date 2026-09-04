@@ -26,6 +26,9 @@ use sha2::{Digest, Sha256};
 const BASELINE_DOMAIN: &[u8] = b"PERP_RESERVES_BASELINE_v1"; // 25 bytes
 /// #131 AC-BASE-2" P2-c: the SPV baseline domain (the balances are SPV-DERIVED, not
 /// host-supplied, so a distinct domain — a scalar-baseline bundle can't authorise it).
+/// (allow(dead_code): consumed by the P2-d ceremony redesign, not yet wired; the golden
+/// test pins the encoding now so it can't drift before then.)
+#[allow(dead_code)]
 const SPV_BASELINE_DOMAIN: &[u8] = b"PERP_RESERVES_SPV_BASELINE_v1"; // 29 bytes
 
 /// SHA-256 over the exact preimage the enclave hashes:
@@ -58,6 +61,8 @@ pub fn baseline_message_hash(
 ///   || le_u64(custody_rlusd) || le_u64(custody_xrp) || rlusd_issuer[20]
 ///   || excluded_senders_hash[32]
 /// Each cosigner signs THIS over the custody IT independently SPV-derived.
+/// (allow(dead_code): the P2-d ceremony that calls it is not yet wired; pinned now.)
+#[allow(dead_code)]
 pub fn spv_baseline_message_hash(
     shard_id: u32,
     ledger_seq: u64,
