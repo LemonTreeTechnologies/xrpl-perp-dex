@@ -646,9 +646,21 @@ mod tests {
             lh[i] = 0x40 + i as u8;
             exhash[i] = 0xC0 + i as u8;
         }
-        let h = spv_baseline_message_hash(0, 84_000_000, &lh, 123_456_789_012, 55_550_000, &issuer, &exhash);
+        let h = spv_baseline_message_hash(
+            0,
+            84_000_000,
+            &lh,
+            123_456_789_012,
+            55_550_000,
+            &issuer,
+            &exhash,
+        );
         let expected = "d73be3361b83201d8fc2fd7d1338f7fb2cd00796e2a2d1a1530d3b1cfce9d129";
-        assert_eq!(hex::encode(h), expected, "Rust SPV baseline hash must match the C++ enclave golden");
+        assert_eq!(
+            hex::encode(h),
+            expected,
+            "Rust SPV baseline hash must match the C++ enclave golden"
+        );
     }
 
     #[test]
