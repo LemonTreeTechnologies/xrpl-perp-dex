@@ -644,8 +644,8 @@ mod tests {
         let mut issuer = [0u8; 20];
         let mut lh = [0u8; 32];
         let mut exhash = [0u8; 32];
-        for i in 0..20 {
-            issuer[i] = 0xA0 + i as u8;
+        for (i, b) in issuer.iter_mut().enumerate() {
+            *b = 0xA0 + i as u8;
         }
         for i in 0..32 {
             lh[i] = 0x40 + i as u8;
