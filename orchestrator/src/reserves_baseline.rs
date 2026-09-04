@@ -24,6 +24,9 @@ use sha2::{Digest, Sha256};
 
 /// Domain prefix — must equal `kReservesBaselineDomain` in perp_reserves_baseline.cpp.
 const BASELINE_DOMAIN: &[u8] = b"PERP_RESERVES_BASELINE_v1"; // 25 bytes
+/// #131 AC-BASE-2" P2-c: the SPV baseline domain (the balances are SPV-DERIVED, not
+/// host-supplied, so a distinct domain — a scalar-baseline bundle can't authorise it).
+const SPV_BASELINE_DOMAIN: &[u8] = b"PERP_RESERVES_SPV_BASELINE_v1"; // 29 bytes
 
 /// SHA-256 over the exact preimage the enclave hashes:
 ///   domain || le_u32(shard) || le_u64(L) || escrow_account[20] || rlusd_issuer[20]
@@ -44,6 +47,35 @@ pub fn baseline_message_hash(
     h.update(rlusd_issuer);
     h.update((escrow_rlusd as u64).to_le_bytes());
     h.update((escrow_xrp as u64).to_le_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
+/// #131 AC-BASE-2" P2-c: SHA-256 over the exact preimage the enclave's
+/// `compute_perp_reserves_spv_baseline_message_hash` hashes:
+///   domain || le_u32(shard) || le_u64(ledger_seq) || ledger_hash[32]
+///   || le_u64(custody_rlusd) || le_u64(custody_xrp) || rlusd_issuer[20]
+///   || excluded_senders_hash[32]
+/// Each cosigner signs THIS over the custody IT independently SPV-derived.
+pub fn spv_baseline_message_hash(
+    shard_id: u32,
+    ledger_seq: u64,
+    ledger_hash: &[u8; 32],
+    custody_rlusd: i64,
+    custody_xrp: i64,
+    rlusd_issuer: &[u8; 20],
+    excluded_senders_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(SPV_BASELINE_DOMAIN);
+    h.update(shard_id.to_le_bytes());
+    h.update(ledger_seq.to_le_bytes());
+    h.update(ledger_hash);
+    h.update((custody_rlusd as u64).to_le_bytes());
+    h.update((custody_xrp as u64).to_le_bytes());
+    h.update(rlusd_issuer);
+    h.update(excluded_senders_hash);
     let mut out = [0u8; 32];
     out.copy_from_slice(&h.finalize());
     out
@@ -597,6 +629,26 @@ mod tests {
             expected,
             "Rust baseline hash must match the C++ enclave hash"
         );
+    }
+
+    /// P2-c SPV baseline hash — must match the C++ golden from
+    /// tests/test_perp_reserves_baseline.cpp (spv_baseline_message_hash). If the two
+    /// encodings drift, the live 2-of-3 quorum over the SPV-derived custody silently fails.
+    #[test]
+    fn spv_baseline_hash_matches_enclave_golden() {
+        let mut issuer = [0u8; 20];
+        let mut lh = [0u8; 32];
+        let mut exhash = [0u8; 32];
+        for i in 0..20 {
+            issuer[i] = 0xA0 + i as u8;
+        }
+        for i in 0..32 {
+            lh[i] = 0x40 + i as u8;
+            exhash[i] = 0xC0 + i as u8;
+        }
+        let h = spv_baseline_message_hash(0, 84_000_000, &lh, 123_456_789_012, 55_550_000, &issuer, &exhash);
+        let expected = "d73be3361b83201d8fc2fd7d1338f7fb2cd00796e2a2d1a1530d3b1cfce9d129";
+        assert_eq!(hex::encode(h), expected, "Rust SPV baseline hash must match the C++ enclave golden");
     }
 
     #[test]
