@@ -61,16 +61,18 @@ pub mod limits {
     pub const SEAL_HEADER_MIN: u64 = 520;
     pub const SEAL_HEADER_MAX: u64 = 640;
     /// Golden perp-meta plaintext sizes — MIRROR of the enclave static_asserts in
-    /// `EthSignerEnclave/Enclave/perp_meta_schema.h` (β7=88, β8=120, β9=128, β10=136).
-    /// Keep in lockstep with that header (its static_asserts are the authoritative
-    /// freeze). Any known-legacy size is migratable (the current enclave's schema-aware
-    /// load upgrades it in place); the current size is a no-op; anything else STOPs.
+    /// `EthSignerEnclave/Enclave/perp_meta_schema.h` (β7=88, β8=120, β9=128, β10=136,
+    /// β12=144). Keep in lockstep with that header (its static_asserts are the
+    /// authoritative freeze). Any known-legacy size is migratable (the current enclave's
+    /// schema-aware load upgrades it in place); the current size is a no-op; else STOPs.
     pub const PERP_META_LEGACY_B7_LEN: u64 = 88;
     pub const PERP_META_B8_LEN: u64 = 120;
     /// β9 = β8 + 8 (D-2 last_credited_ledger watermark).
     pub const PERP_META_B9_LEN: u64 = 128;
-    /// β10 = β9 + 8 (#131 AC-BASE-3″ baseline_epoch) — the current schema.
+    /// β10 = β9 + 8 (#131 AC-BASE-3″ baseline_epoch). β10 and β11 both sealed this.
     pub const PERP_META_B10_LEN: u64 = 136;
+    /// β12 = β10 + 8 (#131 AC-BASE-2″ P2-c reserves_ledger_floor) — the current schema.
+    pub const PERP_META_B12_LEN: u64 = 144;
 }
 
 /// One limit check with the numbers behind the verdict.
@@ -117,7 +119,7 @@ pub struct CapacityReport {
     pub perp_files_by_shard: BTreeMap<u32, u64>,
     pub checks: Vec<CapacityCheck>,
     /// AC-E1-3: per-shard perp-meta schema findings (β7 88B / β8 120B / β9 128B →
-    /// migratable, β10 136B → already current, anything else → non-migratable / STOP).
+    /// migratable, β10/β11 136B → migratable (P2-c), β12 144B → already current, else STOP).
     pub perp_meta_findings: Vec<MetaSchemaFinding>,
 }
 
@@ -132,11 +134,14 @@ pub enum MetaSchema {
     /// it in place. Migratable.
     LegacyB8,
     /// == 128: the β9 schema (D-2 watermark, no baseline_epoch). Schema-aware load
-    /// upgrades it into β10 (LEGACY_B9 → zero-fill baseline_epoch). Migratable — this is
-    /// the OLD size for a β9→β10 migration.
+    /// upgrades it into β10 (LEGACY_B9 → zero-fill baseline_epoch). Migratable.
     LegacyB9,
-    /// == 136: already the β10 (current) schema. Not a blocker — the load is a no-op.
-    AlreadyB10,
+    /// == 136: the β10/β11 schema (baseline_epoch, no reserves_ledger_floor). Schema-aware
+    /// load upgrades it into β12 (LEGACY_B10 → zero-fill reserves_ledger_floor). Migratable
+    /// — this is the OLD size for a β11→β12 (P2-c) migration.
+    LegacyB10,
+    /// == 144: already the β12 (current) schema. Not a blocker — the load is a no-op.
+    AlreadyB12,
     /// Any other length, an unreadable header, or a size that doesn't reconcile with the
     /// file. The current enclave load HARD-FAILS this (AC-CHUNK3-3) — so promoting a node
     /// in this state would strand it. STOP before the point of no return.
@@ -201,7 +206,8 @@ fn classify_perp_meta(payload_len: Option<u64>) -> MetaSchema {
         Some(limits::PERP_META_LEGACY_B7_LEN) => MetaSchema::LegacyB7,
         Some(limits::PERP_META_B8_LEN) => MetaSchema::LegacyB8,
         Some(limits::PERP_META_B9_LEN) => MetaSchema::LegacyB9,
-        Some(limits::PERP_META_B10_LEN) => MetaSchema::AlreadyB10,
+        Some(limits::PERP_META_B10_LEN) => MetaSchema::LegacyB10,
+        Some(limits::PERP_META_B12_LEN) => MetaSchema::AlreadyB12,
         _ => MetaSchema::Unknown,
     }
 }
@@ -356,9 +362,12 @@ pub fn render(report: &CapacityReport) -> String {
                 MetaSchema::LegacyB7 => "β7 (88B) → migratable: current load upgrades it in place",
                 MetaSchema::LegacyB8 => "β8 (120B) → migratable: current load upgrades it in place",
                 MetaSchema::LegacyB9 => {
-                    "β9 (128B) → migratable: β10 load zero-fills baseline_epoch (LEGACY_B9)"
+                    "β9 (128B) → migratable: load zero-fills baseline_epoch (LEGACY_B9)"
                 }
-                MetaSchema::AlreadyB10 => "β10 (136B) → already current schema (no-op)",
+                MetaSchema::LegacyB10 => {
+                    "β10/β11 (136B) → migratable: β12 load zero-fills reserves_ledger_floor (LEGACY_B10)"
+                }
+                MetaSchema::AlreadyB12 => "β12 (144B) → already current schema (no-op)",
                 MetaSchema::Unknown => {
                     "UNKNOWN size → NON-migratable — current load HARD-FAILS (STOP)"
                 }
@@ -501,14 +510,27 @@ mod tests {
     }
 
     #[test]
-    fn perp_meta_already_b10_is_ok() {
-        // A 136-byte β10 meta (already current, or re-run after migration) is not a blocker.
+    fn perp_meta_b10_is_migratable() {
+        // A 136-byte β10/β11 meta is the OLD size for a β11→β12 (P2-c) migration: the β12
+        // load zero-fills reserves_ledger_floor. Migratable, not a blocker.
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         write_sealed_meta(d, "s0_perp_meta.sealed", limits::PERP_META_B10_LEN);
         let r = assess_accounts_dir(d).unwrap();
-        assert!(r.ok(), "β10 meta must pass: {}", render(&r));
-        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB10);
+        assert!(r.ok(), "β10 meta must pass (migratable): {}", render(&r));
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::LegacyB10);
+        assert!(meta_check(&r).ok);
+    }
+
+    #[test]
+    fn perp_meta_already_b12_is_ok() {
+        // A 144-byte β12 meta (already current, or re-run after migration) is not a blocker.
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        write_sealed_meta(d, "s0_perp_meta.sealed", limits::PERP_META_B12_LEN);
+        let r = assess_accounts_dir(d).unwrap();
+        assert!(r.ok(), "β12 meta must pass: {}", render(&r));
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB12);
         assert!(meta_check(&r).ok);
     }
 
