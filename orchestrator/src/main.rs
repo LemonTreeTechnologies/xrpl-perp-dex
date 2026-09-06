@@ -1014,6 +1014,13 @@ async fn main() -> Result<()> {
     } else {
         (None, None)
     };
+    // #131 AC-BASE-2″ P2-c: the SPV backing-gate ceremony channel (mirrors AC-BASE).
+    let (spv_baseline_rx_holder, _spv_baseline_tx) = if signers_config.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<p2p::SpvBaselineRelay>(8);
+        (Some(rx), Some(tx))
+    } else {
+        (None, None)
+    };
 
     let peer_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
@@ -1477,6 +1484,7 @@ async fn main() -> Result<()> {
             app_state.signing_tx.clone(),
             _mrenclave_governance_tx.clone(),
             _reserves_baseline_tx.clone(),
+            _spv_baseline_tx.clone(),
         ) {
             (
                 Some(cfg),
@@ -1485,6 +1493,7 @@ async fn main() -> Result<()> {
                 Some(signing_tx),
                 Some(mrenclave_governance_tx),
                 Some(reserves_baseline_tx),
+                Some(spv_baseline_tx),
             ) if !cli.membership_node_urls.is_empty() => {
                 let escrow = crate::xrpl_signer::decode_xrpl_address(&escrow_address)
                     .context("--membership-admin-listen: escrow address must decode")?;
@@ -1519,6 +1528,7 @@ async fn main() -> Result<()> {
                     current_quorum: cfg.quorum as u32,
                     mrenclave_governance_tx,
                     reserves_baseline_tx,
+                    spv_baseline_tx,
                     operator_capital_account_ids: operator_capital_account_ids.clone(),
                 });
                 tokio::spawn(async move {
@@ -1681,6 +1691,10 @@ async fn main() -> Result<()> {
         // #131 AC-BASE: the one-time custody-baseline collection channel.
         if let Some(rx) = reserves_baseline_rx_holder {
             p2p_node.set_reserves_baseline_channel(rx);
+        }
+        // #131 AC-BASE-2″ P2-c: the SPV backing-gate collection channel.
+        if let Some(rx) = spv_baseline_rx_holder {
+            p2p_node.set_spv_baseline_channel(rx);
         }
         if let Some(ref local) = cfg.local_signer {
             // X-C1 condition C2 (perp RESP-5): enforce loopback on the

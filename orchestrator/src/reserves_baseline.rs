@@ -26,9 +26,6 @@ use sha2::{Digest, Sha256};
 const BASELINE_DOMAIN: &[u8] = b"PERP_RESERVES_BASELINE_v1"; // 25 bytes
 /// #131 AC-BASE-2" P2-c: the SPV baseline domain (the balances are SPV-DERIVED, not
 /// host-supplied, so a distinct domain — a scalar-baseline bundle can't authorise it).
-/// (allow(dead_code): consumed by the P2-d ceremony redesign, not yet wired; the golden
-/// test pins the encoding now so it can't drift before then.)
-#[allow(dead_code)]
 const SPV_BASELINE_DOMAIN: &[u8] = b"PERP_RESERVES_SPV_BASELINE_v1"; // 29 bytes
 
 /// SHA-256 over the exact preimage the enclave hashes:
@@ -61,8 +58,6 @@ pub fn baseline_message_hash(
 ///   || le_u64(custody_rlusd) || le_u64(custody_xrp) || rlusd_issuer[20]
 ///   || excluded_senders_hash[32]
 /// Each cosigner signs THIS over the custody IT independently SPV-derived.
-/// (allow(dead_code): the P2-d ceremony that calls it is not yet wired; pinned now.)
-#[allow(dead_code)]
 pub fn spv_baseline_message_hash(
     shard_id: u32,
     ledger_seq: u64,
@@ -84,6 +79,45 @@ pub fn spv_baseline_message_hash(
     let mut out = [0u8; 32];
     out.copy_from_slice(&h.finalize());
     out
+}
+
+/// #131 AC-BASE-2″ P2-c: reproduce the SPV baseline message hash from the fields a
+/// cosigner's enclave ECHOED back. The orchestrator is untrusted and derives NOTHING
+/// from the proof itself — it only reproduces the hash to recover the returned
+/// signature's pubkey (a wrong echoed field just fails recovery, and the applier
+/// independently re-derives the whole figure from the proof at apply, so these echoed
+/// values are never a trust surface).
+pub fn spv_hash_from_cosign_reply(reply: &serde_json::Value) -> Result<[u8; 32]> {
+    let shard_id = reply["shard_id"].as_u64().context("shard_id")? as u32;
+    let ledger_seq = reply["ledger_seq"].as_u64().context("ledger_seq")?;
+    let custody_xrp = reply["custody_xrp"].as_i64().context("custody_xrp")?;
+    let custody_rlusd = reply["custody_rlusd"].as_i64().context("custody_rlusd")?;
+    let ledger_hash =
+        decode_fixed_hex::<32>(reply["ledger_hash"].as_str().context("ledger_hash")?)?;
+    let issuer = decode_fixed_hex::<20>(reply["issuer"].as_str().context("issuer")?)?;
+    let excluded_hash =
+        decode_fixed_hex::<32>(reply["excluded_hash"].as_str().context("excluded_hash")?)?;
+    Ok(spv_baseline_message_hash(
+        shard_id,
+        ledger_seq,
+        &ledger_hash,
+        custody_rlusd,
+        custody_xrp,
+        &issuer,
+        &excluded_hash,
+    ))
+}
+
+/// Decode a fixed-length hex string (optional `0x`) into `[u8; N]`, erroring on any
+/// length mismatch (never silently truncate/pad a proof-derived field).
+fn decode_fixed_hex<const N: usize>(s: &str) -> Result<[u8; N]> {
+    let v = hex::decode(s.trim_start_matches("0x")).context("hex decode")?;
+    if v.len() != N {
+        bail!("expected {N} bytes, got {}", v.len());
+    }
+    let mut a = [0u8; N];
+    a.copy_from_slice(&v);
+    Ok(a)
 }
 
 /// From a node's recoverable signature `(r, s, v)` over `msg_hash`, recover the
@@ -609,6 +643,156 @@ pub async fn run_reserves_baseline_ceremony(
     Ok(res)
 }
 
+// ── #131 AC-BASE-2″ P2-c SPV ceremony ──────────────────────────────────────────
+// The SPV variant broadcasts ONE validator-quorum-attested proof (not a host figure);
+// each cosigner's enclave SPV-verifies it and cosigns the figure IT derives. The p2p
+// relay lives in `p2p.rs` (`SpvBaselineRelay`, `handle_spv_baseline_request`).
+
+/// Collector for the SPV baseline ceremony — mirrors `LibP2PReservesBaselineCollector`
+/// but ships a proof blob + the agreed excluded set instead of a figure.
+pub struct LibP2PSpvBaselineCollector {
+    relay_tx: tokio::sync::mpsc::Sender<crate::p2p::SpvBaselineRelay>,
+    timeout: std::time::Duration,
+}
+
+impl LibP2PSpvBaselineCollector {
+    pub fn new(relay_tx: tokio::sync::mpsc::Sender<crate::p2p::SpvBaselineRelay>) -> Self {
+        Self {
+            relay_tx,
+            timeout: std::time::Duration::from_secs(30),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_timeout(mut self, t: std::time::Duration) -> Self {
+        self.timeout = t;
+        self
+    }
+
+    /// Broadcast ONE proof blob + the agreed excluded set; collect a 2-of-N bundle of SPV
+    /// cosignatures. Returns `(wire_bundle, accepted_compressed_pubkeys)` — the pubkeys are
+    /// distinct and the bundle is exactly what `seal_verify_quorum_bundle_with_set` consumes.
+    pub async fn collect(
+        &self,
+        proof_blob_hex: String,
+        excluded_hex: Vec<String>,
+    ) -> Result<(Vec<u8>, Vec<Vec<u8>>)> {
+        use uuid::Uuid;
+        let request_id = format!("reserves-spv-{}", Uuid::new_v4());
+        let (responses_tx, mut responses_rx) = tokio::sync::mpsc::channel(32);
+
+        self.relay_tx
+            .send(crate::p2p::SpvBaselineRelay {
+                request_id,
+                proof_blob_hex,
+                excluded_hex,
+                responses_tx,
+            })
+            .await
+            .context("send SpvBaselineRelay to p2p run-loop")?;
+
+        // (compressed_pubkey, DER) per distinct responder.
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let resp = match tokio::time::timeout(remaining, responses_rx.recv()).await {
+                Ok(Some(m)) => m,
+                _ => break,
+            };
+            if let crate::p2p::SigningMessage::Response {
+                der_signature: Some(der_hex),
+                compressed_pubkey: Some(pk_hex),
+                error: None,
+                ..
+            } = resp
+            {
+                let pk = hex::decode(&pk_hex).unwrap_or_default();
+                let der = hex::decode(&der_hex).unwrap_or_default();
+                if pk.len() == 33 && !der.is_empty() && !entries.iter().any(|(p, _)| *p == pk) {
+                    entries.push((pk, der));
+                }
+            }
+        }
+
+        if entries.is_empty() {
+            bail!(
+                "collected zero SPV cosignatures within {:?} — no operator enclave verified \
+                 the proof + cosigned",
+                self.timeout
+            );
+        }
+        let pubkeys: Vec<Vec<u8>> = entries.iter().map(|(p, _)| p.clone()).collect();
+        Ok((build_quorum_bundle(&entries), pubkeys))
+    }
+}
+
+/// #131 AC-BASE-2″ P2-c ceremony driver. The leader fetches ONE validator-quorum-attested
+/// proof (the untrusted patched node produces it, the enclave verifies it), broadcasts it,
+/// collects ≥`cosign_quorum` SPV cosignatures over the SPV-DERIVED figure, asserts cosigner
+/// diversity, then applies on the LOCAL sequencer enclave (re-derive → verify 2-of-N →
+/// seed custody := the SPV-PROVEN balance → seal the one-shot). Returns the apply response.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_reserves_spv_baseline_ceremony(
+    collector: &LibP2PSpvBaselineCollector,
+    enclave_perp_v1_base: &str,
+    fetch_cfg: &crate::spv_proof::SpvFetchConfig,
+    roster: &[BaselineNode],
+    cosign_quorum: usize,
+    host_timestamp_ms: u64,
+    excluded_account_ids: &[String],
+) -> Result<serde_json::Value> {
+    // (1) Fetch ONE proof blob and host-sanity-verify its chaining before broadcasting.
+    let blob = crate::spv_proof::fetch_spv_bundle(fetch_cfg)
+        .await
+        .context("fetch SPV proof bundle from the patched node")?;
+    let proof_blob_hex = hex::encode(&blob);
+    tracing::info!(
+        blob_len = blob.len(),
+        "#131 SPV baseline: fetched a validator-quorum-attested proof — broadcasting for cosign"
+    );
+
+    // (2) Broadcast + collect ≥quorum independent SPV cosignatures over the SAME proof.
+    let (bundle, pubkeys) = collector
+        .collect(proof_blob_hex.clone(), excluded_account_ids.to_vec())
+        .await?;
+    if pubkeys.len() < cosign_quorum {
+        bail!(
+            "collected {} SPV cosignature(s), need ≥{} — refuse",
+            pubkeys.len(),
+            cosign_quorum
+        );
+    }
+
+    // (3) Diversity: the accepted quorum must span ≥quorum distinct cosigning operators.
+    let source_fingerprints = assert_bundle_diversity(&pubkeys, roster, cosign_quorum)?;
+    let distinct = source_fingerprints.len();
+
+    // (4) Apply on the LOCAL sequencer enclave: it INDEPENDENTLY re-derives the figure from
+    // the same proof, verifies the 2-of-N over it, seeds custody + seals the one-shot.
+    let perp = crate::perp_client::PerpClient::new(enclave_perp_v1_base)?;
+    let res = perp
+        .reserves_spv_apply(
+            &proof_blob_hex,
+            host_timestamp_ms,
+            &hex::encode(&bundle),
+            &source_fingerprints,
+            excluded_account_ids,
+        )
+        .await?;
+
+    tracing::info!(
+        distinct_cosigners = distinct,
+        "#131 SPV baseline applied — custody seeded from an SPV-PROVEN escrow balance, \
+         cosigned by {} independent operator enclaves",
+        distinct
+    );
+    Ok(res)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,6 +849,29 @@ mod tests {
             hex::encode(h),
             expected,
             "Rust SPV baseline hash must match the C++ enclave golden"
+        );
+    }
+
+    /// The reply→hash reconstruction (host recovery path) must land on the SAME golden
+    /// as `spv_baseline_message_hash` — locks the echoed JSON field names + the hex decode
+    /// so a cosigner's pubkey recovery can never silently mis-parse the enclave's figures.
+    #[test]
+    fn spv_hash_from_cosign_reply_matches_golden() {
+        let reply = serde_json::json!({
+            "status": "success",
+            "shard_id": 0,
+            "ledger_seq": 84_000_000u64,
+            "ledger_hash": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+            "custody_xrp": 55_550_000i64,
+            "custody_rlusd": 123_456_789_012i64,
+            "issuer": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3",
+            "excluded_hash": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+        });
+        let h = spv_hash_from_cosign_reply(&reply).expect("reply → hash");
+        assert_eq!(
+            hex::encode(h),
+            "d73be3361b83201d8fc2fd7d1338f7fb2cd00796e2a2d1a1530d3b1cfce9d129",
+            "reply-reconstructed hash must match the enclave golden"
         );
     }
 

@@ -73,6 +73,9 @@ pub struct MembershipAdminState {
     /// #131 AC-BASE: drives `LibP2PReservesBaselineCollector` (the one-time
     /// custody-baseline 2-of-3 ceremony).
     pub reserves_baseline_tx: mpsc::Sender<crate::p2p::ReservesBaselineRelay>,
+    /// #131 AC-BASE-2″ P2-c: drives `LibP2PSpvBaselineCollector` (the SPV backing-gate
+    /// ceremony — broadcast one proof, collect 2-of-N SPV cosignatures, apply).
+    pub spv_baseline_tx: mpsc::Sender<crate::p2p::SpvBaselineRelay>,
     /// #131 AC-BASE (a): the operator-capital excluded senders as 20-byte XRPL AccountID
     /// hex (decoded from OPERATOR_CAPITAL_SENDERS — the SAME config the scanner uses),
     /// committed into the baseline marker's excluded_senders_hash.
@@ -546,12 +549,123 @@ async fn handle_reserves_baseline(
     }
 }
 
+// ── #131 AC-BASE-2″ P2-c — SPV backing-gate ceremony trigger ──
+
+#[derive(Debug, Deserialize)]
+pub struct SpvBaselineRequest {
+    /// Patched-node JSON-RPC endpoint that produces the SHAMap proof (UNTRUSTED — the
+    /// enclave verifies the proof against the validator-signed account_hash).
+    pub proof_http_url: String,
+    /// Patched-node ws endpoint the leader subscribes to for validations.
+    pub proof_ws_url: String,
+    /// Escrow classic r-address the proof is built for (the SPV target). The enclave
+    /// pins its OWN escrow from the sealed SignerList, so a wrong value here just fails
+    /// the SPV inclusion check — it is not a trust surface.
+    pub escrow: String,
+    /// Minimum full validations to collect for ONE converging ledger before building.
+    pub validations_quorum: usize,
+    /// Cosignature quorum required (2 on the 3-node cluster).
+    pub cosign_quorum: usize,
+    /// ws collect window (seconds); default 45.
+    #[serde(default)]
+    pub collect_secs: Option<u64>,
+    /// The ceremony roster — each cosigning node's baseline signing pubkey + an identifier
+    /// endpoint (mapped back for the ≥quorum distinct-cosigner assertion).
+    pub nodes: Vec<BaselineNodeReq>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SpvBaselineResponse {
+    pub status: String,
+    pub message: String,
+    pub enclave: serde_json::Value,
+}
+
+async fn drive_reserves_spv_baseline(
+    state: &MembershipAdminState,
+    req: SpvBaselineRequest,
+) -> Result<SpvBaselineResponse> {
+    use crate::reserves_baseline::{
+        run_reserves_spv_baseline_ceremony, BaselineNode, LibP2PSpvBaselineCollector,
+    };
+    if req.cosign_quorum == 0 {
+        bail!("cosign_quorum must be >= 1");
+    }
+    if req.validations_quorum == 0 {
+        bail!("validations_quorum must be >= 1");
+    }
+    let roster: Vec<BaselineNode> = req
+        .nodes
+        .iter()
+        .map(|n| BaselineNode {
+            compressed_pubkey_hex: n.pubkey.trim_start_matches("0x").to_lowercase(),
+            xrpl_endpoint: n.endpoint.clone(),
+        })
+        .collect();
+    let fetch_cfg = crate::spv_proof::SpvFetchConfig {
+        http_url: req.proof_http_url.clone(),
+        ws_url: req.proof_ws_url.clone(),
+        escrow_account: req.escrow.clone(),
+        quorum: req.validations_quorum,
+        collect_secs: req.collect_secs.unwrap_or(45),
+    };
+    let collector = LibP2PSpvBaselineCollector::new(state.spv_baseline_tx.clone());
+    let enclave_v1 = format!("{}/v1", state.enclave_base.trim_end_matches('/'));
+    let host_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let res = run_reserves_spv_baseline_ceremony(
+        &collector,
+        &enclave_v1,
+        &fetch_cfg,
+        &roster,
+        req.cosign_quorum,
+        host_ts,
+        &state.operator_capital_account_ids,
+    )
+    .await?;
+    Ok(SpvBaselineResponse {
+        status: "ok".into(),
+        message: "SPV backing baseline applied — custody seeded from an SPV-proven escrow balance"
+            .into(),
+        enclave: res,
+    })
+}
+
+async fn handle_reserves_spv_baseline(
+    State(state): State<Arc<MembershipAdminState>>,
+    Json(req): Json<SpvBaselineRequest>,
+) -> impl IntoResponse {
+    info!(
+        escrow = %req.escrow,
+        cosign_quorum = req.cosign_quorum,
+        nodes = req.nodes.len(),
+        "#131 AC-BASE-2\u{2033} P2-c SPV baseline ceremony requested"
+    );
+    match drive_reserves_spv_baseline(&state, req).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(e) => {
+            warn!(error = %e, "#131 SPV baseline ceremony failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"status": "error", "message": format!("{e:#}")})),
+            )
+                .into_response()
+        }
+    }
+}
+
 pub fn router(state: Arc<MembershipAdminState>) -> Router {
     Router::new()
         .route("/admin/membership-change", post(handle_membership_change))
         .route("/admin/membership-genesis", post(handle_membership_genesis))
         .route("/admin/mrenclave-govern", post(handle_govern))
         .route("/admin/reserves-baseline", post(handle_reserves_baseline))
+        .route(
+            "/admin/reserves-spv-baseline",
+            post(handle_reserves_spv_baseline),
+        )
         .with_state(state)
 }
 

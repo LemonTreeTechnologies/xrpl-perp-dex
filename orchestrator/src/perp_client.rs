@@ -274,6 +274,55 @@ impl PerpClient {
         .await
     }
 
+    /// #131 AC-BASE-2″ P2-c ceremony — ask a cosigner's enclave to SPV-verify the ONE
+    /// leader proof blob and sign the figure IT derives (no seal). `excluded_account_ids`
+    /// MUST be the SAME set the applier will use, or the bound excluded_senders_hash — and
+    /// thus the message — diverges and the apply-side bundle verify fails. Returns the
+    /// signature JSON `{r,s,v}`.
+    pub async fn reserves_spv_cosign(
+        &self,
+        account_id: &str,
+        session_key: &str,
+        proof_blob_hex: &str,
+        excluded_account_ids: &[String],
+    ) -> Result<Value> {
+        self.post(
+            "/perp/reserves-spv/cosign",
+            serde_json::json!({
+                "account_id": account_id,
+                "session_key": session_key.trim_start_matches("0x"),
+                "proof_blob": proof_blob_hex.trim_start_matches("0x"),
+                "excluded_account_ids": excluded_account_ids,
+            }),
+        )
+        .await
+    }
+
+    /// #131 AC-BASE-2″ P2-c ceremony — the sequencer applies the SPV baseline: re-derive
+    /// the figure from the SAME proof, verify the 2-of-3 bundle over it, seed custody +
+    /// seal the one-shot. escrow/issuer/balances are pinned/derived in-enclave, NOT params
+    /// (unlike `reserves_baseline_apply`, which trusts host scalars).
+    pub async fn reserves_spv_apply(
+        &self,
+        proof_blob_hex: &str,
+        host_timestamp_ms: u64,
+        quorum_bundle_hex: &str,
+        source_fingerprints: &[String],
+        excluded_account_ids: &[String],
+    ) -> Result<Value> {
+        self.post(
+            "/perp/reserves-spv/apply",
+            serde_json::json!({
+                "proof_blob": proof_blob_hex.trim_start_matches("0x"),
+                "host_timestamp_ms": host_timestamp_ms,
+                "quorum_bundle": quorum_bundle_hex.trim_start_matches("0x"),
+                "source_fingerprints": source_fingerprints,
+                "excluded_account_ids": excluded_account_ids,
+            }),
+        )
+        .await
+    }
+
     /// #131 AC-R1/D-2 C-R2: seed the enclave's deposit replay watermark. Advance-only
     /// (the enclave takes max), so calling it at startup with the persisted last-scanned
     /// ledger high-water makes the sealed watermark durable across a /tmp loss and closes

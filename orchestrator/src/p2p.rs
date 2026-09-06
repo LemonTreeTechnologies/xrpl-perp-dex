@@ -282,6 +282,24 @@ pub enum SigningMessage {
         /// Initiator-observed escrow XRP (FP8 = drops·100).
         escrow_xrp: i64,
     },
+    /// #131 AC-BASE-2″ P2-c SPV ceremony. Unlike `ReservesBaselineRequest` (which ships a
+    /// host FIGURE each receiver re-queries), this ships ONE validator-quorum-attested proof
+    /// blob; each receiver's enclave SPV-VERIFIES it and cosigns the figure IT derives — the
+    /// independence is the on-chain validator quorum inside the blob, not N separate
+    /// re-queries. escrow/issuer are pinned in-enclave, never on the wire.
+    ///
+    /// `request_id` MUST start with `"reserves-spv-"` so the response router forwards replies
+    /// to the SPV baseline collector's mpsc.
+    SpvBaselineRequest {
+        request_id: String,
+        requester_peer_id: String,
+        /// The full XSPV transport blob (header + validations + escrow proof), lowercase hex.
+        proof_blob_hex: String,
+        /// The agreed operator-capital excluded set (20-byte AccountID hex strings). MUST be
+        /// identical for every cosigner + the applier, or the bound excluded_senders_hash —
+        /// and thus the cosigned message — diverges.
+        excluded_hex: Vec<String>,
+    },
 }
 
 /// One signer in a β1 membership-epoch transition, as carried on the wire.
@@ -580,6 +598,24 @@ pub struct ReservesBaselineRelay {
     pub ledger_index: u64,
     pub escrow_rlusd: i64,
     pub escrow_xrp: i64,
+    /// Channel to receive `SigningMessage::Response` instances as peers reply.
+    pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
+}
+
+/// #131 AC-BASE-2″ P2-c outbound SPV-baseline collection request. The ceremony driver
+/// fetches ONE validator-quorum-attested proof blob, sends it down the SPV baseline
+/// channel; the run-loop broadcasts `SpvBaselineRequest`, and each peer's enclave
+/// SPV-verifies + cosigns the figure IT derives, forwarding each `Response` here until
+/// quorum or timeout. Mirrors `ReservesBaselineRelay` but ships a proof, not a figure.
+#[derive(Debug)]
+pub struct SpvBaselineRelay {
+    /// Unique id; MUST start with `"reserves-spv-"` so response routing forwards here.
+    pub request_id: String,
+    /// The full XSPV transport blob, lowercase hex.
+    pub proof_blob_hex: String,
+    /// The agreed operator-capital excluded set (20-byte AccountID hex). SAME set every
+    /// cosigner + the applier use, or the bound excluded_senders_hash diverges.
+    pub excluded_hex: Vec<String>,
     /// Channel to receive `SigningMessage::Response` instances as peers reply.
     pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
 }
@@ -888,6 +924,10 @@ pub struct P2PNode {
     // #131 AC-BASE — one-time custody-baseline collection (mirrors β4 Thread B)
     reserves_baseline_rx: Option<mpsc::Receiver<ReservesBaselineRelay>>,
     pending_reserves_baseline: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
+    // #131 AC-BASE-2″ P2-c — SPV custody-baseline collection (mirrors AC-BASE but ships a
+    // validator-quorum-attested proof instead of a host figure)
+    spv_baseline_rx: Option<mpsc::Receiver<SpvBaselineRelay>>,
+    pending_spv_baseline: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
     /// β3.2b: outbound apply-broadcast requests (seal / confirm) from the
     /// membership-change driver — each node applies to its loopback enclave.
     membership_apply_rx: Option<mpsc::Receiver<MembershipApplyRelay>>,
@@ -1073,6 +1113,8 @@ impl P2PNode {
             pending_mrenclave_governance: HashMap::new(),
             reserves_baseline_rx: None,
             pending_reserves_baseline: HashMap::new(),
+            spv_baseline_rx: None,
+            pending_spv_baseline: HashMap::new(),
             membership_apply_rx: None,
             pending_membership_apply: HashMap::new(),
             events_publish_rx: None,
@@ -1210,6 +1252,13 @@ impl P2PNode {
     #[allow(dead_code)]
     pub fn set_reserves_baseline_channel(&mut self, rx: mpsc::Receiver<ReservesBaselineRelay>) {
         self.reserves_baseline_rx = Some(rx);
+    }
+
+    /// #131 AC-BASE-2″ P2-c: the SPV-baseline collection channel. Wired in main.rs
+    /// alongside the operator admin route (same deferred deploy-wiring split).
+    #[allow(dead_code)]
+    pub fn set_spv_baseline_channel(&mut self, rx: mpsc::Receiver<SpvBaselineRelay>) {
+        self.spv_baseline_rx = Some(rx);
     }
 
     /// β3.2b: wire the membership-change driver's apply-broadcast channel. The
@@ -2305,6 +2354,98 @@ impl P2PNode {
         })
     }
 
+    /// #131 AC-BASE-2″ P2-c receiver: SPV-verify the leader's ONE proof on the LOCAL
+    /// enclave and cosign the figure IT derives. Unlike the baseline receiver there is NO
+    /// re-query — the independence is the on-chain validator quorum inside the proof, and
+    /// escrow/issuer are pinned in-enclave (nothing from the wire is trusted but the proof
+    /// bytes, which the enclave verifies). The enclave echoes the exact message-hash inputs
+    /// so we reproduce the hash + recover the pubkey with NO host-side SPV parse. Any local
+    /// failure returns an error `Response` (the collector ignores `error: Some`).
+    async fn handle_spv_baseline_request(
+        local_signer: &LocalSigner,
+        request_id: &str,
+        proof_blob_hex: &str,
+        excluded_hex: &[String],
+    ) -> Option<SigningMessage> {
+        let http = match crate::http_helpers::loopback_http_client(Duration::from_secs(25)) {
+            Ok(c) => c,
+            Err(e) => {
+                return Some(Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("http client: {e}"),
+                ))
+            }
+        };
+        let cosign_url = format!("{}/perp/reserves-spv/cosign", local_signer.enclave_url);
+        let body = serde_json::json!({
+            "account_id": local_signer.address,
+            "session_key": local_signer.session_key_hex(),
+            "proof_blob": proof_blob_hex,
+            "excluded_account_ids": excluded_hex,
+        });
+        let resp = match http.post(&cosign_url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return Some(Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("enclave request: {e}"),
+                ))
+            }
+        };
+        let rbody: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                return Some(Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("enclave response parse: {e}"),
+                ))
+            }
+        };
+        if rbody["status"].as_str() != Some("success") {
+            return Some(Self::membership_sign_error(
+                local_signer,
+                request_id,
+                format!("enclave: {}", rbody.get("message").unwrap_or(&rbody)),
+            ));
+        }
+        // Reproduce the hash from the enclave-echoed inputs, then recover (pubkey, DER). A
+        // wrong echoed field ⇒ recovery fails ⇒ this node contributes nothing (fail-safe).
+        let r_hex = rbody["signature"]["r"].as_str().unwrap_or("");
+        let s_hex = rbody["signature"]["s"].as_str().unwrap_or("");
+        let v = rbody["signature"]["v"].as_u64().unwrap_or(0) as u8;
+        let hash = match crate::reserves_baseline::spv_hash_from_cosign_reply(&rbody) {
+            Ok(h) => h,
+            Err(e) => {
+                return Some(Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("bad cosign figures: {e}"),
+                ))
+            }
+        };
+        let (pk, der) =
+            match crate::reserves_baseline::recover_pubkey_and_der(r_hex, s_hex, v, &hash) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Some(Self::membership_sign_error(
+                        local_signer,
+                        request_id,
+                        format!("pubkey recovery failed: {e}"),
+                    ))
+                }
+            };
+        Some(SigningMessage::Response {
+            request_id: request_id.to_string(),
+            signer_xrpl_address: local_signer.xrpl_address.clone(),
+            der_signature: Some(hex::encode_upper(&der)),
+            compressed_pubkey: Some(hex::encode(&pk)),
+            error: None,
+        })
+    }
+
     /// Uniform error `Response` for the β1 membership signing path.
     fn membership_sign_error(
         local_signer: &LocalSigner,
@@ -2814,6 +2955,7 @@ impl P2PNode {
         let mut membership_epoch_rx = self.membership_epoch_rx.take();
         let mut mrenclave_governance_rx = self.mrenclave_governance_rx.take();
         let mut reserves_baseline_rx = self.reserves_baseline_rx.take();
+        let mut spv_baseline_rx = self.spv_baseline_rx.take();
         let mut membership_apply_rx = self.membership_apply_rx.take();
         let mut events_rx = self.events_publish_rx.take();
         let mut peer_quote_rx = self.peer_quote_publish_rx.take();
@@ -3110,6 +3252,47 @@ impl P2PNode {
                         }
                         Err(e) => {
                             warn!("#131 reserves-baseline publish failed: {}", e);
+                            let _ = relay.responses_tx.send(SigningMessage::Response {
+                                request_id: relay.request_id,
+                                signer_xrpl_address: String::new(),
+                                der_signature: None,
+                                compressed_pubkey: None,
+                                error: Some(format!("P2P publish failed: {e}")),
+                            }).await;
+                        }
+                    }
+                }
+
+                // #131 AC-BASE-2″ P2-c: broadcast ONE SPV proof to the operator quorum;
+                // each receiver's enclave SPV-verifies it and cosigns the figure IT derives
+                // (no re-query — the independence is the on-chain validator quorum in the
+                // blob). The initiator cosigns locally too (gossipsub doesn't self-deliver).
+                Some(relay) = async {
+                    match &mut spv_baseline_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<SpvBaselineRelay>>().await,
+                    }
+                } => {
+                    if let Some(local) = self.local_signer.clone() {
+                        if let Some(local_response) = Self::handle_spv_baseline_request(
+                            &local, &relay.request_id, &relay.proof_blob_hex, &relay.excluded_hex,
+                        ).await {
+                            let _ = relay.responses_tx.send(local_response).await;
+                        }
+                    }
+
+                    let msg = SigningMessage::SpvBaselineRequest {
+                        request_id: relay.request_id.clone(),
+                        requester_peer_id: self.peer_id.to_string(),
+                        proof_blob_hex: relay.proof_blob_hex.clone(),
+                        excluded_hex: relay.excluded_hex.clone(),
+                    };
+                    match self.publish_signing(&msg) {
+                        Ok(_) => {
+                            self.pending_spv_baseline.insert(relay.request_id, relay.responses_tx);
+                        }
+                        Err(e) => {
+                            warn!("#131 reserves-spv publish failed: {}", e);
                             let _ = relay.responses_tx.send(SigningMessage::Response {
                                 request_id: relay.request_id,
                                 signer_xrpl_address: String::new(),
@@ -3436,6 +3619,13 @@ impl P2PNode {
                                             let _ = tx.send(msg).await;
                                         }
                                     }
+                                } else if request_id.starts_with("reserves-spv-") {
+                                    if let Some(tx) =
+                                        self.pending_spv_baseline.get(&request_id) {
+                                        if let Ok(msg) = serde_json::from_slice::<SigningMessage>(&message.data) {
+                                            let _ = tx.send(msg).await;
+                                        }
+                                    }
                                 } else if let Some(tx) = self.pending_signing.remove(&request_id) {
                                     if let Ok(msg) = serde_json::from_slice::<SigningMessage>(&message.data) {
                                         let _ = tx.send(msg);
@@ -3756,6 +3946,52 @@ impl P2PNode {
                                 ).await {
                                     if let Err(e) = self.publish_signing(&response) {
                                         error!("failed to publish #131 reserves-baseline response: {}", e);
+                                    }
+                                }
+                            }
+                            Ok(SigningMessage::SpvBaselineRequest {
+                                request_id,
+                                requester_peer_id,
+                                proof_blob_hex,
+                                excluded_hex,
+                            }) => {
+                                // #131 AC-BASE-2″ P2-c: an SPV baseline co-sign request. OUR
+                                // enclave independently SPV-verifies the proof and cosigns the
+                                // figure IT derives (escrow/issuer pinned in-enclave; nothing
+                                // trusted from the wire but the proof bytes, which are verified).
+                                let local_opt = self.local_signer.clone();
+                                let Some(local) = local_opt else {
+                                    continue;
+                                };
+                                if let Some(ref allow) = self.allowed_signing_peers {
+                                    if !allow.contains(&propagation_source) {
+                                        warn!(
+                                            req_id = %request_id,
+                                            from = %propagation_source,
+                                            "X-C1: #131 reserves-spv request from peer outside allowlist — dropped"
+                                        );
+                                        continue;
+                                    }
+                                }
+                                if !self.check_signing_rate(&propagation_source) {
+                                    warn!(req_id = %request_id, "X-C1: #131 reserves-spv request rate-limited");
+                                    continue;
+                                }
+                                if !self.mark_signing_request_fresh(&request_id) {
+                                    warn!(req_id = %request_id, "X-C1: duplicate #131 reserves-spv request_id — dropped");
+                                    continue;
+                                }
+                                info!(
+                                    req_id = %request_id,
+                                    from = %requester_peer_id,
+                                    propagation = %propagation_source,
+                                    "#131 reserves-spv request received — SPV-verifying + cosigning locally"
+                                );
+                                if let Some(response) = Self::handle_spv_baseline_request(
+                                    &local, &request_id, &proof_blob_hex, &excluded_hex,
+                                ).await {
+                                    if let Err(e) = self.publish_signing(&response) {
+                                        error!("failed to publish #131 reserves-spv response: {}", e);
                                     }
                                 }
                             }
