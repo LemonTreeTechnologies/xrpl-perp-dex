@@ -585,6 +585,104 @@ mod tests {
         );
     }
 
+    /// #131 AC-BASE-2″ P2-e: EMIT fresh C++ cross-ledger-splice vectors from the LIVE
+    /// patched node. Fetches two DISTINCT validated ledgers' headers + escrow proofs,
+    /// converts the proofs with the frozen-tested `proof_from_getproofpath` (no
+    /// reimplementation → no drift), asserts the splice actually rejects on real data,
+    /// and prints C++ hex constants for test_xrpl_spv.cpp. #[ignore]: run on Hetzner.
+    #[tokio::test]
+    #[ignore]
+    async fn emit_cross_splice_vectors() {
+        let http = "http://127.0.0.1:5005";
+        let escrow = "rfYnJDSAeFuDCUTq2oYbckbJcz3gAJTNCd";
+        async fn grab(
+            http: &str,
+            escrow: &str,
+            idx: serde_json::Value,
+        ) -> (String, [u8; 32], u64, XspvProof) {
+            let lr = http_rpc(
+                http,
+                "ledger",
+                serde_json::json!({"ledger_index": idx, "transactions": false}),
+            )
+            .await
+            .unwrap();
+            let ledger = &lr["ledger"];
+            let header = serialize_ledger_header(ledger).unwrap();
+            assert_eq!(
+                hex::encode_upper(ledger_hash(&header)),
+                ledger["ledger_hash"].as_str().unwrap().to_uppercase(),
+                "LWR mismatch"
+            );
+            let seq = as_u64(&ledger["ledger_index"]).unwrap();
+            let ah = hex32(ledger, "account_hash").unwrap();
+            assert_eq!(&header[76..108], &ah[..], "account_hash != header+76");
+            let le = http_rpc(
+                http,
+                "ledger_entry",
+                serde_json::json!({"account_root": escrow, "ledger_index": seq, "binary": true, "proof": true}),
+            )
+            .await
+            .unwrap();
+            let path: Vec<Vec<u8>> = le["proof_path"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| hex::decode(v.as_str().unwrap()).unwrap())
+                .collect();
+            let proof = proof_from_getproofpath(&path, 0).unwrap();
+            assert!(
+                verify_inclusion(&proof, &ah),
+                "proof must verify to account_hash"
+            );
+            (hex::encode_upper(header), ah, seq, proof)
+        }
+        let (hdr_a, ah_a, seq_a, pa) = grab(http, escrow, serde_json::json!("validated")).await;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            let si = http_rpc(http, "server_info", serde_json::json!({}))
+                .await
+                .unwrap();
+            if as_u64(&si["info"]["validated_ledger"]["seq"]).unwrap() > seq_a + 1 {
+                break;
+            }
+        }
+        let (hdr_b, ah_b, seq_b, pb) = grab(http, escrow, serde_json::json!("validated")).await;
+        let emit = |name: &str, hdr: &str, seq: u64, p: &XspvProof| {
+            eprintln!("// ledger {name} (seq {seq})");
+            eprintln!("static const char* HDR_{name} = \"{hdr}\";");
+            eprintln!(
+                "static const char* KEYLET_{name} = \"{}\";",
+                hex::encode_upper(p.leaf_index)
+            );
+            eprintln!(
+                "static const char* LEAF_{name} = \"{}\";",
+                hex::encode_upper(&p.leaf_data)
+            );
+            eprintln!("#define DEPTH_{name} {}", p.inner_root_to_leaf.len());
+            eprintln!(
+                "static const char* INNER_{name}[{}] = {{",
+                p.inner_root_to_leaf.len()
+            );
+            for node in &p.inner_root_to_leaf {
+                eprintln!("  \"{}\",", hex::encode_upper(node));
+            }
+            eprintln!("}};");
+        };
+        emit("A", &hdr_a, seq_a, &pa);
+        emit("B", &hdr_b, seq_b, &pb);
+        assert_ne!(ah_a, ah_b, "need two DISTINCT ledgers for a cross-splice");
+        assert!(
+            !verify_inclusion(&pb, &ah_a),
+            "SPLICE must reject: proof B vs root A"
+        );
+        assert!(
+            !verify_inclusion(&pa, &ah_b),
+            "SPLICE must reject: proof A vs root B"
+        );
+        eprintln!("// cross-splice rejection CONFIRMED on real two-ledger data");
+    }
+
     #[test]
     fn wrong_account_hash_rejected() {
         let path: Vec<Vec<u8>> = WIRE.iter().map(|w| hex::decode(w).unwrap()).collect();
