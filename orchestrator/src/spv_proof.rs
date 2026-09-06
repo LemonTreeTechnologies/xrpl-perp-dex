@@ -197,6 +197,140 @@ fn push_be16(v: &mut Vec<u8>, x: u16) {
     v.extend_from_slice(&x.to_be_bytes());
 }
 
+/// Minimal bounds-checked STObject field walker. From `b[pos..]`, returns
+/// (type, field, id_start, value_start, next_pos) for the next field, or None on
+/// truncation / an unhandled type. Only the types an STValidation carries are handled.
+fn st_next(b: &[u8], pos: usize) -> Option<(u16, u16, usize, usize, usize)> {
+    let id_start = pos;
+    let mut i = pos;
+    let h = *b.get(i)?;
+    i += 1;
+    let mut tc = (h >> 4) as u16;
+    let mut fc = (h & 0x0F) as u16;
+    if tc == 0 {
+        tc = *b.get(i)? as u16;
+        i += 1;
+    }
+    if fc == 0 {
+        fc = *b.get(i)? as u16;
+        i += 1;
+    }
+    let vstart;
+    let vlen;
+    match tc {
+        1 => {
+            vstart = i;
+            vlen = 2;
+        }
+        2 => {
+            vstart = i;
+            vlen = 4;
+        }
+        3 => {
+            vstart = i;
+            vlen = 8;
+        }
+        4 => {
+            vstart = i;
+            vlen = 16;
+        }
+        5 => {
+            vstart = i;
+            vlen = 32;
+        }
+        16 => {
+            vstart = i;
+            vlen = 1;
+        }
+        6 => {
+            vstart = i;
+            vlen = if b.get(i)? & 0x80 != 0 { 48 } else { 8 };
+        }
+        7 | 8 | 19 => {
+            // VL-length-prefixed (1/2/3-byte length)
+            let l0 = *b.get(i)? as usize;
+            i += 1;
+            let l = if l0 <= 192 {
+                l0
+            } else if l0 <= 240 {
+                193 + ((l0 - 193) << 8) + *b.get(i)? as usize + {
+                    i += 1;
+                    0
+                }
+            } else {
+                let a = *b.get(i)? as usize;
+                let bb = *b.get(i + 1)? as usize;
+                i += 2;
+                12481 + ((l0 - 241) << 16) + (a << 8) + bb
+            };
+            vstart = i;
+            vlen = l;
+        }
+        _ => return None,
+    }
+    let next = vstart.checked_add(vlen)?;
+    if next > b.len() {
+        return None;
+    }
+    Some((tc, fc, id_start, vstart, next))
+}
+
+/// From a raw serialized STValidation (`data` from the validations stream), extract the
+/// XSPV validation entry the enclave's `verify_quorum` consumes: the signing pubkey (33),
+/// the DER signature, and the vbody = the validation WITHOUT its `sfSignature` field
+/// (the signed content: SHA-512Half('VAL\0' ‖ vbody) is what the validator signed).
+pub fn validation_entry(data: &[u8]) -> Result<([u8; 33], Vec<u8>, Vec<u8>)> {
+    let mut pos = 0;
+    let mut pubkey: Option<[u8; 33]> = None;
+    let mut sig: Option<Vec<u8>> = None;
+    let mut sig_field: Option<(usize, usize)> = None; // (id_start, next) of sfSignature
+    while pos < data.len() {
+        let (tc, fc, idst, vs, next) = st_next(data, pos).context("STValidation walk")?;
+        if tc == 7 && fc == 3 {
+            // sfSigningPubKey
+            if next - vs != 33 {
+                bail!("sfSigningPubKey not 33 bytes");
+            }
+            let mut pk = [0u8; 33];
+            pk.copy_from_slice(&data[vs..next]);
+            pubkey = Some(pk);
+        } else if tc == 7 && fc == 6 {
+            // sfSignature
+            sig = Some(data[vs..next].to_vec());
+            sig_field = Some((idst, next));
+        }
+        pos = next;
+    }
+    let pubkey = pubkey.context("no sfSigningPubKey")?;
+    let sig = sig.context("no sfSignature")?;
+    let (sf_start, sf_end) = sig_field.unwrap();
+    let mut vbody = Vec::with_capacity(data.len() - (sf_end - sf_start));
+    vbody.extend_from_slice(&data[..sf_start]);
+    vbody.extend_from_slice(&data[sf_end..]);
+    Ok((pubkey, sig, vbody))
+}
+
+/// Build the XSPV validations section (`val_count`, concatenated entries) from the raw
+/// `data` blobs collected for one ledger. Each entry: pubkey33 ‖ sig_len u8 ‖ sig ‖
+/// vbody_len u16 ‖ vbody. The enclave dedups + checks each against the pinned UNL.
+pub fn build_validations_section(datas: &[Vec<u8>]) -> Result<(u16, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut count: u16 = 0;
+    for d in datas {
+        let (pk, sig, vbody) = validation_entry(d)?;
+        if sig.len() > 72 || vbody.len() > u16::MAX as usize {
+            bail!("validation sig/vbody too large");
+        }
+        out.extend_from_slice(&pk);
+        out.push(sig.len() as u8);
+        out.extend_from_slice(&sig);
+        push_be16(&mut out, vbody.len() as u16);
+        out.extend_from_slice(&vbody);
+        count += 1;
+    }
+    Ok((count, out))
+}
+
 /// Assemble the `XSPV` transport blob the enclave parses. `validations` is the
 /// concatenated validation entries (pubkey33|sig_len|sig|vbody_len|vbody)*.
 pub fn build_xspv_blob(
@@ -293,6 +427,33 @@ mod tests {
             .windows(4)
             .any(|w| w == [0x06, 0x13, 0xA9, 0xE8]));
     }
+
+    // A real full-validation `data` for ledger 1124A120… (signing key 027F285B…).
+    const VAL_DATA: &str = "228000000126013949042932300C863A2D270CF98511C639511124A12059FA1D708D4CB718767B5C2C1971E6D644F7731BD8D60B8666538532501700000000000000000000000000000000000000000000000000000000000000005019696E5F5288E3EE08676023DB69CFA2E333692B0F7E97D87553CB0312D9C5C0767321027F285B8BB33F0E8B025BF955C29A7CFA8A0995831EE4AD93A9BD572A7C8EEDCD76463044022018975AFA77A0F6D273D8E36F5FDCB4876491FF3CD2719CE5C30D3A464F6CD33B0220383E44ECCAAB37930DBE272AA2586B1CBD287C872E31FEF587D5218142E44554";
+
+    #[test]
+    fn validation_entry_vbody_verifies() {
+        use k256::ecdsa::signature::hazmat::PrehashVerifier;
+        use k256::ecdsa::{Signature, VerifyingKey};
+        let data = hex::decode(VAL_DATA).unwrap();
+        let (pk, sig, vbody) = validation_entry(&data).unwrap();
+        assert_eq!(pk[0] & 0xFE, 0x02, "compressed secp256k1 signing key");
+        // the validator signed SHA-512Half('VAL\0' || vbody); the reconstructed vbody
+        // (data minus sfSignature) must verify — proving the field-strip is exact.
+        let h = sha512half(&[&[0x56, 0x41, 0x4C, 0x00], &vbody]);
+        let vk = VerifyingKey::from_sec1_bytes(&pk).unwrap();
+        let s = Signature::from_der(&sig).unwrap();
+        assert!(
+            vk.verify_prehash(&h, &s).is_ok(),
+            "reconstructed vbody must verify under the signing key"
+        );
+        // and the vbody must carry the ledger_hash (sfLedgerHash) the enclave checks
+        assert!(vbody
+            .windows(32)
+            .any(|w| w == hex::decode(LEDGER_HASH_VAL).unwrap().as_slice()));
+    }
+    const LEDGER_HASH_VAL: &str =
+        "1124A12059FA1D708D4CB718767B5C2C1971E6D644F7731BD8D60B8666538532";
 
     #[test]
     fn wrong_account_hash_rejected() {
