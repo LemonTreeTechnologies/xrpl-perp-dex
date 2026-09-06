@@ -360,6 +360,113 @@ pub fn build_xspv_blob(
     b
 }
 
+// ── async fetch (ws validations + HTTP header/proof → XSPV blob) ───────────────
+use std::collections::HashMap;
+use std::time::Duration;
+
+/// Config for the leader's one-shot SPV proof fetch.
+pub struct SpvFetchConfig {
+    pub http_url: String, // http://127.0.0.1:5005
+    pub ws_url: String,   // ws://127.0.0.1:6006
+    pub escrow_account: String,
+    pub quorum: usize,     // stop once one ledger has this many full validations
+    pub collect_secs: u64, // ws collect window
+}
+
+async fn http_rpc(url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()?;
+    let body = serde_json::json!({"method": method, "params": [params]});
+    let resp: serde_json::Value = http.post(url).json(&body).send().await?.json().await?;
+    Ok(resp["result"].clone())
+}
+
+/// Fetch header + ≥quorum validations + the escrow AccountRoot proof for ONE validated
+/// ledger and assemble the XSPV blob the enclave verifies. Host-side sanity-checks the
+/// chaining (header→ledger_hash the validations attest, proof→account_hash) before
+/// returning — a producer bug fails here loudly rather than shipping an unverifiable blob.
+pub async fn fetch_spv_bundle(cfg: &SpvFetchConfig) -> Result<Vec<u8>> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    // 1. collect validations by ledger_hash until one ledger reaches quorum.
+    let (mut ws, _) = tokio_tungstenite::connect_async(&cfg.ws_url)
+        .await
+        .context("ws connect")?;
+    ws.send(Message::text(
+        r#"{"command":"subscribe","streams":["validations"]}"#,
+    ))
+    .await
+    .context("ws subscribe")?;
+    let mut by_ledger: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(cfg.collect_secs);
+    let (lh_hex, datas) = loop {
+        let msg = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out collecting validations"))?
+            .context("ws stream closed")?
+            .context("ws frame")?;
+        let Message::Text(t) = msg else { continue };
+        let j: serde_json::Value = match serde_json::from_str(&t) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if j["type"] == "validationReceived" && j["full"] == true {
+            if let Some(d) = j["data"].as_str() {
+                let lh = j["ledger_hash"].as_str().unwrap_or_default().to_string();
+                let entry = by_ledger.entry(lh.clone()).or_default();
+                if let Ok(bytes) = hex::decode(d) {
+                    entry.push(bytes);
+                }
+                if entry.len() >= cfg.quorum {
+                    break (lh, entry.clone());
+                }
+            }
+        }
+    };
+    let _ = ws.close(None).await;
+
+    // 2. header for that validated ledger + sanity-check it hashes to lh_hex.
+    let lr = http_rpc(
+        &cfg.http_url,
+        "ledger",
+        serde_json::json!({"ledger_hash": lh_hex, "transactions": false}),
+    )
+    .await
+    .context("ledger fetch")?;
+    let ledger = &lr["ledger"];
+    let header = serialize_ledger_header(ledger)?;
+    if hex::encode_upper(ledger_hash(&header)) != lh_hex.to_uppercase() {
+        bail!("serialized header does not hash to the validated ledger_hash");
+    }
+    let seq = as_u64(&ledger["ledger_index"]).context("ledger_index")?;
+
+    // 3. escrow AccountRoot proof at that ledger (patched-node getProofPath).
+    let le = http_rpc(
+        &cfg.http_url,
+        "ledger_entry",
+        serde_json::json!({"account_root": cfg.escrow_account, "ledger_index": seq, "binary": true, "proof": true}),
+    )
+    .await
+    .context("ledger_entry proof fetch")?;
+    let path: Vec<Vec<u8>> = le["proof_path"]
+        .as_array()
+        .context("no proof_path (is the node the patched build?)")?
+        .iter()
+        .map(|v| hex::decode(v.as_str().unwrap_or_default()).context("proof node hex"))
+        .collect::<Result<_>>()?;
+    let proof = proof_from_getproofpath(&path, 0)?;
+    let ah = hex32(ledger, "account_hash")?;
+    if !verify_inclusion(&proof, &ah) {
+        bail!("escrow proof does not hash to the ledger's account_hash");
+    }
+
+    // 4. assemble the XSPV blob.
+    let (val_count, vals) = build_validations_section(&datas)?;
+    Ok(build_xspv_blob(&header, val_count, &vals, &[proof]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +561,29 @@ mod tests {
     }
     const LEDGER_HASH_VAL: &str =
         "1124A12059FA1D708D4CB718767B5C2C1971E6D644F7731BD8D60B8666538532";
+
+    /// End-to-end fetch against a LIVE patched node reachable at 127.0.0.1:5005/6006
+    /// (SSH-forward from Hetzner). #[ignore] so CI (no node) skips it. The fetch itself
+    /// verifies chaining (header→ledger_hash the validations attest, proof→account_hash),
+    /// so a returned blob is already self-consistent; we re-parse to double-check shape.
+    #[tokio::test]
+    #[ignore]
+    async fn live_fetch_spv_bundle() {
+        let cfg = SpvFetchConfig {
+            http_url: "http://127.0.0.1:5005".into(),
+            ws_url: "ws://127.0.0.1:6006".into(),
+            escrow_account: "rfYnJDSAeFuDCUTq2oYbckbJcz3gAJTNCd".into(),
+            quorum: 4,
+            collect_secs: 45,
+        };
+        let blob = fetch_spv_bundle(&cfg).await.expect("fetch_spv_bundle");
+        assert_eq!(&blob[..4], b"XSPV", "magic");
+        assert_eq!(blob[4], 1, "version");
+        eprintln!(
+            "XSPV blob: {} bytes (self-verified header+proof+validations)",
+            blob.len()
+        );
+    }
 
     #[test]
     fn wrong_account_hash_rejected() {
