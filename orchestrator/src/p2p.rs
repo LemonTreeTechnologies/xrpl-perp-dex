@@ -290,6 +290,22 @@ pub enum SigningMessage {
     ///
     /// `request_id` MUST start with `"reserves-spv-"` so the response router forwards replies
     /// to the SPV baseline collector's mpsc.
+    /// #131 §6 UNL POLICY cosign request. Carries only the two dials governance still sets.
+    /// The receiver does NOT simply sign them: it checks the proposed freshness anchor
+    /// against ITS OWN validated ledger (Q-UNL-4) and the quorum against the ≥80% floor,
+    /// then has its enclave RE-DERIVE the policy hash from the fields.
+    ///
+    /// `request_id` MUST start with `"unl-policy-"` for response routing.
+    UnlPolicyRequest {
+        request_id: String,
+        requester_peer_id: String,
+        proposed_epoch: u64,
+        /// digest of the CURRENT sealed record — chains updates, replay-proof.
+        prev_unl_hash_hex: String,
+        pinned_ledger_seq: u64,
+        quorum_num: u32,
+        quorum_den: u32,
+    },
     SpvBaselineRequest {
         request_id: String,
         requester_peer_id: String,
@@ -599,6 +615,19 @@ pub struct ReservesBaselineRelay {
     pub escrow_rlusd: i64,
     pub escrow_xrp: i64,
     /// Channel to receive `SigningMessage::Response` instances as peers reply.
+    pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
+}
+
+/// #131 §6 outbound UNL-policy collection request.
+#[derive(Debug)]
+pub struct UnlPolicyRelay {
+    /// Unique id; MUST start with `"unl-policy-"` so response routing forwards here.
+    pub request_id: String,
+    pub proposed_epoch: u64,
+    pub prev_unl_hash: [u8; 32],
+    pub pinned_ledger_seq: u64,
+    pub quorum_num: u32,
+    pub quorum_den: u32,
     pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
 }
 
@@ -928,6 +957,9 @@ pub struct P2PNode {
     // validator-quorum-attested proof instead of a host figure)
     spv_baseline_rx: Option<mpsc::Receiver<SpvBaselineRelay>>,
     pending_spv_baseline: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
+    // #131 §6 — UNL policy governance (quorum + freshness anchor)
+    unl_policy_rx: Option<mpsc::Receiver<UnlPolicyRelay>>,
+    pending_unl_policy: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
     /// β3.2b: outbound apply-broadcast requests (seal / confirm) from the
     /// membership-change driver — each node applies to its loopback enclave.
     membership_apply_rx: Option<mpsc::Receiver<MembershipApplyRelay>>,
@@ -1115,6 +1147,8 @@ impl P2PNode {
             pending_reserves_baseline: HashMap::new(),
             spv_baseline_rx: None,
             pending_spv_baseline: HashMap::new(),
+            unl_policy_rx: None,
+            pending_unl_policy: HashMap::new(),
             membership_apply_rx: None,
             pending_membership_apply: HashMap::new(),
             events_publish_rx: None,
@@ -1259,6 +1293,12 @@ impl P2PNode {
     #[allow(dead_code)]
     pub fn set_spv_baseline_channel(&mut self, rx: mpsc::Receiver<SpvBaselineRelay>) {
         self.spv_baseline_rx = Some(rx);
+    }
+
+    /// #131 §6: the UNL-policy collection channel.
+    #[allow(dead_code)]
+    pub fn set_unl_policy_channel(&mut self, rx: mpsc::Receiver<UnlPolicyRelay>) {
+        self.unl_policy_rx = Some(rx);
     }
 
     /// β3.2b: wire the membership-change driver's apply-broadcast channel. The
@@ -2354,6 +2394,120 @@ impl P2PNode {
         })
     }
 
+    /// #131 §6 receiver: endorse a UNL POLICY proposal — but only after checking it.
+    ///
+    /// ⭐ Q-UNL-4: the freshness anchor is NOT taken on the leader's word. This node reads
+    /// ITS OWN validated ledger and refuses unless the proposal is at or below it and within
+    /// the accept window; a FUTURE ledger is always refused, which is exactly the case the
+    /// anchor exists to prevent. The quorum fraction is checked against the ≥80% floor too,
+    /// so this node never even asks its enclave to endorse a weak threshold (the enclave
+    /// re-checks both anyway — this is early, honest refusal, not the gate).
+    async fn handle_unl_policy_request(
+        cfg: &ReservesBaselineNodeConfig,
+        local_signer: &LocalSigner,
+        request_id: &str,
+        proposed_epoch: u64,
+        prev_unl_hash: &[u8; 32],
+        pinned_ledger_seq: u64,
+        quorum_num: u32,
+        quorum_den: u32,
+    ) -> Option<SigningMessage> {
+        if let Err(e) = crate::unl_policy::cosigner_accepts(
+            &cfg.xrpl_endpoint,
+            pinned_ledger_seq,
+            quorum_num,
+            quorum_den,
+        )
+        .await
+        {
+            warn!(req_id = %request_id, "#131 §6 unl-policy: REFUSING to cosign: {e}");
+            return Some(Self::membership_sign_error(
+                local_signer,
+                request_id,
+                format!("{e}"),
+            ));
+        }
+
+        let http = match crate::http_helpers::loopback_http_client(Duration::from_secs(20)) {
+            Ok(c) => c,
+            Err(e) => {
+                return Some(Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("http client: {e}"),
+                ))
+            }
+        };
+        // NOTE: the enclave RE-DERIVES the policy hash from these fields — we never send a
+        // digest for it to sign.
+        let url = format!("{}/v1/admin/unl/sign-policy", local_signer.enclave_url);
+        let body = serde_json::json!({
+            "account_id": local_signer.address,
+            "session_key": local_signer.session_key_hex(),
+            "proposed_epoch": proposed_epoch,
+            "prev_unl_hash": hex::encode(prev_unl_hash),
+            "pinned_ledger_seq": pinned_ledger_seq,
+            "quorum_num": quorum_num,
+            "quorum_den": quorum_den,
+        });
+        let rbody: serde_json::Value = match http.post(&url).json(&body).send().await {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    return Some(Self::membership_sign_error(
+                        local_signer,
+                        request_id,
+                        format!("enclave response parse: {e}"),
+                    ))
+                }
+            },
+            Err(e) => {
+                return Some(Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("enclave request: {e}"),
+                ))
+            }
+        };
+        if rbody["status"].as_str() != Some("success") {
+            return Some(Self::membership_sign_error(
+                local_signer,
+                request_id,
+                format!("enclave: {}", rbody.get("message").unwrap_or(&rbody)),
+            ));
+        }
+        let r_hex = rbody["signature"]["r"].as_str().unwrap_or("");
+        let s_hex = rbody["signature"]["s"].as_str().unwrap_or("");
+        let v = rbody["signature"]["v"].as_u64().unwrap_or(0) as u8;
+        // Self-validating: recover against the hash WE re-derive. A divergent proposal
+        // (different numbers than the enclave signed) fails recovery and contributes nothing.
+        let hash = crate::unl_policy::unl_policy_message_hash(
+            proposed_epoch,
+            prev_unl_hash,
+            pinned_ledger_seq,
+            quorum_num,
+            quorum_den,
+        );
+        let (pk, der) =
+            match crate::reserves_baseline::recover_pubkey_and_der(r_hex, s_hex, v, &hash) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Some(Self::membership_sign_error(
+                        local_signer,
+                        request_id,
+                        format!("pubkey recovery failed: {e}"),
+                    ))
+                }
+            };
+        Some(SigningMessage::Response {
+            request_id: request_id.to_string(),
+            signer_xrpl_address: local_signer.xrpl_address.clone(),
+            der_signature: Some(hex::encode_upper(&der)),
+            compressed_pubkey: Some(hex::encode(&pk)),
+            error: None,
+        })
+    }
+
     /// #131 AC-BASE-2″ P2-c receiver: SPV-verify the leader's ONE proof on the LOCAL
     /// enclave and cosign the figure IT derives. Unlike the baseline receiver there is NO
     /// re-query — the independence is the on-chain validator quorum inside the proof, and
@@ -2956,6 +3110,7 @@ impl P2PNode {
         let mut mrenclave_governance_rx = self.mrenclave_governance_rx.take();
         let mut reserves_baseline_rx = self.reserves_baseline_rx.take();
         let mut spv_baseline_rx = self.spv_baseline_rx.take();
+        let mut unl_policy_rx = self.unl_policy_rx.take();
         let mut membership_apply_rx = self.membership_apply_rx.take();
         let mut events_rx = self.events_publish_rx.take();
         let mut peer_quote_rx = self.peer_quote_publish_rx.take();
@@ -3252,6 +3407,49 @@ impl P2PNode {
                         }
                         Err(e) => {
                             warn!("#131 reserves-baseline publish failed: {}", e);
+                            let _ = relay.responses_tx.send(SigningMessage::Response {
+                                request_id: relay.request_id,
+                                signer_xrpl_address: String::new(),
+                                der_signature: None,
+                                compressed_pubkey: None,
+                                error: Some(format!("P2P publish failed: {e}")),
+                            }).await;
+                        }
+                    }
+                }
+
+                // #131 §6: broadcast a UNL POLICY proposal. Each receiver checks the anchor
+                // against ITS OWN validated ledger before its enclave re-derives and signs.
+                Some(relay) = async {
+                    match &mut unl_policy_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<UnlPolicyRelay>>().await,
+                    }
+                } => {
+                    if let (Some(cfg), Some(local)) =
+                        (self.reserves_baseline_config.clone(), self.local_signer.clone())
+                    {
+                        if let Some(local_response) = Self::handle_unl_policy_request(
+                            &cfg, &local, &relay.request_id, relay.proposed_epoch,
+                            &relay.prev_unl_hash, relay.pinned_ledger_seq,
+                            relay.quorum_num, relay.quorum_den,
+                        ).await {
+                            let _ = relay.responses_tx.send(local_response).await;
+                        }
+                    }
+                    let msg = SigningMessage::UnlPolicyRequest {
+                        request_id: relay.request_id.clone(),
+                        requester_peer_id: self.peer_id.to_string(),
+                        proposed_epoch: relay.proposed_epoch,
+                        prev_unl_hash_hex: hex::encode(relay.prev_unl_hash),
+                        pinned_ledger_seq: relay.pinned_ledger_seq,
+                        quorum_num: relay.quorum_num,
+                        quorum_den: relay.quorum_den,
+                    };
+                    match self.publish_signing(&msg) {
+                        Ok(_) => { self.pending_unl_policy.insert(relay.request_id, relay.responses_tx); }
+                        Err(e) => {
+                            warn!("#131 §6 unl-policy publish failed: {}", e);
                             let _ = relay.responses_tx.send(SigningMessage::Response {
                                 request_id: relay.request_id,
                                 signer_xrpl_address: String::new(),
@@ -3619,6 +3817,12 @@ impl P2PNode {
                                             let _ = tx.send(msg).await;
                                         }
                                     }
+                                } else if request_id.starts_with("unl-policy-") {
+                                    if let Some(tx) = self.pending_unl_policy.get(&request_id) {
+                                        if let Ok(msg) = serde_json::from_slice::<SigningMessage>(&message.data) {
+                                            let _ = tx.send(msg).await;
+                                        }
+                                    }
                                 } else if request_id.starts_with("reserves-spv-") {
                                     if let Some(tx) =
                                         self.pending_spv_baseline.get(&request_id) {
@@ -3946,6 +4150,49 @@ impl P2PNode {
                                 ).await {
                                     if let Err(e) = self.publish_signing(&response) {
                                         error!("failed to publish #131 reserves-baseline response: {}", e);
+                                    }
+                                }
+                            }
+                            Ok(SigningMessage::UnlPolicyRequest {
+                                request_id,
+                                requester_peer_id,
+                                proposed_epoch,
+                                prev_unl_hash_hex,
+                                pinned_ledger_seq,
+                                quorum_num,
+                                quorum_den,
+                            }) => {
+                                let cfg_opt = self.reserves_baseline_config.clone();
+                                let local_opt = self.local_signer.clone();
+                                let (Some(cfg), Some(local)) = (cfg_opt, local_opt) else { continue; };
+                                if let Some(ref allow) = self.allowed_signing_peers {
+                                    if !allow.contains(&propagation_source) {
+                                        warn!(req_id = %request_id, from = %propagation_source,
+                                              "X-C1: #131 unl-policy request from peer outside allowlist — dropped");
+                                        continue;
+                                    }
+                                }
+                                if !self.check_signing_rate(&propagation_source) {
+                                    warn!(req_id = %request_id, "X-C1: #131 unl-policy request rate-limited");
+                                    continue;
+                                }
+                                if !self.mark_signing_request_fresh(&request_id) {
+                                    warn!(req_id = %request_id, "X-C1: duplicate #131 unl-policy request_id — dropped");
+                                    continue;
+                                }
+                                let prev = match decode_32(&prev_unl_hash_hex) {
+                                    Some(h) => h,
+                                    None => { warn!(req_id = %request_id, "#131 unl-policy: bad prev_unl_hash_hex"); continue; }
+                                };
+                                info!(req_id = %request_id, from = %requester_peer_id,
+                                      pinned = pinned_ledger_seq,
+                                      "#131 §6 unl-policy request — checking the anchor against OUR OWN validated ledger");
+                                if let Some(response) = Self::handle_unl_policy_request(
+                                    &cfg, &local, &request_id, proposed_epoch, &prev,
+                                    pinned_ledger_seq, quorum_num, quorum_den,
+                                ).await {
+                                    if let Err(e) = self.publish_signing(&response) {
+                                        error!("failed to publish #131 unl-policy response: {}", e);
                                     }
                                 }
                             }

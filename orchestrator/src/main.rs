@@ -44,6 +44,7 @@ mod singleton;
 mod spv_proof; // AC-BASE-2″ P2-d — XRPL SPV proof builder/fetcher
 mod trading;
 mod types;
+mod unl_policy; // AC-BASE-2″ §6 — UNL policy ceremony (quorum + freshness anchor)
 mod validator_manifests; // AC-BASE-2″ §6 — feed the enclave's measured-anchor validator root
 mod vault_mm;
 mod withdrawal;
@@ -1022,6 +1023,13 @@ async fn main() -> Result<()> {
     } else {
         (None, None)
     };
+    // #131 §6: the UNL policy ceremony channel.
+    let (unl_policy_rx_holder, _unl_policy_tx) = if signers_config.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<p2p::UnlPolicyRelay>(8);
+        (Some(rx), Some(tx))
+    } else {
+        (None, None)
+    };
 
     let peer_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
@@ -1486,6 +1494,7 @@ async fn main() -> Result<()> {
             _mrenclave_governance_tx.clone(),
             _reserves_baseline_tx.clone(),
             _spv_baseline_tx.clone(),
+            _unl_policy_tx.clone(),
         ) {
             (
                 Some(cfg),
@@ -1495,6 +1504,7 @@ async fn main() -> Result<()> {
                 Some(mrenclave_governance_tx),
                 Some(reserves_baseline_tx),
                 Some(spv_baseline_tx),
+                Some(unl_policy_tx),
             ) if !cli.membership_node_urls.is_empty() => {
                 let escrow = crate::xrpl_signer::decode_xrpl_address(&escrow_address)
                     .context("--membership-admin-listen: escrow address must decode")?;
@@ -1530,6 +1540,7 @@ async fn main() -> Result<()> {
                     mrenclave_governance_tx,
                     reserves_baseline_tx,
                     spv_baseline_tx,
+                    unl_policy_tx,
                     operator_capital_account_ids: operator_capital_account_ids.clone(),
                 });
                 tokio::spawn(async move {
@@ -1696,6 +1707,10 @@ async fn main() -> Result<()> {
         // #131 AC-BASE-2″ P2-c: the SPV backing-gate collection channel.
         if let Some(rx) = spv_baseline_rx_holder {
             p2p_node.set_spv_baseline_channel(rx);
+        }
+        // #131 §6: the UNL policy collection channel.
+        if let Some(rx) = unl_policy_rx_holder {
+            p2p_node.set_unl_policy_channel(rx);
         }
         if let Some(ref local) = cfg.local_signer {
             // X-C1 condition C2 (perp RESP-5): enforce loopback on the

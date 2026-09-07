@@ -76,6 +76,8 @@ pub struct MembershipAdminState {
     /// #131 AC-BASE-2″ P2-c: drives `LibP2PSpvBaselineCollector` (the SPV backing-gate
     /// ceremony — broadcast one proof, collect 2-of-N SPV cosignatures, apply).
     pub spv_baseline_tx: mpsc::Sender<crate::p2p::SpvBaselineRelay>,
+    /// #131 §6: drives `LibP2PUnlPolicyCollector` (quorum fraction + freshness anchor).
+    pub unl_policy_tx: mpsc::Sender<crate::p2p::UnlPolicyRelay>,
     /// #131 AC-BASE (a): the operator-capital excluded senders as 20-byte XRPL AccountID
     /// hex (decoded from OPERATOR_CAPITAL_SENDERS — the SAME config the scanner uses),
     /// committed into the baseline marker's excluded_senders_hash.
@@ -701,6 +703,67 @@ async fn handle_unl_refresh(
             .into_response(),
         Err(e) => {
             warn!(error = %e, "#131 §6 validator-manifest refresh failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"status": "error", "message": format!("{e:#}")})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UnlPolicyRequest {
+    /// The freshness anchor to pin. Each cosigner refuses unless this is at or below ITS
+    /// OWN validated ledger and within the accept window (Q-UNL-4) — a future ledger is
+    /// always refused.
+    pub pinned_ledger_seq: u64,
+    /// SPV quorum fraction; must be >= 80% (enforced in-enclave, checked here early too).
+    pub quorum_num: u32,
+    pub quorum_den: u32,
+    /// Endorsements required (2 on the 3-node cluster).
+    pub cosign_quorum: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UnlPolicyResponse {
+    pub status: String,
+    pub message: String,
+    pub enclave: serde_json::Value,
+}
+
+async fn handle_unl_policy(
+    State(state): State<Arc<MembershipAdminState>>,
+    Json(req): Json<UnlPolicyRequest>,
+) -> impl IntoResponse {
+    info!(
+        pinned_ledger_seq = req.pinned_ledger_seq,
+        quorum = format!("{}/{}", req.quorum_num, req.quorum_den),
+        "#131 §6 UNL policy ceremony requested"
+    );
+    let collector = crate::unl_policy::LibP2PUnlPolicyCollector::new(state.unl_policy_tx.clone());
+    match crate::unl_policy::run_unl_policy_ceremony(
+        &collector,
+        &state.enclave_base,
+        &hex::encode(state.escrow),
+        req.pinned_ledger_seq,
+        req.quorum_num,
+        req.quorum_den,
+        req.cosign_quorum,
+    )
+    .await
+    {
+        Ok(res) => (
+            StatusCode::OK,
+            Json(UnlPolicyResponse {
+                status: "ok".into(),
+                message: "UNL policy updated (quorum fraction + freshness anchor)".into(),
+                enclave: res,
+            }),
+        )
+            .into_response(),
+        Err(e) => {
+            warn!(error = %e, "#131 §6 UNL policy ceremony failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"status": "error", "message": format!("{e:#}")})),
