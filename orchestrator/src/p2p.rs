@@ -2402,6 +2402,7 @@ impl P2PNode {
     /// anchor exists to prevent. The quorum fraction is checked against the ≥80% floor too,
     /// so this node never even asks its enclave to endorse a weak threshold (the enclave
     /// re-checks both anyway — this is early, honest refusal, not the gate).
+    #[allow(clippy::too_many_arguments)]
     async fn handle_unl_policy_request(
         cfg: &ReservesBaselineNodeConfig,
         local_signer: &LocalSigner,
