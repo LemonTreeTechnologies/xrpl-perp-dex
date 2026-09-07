@@ -4302,6 +4302,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64",
  "bs58",
  "clap",
  "ed25519-dalek",

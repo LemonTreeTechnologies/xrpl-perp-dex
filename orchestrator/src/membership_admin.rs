@@ -656,6 +656,60 @@ async fn handle_reserves_spv_baseline(
     }
 }
 
+// ── #131 AC-BASE-2″ §6 — refresh the enclave's DERIVED validator set ──
+// Permissionless in the enclave (a forged manifest cannot pass ed25519 against the measured
+// master anchor), so this trigger carries no bundle and no signatures: it just moves public
+// bytes from the validator list into the enclave, which then verifies them itself.
+
+#[derive(Debug, Deserialize)]
+pub struct UnlRefreshRequest {
+    /// Validator-list URL. UNTRUSTED transport: we neither verify its publisher signature
+    /// nor need several publishers (C-UNL-4 is moot under the measured anchor). A hostile
+    /// one can only withhold, which fails closed.
+    pub vl_url: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UnlRefreshResponse {
+    pub status: String,
+    pub submitted: usize,
+    /// Entries that actually changed the derived state. 0 is a normal outcome — it means
+    /// no validator rotated since the last refresh, and the enclave sealed nothing.
+    pub changed: i64,
+    pub message: String,
+}
+
+async fn handle_unl_refresh(
+    State(state): State<Arc<MembershipAdminState>>,
+    Json(req): Json<UnlRefreshRequest>,
+) -> impl IntoResponse {
+    info!(vl_url = %req.vl_url, "#131 §6 validator-manifest refresh requested");
+    match crate::validator_manifests::refresh_validator_set(&req.vl_url, &state.enclave_base).await
+    {
+        Ok((submitted, changed)) => (
+            StatusCode::OK,
+            Json(UnlRefreshResponse {
+                status: "ok".into(),
+                submitted,
+                changed,
+                message: format!(
+                    "{submitted} manifest(s) submitted; {changed} changed the enclave-derived \
+                     validator set (each verified in-enclave against the measured master anchor)"
+                ),
+            }),
+        )
+            .into_response(),
+        Err(e) => {
+            warn!(error = %e, "#131 §6 validator-manifest refresh failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"status": "error", "message": format!("{e:#}")})),
+            )
+                .into_response()
+        }
+    }
+}
+
 pub fn router(state: Arc<MembershipAdminState>) -> Router {
     Router::new()
         .route("/admin/membership-change", post(handle_membership_change))

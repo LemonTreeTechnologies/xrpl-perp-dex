@@ -36,14 +36,15 @@ mod perp_client;
 mod pool_path_a_client;
 mod price_feed;
 mod rate_limit;
-mod reserves_baseline;
+mod reserves_baseline; // AC-BASE — one-time custody-baseline ceremony (hash + recovery + bundle)
 mod reserves_publisher; // #131 3d — Tier-1 reserves publisher
 pub mod shard_router;
 mod signerlist_update;
 mod singleton;
-mod spv_proof; // AC-BASE — one-time custody-baseline ceremony (hash + recovery + bundle)
+mod spv_proof; // AC-BASE-2″ P2-d — XRPL SPV proof builder/fetcher
 mod trading;
 mod types;
+mod validator_manifests; // AC-BASE-2″ §6 — feed the enclave's measured-anchor validator root
 mod vault_mm;
 mod withdrawal;
 mod ws;
