@@ -489,18 +489,32 @@ impl LibP2PReservesBaselineCollector {
                 Ok(Some(m)) => m,
                 _ => break,
             };
-            if let crate::p2p::SigningMessage::Response {
-                der_signature: Some(der_hex),
-                compressed_pubkey: Some(pk_hex),
-                error: None,
-                ..
-            } = resp
-            {
-                let pk = hex::decode(&pk_hex).unwrap_or_default();
-                let der = hex::decode(&der_hex).unwrap_or_default();
-                if pk.len() == 33 && !der.is_empty() && !entries.iter().any(|(p, _)| *p == pk) {
-                    entries.push((pk, der));
+            match resp {
+                crate::p2p::SigningMessage::Response {
+                    der_signature: Some(der_hex),
+                    compressed_pubkey: Some(pk_hex),
+                    error: None,
+                    ..
+                } => {
+                    let pk = hex::decode(&pk_hex).unwrap_or_default();
+                    let der = hex::decode(&der_hex).unwrap_or_default();
+                    if pk.len() == 33 && !der.is_empty() && !entries.iter().any(|(p, _)| *p == pk) {
+                        entries.push((pk, der));
+                    }
                 }
+                // A cosigner that REFUSES is the interesting case, and it used to fall
+                // through this match and vanish — leaving "collected zero cosignatures",
+                // which reads as a dead network when it may well be every enclave
+                // correctly declining. Say who refused and why.
+                crate::p2p::SigningMessage::Response {
+                    error: Some(err), ..
+                } => {
+                    tracing::warn!(
+                        error = %err,
+                        "#131 SPV baseline: an operator enclave REFUSED to cosign"
+                    );
+                }
+                _ => {}
             }
         }
 
