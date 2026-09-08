@@ -467,16 +467,35 @@ pub async fn fetch_spv_bundle(cfg: &SpvFetchConfig) -> Result<Vec<u8>> {
     let seq = as_u64(&ledger["ledger_index"]).context("ledger_index")?;
 
     // 3. escrow AccountRoot proof at that ledger (patched-node getProofPath).
-    let le = http_rpc(
-        &cfg.http_url,
-        "ledger_entry",
-        serde_json::json!({"account_root": cfg.escrow_account, "ledger_index": seq, "binary": true, "proof": true}),
-    )
-    .await
-    .context("ledger_entry proof fetch")?;
+    //
+    // RETRY for the same reason as the header fetch above: having the ledger HEADER does
+    // not guarantee the node has the state map to walk yet, so `ledger_entry` can come back
+    // without `proof_path` for a few seconds. Observed live on the second real ceremony,
+    // one step past where the first retry was added.
+    let mut le = serde_json::Value::Null;
+    for attempt in 0..10u32 {
+        let r = http_rpc(
+            &cfg.http_url,
+            "ledger_entry",
+            serde_json::json!({"account_root": cfg.escrow_account, "ledger_index": seq, "binary": true, "proof": true}),
+        )
+        .await
+        .context("ledger_entry proof fetch")?;
+        if r.get("proof_path").and_then(|p| p.as_array()).is_some() {
+            le = r;
+            break;
+        }
+        tracing::debug!(
+            attempt,
+            seq,
+            reply = %r,
+            "#131 SPV: no proof_path yet at that ledger — retrying"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
     let path: Vec<Vec<u8>> = le["proof_path"]
         .as_array()
-        .context("no proof_path (is the node the patched build?)")?
+        .context("no proof_path after ~20s (is the node the patched build?)")?
         .iter()
         .map(|v| hex::decode(v.as_str().unwrap_or_default()).context("proof node hex"))
         .collect::<Result<_>>()?;
