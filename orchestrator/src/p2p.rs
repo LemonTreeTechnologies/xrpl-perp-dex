@@ -2441,7 +2441,9 @@ impl P2PNode {
         };
         // NOTE: the enclave RE-DERIVES the policy hash from these fields — we never send a
         // digest for it to sign.
-        let url = format!("{}/v1/admin/unl/sign-policy", local_signer.enclave_url);
+        // NOTE: `enclave_url` already ends in `/v1` (signers_config), so paths are appended
+        // WITHOUT re-adding it — the same trap the membership_http admin paths document.
+        let url = format!("{}/admin/unl/sign-policy", local_signer.enclave_url);
         let body = serde_json::json!({
             "account_id": local_signer.address,
             "session_key": local_signer.session_key_hex(),
