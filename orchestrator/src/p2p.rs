@@ -2473,6 +2473,10 @@ impl P2PNode {
             }
         };
         if rbody["status"].as_str() != Some("success") {
+            // Log it: an error Response is invisible to the leader (the collector skips
+            // them), so a local failure surfaces only as "no operator endorsed" 30s later.
+            warn!(req_id = %request_id, url = %url,
+                  "#131 §6 unl-policy: enclave refused to cosign: {rbody}");
             return Some(Self::membership_sign_error(
                 local_signer,
                 request_id,
