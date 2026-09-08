@@ -102,6 +102,31 @@ pub async fn run_reserves_commit_once(
         .await
         .context("enclave reserves_commit (under-custody or signing error)")?;
 
+    // The figures the enclave actually committed. Logged because the SPV backing gate
+    // (AC-BASE-2″) replaces custody with an SPV-PROVEN balance ONE-SHOT and irreversibly:
+    // deciding whether proven custody will still cover liabilities has to be a READ of the
+    // live books, never an inference from the deposit mirror in Postgres.
+    tracing::info!(
+        rlusd_liabilities = resp
+            .get("rlusd_liabilities")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1),
+        xrp_liabilities = resp
+            .get("xrp_liabilities")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1),
+        custody_rlusd = resp
+            .get("custody_rlusd")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1),
+        custody_xrp = resp
+            .get("custody_xrp")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1),
+        leaf_count = resp.get("leaf_count").and_then(|v| v.as_u64()).unwrap_or(0),
+        "reserves-commit figures (FP8)"
+    );
+
     let root = hex32(&resp, "root")?;
     let snapshot = hex32(&resp, "snapshot_hash")?;
     let sig = resp
