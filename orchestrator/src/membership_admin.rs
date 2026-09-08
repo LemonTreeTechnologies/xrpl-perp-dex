@@ -783,6 +783,8 @@ pub fn router(state: Arc<MembershipAdminState>) -> Router {
             "/admin/reserves-spv-baseline",
             post(handle_reserves_spv_baseline),
         )
+        .route("/admin/unl-refresh", post(handle_unl_refresh))
+        .route("/admin/unl-policy", post(handle_unl_policy))
         .with_state(state)
 }
 
