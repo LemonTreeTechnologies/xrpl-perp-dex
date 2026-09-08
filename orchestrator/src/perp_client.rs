@@ -3,7 +3,7 @@
 //! Rewrite of `perp_client.py`. All amounts are strings in FP8 format
 //! (e.g., "100.50000000").
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 /// Client for the Perp DEX enclave REST API at `/v1/perp/*`.
@@ -461,16 +461,17 @@ impl PerpClient {
 
     async fn post(&self, path: &str, body: Value) -> Result<Value> {
         let url = format!("{}{}", self.base_url, path);
-        let resp: Value = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        Ok(resp)
+        let raw = self.client.post(&url).json(&body).send().await?;
+        let status = raw.status();
+        if !status.is_success() {
+            // Keep the enclave's own message. `error_for_status()` throws the BODY away,
+            // and the body is where the ecall return code lives — so a refusal that is
+            // WORKING AS DESIGNED (e.g. -62, the reserves one-shot) was indistinguishable
+            // from a genuine fault. Asserting "refused for the right reason" needs the code.
+            let text = raw.text().await.unwrap_or_default();
+            bail!("{url} -> HTTP {status}: {}", text.trim());
+        }
+        Ok(raw.json().await?)
     }
 
     async fn get(&self, path: &str) -> Result<Value> {
