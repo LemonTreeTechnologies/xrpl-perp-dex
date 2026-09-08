@@ -428,13 +428,37 @@ pub async fn fetch_spv_bundle(cfg: &SpvFetchConfig) -> Result<Vec<u8>> {
     let _ = ws.close(None).await;
 
     // 2. header for that validated ledger + sanity-check it hashes to lh_hex.
-    let lr = http_rpc(
-        &cfg.http_url,
-        "ledger",
-        serde_json::json!({"ledger_hash": lh_hex, "transactions": false}),
-    )
-    .await
-    .context("ledger fetch")?;
+    //
+    // RETRY: validations for ledger N reach us a few seconds BEFORE our own node has
+    // validated and stored N, so an immediate fetch races and comes back without a
+    // `ledger` object. Observed live on the first real ceremony. Poll briefly rather than
+    // failing the whole ceremony over a few seconds of lag.
+    let mut lr = serde_json::Value::Null;
+    for attempt in 0..10u32 {
+        let r = http_rpc(
+            &cfg.http_url,
+            "ledger",
+            serde_json::json!({"ledger_hash": lh_hex, "transactions": false}),
+        )
+        .await
+        .context("ledger fetch")?;
+        if r.get("ledger").is_some() {
+            lr = r;
+            break;
+        }
+        tracing::debug!(
+            attempt,
+            ledger_hash = %lh_hex,
+            "#131 SPV: our node has not stored the attested ledger yet — retrying"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    if lr.get("ledger").is_none() {
+        bail!(
+            "our node never produced ledger {lh_hex} within ~20s — it attested a ledger it \
+             does not have stored (is the proof node lagging or pruning?)"
+        );
+    }
     let ledger = &lr["ledger"];
     let header = serialize_ledger_header(ledger)?;
     if hex::encode_upper(ledger_hash(&header)) != lh_hex.to_uppercase() {
