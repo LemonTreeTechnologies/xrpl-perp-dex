@@ -2528,7 +2528,9 @@ impl P2PNode {
         proof_blob_hex: &str,
         excluded_hex: &[String],
     ) -> Option<SigningMessage> {
-        let http = match crate::http_helpers::loopback_http_client(Duration::from_secs(25)) {
+        // Must exceed the in-enclave SPV verify (see the collector's window); 25s cut the
+        // cosign off before it could answer, so the leader saw silence, not a refusal.
+        let http = match crate::http_helpers::loopback_http_client(Duration::from_secs(120)) {
             Ok(c) => c,
             Err(e) => {
                 return Some(Self::membership_sign_error(
@@ -2545,6 +2547,7 @@ impl P2PNode {
             "proof_blob": proof_blob_hex,
             "excluded_account_ids": excluded_hex,
         });
+        let started = std::time::Instant::now();
         let resp = match http.post(&cosign_url).json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
@@ -2565,6 +2568,10 @@ impl P2PNode {
                 ))
             }
         };
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "#131 SPV cosign: local enclave verify finished"
+        );
         if rbody["status"].as_str() != Some("success") {
             return Some(Self::membership_sign_error(
                 local_signer,

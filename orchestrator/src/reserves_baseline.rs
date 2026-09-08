@@ -437,7 +437,13 @@ impl LibP2PReservesBaselineCollector {
     pub fn new(relay_tx: tokio::sync::mpsc::Sender<crate::p2p::ReservesBaselineRelay>) -> Self {
         Self {
             relay_tx,
-            timeout: std::time::Duration::from_secs(30),
+            // An operator enclave re-runs the WHOLE SPV verify to cosign: parse, ledger
+            // hash, >=quorum secp256k1 validation checks and a SHAMap walk, inside SGX.
+            // The first live ceremony came in at ~31s against a 30s window and only
+            // squeaked through; the window was never derived from a measurement. Give the
+            // real work room — a ceremony is operator-driven and rare, so waiting costs
+            // nothing, while a too-tight window fails it for no reason.
+            timeout: std::time::Duration::from_secs(150),
         }
     }
 
