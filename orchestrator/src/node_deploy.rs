@@ -560,17 +560,47 @@ fn preflight_new_unit_exists() -> Result<()> {
     Ok(())
 }
 
+/// Files that are the node's OWN provisioned identity, not migration state: the NEW
+/// enclave's `config.json` (its port / accounts dir / cert path) and its per-node TLS
+/// `perp.pem`. They are NOT installed by this deploy, and `perp-dex-server` refuses to
+/// start without config.json — so demanding a strictly-empty directory forced the
+/// operator to delete them, watch the deploy fail its own [4/4] health check, then
+/// restore and restart by hand. Two migrations hit that dance. Tolerate exactly these
+/// two; everything else (stale binaries, a populated accounts/, prior scratch state)
+/// still fails closed, which is the property the check exists for.
+const NEW_DIR_PRESERVED: [&str; 2] = ["config.json", "perp.pem"];
+
 fn preflight_new_dir_clean() -> Result<()> {
-    let p = Path::new(DEPLOY_DIR_NEW);
+    dir_holds_only_node_identity(Path::new(DEPLOY_DIR_NEW))
+}
+
+/// The real predicate, taking the path so it is testable. The previous tests inlined a
+/// copy of it "to avoid the const-path coupling" and therefore asserted nothing about the
+/// function that actually runs before a migration.
+fn dir_holds_only_node_identity(p: &Path) -> Result<()> {
     if !p.exists() {
         return Ok(());
     }
-    let mut entries = std::fs::read_dir(p).with_context(|| format!("read_dir {DEPLOY_DIR_NEW}"))?;
-    if entries.next().is_some() {
+    let mut unexpected: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(p).with_context(|| format!("read_dir {}", p.display()))? {
+        let name = entry
+            .with_context(|| format!("read_dir entry in {}", p.display()))?
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        if !NEW_DIR_PRESERVED.contains(&name.as_str()) {
+            unexpected.push(name);
+        }
+    }
+    if !unexpected.is_empty() {
+        unexpected.sort();
         bail!(
-            "NEW deploy dir {DEPLOY_DIR_NEW} is not empty. \
-             Either a prior --side-by-side attempt left state behind, or the path is in unexpected use. \
-             Operator must inspect + clean (sudo rm -rf {DEPLOY_DIR_NEW}) before retrying."
+            "NEW deploy dir {} holds state that is not this node's provisioned identity: {}. \
+             Either a prior --side-by-side attempt left state behind, or the path is in \
+             unexpected use. Operator must inspect + remove those entries (keeping config.json \
+             and perp.pem) before retrying.",
+            p.display(),
+            unexpected.join(", ")
         );
     }
     Ok(())
@@ -733,27 +763,48 @@ mod tests {
         assert_ne!(ENCLAVE_PORT_NEW, 9088);
     }
 
+    // These exercise the REAL predicate. They used to inline a copy of it and assert
+    // things like `!p.exists()`, which passed no matter what the deploy actually did.
+
     #[test]
-    fn preflight_new_dir_clean_accepts_missing_dir() {
-        // A path that doesn't exist must not error — we'll create it.
-        // This is exercised on the typical first-time --side-by-side
-        // path. We can't easily mutate DEPLOY_DIR_NEW from a test, but
-        // we can verify the helper logic on a similar path.
+    fn new_dir_ok_when_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let nested = tmp.path().join("does-not-exist");
-        let p = nested.as_path();
-        // Inline copy of the predicate to avoid the const-path coupling.
-        assert!(!p.exists());
+        dir_holds_only_node_identity(&tmp.path().join("does-not-exist")).unwrap();
     }
 
     #[test]
-    fn preflight_new_dir_clean_rejects_non_empty() {
+    fn new_dir_ok_when_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("leftover.txt"), b"x").unwrap();
-        let mut entries = std::fs::read_dir(tmp.path()).unwrap();
-        // The helper bails when read_dir().next() is Some — this test
-        // confirms the empty-vs-non-empty discrimination.
-        assert!(entries.next().is_some());
+        dir_holds_only_node_identity(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn new_dir_ok_with_only_node_identity() {
+        // The node's own provisioned files must NOT block the deploy: perp-dex-server
+        // refuses to start without config.json, so requiring their removal made the
+        // deploy fail its own health check.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.json"), b"{}").unwrap();
+        std::fs::write(tmp.path().join("perp.pem"), b"x").unwrap();
+        dir_holds_only_node_identity(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn new_dir_rejects_leftover_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.json"), b"{}").unwrap();
+        std::fs::create_dir(tmp.path().join("accounts")).unwrap();
+        std::fs::write(tmp.path().join("enclave.signed.so"), b"x").unwrap();
+        let err = dir_holds_only_node_identity(tmp.path())
+            .unwrap_err()
+            .to_string();
+        // Names what to remove, and does NOT name the files to keep.
+        assert!(err.contains("accounts"), "{err}");
+        assert!(err.contains("enclave.signed.so"), "{err}");
+        assert!(
+            !err.contains("holds state that is not this node's provisioned identity: config.json"),
+            "{err}"
+        );
     }
 
     #[test]
