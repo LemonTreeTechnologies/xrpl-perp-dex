@@ -1008,14 +1008,6 @@ async fn main() -> Result<()> {
     } else {
         (None, None)
     };
-    // #131 AC-BASE: one-time custody-baseline collection channel (mirror β4 Thread B;
-    // the operator trigger owns the sender via the admin route).
-    let (reserves_baseline_rx_holder, _reserves_baseline_tx) = if signers_config.is_some() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<p2p::ReservesBaselineRelay>(8);
-        (Some(rx), Some(tx))
-    } else {
-        (None, None)
-    };
     // #131 AC-BASE-2″ P2-c: the SPV backing-gate ceremony channel (mirrors AC-BASE).
     let (spv_baseline_rx_holder, _spv_baseline_tx) = if signers_config.is_some() {
         let (tx, rx) = tokio::sync::mpsc::channel::<p2p::SpvBaselineRelay>(8);
@@ -1492,7 +1484,6 @@ async fn main() -> Result<()> {
             _membership_apply_tx.clone(),
             app_state.signing_tx.clone(),
             _mrenclave_governance_tx.clone(),
-            _reserves_baseline_tx.clone(),
             _spv_baseline_tx.clone(),
             _unl_policy_tx.clone(),
         ) {
@@ -1502,7 +1493,6 @@ async fn main() -> Result<()> {
                 Some(membership_apply_tx),
                 Some(signing_tx),
                 Some(mrenclave_governance_tx),
-                Some(reserves_baseline_tx),
                 Some(spv_baseline_tx),
                 Some(unl_policy_tx),
             ) if !cli.membership_node_urls.is_empty() => {
@@ -1538,7 +1528,6 @@ async fn main() -> Result<()> {
                     current_signers,
                     current_quorum: cfg.quorum as u32,
                     mrenclave_governance_tx,
-                    reserves_baseline_tx,
                     spv_baseline_tx,
                     unl_policy_tx,
                     operator_capital_account_ids: operator_capital_account_ids.clone(),
@@ -1700,10 +1689,6 @@ async fn main() -> Result<()> {
         if let Some(rx) = mrenclave_governance_rx_holder {
             p2p_node.set_mrenclave_governance_channel(rx);
         }
-        // #131 AC-BASE: the one-time custody-baseline collection channel.
-        if let Some(rx) = reserves_baseline_rx_holder {
-            p2p_node.set_reserves_baseline_channel(rx);
-        }
         // #131 AC-BASE-2″ P2-c: the SPV backing-gate collection channel.
         if let Some(rx) = spv_baseline_rx_holder {
             p2p_node.set_spv_baseline_channel(rx);
@@ -1751,21 +1736,19 @@ async fn main() -> Result<()> {
             warn!("X-C1: signers-config has no escrow_address — all incoming P2P signing requests will be rejected");
         }
 
-        // #131 AC-BASE: this node's baseline receiver config. Reuses local_signer
-        // (set above) for identity; its OWN --xrpl-url is the DISTINCT source it
-        // independently re-queries at the pinned ledger (C-Q1.1). Fail-closed unless
-        // both --rlusd-issuer and the escrow are configured.
-        if let Some(ref issuer) = cli.rlusd_issuer {
-            if !cfg.escrow_address.is_empty() {
-                p2p_node.set_reserves_baseline_config(p2p::ReservesBaselineNodeConfig {
-                    escrow_r: cfg.escrow_address.clone(),
-                    rlusd_issuer_r: issuer.clone(),
-                    xrpl_endpoint: cli.xrpl_url.clone(),
-                    shard_id: cli.shard_id,
-                });
-            }
+        // This node's cosigner config: its OWN --xrpl-url is the source the §6
+        // UNL-policy cosigner reads its own validated ledger from before endorsing a
+        // proposed freshness anchor (Q-UNL-4). #131 R-1: this used to be gated on
+        // --rlusd-issuer because the retired scalar baseline hashed the issuer. That
+        // coupling is gone — a node with no RLUSD issuer configured must still cosign
+        // UNL policy, so gate only on the escrow being known.
+        if !cfg.escrow_address.is_empty() {
+            p2p_node.set_cosigner_config(p2p::NodeCosignerConfig {
+                escrow_r: cfg.escrow_address.clone(),
+                xrpl_endpoint: cli.xrpl_url.clone(),
+            });
         } else {
-            warn!("#131 AC-BASE: --rlusd-issuer not set — this node will not co-sign a custody baseline");
+            warn!("signers-config has no escrow_address — this node will not cosign");
         }
     }
 

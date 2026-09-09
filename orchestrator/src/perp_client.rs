@@ -208,71 +208,9 @@ impl PerpClient {
         .await
     }
 
-    /// AC-BASE: this node attests the opening escrow figure (issuer/account-pinned
-    /// message signed in-enclave). Returns {signature:{r,s,v}}.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn reserves_baseline_sign(
-        &self,
-        account_id: &str,
-        session_key: &str,
-        ledger_index: u64,
-        escrow_account: &str,
-        rlusd_issuer: &str,
-        escrow_rlusd: i64,
-        escrow_xrp: i64,
-    ) -> Result<Value> {
-        self.post(
-            "/perp/reserves-baseline/sign",
-            serde_json::json!({
-                "account_id": account_id,
-                "session_key": session_key.trim_start_matches("0x"),
-                "ledger_index": ledger_index,
-                "escrow_account": escrow_account.trim_start_matches("0x"),
-                "rlusd_issuer": rlusd_issuer.trim_start_matches("0x"),
-                "escrow_rlusd": escrow_rlusd,
-                "escrow_xrp": escrow_xrp,
-            }),
-        )
-        .await
-    }
-
-    /// AC-BASE: apply the one-time baseline — verify the 2-of-3 quorum over the pinned
-    /// message, seed custody := attested escrow, seal the one-shot marker.
-    #[allow(clippy::too_many_arguments)]
-    /// `source_fingerprints` (#131 AC-BASE (b)): the accepted distinct XRPL observation
-    /// source fingerprints as 8-byte hex strings (orch `endpoint_fingerprint`). Recorded
-    /// in the sealed baseline marker so the "N INDEPENDENT observations" claim is
-    /// auditable (host-DECLARED source diversity — a disclosure, not proof). Empty →
-    /// none recorded (backward-compatible).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn reserves_baseline_apply(
-        &self,
-        ledger_index: u64,
-        escrow_account: &str,
-        rlusd_issuer: &str,
-        escrow_rlusd: i64,
-        escrow_xrp: i64,
-        host_timestamp_ms: u64,
-        quorum_bundle_hex: &str,
-        source_fingerprints: &[String],
-        excluded_account_ids: &[String],
-    ) -> Result<Value> {
-        self.post(
-            "/perp/reserves-baseline/apply",
-            serde_json::json!({
-                "ledger_index": ledger_index,
-                "escrow_account": escrow_account.trim_start_matches("0x"),
-                "rlusd_issuer": rlusd_issuer.trim_start_matches("0x"),
-                "escrow_rlusd": escrow_rlusd,
-                "escrow_xrp": escrow_xrp,
-                "host_timestamp_ms": host_timestamp_ms,
-                "quorum_bundle": quorum_bundle_hex.trim_start_matches("0x"),
-                "source_fingerprints": source_fingerprints,
-                "excluded_account_ids": excluded_account_ids,
-            }),
-        )
-        .await
-    }
+    // #131 R-1: reserves_baseline_sign/_apply removed — the enclave endpoints they called
+    // (/perp/reserves-baseline/{sign,apply}) no longer exist. Custody is written only from
+    // an SPV-verified balance.
 
     /// #131 AC-BASE-2″ P2-c ceremony — ask a cosigner's enclave to SPV-verify the ONE
     /// leader proof blob and sign the figure IT derives (no seal). `excluded_account_ids`
@@ -301,7 +239,7 @@ impl PerpClient {
     /// #131 AC-BASE-2″ P2-c ceremony — the sequencer applies the SPV baseline: re-derive
     /// the figure from the SAME proof, verify the 2-of-3 bundle over it, seed custody +
     /// seal the one-shot. escrow/issuer/balances are pinned/derived in-enclave, NOT params
-    /// (unlike `reserves_baseline_apply`, which trusts host scalars).
+    /// (unlike the retired scalar apply, which trusted host-supplied balances).
     pub async fn reserves_spv_apply(
         &self,
         proof_blob_hex: &str,
