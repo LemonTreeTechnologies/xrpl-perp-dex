@@ -31,8 +31,10 @@ enc_size() { grep -oP "static_assert\(sizeof\($1\) == \K[0-9]+" "$HDR" | head -1
 orch_size() { grep -oP "$1: u64 = \K[0-9]+" "$RS" | head -1; }
 
 fail=0
+checked=0
 check() { # label  enclave-type  orch-const
   local e o
+  checked=$((checked + 1))
   e="$(enc_size "$2")"; o="$(orch_size "$3")"
   if [ -z "$e" ] || [ -z "$o" ]; then
     echo "  MISSING $1: enclave($2)='$e' orch($3)='$o'"; fail=1; return
@@ -57,4 +59,4 @@ if [ "$fail" -ne 0 ]; then
   echo "============================================================"
   exit 1
 fi
-echo "meta-size drift gate OK — all four golden sizes match the enclave static_asserts."
+echo "meta-size drift gate OK — all $checked golden sizes match the enclave static_asserts."
