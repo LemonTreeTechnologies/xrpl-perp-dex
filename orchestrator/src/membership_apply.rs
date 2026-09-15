@@ -90,6 +90,44 @@ impl LibP2PMembershipApplier {
         self
     }
 
+    /// #131 §6: broadcast a cosigned UNL POLICY update so EVERY node seals the same
+    /// record, and report which nodes actually did.
+    ///
+    /// Returns `(applied_nodes, failures)`. The caller decides what a shortfall means;
+    /// this deliberately does not bail on its own, because a partial apply is exactly the
+    /// state an operator must be told about rather than have hidden behind an error —
+    /// the enclave's epoch chaining makes a retry safe and idempotent.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_unl_policy(
+        &self,
+        escrow_hex: &str,
+        proposed_epoch: u64,
+        prev_unl_hash_hex: &str,
+        pinned_ledger_seq: u64,
+        quorum_num: u32,
+        quorum_den: u32,
+        quorum_bundle_hex: &str,
+    ) -> Result<(usize, Vec<String>)> {
+        let acks = self
+            .broadcast_and_collect(MembershipApplyPayload::UnlPolicy {
+                escrow_hex: escrow_hex.to_string(),
+                proposed_epoch,
+                prev_unl_hash_hex: prev_unl_hash_hex.to_string(),
+                pinned_ledger_seq,
+                quorum_num,
+                quorum_den,
+                quorum_bundle_hex: quorum_bundle_hex.to_string(),
+            })
+            .await?;
+        let applied = acks.iter().filter(|a| a.ok).count();
+        let failures: Vec<String> = acks
+            .iter()
+            .filter(|a| !a.ok)
+            .map(|a| format!("{}: {}", a.node, a.error.clone().unwrap_or_default()))
+            .collect();
+        Ok((applied, failures))
+    }
+
     /// Send one apply relay, then collect per-node acks until `expected_nodes`
     /// distinct successes land or the window closes. Dedups by node address (the
     /// local self-apply and that node's gossipsub round-trip can both arrive).

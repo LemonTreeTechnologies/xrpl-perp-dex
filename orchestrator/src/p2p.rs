@@ -334,6 +334,26 @@ pub enum MembershipApplyPayload {
         tx_hash_hex: String,
         ledger_index: u64,
     },
+    /// #131 §6: apply the cosigned UNL POLICY update locally — the SAME sealed record on
+    /// every node, which is the whole point.
+    ///
+    /// The driver used to POST the collected bundle to its OWN enclave only, so the
+    /// operator had to re-run the entire ceremony once per node and each run pinned the
+    /// anchor its own leader happened to read. That is observable on the live cluster:
+    /// node-1 sits at `pinned_ledger_seq` 20591270 while nodes 2-3 sit at 20591293, three
+    /// nodes disagreeing about the freshness anchor their SPV checks use. Riding the
+    /// audited apply-broadcast instead makes the record identical cluster-wide and gives
+    /// the driver per-node acks, so a node that did NOT apply is reported rather than
+    /// silently skipped.
+    UnlPolicy {
+        escrow_hex: String,
+        proposed_epoch: u64,
+        prev_unl_hash_hex: String,
+        pinned_ledger_seq: u64,
+        quorum_num: u32,
+        quorum_den: u32,
+        quorum_bundle_hex: String,
+    },
     /// β4 Thread A genesis (RESP-β4-threadA-impl.1 option 2): apply
     /// `ecall_bootstrap_from_quorum_attestation` locally — seal epoch 1 from the
     /// β1 quorum attestation, with NO pre-seal XRPL SignerListSet signature
@@ -2733,6 +2753,44 @@ impl P2PNode {
                     .record_confirmation(&base, &escrow, &blob, &tx_hash, *ledger_index)
                     .await
             }
+            MembershipApplyPayload::UnlPolicy {
+                escrow_hex,
+                proposed_epoch,
+                prev_unl_hash_hex,
+                pinned_ledger_seq,
+                quorum_num,
+                quorum_den,
+                quorum_bundle_hex,
+            } => {
+                // The enclave re-derives the policy hash from these fields and re-verifies
+                // the quorum bundle against its OWN sealed SignerList, so nothing here is
+                // trusted from the wire — the broadcast only saves every node from having
+                // to re-run the collection itself.
+                let url = format!("{base}/v1/admin/unl/govern-policy");
+                let body = serde_json::json!({
+                    "escrow_account_id": escrow_hex,
+                    "proposed_epoch": proposed_epoch,
+                    "prev_unl_hash": prev_unl_hash_hex,
+                    "pinned_ledger_seq": pinned_ledger_seq,
+                    "quorum_num": quorum_num,
+                    "quorum_den": quorum_den,
+                    "quorum_bundle": quorum_bundle_hex,
+                });
+                match client.post(&url).json(&body).send().await {
+                    Err(e) => Err(anyhow::anyhow!("apply.unl-policy: {e}")),
+                    Ok(r) => {
+                        let status = r.status();
+                        let v: serde_json::Value = r.json().await.unwrap_or_default();
+                        if status.is_success() && v["status"].as_str() == Some("success") {
+                            Ok(())
+                        } else {
+                            Err(anyhow::anyhow!(
+                                "apply.unl-policy: enclave refused (HTTP {status}): {v}"
+                            ))
+                        }
+                    }
+                }
+            }
         };
 
         match result {
@@ -4186,6 +4244,43 @@ impl P2PNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #131 §6: the UNL-policy apply crosses gossipsub, so a wrong serde tag would make
+    /// every peer silently DROP it — the driver would report "applied on 1 node" forever
+    /// and the cluster would keep diverging, with nothing in any log saying why. Pin the
+    /// tag and the field names, and prove the value survives a round-trip.
+    #[test]
+    fn unl_policy_apply_payload_wire_format() {
+        let p = MembershipApplyPayload::UnlPolicy {
+            escrow_hex: "aa".repeat(20),
+            proposed_epoch: 7,
+            prev_unl_hash_hex: "bb".repeat(32),
+            pinned_ledger_seq: 20_591_293,
+            quorum_num: 5,
+            quorum_den: 6,
+            quorum_bundle_hex: "cc".repeat(8),
+        };
+        let json = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(json["op"], "unl_policy", "tag must stay `unl_policy`");
+        assert_eq!(json["pinned_ledger_seq"], 20_591_293);
+        assert_eq!(json["quorum_num"], 5);
+
+        let back: MembershipApplyPayload = serde_json::from_value(json).expect("deserialize");
+        match back {
+            MembershipApplyPayload::UnlPolicy {
+                proposed_epoch,
+                pinned_ledger_seq,
+                quorum_num,
+                quorum_den,
+                ..
+            } => {
+                assert_eq!(proposed_epoch, 7);
+                assert_eq!(pinned_ledger_seq, 20_591_293);
+                assert_eq!((quorum_num, quorum_den), (5, 6));
+            }
+            other => panic!("round-trip changed the variant: {other:?}"),
+        }
+    }
 
     #[test]
     fn order_batch_serialization() {

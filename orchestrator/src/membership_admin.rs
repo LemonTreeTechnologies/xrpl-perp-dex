@@ -668,6 +668,11 @@ async fn handle_unl_policy(
         "#131 §6 UNL policy ceremony requested"
     );
     let collector = crate::unl_policy::LibP2PUnlPolicyCollector::new(state.unl_policy_tx.clone());
+    // #131 §6: the sealed policy record must land on EVERY node, so the apply rides the
+    // same audited broadcast the membership seal uses. `cluster_size` is what "every node"
+    // means here — a shortfall is reported, not hidden.
+    let applier =
+        LibP2PMembershipApplier::new(state.membership_apply_tx.clone(), state.cluster_size);
     match crate::unl_policy::run_unl_policy_ceremony(
         &collector,
         &state.enclave_base,
@@ -676,6 +681,7 @@ async fn handle_unl_policy(
         req.quorum_num,
         req.quorum_den,
         req.cosign_quorum,
+        &applier,
     )
     .await
     {

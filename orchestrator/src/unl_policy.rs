@@ -197,7 +197,9 @@ impl LibP2PUnlPolicyCollector {
     }
 }
 
-/// Drive a full policy update: read state -> propose -> collect >= quorum -> apply.
+/// Drive a full policy update: read state -> propose -> collect >= quorum -> apply on
+/// EVERY node. Matches the sibling ceremony drivers' shape, hence the same lint waiver.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_unl_policy_ceremony(
     collector: &LibP2PUnlPolicyCollector,
     admin_base: &str,
@@ -206,6 +208,7 @@ pub async fn run_unl_policy_ceremony(
     quorum_num: u32,
     quorum_den: u32,
     cosign_quorum: usize,
+    applier: &crate::membership_apply::LibP2PMembershipApplier,
 ) -> Result<serde_json::Value> {
     if !quorum_floor_ok(quorum_num, quorum_den) {
         bail!("refusing to propose {quorum_num}/{quorum_den}: below the 80% floor");
@@ -226,30 +229,49 @@ pub async fn run_unl_policy_ceremony(
             pubkeys.len()
         );
     }
-    let http = crate::http_helpers::loopback_http_client(std::time::Duration::from_secs(30))?;
-    let url = format!(
-        "{}/v1/admin/unl/govern-policy",
-        admin_base.trim_end_matches('/')
-    );
-    let resp: serde_json::Value = http
-        .post(&url)
-        .json(&serde_json::json!({
-            "escrow_account_id": escrow_account_id_hex,
-            "proposed_epoch": epoch + 1,
-            "prev_unl_hash": hex::encode(prev),
-            "pinned_ledger_seq": pinned_ledger_seq,
-            "quorum_num": quorum_num,
-            "quorum_den": quorum_den,
-            "quorum_bundle": hex::encode(&bundle),
-        }))
-        .send()
-        .await?
-        .json()
+    // Apply on EVERY node, not just this one. The bundle is already cosigned, so each
+    // node's enclave re-derives the hash and re-verifies it against its own sealed
+    // SignerList — the broadcast only spares the operator from re-running the whole
+    // ceremony per node, which is what previously left the cluster pinning three
+    // different freshness anchors.
+    let (applied, failures) = applier
+        .apply_unl_policy(
+            escrow_account_id_hex,
+            epoch + 1,
+            &hex::encode(prev),
+            pinned_ledger_seq,
+            quorum_num,
+            quorum_den,
+            &hex::encode(&bundle),
+        )
         .await?;
-    if resp["status"].as_str() != Some("success") {
-        bail!("enclave refused the policy update: {resp}");
+    if applied == 0 {
+        bail!("no node applied the policy update: {}", failures.join("; "));
     }
-    Ok(resp)
+    if !failures.is_empty() {
+        // Partial apply is reported, never swallowed: the cluster is now inconsistent and
+        // the operator must retry (chaining makes that safe) rather than discover it later
+        // through diverging pinned anchors.
+        tracing::warn!(
+            applied,
+            failed = failures.len(),
+            detail = %failures.join("; "),
+            "#131 §6: UNL policy applied on SOME nodes only — retry to converge"
+        );
+    }
+    tracing::info!(
+        applied_nodes = applied,
+        new_epoch = epoch + 1,
+        pinned_ledger_seq,
+        "#131 §6: UNL policy update applied"
+    );
+    Ok(serde_json::json!({
+        "status": "ok",
+        "unl_epoch": epoch + 1,
+        "pinned_ledger_seq": pinned_ledger_seq,
+        "applied_nodes": applied,
+        "failed_nodes": failures,
+    }))
 }
 
 #[cfg(test)]
