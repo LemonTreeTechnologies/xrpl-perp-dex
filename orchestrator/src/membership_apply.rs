@@ -93,10 +93,12 @@ impl LibP2PMembershipApplier {
     /// #131 §6: broadcast a cosigned UNL POLICY update so EVERY node seals the same
     /// record, and report which nodes actually did.
     ///
-    /// Returns `(applied_nodes, failures)`. The caller decides what a shortfall means;
-    /// this deliberately does not bail on its own, because a partial apply is exactly the
-    /// state an operator must be told about rather than have hidden behind an error —
-    /// the enclave's epoch chaining makes a retry safe and idempotent.
+    /// Returns `(applied_nodes, expected_nodes, failures)`.
+    ///
+    /// `expected` is returned because `failures` alone CANNOT express a shortfall: a node
+    /// that never answers produces no ack at all, so `applied=1, failures=[]` is a real and
+    /// dangerous outcome — one node sealed, two silently did nothing. C-FORK-ORCH-2: the
+    /// caller must compare against `expected`, not merely check `failures.is_empty()`.
     #[allow(clippy::too_many_arguments)]
     pub async fn apply_unl_policy(
         &self,
@@ -107,7 +109,7 @@ impl LibP2PMembershipApplier {
         quorum_num: u32,
         quorum_den: u32,
         quorum_bundle_hex: &str,
-    ) -> Result<(usize, Vec<String>)> {
+    ) -> Result<(usize, usize, Vec<String>)> {
         let acks = self
             .broadcast_and_collect(MembershipApplyPayload::UnlPolicy {
                 escrow_hex: escrow_hex.to_string(),
@@ -125,7 +127,7 @@ impl LibP2PMembershipApplier {
             .filter(|a| !a.ok)
             .map(|a| format!("{}: {}", a.node, a.error.clone().unwrap_or_default()))
             .collect();
-        Ok((applied, failures))
+        Ok((applied, self.expected_nodes, failures))
     }
 
     /// Send one apply relay, then collect per-node acks until `expected_nodes`

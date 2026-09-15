@@ -197,6 +197,29 @@ impl LibP2PUnlPolicyCollector {
     }
 }
 
+/// C-FORK-ORCH-2: decide whether an apply-broadcast actually reached the whole cluster.
+///
+/// Returns `Some(reason)` when it did NOT — a partial apply is a hard failure, never a
+/// warning. "Leader applied, others refused" returning 200/ok is the exact signature that
+/// hid the original policy fork for a whole round: the operator saw success and moved on
+/// while the chains split irreversibly.
+///
+/// `failures` alone cannot express the shortfall. A node that never answers contributes no
+/// ack at all, so `applied = 1, failures = []` means one node sealed and two silently did
+/// nothing — indistinguishable from success if you only check `failures.is_empty()`.
+fn apply_shortfall(applied: usize, expected: usize, failures: &[String]) -> Option<String> {
+    if applied >= expected {
+        return None;
+    }
+    let silent = expected.saturating_sub(applied + failures.len());
+    Some(format!(
+        "UNL policy applied on {applied}/{expected} nodes - the cluster is now SPLIT and the \
+         policy chains will not rejoin. Refused: [{}]. Silent (no ack): {silent}. Retry: the \
+         enclave's epoch chaining makes re-running safe and idempotent.",
+        failures.join("; ")
+    ))
+}
+
 /// Drive a full policy update: read state -> propose -> collect >= quorum -> apply on
 /// EVERY node. Matches the sibling ceremony drivers' shape, hence the same lint waiver.
 #[allow(clippy::too_many_arguments)]
@@ -234,7 +257,7 @@ pub async fn run_unl_policy_ceremony(
     // SignerList — the broadcast only spares the operator from re-running the whole
     // ceremony per node, which is what previously left the cluster pinning three
     // different freshness anchors.
-    let (applied, failures) = applier
+    let (applied, expected, failures) = applier
         .apply_unl_policy(
             escrow_account_id_hex,
             epoch + 1,
@@ -245,38 +268,47 @@ pub async fn run_unl_policy_ceremony(
             &hex::encode(&bundle),
         )
         .await?;
-    if applied == 0 {
-        bail!("no node applied the policy update: {}", failures.join("; "));
-    }
-    if !failures.is_empty() {
-        // Partial apply is reported, never swallowed: the cluster is now inconsistent and
-        // the operator must retry (chaining makes that safe) rather than discover it later
-        // through diverging pinned anchors.
-        tracing::warn!(
-            applied,
-            failed = failures.len(),
-            detail = %failures.join("; "),
-            "#131 §6: UNL policy applied on SOME nodes only — retry to converge"
-        );
+    if let Some(msg) = apply_shortfall(applied, expected, &failures) {
+        bail!("{msg}");
     }
     tracing::info!(
         applied_nodes = applied,
         new_epoch = epoch + 1,
         pinned_ledger_seq,
-        "#131 §6: UNL policy update applied"
+        "#131 §6: UNL policy update applied on every node"
     );
     Ok(serde_json::json!({
         "status": "ok",
         "unl_epoch": epoch + 1,
         "pinned_ledger_seq": pinned_ledger_seq,
         "applied_nodes": applied,
-        "failed_nodes": failures,
+        "expected_nodes": expected,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three shapes an apply-broadcast can end in. The third is the one that matters:
+    /// silent non-responders leave `failures` EMPTY, so a check that only looked at
+    /// `failures` would call a two-node no-op a success — which is how the fork formed.
+    #[test]
+    fn partial_apply_is_a_hard_failure() {
+        assert!(
+            apply_shortfall(3, 3, &[]).is_none(),
+            "full apply must succeed"
+        );
+
+        let refused = apply_shortfall(1, 3, &["node-2: PREVHASH_MISMATCH".into()])
+            .expect("partial apply must fail");
+        assert!(refused.contains("1/3"), "{refused}");
+        assert!(refused.contains("PREVHASH_MISMATCH"), "{refused}");
+        assert!(refused.contains("Silent (no ack): 1"), "{refused}");
+
+        let silent = apply_shortfall(1, 3, &[]).expect("silent shortfall must ALSO fail");
+        assert!(silent.contains("Silent (no ack): 2"), "{silent}");
+    }
 
     /// Cross-language golden: the Rust preimage must equal the C++ enclave's
     /// compute_pinned_unl_policy_hash, byte for byte. Inputs match the frozen vector in
