@@ -20,14 +20,15 @@ one the code does not implement — and nothing the code does implement is left 
   sealed state and it is published hourly to a monotonic-epoch registry on
   Base-Sepolia through a 2-of-3 Safe. Anyone can verify that **their own account is
   included** in the published root
-- **SPV-proven custody** — the custody figure is no longer asserted by the host: the
-  enclave derives the escrow balance **itself** from an XRPL ledger attested by
-  ≥80% of a validator set **anchored in the measurement**, verifying the validator
-  manifests and the SHAMap inclusion proof in-enclave. A third party can re-check
-  the figure directly against XRPL
+- **SPV-proven custody baseline** — the custody figure is no longer asserted by the
+  host: the enclave derived the escrow balance **itself** from an XRPL ledger
+  attested by ≥80% of a validator set **anchored in the measurement**, verifying the
+  validator manifests and the SHAMap inclusion proof in-enclave. A third party can
+  re-check the figure directly against XRPL. It is a **baseline at one attested
+  ledger**, not a continuous proof — see the limits below
 
 ## Hardened — done and live on the 3-node cluster
-- **State-preserving enclave upgrades are routine, not a one-off** — **ten**
+- **State-preserving enclave upgrades are a routine testnet operation** — **ten**
   performed on the live 3-node cluster (May–September 2026, most recently
   2026-09-15), each a full re-key with **all customer state preserved** and
   verified afterwards against on-chain evidence
@@ -45,12 +46,21 @@ one the code does not implement — and nothing the code does implement is left 
   membership-authority, upgrade-path and proof-of-reserves work
 
 ## What the reserves artifact does *not* prove
-Stated explicitly, because the useful claim is the precise one. Custody is
-SPV-proven and independently checkable against XRPL. **Liability completeness is
-not**: the root is an in-TEE assertion over the enclave's own sealed state, so a
-third party can verify that their account is *included*, not that the root
-enumerates every liability. The 2-of-3 Safe gate is key-custody plus a structural
-publish gate — it is not independent economic validation of the figures.
+Stated explicitly, because the useful claim is the precise one.
+
+**The custody proof is a point in time, not a running guarantee.** The escrow
+balance was SPV-proven at one validator-attested ledger. Deposits and withdrawals
+since then are tracked by the enclave's own accounting and are **not yet
+independently SPV-proven** — per-flow on-chain proofs are a later phase. So the
+published figure is a proven baseline plus enclave-tracked flows; re-derive the
+escrow balance on XRPL for the current on-chain number.
+
+**Liability completeness is not proven.** The root is an in-TEE assertion over the
+enclave's own sealed state, so a third party can verify that their account is
+*included*, not that the root enumerates every liability.
+
+**The 2-of-3 Safe gate is key-custody plus a structural publish gate** — it is not
+independent economic validation of the figures.
 
 ## Roadmap
 - **Anti-MEV** — order flow encrypted to the enclave's attested public key
