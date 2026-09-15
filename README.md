@@ -1,6 +1,6 @@
 # xrpl-perp-dex
 
-Perpetual futures DEX on XRPL mainnet with TEE (Intel SGX) computation layer and RLUSD settlement.
+Perpetual futures DEX on XRPL with a TEE (Intel SGX) computation layer and RLUSD settlement. Runs on XRPL **testnet** today (mainnet-capable — single-mode codebase; see [docs/status-and-features.md](docs/status-and-features.md)).
 
 ## Architecture
 
@@ -24,8 +24,8 @@ Users ──[HTTPS]──► Orchestrator (Rust)
                               │
                     [XRPL native multisig 2-of-3]
                               │
-                      XRPL Mainnet
-                      ├── RLUSD collateral (SignerListSet escrow)
+                      XRPL (testnet today)
+                      ├── RLUSD margin + XRP collateral (SignerListSet escrow)
                       ├── P&L settlement
                       └── Deposit / withdrawal
 ```
@@ -120,8 +120,8 @@ Verify with: `python3 dcap_verifier.py --url http://host:3000/v1/attestation/quo
 
 ## Key Properties
 
-- **Anti-MEV**: orders encrypted with enclave's attested public key; operator sees only ciphertext
-- **RLUSD-native**: all collateral, settlement, and fees denominated in RLUSD
+- **Anti-MEV** *(roadmap, not yet implemented)*: order flow encrypted to the enclave's attested public key so the operator sees only ciphertext
+- **RLUSD settlement**: RLUSD margin (+ XRP collateral at a haircut); settlement and fees in RLUSD
 - **DCAP Attestation**: Intel-signed proof that enclave runs genuine, untampered code (Azure DCsv3)
 - **XRPL Multisig**: 2-of-3 SignerListSet — no single operator can steal funds, master key disabled
 - **No sidechain**: settles directly on XRPL L1 in RLUSD
