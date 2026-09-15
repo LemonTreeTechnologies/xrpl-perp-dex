@@ -1,6 +1,6 @@
 # Demoed vs. Planned
 
-*Every item below is backed by the code (verified 2026-07-24). See
+*Every item below is backed by the code (verified 2026-09-15). See
 [status-and-features.md](status-and-features.md) for the fuller feature list.*
 
 ## Demoed (Hack the Block Paris — mainnet demo; production runs on testnet today)
@@ -13,14 +13,15 @@
 - Market Making vault deployed — auto two-sided liquidity (V1 sign-off pending review)
 
 ## Hardened since (post-demo)
-- Atomic state-preserving migration performed — live 3-node enclave cluster, all customer state preserved (May 2026)
+- State-preserving enclave upgrades are routine — **ten** performed on the live 3-node cluster (May–September 2026), each preserving all customer state
 - Cluster is authority over its own signer set — the XRPL SignerList is now a confirmed downstream projection (sync-before-spend + drift-halt), live
-- Escrow key signs only typed, in-enclave-verified transactions — no "sign-any-hash" oracle (audit-passed, deploying next)
-- Governed enclave-version trust — operator quorum + reproducible-build proof from ≥2 independent operators (audit-passed, deploying next)
-- 20+ external audit review rounds (REQ/RESP) across the membership-authority + upgrade-path work
+- Escrow key signs only typed, in-enclave-verified transactions — no "sign-any-hash" oracle, **live**
+- Governed enclave-version trust — operator quorum + reproducible-build proof from ≥2 independent operators, **live and exercised on every migration**
+- On-chain proof-of-liabilities — enclave-signed merkle root published hourly to Base-Sepolia via a 2-of-3 Safe; you can verify your own account's inclusion
+- SPV-proven custody — the enclave derives the escrow balance itself from an XRPL ledger attested by ≥80% of a validator set anchored in the measurement, so custody is not a host assertion (liability *completeness* remains an in-TEE assertion — see status-and-features.md)
+- 90 external audit review rounds (90 REQ / 102 RESP documents) across the membership-authority, upgrade-path and proof-of-reserves work
 
 ## Planned
-- First live enclave-version upgrade on testnet (state-preserving migration) → external audit → mainnet relaunch
 - Anti-MEV: enclave-key-encrypted order flow
 - Delta Neutral vault (hedged spread + funding)
 - Delta One vault (rate arbitrage)
