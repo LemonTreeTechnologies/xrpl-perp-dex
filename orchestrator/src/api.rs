@@ -415,18 +415,33 @@ async fn attestation_quote(
 /// Public endpoint — no auth needed.
 async fn attestation_commitment() -> impl IntoResponse {
     // #131: retargeted Ethereum-Sepolia → Base-Sepolia; V4 → ReservesRegistry.
-    // The registry address is operator config (set once deployed, chunk 4) — the
-    // artifact is honestly proof-of-LIABILITIES + inclusion, not proof-of-reserves.
+    //
+    // The claim here must track what the system actually proves, in BOTH directions.
+    // Until AC-BASE-2″ the custody side was a host-asserted escrow balance, so this
+    // endpoint correctly said "not proof-of-reserves". Since the SPV backing gate went
+    // live the enclave DERIVES custody itself from a ledger attested by >=80% of the
+    // pinned validator UNL — so continuing to call it liabilities-only now UNDERSTATES
+    // it. What is still not proven is liability COMPLETENESS; that limit is stated
+    // explicitly below rather than left for the reader to infer.
+    //
+    // The registry address is operator config; it is public (a contract address, not a
+    // secret) and the endpoint is useless without it — "how to verify" that omits what
+    // to verify against is not a verification path.
+    let registry = std::env::var("RESERVES_REGISTRY")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     ok(serde_json::json!({
         "network": "base-sepolia",
         "chain_id": crate::commitment::BASE_SEPOLIA_CHAIN_ID,
-        "registry": serde_json::Value::Null,
-        "artifact": "proof-of-liabilities + inclusion (enclave-signed merkle root, in-TEE internal-solvency assertion)",
+        "registry": registry,
+        "artifact": "proof-of-liabilities (in-TEE, enclave-signed merkle root over sealed state)                      + SPV-PROVEN custody (the XRPL escrow balance the enclave derives itself                      from a ledger attested by >=80% of the pinned validator UNL)",
         "description": "ReservesRegistry — periodic, 2-of-3-Safe-gated, monotonic-epoch liabilities root",
+        "limits": "Custody is SPV-proven and independently checkable against XRPL. Liabilities                    are an in-TEE assertion over the enclave's OWN sealed state: a third party can                    verify that their account is INCLUDED in the published root, not that the root                    enumerates every liability. The 2-of-3 Safe gate is key-custody plus a                    structural publish gate — it is not independent economic validation of the                    figures.",
         "how_to_verify": {
             "1": "Read latestReserves() on the ReservesRegistry (Base-Sepolia)",
             "2": "Verify your account's inclusion via the Q-22 merkle proof against latestRoot",
-            "3": "Use /v1/attestation/quote to verify enclave identity (DCAP)"
+            "3": "Use /v1/attestation/quote to verify enclave identity (DCAP)",
+            "4": "Check the escrow balance on XRPL yourself — the custody figure is the balance                   the enclave proved against a validator-attested ledger, not a number we assert"
         },
         "contract_abi": "publishReserves(uint64 epoch, bytes32 root, bytes32 snapshotHash)",
         "basescan": "https://sepolia.basescan.org/",
@@ -552,8 +567,9 @@ async fn openapi_spec() -> impl IntoResponse {
             },
             "/v1/attestation/commitment": {
                 "get": {
-                    "summary": "On-chain state commitment info (Sepolia)",
-                    "responses": {"200": {"description": "CommitmentRegistryV4 contract details"}}
+                    "summary": "On-chain reserves commitment info (Base-Sepolia)",
+                    "description": "Where and how to verify the published commitment: the ReservesRegistry address, the ABI, and what the artifact does and does NOT prove. Custody is SPV-proven against XRPL; liabilities are an in-TEE assertion you can check your own inclusion in.",
+                    "responses": {"200": {"description": "ReservesRegistry address + verification path + stated limits"}}
                 }
             },
             "/ws": {
