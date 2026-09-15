@@ -434,14 +434,14 @@ async fn attestation_commitment() -> impl IntoResponse {
         "network": "base-sepolia",
         "chain_id": crate::commitment::BASE_SEPOLIA_CHAIN_ID,
         "registry": registry,
-        "artifact": "proof-of-liabilities (in-TEE, enclave-signed merkle root over sealed state)                      + SPV-PROVEN custody (the XRPL escrow balance the enclave derives itself                      from a ledger attested by >=80% of the pinned validator UNL)",
+        "artifact": "proof-of-liabilities (in-TEE, enclave-signed merkle root over sealed state) + SPV-PROVEN custody (the XRPL escrow balance the enclave derives itself from a ledger attested by >=80% of the pinned validator UNL)",
         "description": "ReservesRegistry — periodic, 2-of-3-Safe-gated, monotonic-epoch liabilities root",
-        "limits": "Custody is SPV-proven and independently checkable against XRPL. Liabilities                    are an in-TEE assertion over the enclave's OWN sealed state: a third party can                    verify that their account is INCLUDED in the published root, not that the root                    enumerates every liability. The 2-of-3 Safe gate is key-custody plus a                    structural publish gate — it is not independent economic validation of the                    figures.",
+        "limits": "Custody is SPV-proven and independently checkable against XRPL. Liabilities are an in-TEE assertion over the enclave's OWN sealed state: a third party can verify that their account is INCLUDED in the published root, not that the root enumerates every liability. The 2-of-3 Safe gate is key-custody plus a structural publish gate — it is not independent economic validation of the figures.",
         "how_to_verify": {
             "1": "Read latestReserves() on the ReservesRegistry (Base-Sepolia)",
             "2": "Verify your account's inclusion via the Q-22 merkle proof against latestRoot",
             "3": "Use /v1/attestation/quote to verify enclave identity (DCAP)",
-            "4": "Check the escrow balance on XRPL yourself — the custody figure is the balance                   the enclave proved against a validator-attested ledger, not a number we assert"
+            "4": "Check the escrow balance on XRPL yourself — the custody figure is the balance the enclave proved against a validator-attested ledger, not a number we assert"
         },
         "contract_abi": "publishReserves(uint64 epoch, bytes32 root, bytes32 snapshotHash)",
         "basescan": "https://sepolia.basescan.org/",
