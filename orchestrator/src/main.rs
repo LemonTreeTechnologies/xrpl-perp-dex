@@ -43,6 +43,9 @@ mod signerlist_update;
 mod singleton;
 mod spv_proof; // AC-BASE-2″ P2-d — XRPL SPV proof builder/fetcher
 mod trading;
+mod tx_shamap; // #131 P3 — rebuild a ledger's tx SHAMap + read inclusion paths off it
+#[cfg(test)]
+mod tx_shamap_vector; // real ledger 20808565, golden vector for the rebuild
 mod types;
 mod unl_policy; // AC-BASE-2″ §6 — UNL policy ceremony (quorum + freshness anchor)
 mod validator_manifests; // AC-BASE-2″ §6 — feed the enclave's measured-anchor validator root
