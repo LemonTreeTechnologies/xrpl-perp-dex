@@ -15,6 +15,25 @@ use crate::perp_client::PerpClient;
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
+/// The figures the enclave last committed, cached for the public attestation endpoint.
+///
+/// Deliberately a snapshot of what was PUBLISHED, not a fresh read: the endpoint must
+/// describe the commitment that is actually on-chain, and a live re-read could disagree
+/// with the published root by a whole interval of flows. A stale-but-matching figure is
+/// honest; a fresh-but-unpublished one invites someone to check it against the registry
+/// and find a mismatch we created ourselves.
+#[derive(Debug, Clone, Copy)]
+pub struct ReservesFigures {
+    pub rlusd_liabilities: i64,
+    pub xrp_liabilities: i64,
+    pub custody_rlusd: i64,
+    pub custody_xrp: i64,
+    pub epoch: u64,
+}
+
+/// Shared handle: the publisher writes it once per interval, the API reads it.
+pub type ReservesFiguresCache = std::sync::Arc<std::sync::Mutex<Option<ReservesFigures>>>;
+
 #[derive(Debug, Clone)]
 pub struct ReservesPublisherConfig {
     pub rpc_url: String,    // RESERVES_RPC_URL   (secret — embeds QuickNode key)
@@ -79,6 +98,7 @@ pub async fn run_reserves_commit_once(
     account_id: &str,
     session_key: &str,
     excluded_account_ids: &[String],
+    last_figures: Option<&ReservesFiguresCache>,
 ) -> Result<String> {
     let latest = commitment::query_latest_reserves(&cfg.rpc_url, &cfg.registry)
         .await
@@ -126,6 +146,44 @@ pub async fn run_reserves_commit_once(
         leaf_count = resp.get("leaf_count").and_then(|v| v.as_u64()).unwrap_or(0),
         "reserves-commit figures (FP8)"
     );
+
+    /* Q-BND-3 condition: the gap between proven custody and counted liabilities has to
+     * be VISIBLE and QUANTIFIABLE, not merely stated in prose.
+     *
+     * The reason is the reconciliation path. A deposit that landed at or below the
+     * baseline ledger but was never credited is permanently uncreditable through SPV —
+     * the boundary refuses it, correctly, because crediting it would double-count a
+     * payment already inside the proven balance. The money is real and sits in the
+     * escrow. The remedy is operational, and an operator can only bound it if they can
+     * see the gap: custody minus liabilities is exactly the ceiling on what such a
+     * reconciliation may legitimately restore. Without the number published, "reconcile
+     * no more than the observed gap" is a rule nobody can check.
+     *
+     * Published rather than logged for the same reason the figures themselves are: a
+     * third party checking our claim should not have to take our word for the size of
+     * what we have not proven. */
+    if let Some(figs) = last_figures {
+        let mut f = figs.lock().expect("reserves figures mutex poisoned");
+        *f = Some(ReservesFigures {
+            rlusd_liabilities: resp
+                .get("rlusd_liabilities")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            xrp_liabilities: resp
+                .get("xrp_liabilities")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            custody_rlusd: resp
+                .get("custody_rlusd")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            custody_xrp: resp
+                .get("custody_xrp")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            epoch,
+        });
+    }
 
     let root = hex32(&resp, "root")?;
     let snapshot = hex32(&resp, "snapshot_hash")?;

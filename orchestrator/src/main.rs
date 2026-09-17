@@ -1033,6 +1033,12 @@ async fn main() -> Result<()> {
         Some("1") | Some("true") | Some("yes")
     )));
 
+    // Q-BND-3: the last PUBLISHED reserves figures, so /v1/attestation/commitment can
+    // state the custody-minus-liabilities gap instead of only describing it. Declared
+    // here because AppState needs it and the publisher fills it later.
+    let reserves_figures_cache: reserves_publisher::ReservesFiguresCache =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+
     let app_state = Arc::new(AppState {
         engine,
         perp: PerpClient::new(&cli.enclave_url)?,
@@ -1053,6 +1059,7 @@ async fn main() -> Result<()> {
         shard_router: shard_router.clone(),
         peer_count: peer_count.clone(),
         start_time: Instant::now(),
+        reserves_figures: Some(reserves_figures_cache.clone()),
         maintenance_mode: maintenance_mode.clone(),
     });
 
@@ -2335,6 +2342,7 @@ async fn main() -> Result<()> {
                             &signer.address,
                             &signer.session_key,
                             &operator_capital_account_ids,
+                            Some(&reserves_figures_cache),
                         )
                         .await
                         {
