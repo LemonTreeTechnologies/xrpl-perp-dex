@@ -354,9 +354,9 @@ pub fn build_xspv_blob(
     validations: &[u8],
     proofs: &[XspvProof],
 ) -> Result<Vec<u8>> {
-    // Checked narrowing throughout — see the note in build_xdep_blob. A truncated
-    // count or length here produces a blob the enclave refuses, with the cause a long
-    // way from the symptom.
+    // Same defect class as build_xdep_blob — see the note there. `proofs.len() as u8`
+    // and `leaf_data.len() as u16` would each silently serialise a wrong value rather
+    // than fail.
     let proof_count = u8::try_from(proofs.len()).context("too many proofs for a u8 count")?;
     let mut b = Vec::new();
     b.extend_from_slice(&XSPV_MAGIC);
@@ -407,11 +407,12 @@ pub fn build_xdep_blob(
     meta: &[u8],
     inner_root_to_leaf: &[[u8; 512]],
 ) -> Result<Vec<u8>> {
-    // Every narrowing here is checked rather than cast. `len() as u8` on a 256-deep
-    // path would serialise as 0 and emit a malformed blob with no error at the
-    // producer; the enclave would refuse it, so it is not a safety hole, but the
-    // failure would surface far from its cause. A cast that can silently lose the
-    // value is not worth the character it saves.
+    // DEFECT FIXED, not merely hardening (audit-claude, 2026-09-17): the original
+    // `inner_root_to_leaf.len() as u8` SERIALISED A WRONG WIRE VALUE — a 256-deep path
+    // became a 0 depth byte, emitting a malformed blob with no error at the producer.
+    // The enclave refuses such a blob, so nothing unsafe reaches the TCB, but "the
+    // receiver catches it" does not make a producer that silently writes the wrong
+    // number correct. Recorded as a defect so the trail shows one, not a style note.
     let tx_len = u32::try_from(tx_blob.len()).context("transaction too large for a u32 length")?;
     let meta_len = u32::try_from(meta.len()).context("metadata too large for a u32 length")?;
     let depth = u8::try_from(inner_root_to_leaf.len())
