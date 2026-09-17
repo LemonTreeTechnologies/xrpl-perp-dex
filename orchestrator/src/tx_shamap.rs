@@ -488,6 +488,58 @@ mod tests {
         println!("#define kTx2Depth {}", proof.inner_root_to_leaf.len());
     }
 
+    /// Emit an XDEP transport blob for the enclave's parser test. Ignored by default.
+    ///
+    ///   cargo test --locked emit_xdep_vector -- --ignored --nocapture
+    ///
+    /// `val_count = 0`: this vector exercises the TRANSPORT and the inclusion path, not
+    /// the quorum — validator signatures are verified by machinery that already has its
+    /// own real-manifest tests, and stapling six signatures in here would make the
+    /// vector huge without testing anything the other suite does not.
+    #[test]
+    #[ignore = "vector generator, not an assertion"]
+    fn emit_xdep_vector() {
+        use crate::spv_proof::build_xdep_blob;
+        let items = ledger_items();
+        let map = TxShaMap::build(&items).unwrap();
+        let hdr_v = unhex(v::LEDGER_HEADER);
+        let mut header = [0u8; 118];
+        header.copy_from_slice(&hdr_v);
+        let deep = (0..items.len())
+            .max_by_key(|&i| {
+                map.inclusion_proof(&tx_id(&items[i].0))
+                    .unwrap()
+                    .inner_root_to_leaf
+                    .len()
+            })
+            .unwrap();
+        let (tx, meta) = &items[deep];
+        let proof = map.inclusion_proof(&tx_id(tx)).unwrap();
+        let blob = build_xdep_blob(&header, 0, &[], tx, meta, &proof.inner_root_to_leaf);
+
+        println!(
+            "/* XDEP blob, ledger {} tx[{}], emitted by orchestrator build_xdep_blob */",
+            v::LEDGER_INDEX,
+            deep
+        );
+        println!("static const uint8_t kXdepBlob[] = {{");
+        for (i, x) in blob.iter().enumerate() {
+            if i % 12 == 0 {
+                print!("    ");
+            }
+            print!("0x{x:02x},");
+            if i % 12 == 11 {
+                println!();
+            } else {
+                print!(" ");
+            }
+        }
+        println!("\n}};");
+        println!("#define kXdepTxLen {}", tx.len());
+        println!("#define kXdepMetaLen {}", meta.len());
+        println!("#define kXdepDepth {}", proof.inner_root_to_leaf.len());
+    }
+
     /// VL prefix boundaries, mirrored from the enclave's `vl_prefix`. These are the
     /// exact lengths where the encoding changes width; an off-by-one here shifts every
     /// leaf hash for transactions of that size.

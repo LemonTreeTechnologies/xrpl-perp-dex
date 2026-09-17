@@ -360,6 +360,48 @@ pub fn build_xspv_blob(
     b
 }
 
+/// #131 P3 — the deposit transport (`XDEP`).
+///
+/// Same attested-ledger prefix as [`build_xspv_blob`] — the header the validators
+/// signed and their signatures over it — then one transaction, its metadata, and the
+/// transaction-tree inclusion path from [`crate::tx_shamap`].
+///
+/// Deliberately ONE deposit per blob. Batching would make a partial failure ambiguous
+/// (which of N was refused, and did the others credit?), and a deposit credit is not a
+/// place to be ambiguous.
+///
+/// Note what is NOT in the blob: no tx-ID, no leaf index, no amount, no sender. The
+/// enclave derives the SHAMap key from the transaction bytes itself, so the host cannot
+/// say which transaction a proof is about — only which bytes it ships.
+///
+/// Lengths are u32, unlike XSPV's u16 leaf_len: that one sizes a ledger entry, which
+/// cannot approach 64 KiB, whereas real transaction metadata on a busy ledger can.
+pub fn build_xdep_blob(
+    header: &[u8; HEADER_LEN],
+    val_count: u16,
+    validations: &[u8],
+    tx_blob: &[u8],
+    meta: &[u8],
+    inner_root_to_leaf: &[[u8; 512]],
+) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"XDEP");
+    b.push(1); // version
+    push_be16(&mut b, HEADER_LEN as u16);
+    b.extend_from_slice(header);
+    push_be16(&mut b, val_count);
+    b.extend_from_slice(validations);
+    b.extend_from_slice(&(tx_blob.len() as u32).to_be_bytes());
+    b.extend_from_slice(tx_blob);
+    b.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+    b.extend_from_slice(meta);
+    b.push(inner_root_to_leaf.len() as u8);
+    for node in inner_root_to_leaf {
+        b.extend_from_slice(node);
+    }
+    b
+}
+
 // ── async fetch (ws validations + HTTP header/proof → XSPV blob) ───────────────
 use std::collections::HashMap;
 use std::time::Duration;
