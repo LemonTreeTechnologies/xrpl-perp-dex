@@ -11,6 +11,7 @@ mod bootstrap_join;
 mod cli_tools;
 mod commitment;
 mod db;
+mod deposit_spv; // #131 P3 — assemble SPV deposit proofs for the enclave
 mod dkg_coordinate;
 mod election;
 mod http_helpers;
