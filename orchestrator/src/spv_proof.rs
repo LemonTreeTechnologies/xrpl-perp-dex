@@ -59,7 +59,13 @@ fn as_u64(v: &serde_json::Value) -> Option<u64> {
 /// close_time_resolution(u8) ‖ close_flags(u8). All big-endian (matches rippled + the
 /// enclave `xrpl_spv_ledger_hash`).
 pub fn serialize_ledger_header(ledger: &serde_json::Value) -> Result<[u8; HEADER_LEN]> {
-    let seq = as_u64(&ledger["ledger_index"]).context("ledger_index")? as u32;
+    // Every field below is narrowed with try_from, not `as`. This JSON comes from a
+    // rippled node we do not trust; a value past the field width means the response is
+    // not what we think it is, and truncating it would silently serialise a DIFFERENT
+    // header than the one the validators signed — which then fails quorum for a reason
+    // no log line explains. Fail here, where the cause is visible.
+    let seq = u32::try_from(as_u64(&ledger["ledger_index"]).context("ledger_index")?)
+        .context("ledger_index does not fit the header's u32 sequence field")?;
     let drops: u64 = ledger["total_coins"]
         .as_str()
         .context("total_coins")?
@@ -68,10 +74,15 @@ pub fn serialize_ledger_header(ledger: &serde_json::Value) -> Result<[u8; HEADER
     let parent = hex32(ledger, "parent_hash")?;
     let txh = hex32(ledger, "transaction_hash")?;
     let acct = hex32(ledger, "account_hash")?;
-    let pct = as_u64(&ledger["parent_close_time"]).context("parent_close_time")? as u32;
-    let ct = as_u64(&ledger["close_time"]).context("close_time")? as u32;
-    let ctr = as_u64(&ledger["close_time_resolution"]).context("close_time_resolution")? as u8;
-    let cf = as_u64(&ledger["close_flags"]).context("close_flags")? as u8;
+    let pct = u32::try_from(as_u64(&ledger["parent_close_time"]).context("parent_close_time")?)
+        .context("parent_close_time does not fit the header's u32 field")?;
+    let ct = u32::try_from(as_u64(&ledger["close_time"]).context("close_time")?)
+        .context("close_time does not fit the header's u32 field")?;
+    let ctr =
+        u8::try_from(as_u64(&ledger["close_time_resolution"]).context("close_time_resolution")?)
+            .context("close_time_resolution does not fit the header's u8 field")?;
+    let cf = u8::try_from(as_u64(&ledger["close_flags"]).context("close_flags")?)
+        .context("close_flags does not fit the header's u8 field")?;
 
     let mut out = [0u8; HEADER_LEN];
     let mut p = 0;
@@ -250,18 +261,22 @@ fn st_next(b: &[u8], pos: usize) -> Option<(u16, u16, usize, usize, usize)> {
             // VL-length-prefixed (1/2/3-byte length)
             let l0 = *b.get(i)? as usize;
             i += 1;
+            // The subtractions are guarded by the branch conditions, but written with
+            // checked_sub so the guarantee lives in the expression rather than in the
+            // `if` above it — a later edit that moves a bound cannot turn this into a
+            // silent wrap (release builds do not panic).
             let l = if l0 <= 192 {
                 l0
             } else if l0 <= 240 {
-                193 + ((l0 - 193) << 8) + *b.get(i)? as usize + {
-                    i += 1;
-                    0
-                }
+                let hi = l0.checked_sub(193)?;
+                i += 1;
+                193 + (hi << 8) + *b.get(i - 1)? as usize
             } else {
                 let a = *b.get(i)? as usize;
                 let bb = *b.get(i + 1)? as usize;
                 i += 2;
-                12481 + ((l0 - 241) << 16) + (a << 8) + bb
+                let hi = l0.checked_sub(241)?;
+                12481 + (hi << 16) + (a << 8) + bb
             };
             vstart = i;
             vlen = l;
@@ -338,26 +353,34 @@ pub fn build_xspv_blob(
     val_count: u16,
     validations: &[u8],
     proofs: &[XspvProof],
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
+    // Checked narrowing throughout — see the note in build_xdep_blob. A truncated
+    // count or length here produces a blob the enclave refuses, with the cause a long
+    // way from the symptom.
+    let proof_count = u8::try_from(proofs.len()).context("too many proofs for a u8 count")?;
     let mut b = Vec::new();
     b.extend_from_slice(&XSPV_MAGIC);
     b.push(1); // version
-    push_be16(&mut b, HEADER_LEN as u16);
+    push_be16(&mut b, HEADER_LEN as u16); // const 118, cannot narrow
     b.extend_from_slice(header);
     push_be16(&mut b, val_count);
     b.extend_from_slice(validations);
-    b.push(proofs.len() as u8);
+    b.push(proof_count);
     for pr in proofs {
+        let leaf_len =
+            u16::try_from(pr.leaf_data.len()).context("ledger entry too large for a u16 length")?;
+        let depth = u8::try_from(pr.inner_root_to_leaf.len())
+            .context("inclusion path deeper than a u8 can express")?;
         b.push(pr.kind);
         b.extend_from_slice(&pr.leaf_index);
-        push_be16(&mut b, pr.leaf_data.len() as u16);
+        push_be16(&mut b, leaf_len);
         b.extend_from_slice(&pr.leaf_data);
-        b.push(pr.inner_root_to_leaf.len() as u8);
+        b.push(depth);
         for node in &pr.inner_root_to_leaf {
             b.extend_from_slice(node);
         }
     }
-    b
+    Ok(b)
 }
 
 /// #131 P3 — the deposit transport (`XDEP`).
@@ -383,23 +406,33 @@ pub fn build_xdep_blob(
     tx_blob: &[u8],
     meta: &[u8],
     inner_root_to_leaf: &[[u8; 512]],
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
+    // Every narrowing here is checked rather than cast. `len() as u8` on a 256-deep
+    // path would serialise as 0 and emit a malformed blob with no error at the
+    // producer; the enclave would refuse it, so it is not a safety hole, but the
+    // failure would surface far from its cause. A cast that can silently lose the
+    // value is not worth the character it saves.
+    let tx_len = u32::try_from(tx_blob.len()).context("transaction too large for a u32 length")?;
+    let meta_len = u32::try_from(meta.len()).context("metadata too large for a u32 length")?;
+    let depth = u8::try_from(inner_root_to_leaf.len())
+        .context("inclusion path deeper than a u8 can express")?;
+
     let mut b = Vec::new();
     b.extend_from_slice(b"XDEP");
     b.push(1); // version
-    push_be16(&mut b, HEADER_LEN as u16);
+    push_be16(&mut b, HEADER_LEN as u16); // const 118, cannot narrow
     b.extend_from_slice(header);
     push_be16(&mut b, val_count);
     b.extend_from_slice(validations);
-    b.extend_from_slice(&(tx_blob.len() as u32).to_be_bytes());
+    b.extend_from_slice(&tx_len.to_be_bytes());
     b.extend_from_slice(tx_blob);
-    b.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+    b.extend_from_slice(&meta_len.to_be_bytes());
     b.extend_from_slice(meta);
-    b.push(inner_root_to_leaf.len() as u8);
+    b.push(depth);
     for node in inner_root_to_leaf {
         b.extend_from_slice(node);
     }
-    b
+    Ok(b)
 }
 
 // ── async fetch (ws validations + HTTP header/proof → XSPV blob) ───────────────
@@ -549,7 +582,7 @@ pub async fn fetch_spv_bundle(cfg: &SpvFetchConfig) -> Result<Vec<u8>> {
 
     // 4. assemble the XSPV blob.
     let (val_count, vals) = build_validations_section(&datas)?;
-    Ok(build_xspv_blob(&header, val_count, &vals, &[proof]))
+    build_xspv_blob(&header, val_count, &vals, &[proof])
 }
 
 #[cfg(test)]

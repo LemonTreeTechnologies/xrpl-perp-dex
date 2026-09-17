@@ -24,7 +24,7 @@
 // emits. Drop this allow when the driver wires it up.
 #![allow(dead_code)]
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha512};
 
 /// `'TXN\0'` — the transaction-ID prefix. The tx-ID is also the tx tree's SHAMap key.
@@ -54,15 +54,24 @@ fn sha512half(parts: &[&[u8]]) -> [u8; 32] {
 /// the leaf hash is over the PREFIXED blobs, so an encoding difference here produces a
 /// leaf hash that silently fails inclusion rather than erroring.
 pub fn vl_prefix(n: usize) -> Result<Vec<u8>> {
+    // Written with checked_sub and try_from throughout. The range guards make every
+    // operation provably safe today, so this changes no behaviour — the point is that
+    // the guarantee lives in the expression instead of in the `if` above it. Rust
+    // release builds wrap silently, so an edit that moved a bound would produce a
+    // wrong prefix, and a wrong prefix is a leaf hash that fails inclusion for a reason
+    // nothing reports.
+    let byte = |x: usize, what: &'static str| -> Result<u8> {
+        u8::try_from(x).map_err(|_| anyhow::anyhow!("VL {what} byte out of range: {x}"))
+    };
     if n <= 192 {
-        Ok(vec![n as u8])
+        Ok(vec![byte(n, "single-byte length")?])
     } else if n <= 12480 {
-        let v = n - 193;
-        Ok(vec![(193 + (v >> 8)) as u8, (v & 0xFF) as u8])
+        let v = n.checked_sub(193).context("VL 2-byte base underflow")?;
+        Ok(vec![byte(193 + (v >> 8), "2-byte high")?, (v & 0xFF) as u8])
     } else if n <= 918_744 {
-        let v = n - 12481;
+        let v = n.checked_sub(12481).context("VL 3-byte base underflow")?;
         Ok(vec![
-            (241 + (v >> 16)) as u8,
+            byte(241 + (v >> 16), "3-byte high")?,
             ((v >> 8) & 0xFF) as u8,
             (v & 0xFF) as u8,
         ])
@@ -515,7 +524,7 @@ mod tests {
             .unwrap();
         let (tx, meta) = &items[deep];
         let proof = map.inclusion_proof(&tx_id(tx)).unwrap();
-        let blob = build_xdep_blob(&header, 0, &[], tx, meta, &proof.inner_root_to_leaf);
+        let blob = build_xdep_blob(&header, 0, &[], tx, meta, &proof.inner_root_to_leaf).unwrap();
 
         println!(
             "/* XDEP blob, ledger {} tx[{}], emitted by orchestrator build_xdep_blob */",
