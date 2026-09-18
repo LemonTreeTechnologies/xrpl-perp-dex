@@ -280,6 +280,257 @@ pub fn outcome_from_error(msg: &str) -> SubmitOutcome {
     SubmitOutcome::Transient(msg.to_string())
 }
 
+/// Config for the deposit driver.
+pub struct DepositDriverConfig {
+    /// rippled HTTP RPC, e.g. `http://127.0.0.1:5005`.
+    pub http_url: String,
+    /// rippled websocket, for the validations stream.
+    pub ws_url: String,
+    /// The escrow, as a classic address — the same form rippled renders `Destination` in.
+    pub escrow_classic: String,
+    /// Seconds between scans. A ledger closes roughly every 4s, so anything under that
+    /// just re-reads the same ledger.
+    pub scan_interval_secs: u64,
+}
+
+impl DepositDriverConfig {
+    /// Absent `PERP_DEPOSIT_SPV=1`, the driver does not run.
+    ///
+    /// Opt-in rather than opt-out on purpose: until an operator has armed the boundary,
+    /// every submission refuses with -85, and a driver running by default would fill the
+    /// log with refusals on every node that upgraded. P3 starts when someone turns it on.
+    pub fn from_env(escrow_classic: &str) -> Option<Self> {
+        if std::env::var("PERP_DEPOSIT_SPV").ok().as_deref() != Some("1") {
+            return None;
+        }
+        Some(Self {
+            http_url: std::env::var("XRPL_RPC_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:5005".to_string()),
+            ws_url: std::env::var("XRPL_WS_URL")
+                .unwrap_or_else(|_| "ws://127.0.0.1:6006".to_string()),
+            escrow_classic: escrow_classic.to_string(),
+            scan_interval_secs: std::env::var("PERP_DEPOSIT_SPV_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8),
+        })
+    }
+}
+
+/// Which ledger to resume scanning from, given the enclave's watermark.
+///
+/// The enclave will refuse anything at or below `max(last_credited, boundary)`, so
+/// rescanning below that is wasted work — but it is not HARMFUL, and that asymmetry is
+/// why this errs low. Starting too high silently skips a deposit forever; starting too
+/// low costs a few refusals that classify as AlreadySettled. Given the choice, lose time.
+pub fn resume_from(last_credited: u64, boundary: u64, safety_margin: u64) -> u64 {
+    let floor = last_credited.max(boundary);
+    floor.saturating_sub(safety_margin)
+}
+
+/// Continuously collect validations into the shared buffer.
+///
+/// Runs for the life of the process and reconnects on failure. It must NOT be started
+/// on demand: rippled serves no validation history, so a signature missed while we were
+/// not listening is gone, and the deposit it would have proven becomes uncreditable
+/// until someone reconciles it by hand.
+///
+/// Errors are logged and retried rather than propagated. A collector that exits on a
+/// dropped websocket is a collector that silently stops proving deposits, and the
+/// symptom would appear hours later as "deposits stopped crediting".
+pub async fn run_validation_collector(
+    ws_url: String,
+    buffer: std::sync::Arc<std::sync::Mutex<ValidationBuffer>>,
+) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    loop {
+        match tokio_tungstenite::connect_async(&ws_url).await {
+            Ok((mut ws, _)) => {
+                if let Err(e) = ws
+                    .send(Message::text(
+                        r#"{"command":"subscribe","streams":["validations"]}"#,
+                    ))
+                    .await
+                {
+                    tracing::warn!(error = %e, "deposit-spv: validations subscribe failed");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+                tracing::info!("deposit-spv: collecting validations");
+                while let Some(msg) = ws.next().await {
+                    let Ok(Message::Text(txt)) = msg else { break };
+                    let Ok(j) = serde_json::from_str::<serde_json::Value>(&txt) else {
+                        continue;
+                    };
+                    // `full: true` only. A partial validation is not a signature over the
+                    // ledger the enclave will check, so buffering one would inflate the
+                    // apparent count and produce a blob that fails quorum for a reason
+                    // nothing reports.
+                    if j["type"] != "validationReceived" || j["full"] != true {
+                        continue;
+                    }
+                    let (Some(lh), Some(data_hex)) =
+                        (j["ledger_hash"].as_str(), j["data"].as_str())
+                    else {
+                        continue;
+                    };
+                    if let Ok(data) = unhex(data_hex) {
+                        if let Ok(mut b) = buffer.lock() {
+                            b.insert(lh, data);
+                        }
+                    }
+                }
+                tracing::warn!("deposit-spv: validations stream closed, reconnecting");
+            }
+            Err(e) => tracing::warn!(error = %e, "deposit-spv: ws connect failed"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+/// Scan validated ledgers for escrow payments and submit proofs.
+///
+/// Sequencer-only, like the reserves publisher: only that node holds the authoritative
+/// state, so a follower submitting deposits would be crediting a book it does not own.
+/// The flag is re-read every pass rather than captured, because the role changes at
+/// runtime and a driver that captured it would keep running after a demotion.
+pub async fn run_deposit_scanner(
+    cfg: DepositDriverConfig,
+    perp: crate::perp_client::PerpClient,
+    buffer: std::sync::Arc<std::sync::Mutex<ValidationBuffer>>,
+    is_sequencer: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    let http = reqwest::Client::new();
+    // In-memory, deliberately. The enclave's watermark is the durable record of what has
+    // been credited, and it refuses anything at or below it — so a restart that rescans
+    // costs a handful of AlreadySettled refusals and nothing else. Persisting a cursor
+    // here would add a second source of truth that can disagree with the first.
+    let mut next_ledger: Option<u64> = None;
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(cfg.scan_interval_secs)).await;
+        if !is_sequencer.load(Ordering::Relaxed) {
+            continue;
+        }
+
+        let validated = match fetch_validated_index(&http, &cfg.http_url).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "deposit-spv: cannot read the validated index");
+                continue;
+            }
+        };
+        let start = *next_ledger.get_or_insert(validated);
+        if start > validated {
+            continue;
+        }
+
+        // One ledger per pass. Deliberately unhurried: a backlog is not urgent (the
+        // deposits are already on XRPL and the watermark keeps them creditable), and
+        // sprinting through hundreds of ledgers would hold the enclave busy against the
+        // hourly reserves commit, which IS time-sensitive.
+        match scan_one_ledger(&http, &cfg, &perp, &buffer, start).await {
+            Ok(()) => next_ledger = Some(start + 1),
+            Err(e) => {
+                // Do NOT advance. A ledger that failed for a transient reason must be
+                // retried, and one that failed permanently will keep failing loudly
+                // rather than being skipped silently — a skipped ledger is a deposit
+                // nobody will ever notice was lost.
+                tracing::warn!(ledger = start, error = %format!("{e:#}"),
+                               "deposit-spv: ledger scan failed, will retry");
+            }
+        }
+    }
+}
+
+async fn fetch_validated_index(http: &reqwest::Client, url: &str) -> Result<u64> {
+    let body = serde_json::json!({"method": "ledger",
+        "params": [{"ledger_index": "validated", "transactions": false}]});
+    let v: serde_json::Value = http.post(url).json(&body).send().await?.json().await?;
+    v["result"]["ledger_index"]
+        .as_u64()
+        .context("no validated ledger_index in the response")
+}
+
+async fn scan_one_ledger(
+    http: &reqwest::Client,
+    cfg: &DepositDriverConfig,
+    perp: &crate::perp_client::PerpClient,
+    buffer: &std::sync::Arc<std::sync::Mutex<ValidationBuffer>>,
+    index: u64,
+) -> Result<()> {
+    // Expanded JSON first, to find the payments cheaply without parsing binary.
+    let j: serde_json::Value = http
+        .post(&cfg.http_url)
+        .json(&serde_json::json!({"method": "ledger", "params": [
+            {"ledger_index": index, "transactions": true, "expand": true}]}))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let result = &j["result"];
+    let hits = find_escrow_payments(result, &cfg.escrow_classic);
+    if hits.is_empty() {
+        return Ok(());
+    }
+
+    let ledger_hash = result["ledger_hash"]
+        .as_str()
+        .context("ledger response has no ledger_hash")?
+        .to_string();
+    let validations = {
+        let b = buffer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("buffer mutex poisoned"))?;
+        b.get(&ledger_hash).cloned()
+    };
+    let Some(validations) = validations else {
+        // We were not listening when this ledger was validated. Said plainly, because
+        // the deposit is now uncreditable through SPV and needs a human — silently
+        // moving on would lose it.
+        bail!(
+            "no buffered validations for ledger {index} ({ledger_hash}) —              {} escrow payment(s) in it cannot be proven and need reconciliation",
+            hits.len()
+        );
+    };
+
+    // Binary for the transaction bytes: the tree is rebuilt from what the validators
+    // signed, not from a JSON rendering of it.
+    let jb: serde_json::Value = http
+        .post(&cfg.http_url)
+        .json(&serde_json::json!({"method": "ledger", "params": [
+            {"ledger_index": index, "transactions": true, "expand": true, "binary": true}]}))
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    for idx in hits {
+        let proof = build_deposit_proof(&jb["result"], idx, &validations)
+            .with_context(|| format!("build proof for tx {idx} of ledger {index}"))?;
+        match perp.deposit_spv(&proof.blob).await {
+            Ok(v) => tracing::info!(
+                ledger = index,
+                user = %v["credited_user_id"].as_str().unwrap_or("?"),
+                amount_fp8 = v["amount_fp8"].as_i64().unwrap_or(0),
+                "deposit-spv: credited"
+            ),
+            Err(e) => match outcome_from_error(&format!("{e:#}")) {
+                SubmitOutcome::AlreadySettled => {}
+                SubmitOutcome::BoundaryNotArmed => {
+                    bail!("the SPV-deposit boundary is not armed — no deposit can credit until an operator arms it")
+                }
+                other => tracing::warn!(ledger = index, tx = idx, outcome = ?other,
+                                        "deposit-spv: refused"),
+            },
+        }
+    }
+    Ok(())
+}
+
 fn unhex(s: &str) -> Result<Vec<u8>> {
     if s.len() % 2 != 0 {
         bail!("odd-length hex ({} chars)", s.len());
@@ -368,6 +619,26 @@ mod tests {
         let mut j = real_ledger();
         j["ledger"]["ledger_data"] = serde_json::json!("00112233");
         assert!(build_deposit_proof(&j, 0, &[]).is_err());
+    }
+
+    #[test]
+    fn resume_errs_low_because_skipping_is_worse_than_repeating() {
+        // Below the floor the enclave refuses as AlreadySettled — cheap. Above it, a
+        // deposit is skipped forever — not cheap. So the margin is subtracted.
+        assert_eq!(resume_from(1000, 900, 10), 990);
+        assert_eq!(
+            resume_from(900, 1000, 10),
+            990,
+            "the higher of the two is the floor"
+        );
+    }
+
+    #[test]
+    fn resume_never_underflows_at_genesis() {
+        // A fresh enclave has both at 0; saturating_sub keeps this from wrapping to
+        // u64::MAX, which would skip every deposit that will ever exist.
+        assert_eq!(resume_from(0, 0, 50), 0);
+        assert_eq!(resume_from(5, 0, 50), 0);
     }
 
     #[test]

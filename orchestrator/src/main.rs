@@ -2095,6 +2095,30 @@ async fn main() -> Result<()> {
     if reserves_publisher_cfg.is_some() {
         info!("reserves publisher ENABLED (Tier-1 single attested-enclave, sequencer-only)");
     }
+
+    // #131 P3 — SPV-proven deposits. Opt-in via PERP_DEPOSIT_SPV=1: until an operator
+    // has armed the boundary every submission refuses with -85, so a driver running by
+    // default would fill the log with refusals on every upgraded node.
+    //
+    // The collector starts regardless of role and never stops. rippled serves no
+    // validation history, so a signature missed while we were not listening is gone and
+    // the deposit it would have proven becomes uncreditable — a follower that is
+    // promoted later needs the buffer already warm, not started at promotion.
+    if let Some(dcfg) = deposit_spv::DepositDriverConfig::from_env(&escrow_address) {
+        let buffer =
+            std::sync::Arc::new(std::sync::Mutex::new(deposit_spv::ValidationBuffer::new()));
+        tokio::spawn(deposit_spv::run_validation_collector(
+            dcfg.ws_url.clone(),
+            buffer.clone(),
+        ));
+        tokio::spawn(deposit_spv::run_deposit_scanner(
+            dcfg,
+            perp.clone(),
+            buffer,
+            is_sequencer.clone(),
+        ));
+        info!("deposit-spv ENABLED (collector always; scanner sequencer-only)");
+    }
     let mut last_reserves_commit = Instant::now();
 
     let price_interval = Duration::from_secs(cli.price_interval);

@@ -7,6 +7,10 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 /// Client for the Perp DEX enclave REST API at `/v1/perp/*`.
+///
+/// Clone is cheap and shares the connection pool: `reqwest::Client` is reference-counted
+/// internally, so background tasks get a handle rather than a second pool.
+#[derive(Clone)]
 pub struct PerpClient {
     base_url: String,
     client: reqwest::Client,
