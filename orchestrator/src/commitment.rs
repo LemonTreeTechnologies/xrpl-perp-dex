@@ -4,7 +4,9 @@
 //! #131 chunk 2 (alloy tx-path). This module is now ONLY the alloy transaction /
 //! query layer — it does NOT produce or sign the root. Per RESP AC-4 the root is
 //! built + signed INSIDE the enclave (a new ecall, chunk 3), and the actual
-//! `publishReserves` call is authorised by the cluster's 2-of-3 Safe (chunk 5), so
+//! `publishReserves` call is authorised by the cluster's Safe (chunk 5) — 1-of-1
+//! today, its sole owner being the sequencer enclave's own EVM key; 2-of-3 across
+//! the three enclaves is a planned Safe governance change, not the live shape — so
 //! the earlier orchestrator-side `compute_state_hashes` / `sign_commitment` path —
 //! which computed the root outside the TEE and had the enclave blind-sign it — is
 //! deleted. The old ethers-rs stack (43 crates, the cargo-audit ethereum tail) is
@@ -89,7 +91,7 @@ pub async fn query_latest_reserves(rpc_url: &str, registry: &str) -> Result<Late
 }
 
 /// Encode the `publishReserves(epoch, root, snapshotHash)` calldata. This is what
-/// the 2-of-3 Safe execTransaction wraps (chunk 5); returning the calldata keeps
+/// the Safe execTransaction wraps (chunk 5); returning the calldata keeps
 /// this module signer-free — the enclave-produced root goes in, the Safe (not this
 /// orchestrator) authorises the send.
 #[allow(dead_code)] // wired by the 3d publisher (Safe execTransaction data)

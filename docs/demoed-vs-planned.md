@@ -17,11 +17,12 @@
 - Cluster is authority over its own signer set — the XRPL SignerList is now a confirmed downstream projection (sync-before-spend + drift-halt), live
 - Escrow key signs only typed, in-enclave-verified transactions — no "sign-any-hash" oracle, **live**
 - Governed enclave-version trust — operator quorum + reproducible-build proof from ≥2 independent operators, **live and exercised on every migration**
-- On-chain proof-of-liabilities — enclave-signed merkle root published hourly to Base-Sepolia via a 2-of-3 Safe; you can verify your own account's inclusion
+- On-chain proof-of-liabilities — enclave-signed merkle root published hourly to Base-Sepolia via a Safe whose sole owner is the sequencer enclave's own key, at threshold 1 (2-of-3 across the three enclaves is planned, not live); you can verify your own account's inclusion
 - SPV-proven custody **baseline** — the enclave derived the escrow balance itself from an XRPL ledger attested by ≥80% of a validator set anchored in the measurement, so custody is not a host assertion. It is a point-in-time baseline: flows since are enclave-tracked, not yet SPV-proven, and liability *completeness* remains an in-TEE assertion — see status-and-features.md
 - 90 external audit review rounds (90 REQ / 102 RESP documents) across the membership-authority, upgrade-path and proof-of-reserves work
 
 ## Planned
+- 2-of-3 Safe publish gate (add the other two enclaves as owners, raise the threshold) — gated on full-state replication
 - Anti-MEV: enclave-key-encrypted order flow
 - Delta Neutral vault (hedged spread + funding)
 - Delta One vault (rate arbitrage)

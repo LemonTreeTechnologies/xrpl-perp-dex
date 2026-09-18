@@ -18,8 +18,9 @@ one the code does not implement — and nothing the code does implement is left 
   (V1 formal sign-off pending the accessibility + spec-faithfulness review)
 - **On-chain proof-of-liabilities** — the enclave signs a merkle root over its own
   sealed state and it is published hourly to a monotonic-epoch registry on
-  Base-Sepolia through a 2-of-3 Safe. Anyone can verify that **their own account is
-  included** in the published root
+  Base-Sepolia through a Safe whose sole owner is the sequencer enclave's own EVM
+  key, at threshold 1 (see the limits). Anyone can verify that **their own account
+  is included** in the published root
 - **SPV-proven custody baseline** — the custody figure is no longer asserted by the
   host: the enclave derived the escrow balance **itself** from an XRPL ledger
   attested by ≥80% of a validator set **anchored in the measurement**, verifying the
@@ -59,10 +60,21 @@ escrow balance on XRPL for the current on-chain number.
 enclave's own sealed state, so a third party can verify that their account is
 *included*, not that the root enumerates every liability.
 
-**The 2-of-3 Safe gate is key-custody plus a structural publish gate** — it is not
-independent economic validation of the figures.
+**The Safe publish gate is 1-of-1 today.** The live Safe (`0xa6b6bf…`, Base-Sepolia)
+has one owner and threshold 1, and that owner is the sequencer enclave's own EVM key:
+the enclave signs the Safe's EIP-712 hash *in-enclave*, so the gas-paying host key
+cannot forge a publish. The gate is therefore key-custody plus a structural publish
+gate — it is **not** independent economic validation of the figures, and it is **not**
+a second independent signer. Raising it to 2-of-3 across the three enclaves is a Safe
+governance change (add owners, raise the threshold — no contract change, no re-audit
+of the registry); it is gated on full-state replication, because today only the
+sequencer holds authoritative state, so the other two enclaves would have nothing
+independent to check the figures against.
 
 ## Roadmap
+- **2-of-3 Safe publish gate** — add the other two enclaves as Safe owners and raise
+  the threshold; gated on full-state replication (today only the sequencer holds
+  authoritative state)
 - **Anti-MEV** — order flow encrypted to the enclave's attested public key
   (not yet implemented)
 - **Delta-Neutral vault** (hedged spread + funding) and **Delta-One vault**
