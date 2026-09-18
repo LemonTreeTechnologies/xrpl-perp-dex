@@ -68,7 +68,7 @@ Empirical evidence on our system:
 The naming `Dockerfile.azure` and the comment "matching Azure runtime" historically created the impression that we have an "Azure binary" and a "Hetzner binary." We don't, except by accident of when builds were done.
 
 What is actually true:
-- `Dockerfile.azure` was added 2026-04-08 to **make builds reproducible** — primary motivation was Azure DCsv3 cluster requiring all 3 peers to attest the same MRENCLAVE for FROST cross-machine signing. Pre-Dockerfile, builds were operator-laptop-or-Hetzner-local with whatever SDK happened to be installed → MRENCLAVE drift on every rebuild.
+- `Dockerfile.azure` was added 2026-04-08 to **make builds reproducible** — primary motivation was Azure DCsv3 cluster requiring all 3 peers to attest the same MRENCLAVE for cross-machine multi-operator signing and FROST share transport. Pre-Dockerfile, builds were operator-laptop-or-Hetzner-local with whatever SDK happened to be installed → MRENCLAVE drift on every rebuild.
 - `Dockerfile.azure` was named "azure" because that was the cluster motivating it. The output binary works equally on Hetzner SGX1 (without DCAP) for non-DCAP operations and on Azure DCsv3 (with DCAP) for full peer attestation.
 - The MRENCLAVE differential between mainnet (`cf65d92a…`) and testnet (`4dfe8997…`) is **NOT** because one is "for Azure" and the other "for Hetzner." It's because they were built with **different SDK versions** at different points in time (April 7 with Hetzner local SDK ~2.25, vs subsequent builds via Dockerfile.azure with SDK 2.28).
 

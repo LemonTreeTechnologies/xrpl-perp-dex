@@ -528,7 +528,7 @@ Concrete instances we ship workarounds for, all traceable to this single cause:
 
 | Audit issue | What's needed | SGX workaround we built | TDX would do instead |
 |---|---|---|---|
-| **C-02** admin session keys | Authentication on price/funding/liquidation ecalls | Multi-operator architecture as compensating control (FROST 2-of-N quorum required) | Direct chain read of authorisation |
+| **C-02** admin session keys | Authentication on price/funding/liquidation ecalls | Multi-operator architecture as compensating control (XRPL SignerList M-of-N quorum required) | Direct chain read of authorisation |
 | **C-04** deposit trust model | Verify XRPL deposit happened | Trust orchestrator's claim, multi-operator quorum to compensate | TDX guest does SPV header-chain verification itself |
 | **E-H5** DCAP `/tmp` TOCTOU | Generate DCAP quote for attestation | Subprocess helper compiled at runtime to private dir (because DCAP QL crashes if loaded in same process as enclave) | TDX includes attestation natively in-process |
 | **Path A MRENCLAVE allowlist** (perp REQ-7 §3.4) | Old enclave knows which new MRENCLAVE is blessed | Delegation messages signed by operator quorum, verified locally inside enclave against pubkeys sealed at bootstrap | Direct on-chain read of approved MRENCLAVE |

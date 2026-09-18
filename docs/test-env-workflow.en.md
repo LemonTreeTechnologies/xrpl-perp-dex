@@ -12,7 +12,7 @@ Hetzner (single host) │   Azure 3-node cluster   │   Tom + frontend
                       │   (testnet-cluster)      │
                       │                          │
 local enclave         │   real DCAP attestation  │
-no multi-op signing   │   multi-operator FROST   │
+no multi-op signing   │   multi-op XRPL 2-of-3   │
 fast iteration        │   failover / promote     │
 accumulation bugs     │                          │
 visible here          │                          │
@@ -21,7 +21,7 @@ visible here          │                          │
 ## Flow per feature
 
 1. **dev-perp implements + runs preflight on Hetzner.** Code verification, accumulation-class scenarios (state that builds up across restarts surfaces here), rapid debug-rebuild iteration. Hetzner enclave is single-node dev SGX, no DCAP — so attestation-shape bugs are invisible. Multi-operator signing is bypassed (single-operator path used).
-2. **Deploy to Azure testnet-cluster (staging).** Binary copied to all 3 nodes, systemd swap. Cluster-only behavior gets validated here: sequencer failover, multi-operator FROST signing, real DCAP attestation, libp2p mesh dynamics. Production-shape behaviour appears here that Hetzner can't show by design.
+2. **Deploy to Azure testnet-cluster (staging).** Binary copied to all 3 nodes, systemd swap. Cluster-only behavior gets validated here: sequencer failover, multi-operator XRPL multisig signing, FROST DKG / share transport, real DCAP attestation, libp2p mesh dynamics. Production-shape behaviour appears here that Hetzner can't show by design.
 3. **Tom (and we, alongside) test against `api-dev.xperp.fi`.** Through TLS + Hetzner nginx + passive failover (`proxy_next_upstream` on 503) the request lands on the current Azure sequencer. Tom never has to know about per-env behavior — for him this is one black box with full system features. Bugs Tom surfaces here go back to step 1 for fix, then 2, then 3 (round-trip).
 
 ## Why this resolves "Hetzner ≠ Azure equivalence"
@@ -33,7 +33,7 @@ Each env contributes a different surface of validation:
 | Vault curve math, ladder placement, posture transitions | Hetzner + Azure (both have the code path) |
 | Accumulation-class bugs (Q-19-4-like) | Hetzner mandatory (state accumulates across restarts naturally) |
 | Failover / singleton respawn (X-19-2-like) | Azure mandatory (cluster-only) |
-| Multi-operator FROST signing | Azure mandatory |
+| Multi-operator signing (XRPL multisig + FROST DKG) | Azure mandatory |
 | Real DCAP attestation | Azure mandatory |
 | External-consumer access path (TLS, auth, headers) | Tom acceptance through `api-dev.xperp.fi` |
 

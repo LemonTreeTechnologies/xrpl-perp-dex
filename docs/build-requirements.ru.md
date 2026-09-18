@@ -167,7 +167,7 @@ Signing требует только sign-key file и SGX SDK `sgx_sign` tool. О
 | EPID attestation | ДА (deprecated) | Intel-managed; не используется в этом проекте |
 | **DCAP attestation quote generation** | НЕТ | требует SGX2 + Provisioning Certification |
 | ECDH-over-DCAP cross-machine peer authentication | НЕТ | depends on DCAP |
-| Multi-operator FROST signing peer (production) | НЕТ | требует DCAP для cross-machine peer attestation |
+| Multi-operator signing peer — XRPL-мультиподпись + FROST DKG (production) | НЕТ | требует DCAP для cross-machine peer attestation |
 | Test-only multi-machine peering с attestation disabled | ДА | only valid для development/testnet, не production |
 
 Implication для Path A testing: один Hetzner host может запустить OLD enclave + NEW enclave side-by-side и exercise полную Path A migration ceremony, потому что Local Attestation не требует DCAP. Это делает Hetzner полезным single-machine Path A test environment, отдельным от multi-machine Azure DCsv3 testnet кластера.

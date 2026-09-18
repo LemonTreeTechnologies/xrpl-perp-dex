@@ -28,7 +28,7 @@ Conflation produce'нула multiple documented errors во время 2026-05 b
 | Environment | XRPL network | Operating mode | Host | SGX driver / SDK | Purpose | MRENCLAVE policy |
 |---|---|---|---|---|---|---|
 | **dev-hetzner** | testnet | sandbox-single | Hetzner SGX1 (bare metal `94.130.18.162`) | OOT `isgx` + SDK 2.25 | Personal dev playground для Andrey: fast iteration на testnet code без spinning up Azure VM; experimentation; offline-from-cluster work; smoke-testing changes которые НЕ требуют multi-operator FROST или DCAP | **Local-only.** MRENCLAVE produced здесь никогда не enters любой cluster's on-chain MRENCLAVE allowlist. Ephemeral by design. |
-| **testnet-cluster** | testnet | sandbox-multi | Azure DCsv3 ×3 (`sgx-node-1` `20.71.184.176`, `sgx-node-3` `52.236.130.102`, plus 1 more) | in-kernel `/dev/sgx_enclave` + SDK 2.28 | Multi-operator FROST validation на faucet XRP; first place мы тестируем cross-machine signing, DKG, peer attestation; Path A migration ceremony testing | **Canonical** (built via committed `Dockerfile.azure`). Reproducible. Auditable. Currently MRENCLAVE `4dfe899771bdb3f3097714013d054c08c7dd6e28f2acd17948f8a08f328c011b` для commit `2c3d31f`. |
+| **testnet-cluster** | testnet | sandbox-multi | Azure DCsv3 ×3 (`sgx-node-1` `20.71.184.176`, `sgx-node-3` `52.236.130.102`, plus 1 more) | in-kernel `/dev/sgx_enclave` + SDK 2.28 | Multi-operator validation на faucet XRP: подпись сеттлмента через XRPL SignerList 2-of-3, cross-machine DKG / перенос долей FROST, peer attestation; Path A migration ceremony testing | **Canonical** (built via committed `Dockerfile.azure`). Reproducible. Auditable. Currently MRENCLAVE `4dfe899771bdb3f3097714013d054c08c7dd6e28f2acd17948f8a08f328c011b` для commit `2c3d31f`. |
 | **mainnet-sandbox** | XRPL mainnet | sandbox-single | Azure DCsv3 (new VM, post-migration) | in-kernel `/dev/sgx_enclave` + SDK 2.28 | Real XRP small amounts, operator-of-record only; pre-production proof of system на real funds; transient state — bridges к mainnet-sandbox-cluster когда second operator joins | **Canonical** (`Dockerfile.azure`), pinned via on-chain MRENCLAVE allowlist (per REQ-7 §3.4). |
 | **mainnet-sandbox-cluster** | XRPL mainnet | sandbox-multi | Azure DCsv3 ×N (≥2 operator topology, но still no real customer state) | in-kernel `/dev/sgx_enclave` + SDK 2.28 | Bridge state между single-operator sandbox и production. Real XRP small amounts, multi-operator architecture activated (foundation invariants 1–4 enforced, 5 + 7 enforced), но no real customer funds. Validation что multi-operator topology actually works на mainnet до promoting к `production`. | **Canonical** (`Dockerfile.azure`), pinned on-chain. Multi-operator reproducibility cross-check now meaningful (≥2 operators independently rebuild и verify MRENCLAVE per `feedback_reproducible_build_foundation.md`). |
 | **production** | XRPL mainnet | production (future, gated на Path A REQ-8 PASS + reproducibility cross-check by ≥N operators) | Azure DCsv3 ×N (multi-operator topology) | in-kernel `/dev/sgx_enclave` + SDK 2.28 | Multi-operator real customer funds. Full audit cycle each upgrade. Third-party human audit replaces AI-Auditor as primary gate. | **Canonical**, on-chain allowlist enforced, full audit cycle each upgrade. |
@@ -52,7 +52,7 @@ Anything что doesn't fit table — это не defined environment. Examples 
 
 ### 2.2 testnet-cluster
 
-- **Что это IS:** validation environment для cluster-level changes. 3 Azure DCsv3 VMs running cross-machine FROST 2-of-3, DCAP peer attestation, libp2p mesh. Faucet-funded XRP.
+- **Что это IS:** validation environment для cluster-level changes. 3 Azure DCsv3 VMs running подпись сеттлмента XRPL SignerList 2-of-3 плюс cross-machine FROST DKG / перенос долей, DCAP peer attestation, libp2p mesh. Faucet-funded XRP.
 - **Что это IS NOT:** dev-hetzner. Anyone confusing the two — это one mistake away from accidentally pushing non-canonical MRENCLAVE в cluster.
 - **Что at risk если ломается:** validation gate для promoting code в mainnet-sandbox. Faucet-XRP loss acceptable.
 - **Build path:** committed `Dockerfile.azure` → SDK 2.28 → MRENCLAVE matches на всех 3 peers. Reproducible-build-N-of-M required для production-mode unlock; для testnet-cluster ≥1 reproducer (GHA) sufficient today.
@@ -66,7 +66,7 @@ Anything что doesn't fit table — это не defined environment. Examples 
 
 ### 2.4 mainnet-sandbox-cluster
 
-- **Что это IS (future, transient bridge state):** validation environment между mainnet-sandbox (single-op) и production (multi-op real funds). Real XRP small amounts на XRPL mainnet, ≥2 independent operators each running свой own Azure DCsv3 VM, FROST 2-of-N + DCAP peer attestation activated. Foundation invariants 1–4 (multi-operator zero trust) + 5 (upgrade-path) + 7 (reproducibility) all enforced.
+- **Что это IS (future, transient bridge state):** validation environment между mainnet-sandbox (single-op) и production (multi-op real funds). Real XRP small amounts на XRPL mainnet, ≥2 independent operators each running свой own Azure DCsv3 VM, подпись сеттлмента XRPL SignerList M-of-N + FROST DKG + DCAP peer attestation activated. Foundation invariants 1–4 (multi-operator zero trust) + 5 (upgrade-path) + 7 (reproducibility) all enforced.
 - **Что это IS NOT:** production. No real customer funds yet — только operators' own seed XRP. AI-Auditor remains primary gate, не third-party human audit.
 - **Что at risk если ломается:** operators' own small XRP balances. Customer reputation если third parties were watching, но no customer funds.
 - **Build path:** identical к testnet-cluster и mainnet-sandbox. Same `Dockerfile.azure`. Reproducibility cross-check now actually meaningful (≥2 humans independently rebuild и confirm MRENCLAVE).
@@ -161,7 +161,7 @@ Hetzner SGX1 bare metal continues to be valuable в two non-runtime roles plus o
 
 Что Hetzner stops being:
 - ❌ **mainnet** runtime host (post-migration).
-- ❌ **testnet-cluster** peer (он не может DCAP-attest, поэтому не может meaningfully participate в cross-machine FROST).
+- ❌ **testnet-cluster** peer (он не может DCAP-attest, поэтому не может meaningfully participate в cross-machine подписи или переносе долей FROST).
 - ❌ **production** host (foundation invariants 1–7 require SGX2 + DCAP + in-kernel).
 
 ---

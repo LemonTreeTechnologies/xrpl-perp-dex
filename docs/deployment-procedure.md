@@ -128,7 +128,7 @@ The deploy agent has no operator interaction during normal deployment. The opera
 
 ### 3.5 Attestation cross-check
 
-After deploy, each node verifies its peers via DCAP attestation before re-joining the FROST signing quorum. If node A comes up with an unexpected MRENCLAVE, nodes B and C will refuse to perform signing rounds with A. This is the second line of defence: even if the deploy gate is somehow bypassed on one node, the cluster will exclude it.
+After deploy, each node verifies its peers via DCAP attestation before re-joining the signing quorum (mechanism 1 — the XRPL SignerList 2-of-3; see the clarification at the top). If node A comes up with an unexpected MRENCLAVE, nodes B and C will refuse to perform signing rounds with A. This is the second line of defence: even if the deploy gate is somehow bypassed on one node, the cluster will exclude it.
 
 This requires the post-hackathon work on `feedback_dcap_subprocess_pattern.md` and `feedback_dcap_azure_two_bugs.md` to be production-stable, and remote attestation working on whichever cloud provider is chosen for production.
 
@@ -365,16 +365,16 @@ Run through this list before touching any production node. If any item is missin
 1. **Release manifest has 2-of-3 valid signatures** (section 5). Verify each signature locally against the trust-anchor pubkeys.
 2. **Reproducible build hash matches** — you have independently built from the tagged commit and your `sha256` matches the manifest.
 3. **Previous good manifest identified** — write down its version and commit hash. This is the rollback target; do not hunt for it under pressure.
-4. **Testnet soak completed** — the exact same build has been running on the testnet cluster for ≥24h with healthy FROST rounds.
+4. **Testnet soak completed** — the exact same build has been running on the testnet cluster for ≥24h with healthy XRPL multisig signing rounds.
 5. **Cluster state snapshot taken:**
    - Current MRENCLAVE on each node (from the local attestation endpoint).
    - Current XRPL account sequence for the escrow account.
    - Current signer list on chain (addresses + quorum).
    - Escrow XRP balance and any open positions.
-   - FROST health: last successful quorum round timestamp.
+   - Signing health: last successful XRPL multisig quorum round timestamp.
 6. **No in-flight withdrawals** — check the orchestrator's pending-tx table. If non-empty, either wait for them to confirm or abort.
 7. **No unconfirmed deposits younger than 20 ledgers** — anything mid-validation should settle before you start.
-8. **All three operators reachable** in a shared channel for the duration of the window. A path-B rotation requires live 2-of-3 FROST rounds mid-procedure.
+8. **All three operators reachable** in a shared channel for the duration of the window. A path-B rotation requires live 2-of-3 XRPL multisig rounds mid-procedure (a `SignerListSet` is itself an XRPL multisigned transaction).
 9. **Rollback release is already built and hash-verified** on each node's disk as `.prev`. The rollback must not depend on a rebuild.
 
 ### 11.4 Path A — Orchestrator-only hotfix
@@ -404,7 +404,7 @@ Per-node steps:
    ```
    for i in $(seq 1 60); do curl -fsS http://localhost:3003/v1/health || exit 1; sleep 1; done
    ```
-7. Run a **dry-run FROST round** against the other two peers (no XRPL submission — the orchestrator has a diagnostic endpoint for this). Round must complete within 10 s.
+7. Run a **dry-run signing round** (XRPL multisig, mechanism 1) against the other two peers (no XRPL submission — the orchestrator has a diagnostic endpoint for this). Round must complete within 10 s.
 8. Soak 5 minutes. Watch `journalctl -u perp-dex-orchestrator-prod -f` for errors.
 9. If clean: move to the next node. If anything flaps: see §11.6 rollback.
 
@@ -456,7 +456,7 @@ Per-node steps:
    ```
    At this point the new enclave on 9089 is the only enclave on this node, but it has not yet been promoted to the production port/service name.
 
-8. **Soak before shredding (golden rule).** Run one real FROST round on mainnet (a no-op such as a trivial escrow memo payment of 1 drop back to the escrow itself, or a ping-style liveness tx agreed in advance). Wait for the tx to confirm on-chain. Confirm the new enclave signed correctly. This is the last safe window — do not skip.
+8. **Soak before shredding (golden rule).** Run one real XRPL multisig signing round on mainnet — mechanism 1, **not** a FROST round (a no-op such as a trivial escrow memo payment of 1 drop back to the escrow itself, or a ping-style liveness tx agreed in advance). An escrow Payment is authorised by the SignerList quorum; no FROST signature is involved. Wait for the tx to confirm on-chain. Confirm the new enclave signed correctly. This is the last safe window — do not skip.
 
 9. **Shred old sealed data.**
    ```
@@ -477,7 +477,7 @@ Per-node steps:
 11. **Cross-attest with peers.** Each of the other two nodes runs its attestation check against this node and must accept the new MRENCLAVE. If any peer rejects, this node is out of the quorum — see §11.7.
 
 12. **Operational soak — 10 minutes minimum.** Watch for:
-    - Healthy FROST rounds involving this node.
+    - Healthy XRPL multisig signing rounds involving this node.
     - No unexpected errors in `journalctl -u perp-dex-enclave-prod -u perp-dex-orchestrator-prod`.
     - Attestation status remains "OK" on all three nodes.
 
@@ -498,7 +498,7 @@ Listed from least to most drastic. Pick the narrowest one that matches the failu
 | Path B — remove-signer tx not confirmed within 10 min | Single node | Submit emergency SignerListSet #3 removing the *new* key. Return to original 3-signer list. Escalate. |
 | Path B — new enclave fails DCAP attestation by peers | Single node | Stop new enclave. Old enclave still running, old sealed data intact. Investigate MRENCLAVE mismatch (build env drift, wrong manifest) before re-attempting. |
 | Path B — cross-attestation after promotion fails on one peer | Single node | If soak has not yet shredded old data: restart old enclave from its sealed blobs. If shred already done: this node is out of the quorum, follow §11.7. |
-| Operational failure during post-rotation soak (bad FROST rounds, corrupted state) | Cluster | Co-sign a SignerListSet that re-adds the previous node's old key and removes its new key. Cluster returns to pre-hotfix signer set. Quarantine the bad node. |
+| Operational failure during post-rotation soak (bad signing rounds, corrupted state) | Cluster | Co-sign a SignerListSet that re-adds the previous node's old key and removes its new key. Cluster returns to pre-hotfix signer set. Quarantine the bad node. |
 | Production bug discovered after full cluster rotation | Cluster | Treat as a new release: sign 2-of-3 a manifest pointing at the previous good version. Run this runbook again in reverse. |
 
 No rollback path involves a single operator overriding the 2-of-3 requirement. If a situation seems to require that, you are either in the "two operators compromised" out-of-scope case or you have misclassified the failure.
@@ -507,7 +507,7 @@ No rollback path involves a single operator overriding the 2-of-3 requirement. I
 
 If §11.5 step 9 (shred) has completed and the new enclave then fails permanently on that node (hardware fault, MRENCLAVE mismatch that was not caught earlier, unrecoverable data corruption), the node has **no FROST share** — not old, not new.
 
-This node is out of the FROST quorum permanently until a fresh DKG ceremony runs. The cluster continues signing with 2-of-2 of the remaining nodes (the list has 3 signers, quorum 2 — mathematically intact), but the margin of safety is now zero. A second node failing during this window would freeze the escrow.
+This node is out of the FROST group permanently until a fresh DKG ceremony runs (mechanism 2). XRPL settlement signing is unaffected in principle: 2 of the 3 SignerList entries still meet quorum 2 (mechanism 1 — mathematically intact), but the margin of safety is now zero. A second node failing during this window would freeze the escrow.
 
 Recovery procedure (separate from this runbook):
 
@@ -520,7 +520,7 @@ DKG itself is a separate ceremony and is out of scope of this document. It is do
 
 ### 11.8 Golden rule
 
-> **Do not shred old sealed data until the new enclave has signed at least one real FROST round on mainnet.**
+> **Do not shred old sealed data until the new enclave has signed at least one real XRPL multisig round on mainnet** (mechanism 1 — not a FROST round).
 
 Everything before the shred is reversible. The shred is the point of no return for that node. The 10-minute soak at §11.5 step 8 exists specifically so you have a last safe window to abort.
 

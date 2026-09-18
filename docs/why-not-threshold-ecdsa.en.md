@@ -79,6 +79,6 @@ In both scenarios the effort estimate from the talk is "research-grade, 4–6 mo
 - DKLS family — Doerner, Kondi, Lee, Shelat (2018, 2019, 2023) — "Secure Two-party Threshold ECDSA from ECDSA Assumptions" and follow-ups; the 2023 paper consolidates the protocol used in current DKLS implementations.
 - KOS protocol — Keller, Orsini, Scholl (2015) for OT-extension; the 2025 paper revising KOS's CD-security argument was referenced by the talk's audience (Mike Voronov, in chat).
 - `docs/cluster-trust-model-decision.md` — DCAP cross-attestation choice and rejection of operator-signed roster.
-- `docs/sgx-enclave-capabilities-and-limits.md` — SGX trust model + FROST 2-of-3 framing.
+- `docs/sgx-enclave-capabilities-and-limits.md` — SGX trust model + 2-of-3 multi-operator framing (XRPL SignerList ECDSA; FROST is an enclave primitive for the Bitcoin leg).
 - `docs/multi-operator-architecture.md` §1 (trust model), §10 (subcommand classes).
 - `SECURITY-REAUDIT-4.md` X-C1 hardening — the per-tx-type signing-policy pattern that bounds this layer's audit surface.

@@ -12,7 +12,7 @@ This document fixes the policy for which **environment** Tom's components target
 
 Tom's component connects to **our same-environment instance**, never crosses environments:
 
-- Tom-**testnet** client → our **testnet** API (Azure DCsv3 cluster, escrow `rbqCUxgi…`, faucet-funded, multi-operator FROST 2-of-3, current code at `master` HEAD).
+- Tom-**testnet** client → our **testnet** API (Azure DCsv3 cluster, escrow `rbqCUxgi…`, faucet-funded, multi-operator XRPL SignerList 2-of-3 (independent per-operator ECDSA, not FROST), current code at `master` HEAD).
 - Tom-**mainnet-sandbox** client → our **mainnet-sandbox** API (Hetzner mainnet stack) — only after the graduation gate in §4.
 - Tom-**production** client → out of scope this document; production has its own launch playbook per `development-operating-model.md` §1.3.
 

@@ -28,7 +28,7 @@ Each row is the unique tuple of all four axes, given a stable name. The combinat
 | Environment | XRPL network | Operating mode | Host | SGX driver / SDK | Purpose | MRENCLAVE policy |
 |---|---|---|---|---|---|---|
 | **dev-hetzner** | testnet | sandbox-single | Hetzner SGX1 (bare metal `94.130.18.162`) | OOT `isgx` + SDK 2.25 | Personal dev playground for Andrey: fast iteration on testnet code without spinning up an Azure VM; experimentation; offline-from-cluster work; smoke-testing changes that do NOT require multi-operator FROST or DCAP | **Local-only.** The MRENCLAVE produced here never enters any cluster's on-chain MRENCLAVE allowlist. Ephemeral by design. |
-| **testnet-cluster** | testnet | sandbox-multi | Azure DCsv3 ×3 (`sgx-node-1` `20.71.184.176`, `sgx-node-3` `52.236.130.102`, plus 1 more) | in-kernel `/dev/sgx_enclave` + SDK 2.28 | Multi-operator FROST validation on faucet XRP; first place we test cross-machine signing, DKG, peer attestation; Path A migration ceremony testing | **Canonical** (built via committed `Dockerfile.azure`). Reproducible. Auditable. Currently MRENCLAVE `4dfe899771bdb3f3097714013d054c08c7dd6e28f2acd17948f8a08f328c011b` for commit `2c3d31f`. |
+| **testnet-cluster** | testnet | sandbox-multi | Azure DCsv3 ×3 (`sgx-node-1` `20.71.184.176`, `sgx-node-3` `52.236.130.102`, plus 1 more) | in-kernel `/dev/sgx_enclave` + SDK 2.28 | Multi-operator validation on faucet XRP: XRPL SignerList 2-of-3 settlement signing, cross-machine DKG / FROST share transport, peer attestation; Path A migration ceremony testing | **Canonical** (built via committed `Dockerfile.azure`). Reproducible. Auditable. Currently MRENCLAVE `4dfe899771bdb3f3097714013d054c08c7dd6e28f2acd17948f8a08f328c011b` for commit `2c3d31f`. |
 | **mainnet-sandbox** | XRPL mainnet | sandbox-single | Azure DCsv3 (new VM, post-migration) | in-kernel `/dev/sgx_enclave` + SDK 2.28 | Real XRP small amounts, operator-of-record only; pre-production proof of system on real funds; transient state — bridges to mainnet-sandbox-cluster when a second operator joins | **Canonical** (`Dockerfile.azure`), pinned via on-chain MRENCLAVE allowlist (per REQ-7 §3.4). |
 | **mainnet-sandbox-cluster** | XRPL mainnet | sandbox-multi | Azure DCsv3 ×N (≥2 operator topology, but still no real customer state) | in-kernel `/dev/sgx_enclave` + SDK 2.28 | The bridge state between single-operator sandbox and production. Real XRP small amounts, multi-operator architecture activated (foundation invariants 1–4 enforced, 5 + 7 enforced), but no real customer funds. Validation that the multi-operator topology actually works on mainnet before promoting to `production`. | **Canonical** (`Dockerfile.azure`), pinned on-chain. Multi-operator reproducibility cross-check now meaningful (≥2 operators independently rebuild and verify MRENCLAVE per `feedback_reproducible_build_foundation.md`). |
 | **production** | XRPL mainnet | production (future, gated on Path A REQ-8 PASS + reproducibility cross-check by ≥N operators) | Azure DCsv3 ×N (multi-operator topology) | in-kernel `/dev/sgx_enclave` + SDK 2.28 | Multi-operator real customer funds. Full audit cycle each upgrade. Third-party human audit replaces AI-Auditor as primary gate. | **Canonical**, on-chain allowlist enforced, full audit cycle each upgrade. |
@@ -52,7 +52,7 @@ Anything that doesn't fit the table is not a defined environment. Examples of th
 
 ### 2.2 testnet-cluster
 
-- **What it IS:** the validation environment for cluster-level changes. 3 Azure DCsv3 VMs running cross-machine FROST 2-of-3, DCAP peer attestation, libp2p mesh. Faucet-funded XRP.
+- **What it IS:** the validation environment for cluster-level changes. 3 Azure DCsv3 VMs running XRPL SignerList 2-of-3 settlement signing plus cross-machine FROST DKG / share transport, DCAP peer attestation, libp2p mesh. Faucet-funded XRP.
 - **What it IS NOT:** dev-hetzner. Anyone confusing the two is one mistake away from accidentally pushing a non-canonical MRENCLAVE into the cluster.
 - **What's at risk if it breaks:** validation gate for promoting code to mainnet-sandbox. Faucet-XRP loss is acceptable.
 - **Build path:** committed `Dockerfile.azure` → SDK 2.28 → MRENCLAVE matches on all 3 peers. Reproducible-build-N-of-M required for production-mode unlock; for testnet-cluster ≥1 reproducer (GHA) is sufficient today.
@@ -66,7 +66,7 @@ Anything that doesn't fit the table is not a defined environment. Examples of th
 
 ### 2.4 mainnet-sandbox-cluster
 
-- **What it IS (future, transient bridge state):** the validation environment between mainnet-sandbox (single-op) and production (multi-op real funds). Real XRP small amounts on XRPL mainnet, ≥2 independent operators each running their own Azure DCsv3 VM, FROST 2-of-N + DCAP peer attestation activated. Foundation invariants 1–4 (multi-operator zero trust) + 5 (upgrade-path) + 7 (reproducibility) all enforced.
+- **What it IS (future, transient bridge state):** the validation environment between mainnet-sandbox (single-op) and production (multi-op real funds). Real XRP small amounts on XRPL mainnet, ≥2 independent operators each running their own Azure DCsv3 VM, XRPL SignerList M-of-N settlement signing + FROST DKG + DCAP peer attestation activated. Foundation invariants 1–4 (multi-operator zero trust) + 5 (upgrade-path) + 7 (reproducibility) all enforced.
 - **What it IS NOT:** production. No real customer funds yet — only the operators' own seed XRP. AI-Auditor remains the primary gate, not third-party human audit.
 - **What's at risk if it breaks:** the operators' own small XRP balances. Customer reputation if third parties were watching, but no customer funds.
 - **Build path:** identical to testnet-cluster and mainnet-sandbox. Same `Dockerfile.azure`. Reproducibility cross-check is now actually meaningful (≥2 humans independently rebuild and confirm MRENCLAVE).
@@ -161,7 +161,7 @@ Hetzner SGX1 bare metal continues to be valuable in two non-runtime roles plus o
 
 What Hetzner stops being:
 - ❌ The **mainnet** runtime host (post-migration).
-- ❌ A **testnet-cluster** peer (it cannot DCAP-attest, so cannot meaningfully participate in cross-machine FROST).
+- ❌ A **testnet-cluster** peer (it cannot DCAP-attest, so cannot meaningfully participate in cross-machine signing or FROST share transport).
 - ❌ A **production** host (foundation invariants 1–7 require SGX2 + DCAP + in-kernel).
 
 ---
