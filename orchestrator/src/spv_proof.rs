@@ -436,6 +436,103 @@ pub fn build_xdep_blob(
     Ok(b)
 }
 
+#[cfg(test)]
+mod xspv_producer_tests {
+    use super::*;
+    use crate::spv_proof_vector as v;
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn real_proof() -> XspvProof {
+        let mut leaf_index = [0u8; 32];
+        leaf_index.copy_from_slice(&unhex(v::ESCROW_KEYLET));
+        let inner: Vec<[u8; 512]> = v::INNER_ROOT_TO_LEAF
+            .iter()
+            .map(|h| {
+                let mut n = [0u8; 512];
+                n.copy_from_slice(&unhex(h));
+                n
+            })
+            .collect();
+        XspvProof {
+            kind: 0,
+            leaf_index,
+            leaf_data: unhex(v::ESCROW_LEAF),
+            inner_root_to_leaf: inner,
+        }
+    }
+
+    /// The gap this closes: `build_xspv_blob` assembles the blob for the RESERVES path —
+    /// the one live in production since 2026-09-08 — and had no test at all. The enclave
+    /// suite tests its parser against a blob the enclave's own test builds by hand in
+    /// C++, so the Rust producer and the C++ consumer had never met. Both sides are
+    /// mine, written from one reading of the format; it works in production, which is
+    /// real evidence, but nothing would have caught a drift.
+    ///
+    /// Found by taking the auditor's question about the deposit module seriously and
+    /// asking it of the others: which module has tests on its edges and none on its
+    /// centre?
+    #[test]
+    fn the_blob_verifies_against_the_root_the_validators_signed() {
+        let p = real_proof();
+        let mut account_hash = [0u8; 32];
+        account_hash.copy_from_slice(&unhex(v::ACCOUNT_HASH));
+        assert!(
+            verify_inclusion(&p, &account_hash),
+            "the real escrow proof must reach the signed account_hash"
+        );
+    }
+
+    #[test]
+    fn the_producer_emits_what_the_parser_expects() {
+        // Mirrors the enclave parser's layout expectations byte for byte, so a change to
+        // either side that the other does not follow shows up here rather than as a
+        // refused ceremony.
+        let header = [0x11u8; HEADER_LEN];
+        let blob = build_xspv_blob(&header, 0, &[], &[real_proof()]).expect("blob builds");
+
+        assert_eq!(&blob[0..4], b"XSPV", "magic");
+        assert_eq!(blob[4], 1, "version");
+        assert_eq!(&blob[5..7], &[0, 118], "header length, big-endian");
+        assert_eq!(&blob[7..7 + HEADER_LEN], &header[..], "header verbatim");
+        let p = 7 + HEADER_LEN;
+        assert_eq!(&blob[p..p + 2], &[0, 0], "validation count");
+        assert_eq!(blob[p + 2], 1, "proof count");
+        assert_eq!(blob[p + 3], 0, "kind = AccountRoot");
+        assert_eq!(
+            &blob[p + 4..p + 36],
+            &unhex(v::ESCROW_KEYLET)[..],
+            "leaf index"
+        );
+
+        let leaf = unhex(v::ESCROW_LEAF);
+        let ll = u16::from_be_bytes([blob[p + 36], blob[p + 37]]) as usize;
+        assert_eq!(ll, leaf.len(), "leaf length");
+        assert_eq!(&blob[p + 38..p + 38 + ll], &leaf[..], "leaf verbatim");
+        assert_eq!(blob[p + 38 + ll], 7, "depth");
+        assert_eq!(
+            blob.len(),
+            p + 39 + ll + 7 * 512,
+            "no trailing bytes — the enclave refuses a blob with any"
+        );
+    }
+
+    /// A depth past what the wire format can express must refuse, not truncate. The
+    /// enclave caps depth at 64 anyway, but a producer that silently wrote a wrong byte
+    /// would emit a blob that fails inclusion for a reason nothing reports.
+    #[test]
+    fn an_inexpressible_depth_is_refused() {
+        let mut p = real_proof();
+        p.inner_root_to_leaf = vec![[0u8; 512]; 300];
+        assert!(build_xspv_blob(&[0u8; HEADER_LEN], 0, &[], &[p]).is_err());
+    }
+}
+
 // ── async fetch (ws validations + HTTP header/proof → XSPV blob) ───────────────
 use std::collections::HashMap;
 use std::time::Duration;

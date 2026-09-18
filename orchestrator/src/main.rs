@@ -43,6 +43,8 @@ pub mod shard_router;
 mod signerlist_update;
 mod singleton;
 mod spv_proof; // AC-BASE-2″ P2-d — XRPL SPV proof builder/fetcher
+#[cfg(test)]
+mod spv_proof_vector; // the live reserves-path vectors, mirrored from the enclave suite
 mod trading;
 mod tx_shamap; // #131 P3 — rebuild a ledger's tx SHAMap + read inclusion paths off it
 #[cfg(test)]
