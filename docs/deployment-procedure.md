@@ -404,7 +404,9 @@ Per-node steps:
    ```
    for i in $(seq 1 60); do curl -fsS http://localhost:3003/v1/health || exit 1; sleep 1; done
    ```
-7. Run a **dry-run signing round** (XRPL multisig, mechanism 1) against the other two peers (no XRPL submission — the orchestrator has a diagnostic endpoint for this). Round must complete within 10 s.
+7. Run a **dry-run signing round** against the other two peers (no XRPL submission). Round must complete within 10 s.
+
+   > **⚠ NOT EXECUTABLE TODAY (verified 2026-09-18).** No such diagnostic endpoint exists. The orchestrator's only `dry_run` (`signerlist_update.rs`) returns *before* any peer signature is collected — it builds the unsigned tx and stops — so it is not a peer signing round. Neither mechanism has a reachable "prove the quorum still signs" probe: mechanism 2's `ecall_frost_nonce_gen` / `partial_sign` / `partial_sig_agg` are implemented and are exposed on each enclave's own loopback API (`/v1/pool/frost/*`), but no cluster-level round driver exists in the orchestrator, so a 3-node round cannot be initiated. Until that lands, this step cannot be performed; treat the soak in step 8 as the first real signing evidence.
 8. Soak 5 minutes. Watch `journalctl -u perp-dex-orchestrator-prod -f` for errors.
 9. If clean: move to the next node. If anything flaps: see §11.6 rollback.
 
