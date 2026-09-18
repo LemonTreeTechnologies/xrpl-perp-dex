@@ -180,7 +180,6 @@ impl PerpClient {
     /// snapshot, so the on-chain custody≥liabilities claim discloses the declared
     /// exclusion set (tamper-EVIDENT, not SPV-verified). Empty slice → the enclave's
     /// empty-set sentinel.
-    #[allow(clippy::too_many_arguments)]
     /// #131 P3 — arm the SPV-deposit boundary. No arguments: the enclave copies its own
     /// sealed reserves floor, so there is no value for this side to supply.
     pub async fn arm_spv_deposit_boundary(&self) -> Result<Value> {
@@ -201,6 +200,7 @@ impl PerpClient {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn reserves_commit(
         &self,
         account_id: &str,
