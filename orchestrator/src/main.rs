@@ -14,6 +14,7 @@ mod db;
 mod deposit_spv; // #131 P3 — assemble SPV deposit proofs for the enclave
 mod dkg_coordinate;
 mod election;
+mod frost_round; // FROST threshold-Schnorr signing round driver
 mod http_helpers;
 mod membership_admin;
 mod membership_apply;

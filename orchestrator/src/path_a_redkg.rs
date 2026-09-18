@@ -168,6 +168,13 @@ pub fn router(state: Arc<AdminState>) -> Router {
     Router::new()
         .route("/admin/path-a/share-export", post(handle_share_export))
         .with_state(state)
+        // FROST signing-round probe. Stateless (the caller names the enclave,
+        // the signer set and the group key), so it is merged rather than
+        // sharing AdminState.
+        .merge(Router::new().route(
+            "/admin/frost/round",
+            post(crate::frost_round::handle_frost_round),
+        ))
 }
 
 /// Bind a 127.0.0.1-only admin HTTP listener. Errors if `listen_addr`
