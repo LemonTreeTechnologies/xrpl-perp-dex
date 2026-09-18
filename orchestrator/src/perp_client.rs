@@ -181,6 +181,26 @@ impl PerpClient {
     /// exclusion set (tamper-EVIDENT, not SPV-verified). Empty slice → the enclave's
     /// empty-set sentinel.
     #[allow(clippy::too_many_arguments)]
+    /// #131 P3 — arm the SPV-deposit boundary. No arguments: the enclave copies its own
+    /// sealed reserves floor, so there is no value for this side to supply.
+    pub async fn arm_spv_deposit_boundary(&self) -> Result<Value> {
+        self.post("/perp/deposit-spv/arm", serde_json::json!({}))
+            .await
+    }
+
+    /// #131 P3 — submit a proven deposit.
+    ///
+    /// Only the blob goes over the wire. Sender, amount, ledger and transaction identity
+    /// come back in the response, derived in-enclave — this side never asserts them,
+    /// which is the whole point of the path.
+    pub async fn deposit_spv(&self, proof_blob: &[u8]) -> Result<Value> {
+        self.post(
+            "/perp/deposit-spv",
+            serde_json::json!({ "proof_blob": hex::encode(proof_blob) }),
+        )
+        .await
+    }
+
     pub async fn reserves_commit(
         &self,
         account_id: &str,

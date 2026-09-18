@@ -220,6 +220,66 @@ pub fn find_escrow_payments(ledger_json: &serde_json::Value, escrow_classic: &st
         .collect()
 }
 
+/// Outcome of offering one proven deposit to the enclave.
+///
+/// The distinction that matters operationally is PERMANENT vs TRANSIENT. A driver that
+/// retries everything hammers a refusal that will never change; a driver that retries
+/// nothing drops a deposit over a momentary failure. The enclave's codes carry that
+/// distinction and this preserves it rather than collapsing everything to an error.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SubmitOutcome {
+    /// Credited.
+    Credited { user_id: String, amount_fp8: i64 },
+    /// Already in the dedup ring (-2), or below the watermark/boundary (-86). Expected
+    /// in normal operation — a rescan sees deposits it has already submitted — and never
+    /// worth retrying or logging as a failure.
+    AlreadySettled,
+    /// The enclave refused for a reason that will not change: not a Payment, not to our
+    /// escrow, failed, partial, non-native, not in the tree. Retrying is pointless; the
+    /// deposit needs a human if it was expected to credit.
+    PermanentRefusal(i32),
+    /// The boundary is not armed (-85). Not a deposit problem at all — the operator has
+    /// not run the activation — so every deposit will refuse until they do. Called out
+    /// separately because it is the one refusal that says "stop and do something".
+    BoundaryNotArmed,
+    /// Transport or an unrecognised code. Worth retrying.
+    Transient(String),
+}
+
+/// Classify what the enclave said. Pure, so the mapping is testable without a cluster.
+///
+/// Unknown NEGATIVE codes are treated as PERMANENT, not transient. That is the
+/// conservative direction here: a new refusal we do not recognise is far more likely to
+/// be a new gate than a hiccup, and retrying it forever would bury the message that
+/// something needs attention.
+pub fn classify_submit(rc: i32) -> SubmitOutcome {
+    match rc {
+        -2 | -86 => SubmitOutcome::AlreadySettled,
+        -85 => SubmitOutcome::BoundaryNotArmed,
+        _ => SubmitOutcome::PermanentRefusal(rc),
+    }
+}
+
+/// Pull the enclave's `rc=` out of the error text the HTTP layer surfaces.
+///
+/// The handler reports refusals as a 400 with the code in the message, so this is how a
+/// structured outcome is recovered from an unstructured error. If the code cannot be
+/// found the failure is TRANSIENT, not permanent: an unparseable error is more likely a
+/// transport problem than a verdict, and mistaking one for a permanent refusal would
+/// silently drop a creditable deposit.
+pub fn outcome_from_error(msg: &str) -> SubmitOutcome {
+    if let Some(i) = msg.find("rc=") {
+        let rest = &msg[i + 3..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '-')
+            .unwrap_or(rest.len());
+        if let Ok(rc) = rest[..end].parse::<i32>() {
+            return classify_submit(rc);
+        }
+    }
+    SubmitOutcome::Transient(msg.to_string())
+}
+
 fn unhex(s: &str) -> Result<Vec<u8>> {
     if s.len() % 2 != 0 {
         bail!("odd-length hex ({} chars)", s.len());
@@ -308,6 +368,54 @@ mod tests {
         let mut j = real_ledger();
         j["ledger"]["ledger_data"] = serde_json::json!("00112233");
         assert!(build_deposit_proof(&j, 0, &[]).is_err());
+    }
+
+    #[test]
+    fn already_settled_is_not_a_failure() {
+        // A rescan re-offering a credited deposit is NORMAL. Treating -2 as an error
+        // would make routine operation look broken.
+        assert_eq!(classify_submit(-2), SubmitOutcome::AlreadySettled);
+        assert_eq!(classify_submit(-86), SubmitOutcome::AlreadySettled);
+    }
+
+    #[test]
+    fn an_unarmed_boundary_is_called_out_separately() {
+        // Every deposit refuses until an operator arms it, so this must not look like
+        // one bad deposit among many.
+        assert_eq!(classify_submit(-85), SubmitOutcome::BoundaryNotArmed);
+    }
+
+    #[test]
+    fn unknown_codes_are_permanent_not_transient() {
+        // The conservative direction: an unrecognised refusal is more likely a new gate
+        // than a hiccup, and retrying forever would bury it.
+        assert_eq!(classify_submit(-19), SubmitOutcome::PermanentRefusal(-19));
+        assert_eq!(
+            classify_submit(-12345),
+            SubmitOutcome::PermanentRefusal(-12345)
+        );
+    }
+
+    #[test]
+    fn codes_are_recovered_from_the_error_text() {
+        assert_eq!(
+            outcome_from_error("SPV deposit refused (rc=-85)"),
+            SubmitOutcome::BoundaryNotArmed
+        );
+        assert_eq!(
+            outcome_from_error("SPV deposit refused (rc=-2)"),
+            SubmitOutcome::AlreadySettled
+        );
+    }
+
+    #[test]
+    fn an_unparseable_error_is_transient_not_permanent() {
+        // Mistaking a transport failure for a verdict would silently drop a creditable
+        // deposit, so the ambiguous case must fall to the retryable side.
+        match outcome_from_error("connection reset by peer") {
+            SubmitOutcome::Transient(_) => {}
+            other => panic!("expected Transient, got {other:?}"),
+        }
     }
 
     #[test]
