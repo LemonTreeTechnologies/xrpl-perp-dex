@@ -51,7 +51,8 @@ check "β8"  "PerpMetaLegacyB8"  "PERP_META_B8_LEN"
 check "β9"  "PerpMetaLegacyB9"  "PERP_META_B9_LEN"
 check "β10" "PerpMetaLegacyB10" "PERP_META_B10_LEN"
 check "β12" "PerpMetaLegacyB12" "PERP_META_B12_LEN"
-check "β14" "PerpMeta"          "PERP_META_B14_LEN"
+check "β14" "PerpMetaLegacyB14" "PERP_META_B14_LEN"
+check "β15" "PerpMeta"          "PERP_META_B15_LEN"
 
 if [ "$fail" -ne 0 ]; then
   echo "============================================================"

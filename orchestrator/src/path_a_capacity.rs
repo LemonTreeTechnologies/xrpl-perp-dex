@@ -74,8 +74,10 @@ pub mod limits {
     /// β12 = β10 + 8 (#131 AC-BASE-2″ P2-c reserves_ledger_floor). β12 and β13 both
     /// sealed this — β13 changed no perp-meta field.
     pub const PERP_META_B12_LEN: u64 = 144;
-    /// β14 = β12 + 8 (#131 P3 C-P3-5 spv_deposits_mandatory_from) — the current schema.
+    /// β14 = β12 + 8 (#131 P3 C-P3-5 spv_deposits_mandatory_from).
     pub const PERP_META_B14_LEN: u64 = 152;
+    /// β15 = β14 + 8 (#131 Safe projection base_projection_confirmed_epoch) — current.
+    pub const PERP_META_B15_LEN: u64 = 160;
 }
 
 /// One limit check with the numbers behind the verdict.
@@ -147,8 +149,19 @@ pub enum MetaSchema {
     /// Schema-aware load upgrades it into β14 (LEGACY_B12 → zero-fill the SPV-deposit
     /// boundary). Migratable — this is the OLD size for a β13→β14 (P3) migration.
     LegacyB12,
-    /// == 152: already the β14 (current) schema. Not a blocker — the load is a no-op.
-    AlreadyB14,
+    /// == 152: the β14 schema. It was "already current" until β15 appended
+    /// `base_projection_confirmed_epoch`; the schema-aware load upgrades it in place,
+    /// zero-filling that field — which HALTS reserves publishing until the cluster
+    /// confirms a Base projection, deliberately, so a migration cannot inherit a sync it
+    /// never verified. Migratable.
+    ///
+    /// This mirror has silently lagged the enclave across TWO schema bumps before and
+    /// surfaced as a false STOP under live-migration pressure; the drift gate
+    /// (`scripts/check-meta-sizes-vs-enclave.sh`) exists because a lockstep comment did
+    /// not prevent it.
+    LegacyB14,
+    /// == 160: the β15 schema. Already current — nothing to upgrade.
+    AlreadyB15,
     /// Any other length, an unreadable header, or a size that doesn't reconcile with the
     /// file. The current enclave load HARD-FAILS this (AC-CHUNK3-3) — so promoting a node
     /// in this state would strand it. STOP before the point of no return.
@@ -215,7 +228,8 @@ fn classify_perp_meta(payload_len: Option<u64>) -> MetaSchema {
         Some(limits::PERP_META_B9_LEN) => MetaSchema::LegacyB9,
         Some(limits::PERP_META_B10_LEN) => MetaSchema::LegacyB10,
         Some(limits::PERP_META_B12_LEN) => MetaSchema::LegacyB12,
-        Some(limits::PERP_META_B14_LEN) => MetaSchema::AlreadyB14,
+        Some(limits::PERP_META_B14_LEN) => MetaSchema::LegacyB14,
+        Some(limits::PERP_META_B15_LEN) => MetaSchema::AlreadyB15,
         _ => MetaSchema::Unknown,
     }
 }
@@ -378,7 +392,8 @@ pub fn render(report: &CapacityReport) -> String {
                 MetaSchema::LegacyB12 => {
                     "β12/β13 (144B) → migratable: β14 load zero-fills spv_deposits_mandatory_from (LEGACY_B12)"
                 }
-                MetaSchema::AlreadyB14 => "β14 (152B) → already current schema (no-op)",
+                MetaSchema::LegacyB14 => "β14 (152B) → upgrades to β15 (160B): zero-fills base_projection_confirmed_epoch, which HALTS publishing until a Base projection is confirmed",
+                MetaSchema::AlreadyB15 => "β15 (160B) → already current schema (no-op)",
                 MetaSchema::Unknown => {
                     "UNKNOWN size → NON-migratable — current load HARD-FAILS (STOP)"
                 }
@@ -557,7 +572,7 @@ mod tests {
         write_sealed_meta(d, "s0_perp_meta.sealed", limits::PERP_META_B14_LEN);
         let r = assess_accounts_dir(d).unwrap();
         assert!(r.ok(), "β14 meta must pass: {}", render(&r));
-        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB14);
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::LegacyB14);
         assert!(meta_check(&r).ok);
     }
 
