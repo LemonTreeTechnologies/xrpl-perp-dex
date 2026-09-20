@@ -182,6 +182,12 @@ pub fn router(state: Arc<AdminState>) -> Router {
             "/admin/safe/exec",
             post(crate::safe_governance::handle_safe_exec),
         ))
+        // What owner set does the sealed membership imply, and are we in sync? The
+        // operator reads the plan here and relays it; they do not compose an operation.
+        .merge(Router::new().route(
+            "/admin/safe/projection",
+            post(crate::safe_projection::handle_projection),
+        ))
 }
 
 /// Bind a 127.0.0.1-only admin HTTP listener. Errors if `listen_addr`

@@ -179,32 +179,15 @@ pub struct SafeExecRequest {
     pub safe_tx_hash: String,
     /// 65-byte owner signatures, hex, in any order.
     pub signatures: Vec<String>,
-    /// Which owner-management call to make.
-    pub op: SafeOpRequest,
-}
-
-/// Wire form of [`SafeOp`]. Separate from the enum so the JSON shape can be explicit about
-/// which fields each operation needs rather than carrying four optional ones.
-#[derive(serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SafeOpRequest {
-    AddOwner {
-        owner: String,
-        threshold: u64,
-    },
-    RemoveOwner {
-        prev_owner: String,
-        owner: String,
-        threshold: u64,
-    },
-    SwapOwner {
-        prev_owner: String,
-        old_owner: String,
-        new_owner: String,
-    },
-    ChangeThreshold {
-        threshold: u64,
-    },
+    /// The calldata to execute, hex.
+    ///
+    /// Deliberately NOT an operation the caller picks. It comes from
+    /// `/admin/safe/projection`, which derives the plan from the sealed membership — an
+    /// operator choosing "add this owner" would be governing the Safe on the side, which
+    /// is the whole thing this design exists to stop. The quorum bundle the enclaves
+    /// required is over the hash of exactly these bytes, so a calldata that did not come
+    /// from the plan cannot have been signed.
+    pub data: String,
 }
 
 #[derive(serde::Serialize)]
@@ -214,47 +197,7 @@ pub struct SafeExecResponse {
     pub owners_in_order: Vec<String>,
 }
 
-fn addr20(s: &str) -> Result<[u8; 20]> {
-    let b = hex::decode(s.trim_start_matches("0x")).context("address is not hex")?;
-    if b.len() != 20 {
-        bail!("address must be 20 bytes, got {}", b.len());
-    }
-    let mut a = [0u8; 20];
-    a.copy_from_slice(&b);
-    Ok(a)
-}
-
-impl SafeOpRequest {
-    fn into_op(self) -> Result<SafeOp> {
-        Ok(match self {
-            SafeOpRequest::AddOwner { owner, threshold } => SafeOp::AddOwner {
-                owner: addr20(&owner)?,
-                threshold,
-            },
-            SafeOpRequest::RemoveOwner {
-                prev_owner,
-                owner,
-                threshold,
-            } => SafeOp::RemoveOwner {
-                prev_owner: addr20(&prev_owner)?,
-                owner: addr20(&owner)?,
-                threshold,
-            },
-            SafeOpRequest::SwapOwner {
-                prev_owner,
-                old_owner,
-                new_owner,
-            } => SafeOp::SwapOwner {
-                prev_owner: addr20(&prev_owner)?,
-                old_owner: addr20(&old_owner)?,
-                new_owner: addr20(&new_owner)?,
-            },
-            SafeOpRequest::ChangeThreshold { threshold } => SafeOp::ChangeThreshold { threshold },
-        })
-    }
-}
-
-/// `POST /admin/safe/exec`
+/// `POST /admin/safe/exec` — order the owner signatures and submit the self-call.
 pub async fn handle_safe_exec(
     axum::Json(req): axum::Json<SafeExecRequest>,
 ) -> std::result::Result<axum::Json<SafeExecResponse>, (axum::http::StatusCode, String)> {
@@ -265,6 +208,12 @@ pub async fn handle_safe_exec(
     let hash: [u8; 32] = h
         .try_into()
         .map_err(|_| bad(anyhow::anyhow!("safe_tx_hash must be 32 bytes")))?;
+
+    let data = hex::decode(req.data.trim_start_matches("0x"))
+        .map_err(|e| bad(anyhow::anyhow!("data is not hex: {e}")))?;
+    if data.is_empty() {
+        return Err(bad(anyhow::anyhow!("data is empty")));
+    }
 
     let mut sigs = Vec::with_capacity(req.signatures.len());
     for s in &req.signatures {
@@ -286,9 +235,6 @@ pub async fn handle_safe_exec(
         })
         .collect::<Result<Vec<_>>>()
         .map_err(bad)?;
-
-    let op = req.op.into_op().map_err(bad)?;
-    let data = op.calldata();
 
     // Same configuration the publisher reads; there is no second way to hold these.
     let rpc = std::env::var("RESERVES_RPC_URL")

@@ -41,6 +41,7 @@ mod rate_limit;
 mod reserves_baseline; // AC-BASE — one-time custody-baseline ceremony (hash + recovery + bundle)
 mod reserves_publisher; // #131 3d — Tier-1 reserves publisher
 mod safe_governance; // #131 Safe owner-management calldata + signature ordering
+mod safe_projection; // #131 the Safe owner set as a projection of sealed membership
 pub mod shard_router;
 mod signerlist_update;
 mod singleton;
