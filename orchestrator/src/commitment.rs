@@ -124,6 +124,59 @@ pub async fn query_safe_nonce(rpc_url: &str, safe: &str) -> Result<u64> {
 /// `owner_sig` is the enclave's 65-byte `[r‖s‖v]` over the SafeTxHash (v ∈ {27,28}),
 /// which is exactly the Safe's expected ECDSA owner-signature encoding. `gas_key` is
 /// a gas-paying EOA private key (hex) — NOT the enclave key: it is only `msg.sender`
+/// Submit a Safe owner-management transaction — a SELF-call.
+///
+/// `to` is the Safe itself, which is not a choice made here: every Safe owner-management
+/// function is `authorized`, i.e. requires a self-call, and the enclave derived the
+/// SafeTxHash with `to = safe` too. Passing anything else would produce a hash the
+/// enclave never signed, so the Safe would reject it — the two ends agree by construction
+/// rather than by convention.
+///
+/// `signatures` must already be ordered by ascending owner address; see
+/// `safe_governance::order_signatures`, which recovers the owner from each signature
+/// rather than trusting a label.
+pub async fn submit_safe_selfcall(
+    rpc_url: &str,
+    gas_key: &str,
+    safe: &str,
+    data: Vec<u8>,
+    signatures: Vec<u8>,
+) -> Result<String> {
+    let safe_addr: Address = safe.parse().context("invalid safe address")?;
+    let signer: PrivateKeySigner = gas_key
+        .trim_start_matches("0x")
+        .parse()
+        .context("parse gas EOA key")?;
+    let provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(signer))
+        .connect(rpc_url)
+        .await
+        .context("connect Base-Sepolia RPC (wallet)")?;
+
+    let s = GnosisSafe::new(safe_addr, &provider);
+    let pending = s
+        .execTransaction(
+            safe_addr,         // to = the Safe ITSELF (owner management is a self-call)
+            U256::ZERO,        // value
+            Bytes::from(data), // data = the owner-management call
+            0u8,               // operation = CALL
+            U256::ZERO,        // safeTxGas
+            U256::ZERO,        // baseGas
+            U256::ZERO,        // gasPrice
+            Address::ZERO,     // gasToken
+            Address::ZERO,     // refundReceiver
+            Bytes::from(signatures),
+        )
+        .send()
+        .await
+        .context("send Safe self-call execTransaction")?;
+    let receipt = pending
+        .get_receipt()
+        .await
+        .context("await self-call receipt")?;
+    Ok(format!("{:#x}", receipt.transaction_hash))
+}
+
 /// for `execTransaction` and pays Base-Sepolia gas; the Safe verifies the owner sig,
 /// so this orchestrator can never forge the authorised call (AC-R2-1).
 #[allow(dead_code)] // wired by the 3d publisher

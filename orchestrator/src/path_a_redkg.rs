@@ -175,6 +175,13 @@ pub fn router(state: Arc<AdminState>) -> Router {
             "/admin/frost/round",
             post(crate::frost_round::handle_frost_round),
         ))
+        // #131 Safe governance: order the owner signatures and submit the self-call.
+        // Stateless like the FROST probe; configuration comes from the same env the
+        // publisher reads, so there is no second place to hold the gas key.
+        .merge(Router::new().route(
+            "/admin/safe/exec",
+            post(crate::safe_governance::handle_safe_exec),
+        ))
 }
 
 /// Bind a 127.0.0.1-only admin HTTP listener. Errors if `listen_addr`
