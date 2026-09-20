@@ -44,6 +44,10 @@ sol! {
     #[sol(rpc)]
     contract GnosisSafe {
         function nonce() external view returns (uint256);
+        // Read back for the owner-set PROJECTION: every node derives the convergence step
+        // from the chain itself rather than from a peer's claim about it.
+        function getOwners() external view returns (address[] memory);
+        function getThreshold() external view returns (uint256);
         // Gnosis Safe v1.3.0/1.4.1 — the enclave signs the SafeTxHash; this orchestrator
         // only relays the owner signature + pays gas (AC-R2-1). operation=0 (CALL),
         // gas fields 0, gasToken/refundReceiver = zero address.
@@ -124,6 +128,28 @@ pub async fn query_safe_nonce(rpc_url: &str, safe: &str) -> Result<u64> {
 /// `owner_sig` is the enclave's 65-byte `[r‖s‖v]` over the SafeTxHash (v ∈ {27,28}),
 /// which is exactly the Safe's expected ECDSA owner-signature encoding. `gas_key` is
 /// a gas-paying EOA private key (hex) — NOT the enclave key: it is only `msg.sender`
+/// Read the Safe's CURRENT owner set and threshold.
+///
+/// `getOwners()` returns the linked-list order, and that order is load-bearing: `removeOwner`
+/// and `swapOwner` need each owner's predecessor, so sorting this before planning would
+/// silently produce operations that revert on-chain. It is returned as the chain gives it.
+pub async fn read_safe_owners(rpc_url: &str, safe: &str) -> Result<(Vec<[u8; 20]>, u64)> {
+    let safe_addr: Address = safe.parse().context("invalid safe address")?;
+    let provider = ProviderBuilder::new()
+        .connect(rpc_url)
+        .await
+        .context("connect Base-Sepolia RPC (read-only)")?;
+    let s = GnosisSafe::new(safe_addr, &provider);
+    let owners = s.getOwners().call().await.context("Safe getOwners()")?;
+    let threshold = s
+        .getThreshold()
+        .call()
+        .await
+        .context("Safe getThreshold()")?;
+    let out: Vec<[u8; 20]> = owners.iter().map(|a| a.into_array()).collect();
+    Ok((out, threshold.to::<u64>()))
+}
+
 /// Submit a Safe owner-management transaction — a SELF-call.
 ///
 /// `to` is the Safe itself, which is not a choice made here: every Safe owner-management

@@ -380,6 +380,201 @@ async fn fetch_sealed_members(enclave_url: &str) -> Result<Vec<String>> {
         .collect()
 }
 
+/// Read THIS node's own signers config.
+///
+/// Not a request field, deliberately. The whole point of independent derivation is that a
+/// node uses its own view — its own enclave's sealed membership and its own record of the
+/// members' keys. Accepting the key map from the caller would mean every node could be
+/// steered to the same wrong answer by whoever assembled the request, which is the blind
+/// co-signing this exists to prevent.
+fn own_known_members() -> Result<Vec<MemberIdentity>> {
+    let path = std::env::var("SIGNERS_CONFIG").unwrap_or_else(|_| "signers_config.json".into());
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("read this node's signers config at {path}"))?;
+    let v: serde_json::Value = serde_json::from_str(&raw).context("parse signers config")?;
+    let mut out = Vec::new();
+    let mut push = |e: &serde_json::Value| -> Result<()> {
+        let (Some(name), Some(pk), Some(addr)) = (
+            e.get("name").and_then(|x| x.as_str()),
+            e.get("compressed_pubkey").and_then(|x| x.as_str()),
+            e.get("address").and_then(|x| x.as_str()),
+        ) else {
+            return Ok(()); // an entry without keys is not a projectable member
+        };
+        out.push(identity_from_pubkey(name, pk, addr)?);
+        Ok(())
+    };
+    if let Some(l) = v.get("local_signer") {
+        push(l)?;
+    }
+    if let Some(arr) = v.get("signers").and_then(|x| x.as_array()) {
+        for e in arr {
+            push(e)?;
+        }
+    }
+    if out.is_empty() {
+        bail!("this node's signers config lists no projectable members");
+    }
+    Ok(out)
+}
+
+/// The canonical digest of an owner set, as the confirmation quorum signs it.
+///
+/// Sorted and domain-tagged: sorted so every node hashes the same bytes regardless of the
+/// order the chain or the config happened to give, tagged so this digest cannot be mistaken
+/// for any other use of the shared quorum primitive.
+///
+/// SHA-256 to match the family the enclave's own confirmation digest uses
+/// (`kBaseProjDomain`), which keeps both sides of the comparison in one hash family.
+pub fn owner_set_hash(owners: &[[u8; 20]]) -> [u8; 32] {
+    let mut sorted = owners.to_vec();
+    sorted.sort();
+    let mut h = Sha256::new();
+    h.update(b"perp.base-owner-set.v1");
+    for o in &sorted {
+        h.update(o);
+    }
+    h.finalize().into()
+}
+
+/// What this node is willing to attest: that the Safe's owner set ON CHAIN matches the
+/// projection of the membership THIS enclave has sealed.
+///
+/// This is the function that makes the confirmation quorum non-blind. `ecall_perp_record_
+/// base_projection` takes `owner_set_hash` as a parameter and trusts the quorum to have
+/// verified it — so every attesting node must have derived it from its own sealed
+/// membership and compared it against its own read of the chain. A node that skips this and
+/// signs a hash it was handed turns the in_sync gate into a correct gate on a blind quorum.
+///
+/// Refuses on mismatch rather than reporting it, because the only use of the result is to
+/// be signed: returning "here is the hash, but the chain disagrees" invites a caller to sign
+/// it anyway.
+pub async fn attest_projection(
+    enclave_url: &str,
+    rpc_url: &str,
+    safe: &str,
+    target_threshold: u64,
+) -> Result<(u64, [u8; 32])> {
+    let sealed_hex = fetch_sealed_members(enclave_url).await?;
+    let sealed: Vec<[u8; 20]> = sealed_hex
+        .iter()
+        .map(|s| addr20(s))
+        .collect::<Result<_>>()?;
+    let known = own_known_members()?;
+    let target = project_owner_set(&sealed, &known)?;
+    let epoch = fetch_authority_epoch(enclave_url).await?;
+
+    let (current, current_threshold) = crate::commitment::read_safe_owners(rpc_url, safe).await?;
+    if !in_sync(&current, current_threshold, &target, target_threshold) {
+        let mut c = current.clone();
+        c.sort();
+        bail!(
+            "refusing to attest: the Safe's owner set does not match this node's projection \
+             of epoch {epoch}. on chain {:?} at threshold {current_threshold}; projected {:?} \
+             at threshold {target_threshold}",
+            c.iter().map(hex::encode).collect::<Vec<_>>(),
+            target.iter().map(hex::encode).collect::<Vec<_>>()
+        );
+    }
+    Ok((epoch, owner_set_hash(&target)))
+}
+
+/// One convergence step, derived entirely from what THIS node can see.
+#[derive(Clone, Debug)]
+pub struct DerivedStep {
+    pub op: SafeOp,
+    pub calldata: Vec<u8>,
+    pub safe_tx_hash: [u8; 32],
+    pub plan_len: usize,
+}
+
+/// Derive convergence step `step_index` from this node's own enclave and its own read of
+/// the chain.
+///
+/// Nothing about the step's CONTENT is an input: not the calldata, not the hash, not the
+/// owner set. The caller says only WHICH step of the plan it wants. Every node handed the
+/// same (epoch, step_index, nonce) computes the same bytes, or it computes different bytes
+/// and its quorum contribution simply does not match — which is the entire mechanism that
+/// makes an opaque-hash quorum non-blind.
+#[allow(clippy::too_many_arguments)]
+pub async fn derive_step(
+    enclave_url: &str,
+    rpc_url: &str,
+    safe: &str,
+    chain_id: u64,
+    expected_epoch: u64,
+    target_threshold: u64,
+    step_index: usize,
+    safe_nonce: u64,
+) -> Result<DerivedStep> {
+    let sealed_hex = fetch_sealed_members(enclave_url).await?;
+    let sealed: Vec<[u8; 20]> = sealed_hex
+        .iter()
+        .map(|s| addr20(s))
+        .collect::<Result<_>>()?;
+    let known = own_known_members()?;
+    let target = project_owner_set(&sealed, &known)?;
+
+    let (current, current_threshold) = crate::commitment::read_safe_owners(rpc_url, safe).await?;
+    let plan = plan_reconciliation(&current, current_threshold, &target, target_threshold)?;
+    if plan.is_empty() {
+        bail!("already in sync — nothing to converge");
+    }
+    let op = plan
+        .get(step_index)
+        .with_context(|| {
+            format!(
+                "step {step_index} is past the end of a {}-step plan",
+                plan.len()
+            )
+        })?
+        .clone();
+
+    // The epoch the caller believes it is converging to must be the one this node has
+    // sealed. A mismatch means the cluster is not agreeing about WHICH membership this
+    // step serves, and signing anyway would attach a quorum to the wrong question.
+    let epoch = fetch_authority_epoch(enclave_url).await?;
+    if epoch != expected_epoch {
+        bail!("this node's sealed authority epoch is {epoch}, caller expected {expected_epoch}");
+    }
+
+    let safe_bytes = addr20(safe)?;
+    let calldata = op.calldata();
+    // `to` is the Safe itself: owner management is a self-call, and the enclave derives its
+    // hash the same way with no `to` parameter at all.
+    let safe_tx_hash = crate::safe_governance::safe_tx_hash(
+        &safe_bytes,
+        chain_id,
+        &safe_bytes,
+        &calldata,
+        safe_nonce,
+    );
+
+    Ok(DerivedStep {
+        op,
+        calldata,
+        safe_tx_hash,
+        plan_len: plan.len(),
+    })
+}
+
+/// The authority epoch this node has sealed.
+async fn fetch_authority_epoch(enclave_url: &str) -> Result<u64> {
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(format!("{enclave_url}/v1/admin/signerlist/members"))
+        .send()
+        .await
+        .context("ask the enclave for its authority epoch")?
+        .error_for_status()
+        .context("enclave refused the membership read")?
+        .json()
+        .await
+        .context("parse the enclave's membership response")?;
+    v["authority_epoch"]
+        .as_u64()
+        .context("membership response has no authority_epoch")
+}
+
 /// `POST /admin/safe/projection`
 pub async fn handle_projection(
     axum::Json(req): axum::Json<ProjectionRequest>,
@@ -441,6 +636,104 @@ pub async fn handle_projection(
                 data: format!("0x{}", hex::encode(op.calldata())),
             })
             .collect(),
+    }))
+}
+
+// ── The two endpoints that make derivation independent ──────────────────────────
+//
+// Note what neither request carries: no calldata, no SafeTxHash, no owner set. The caller
+// says WHICH step or WHICH epoch; every node computes the content itself. `deny_unknown_
+// fields` is there so a caller who believes it is supplying content gets an error instead of
+// having it silently ignored — a silent drop would look like it worked.
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeriveStepRequest {
+    pub enclave_url: String,
+    pub rpc_url: String,
+    pub safe: String,
+    pub chain_id: u64,
+    pub epoch: u64,
+    pub target_threshold: u64,
+    pub step_index: usize,
+    pub safe_nonce: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct DeriveStepResponse {
+    pub op: String,
+    pub calldata: String,
+    pub safe_tx_hash: String,
+    pub plan_len: usize,
+}
+
+/// `POST /admin/safe/derive-step`
+pub async fn handle_derive_step(
+    axum::Json(req): axum::Json<DeriveStepRequest>,
+) -> std::result::Result<axum::Json<DeriveStepResponse>, (axum::http::StatusCode, String)> {
+    if !(req.enclave_url.contains("127.0.0.1") || req.enclave_url.contains("localhost")) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "enclave_url must be loopback".to_string(),
+        ));
+    }
+    let d = derive_step(
+        &req.enclave_url,
+        &req.rpc_url,
+        &req.safe,
+        req.chain_id,
+        req.epoch,
+        req.target_threshold,
+        req.step_index,
+        req.safe_nonce,
+    )
+    .await
+    .map_err(|e| (axum::http::StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(axum::Json(DeriveStepResponse {
+        op: d.op.signature().to_string(),
+        calldata: format!("0x{}", hex::encode(&d.calldata)),
+        safe_tx_hash: format!("0x{}", hex::encode(d.safe_tx_hash)),
+        plan_len: d.plan_len,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttestRequest {
+    pub enclave_url: String,
+    pub rpc_url: String,
+    pub safe: String,
+    pub target_threshold: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct AttestResponse {
+    pub epoch: u64,
+    pub owner_set_hash: String,
+}
+
+/// `POST /admin/safe/attest-projection` — what this node is willing to sign into the
+/// confirmation bundle, after checking the chain against its own projection.
+pub async fn handle_attest(
+    axum::Json(req): axum::Json<AttestRequest>,
+) -> std::result::Result<axum::Json<AttestResponse>, (axum::http::StatusCode, String)> {
+    if !(req.enclave_url.contains("127.0.0.1") || req.enclave_url.contains("localhost")) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "enclave_url must be loopback".to_string(),
+        ));
+    }
+    let (epoch, h) = attest_projection(
+        &req.enclave_url,
+        &req.rpc_url,
+        &req.safe,
+        req.target_threshold,
+    )
+    .await
+    .map_err(|e| (axum::http::StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(axum::Json(AttestResponse {
+        epoch,
+        owner_set_hash: format!("0x{}", hex::encode(h)),
     }))
 }
 
@@ -546,6 +839,63 @@ mod tests {
     }
 
     // ── in_sync ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_owner_set_digest_is_order_independent_but_content_sensitive() {
+        // Every node must hash the same bytes whatever order its chain read or its config
+        // produced, or the confirmation quorum can never assemble even when all nodes agree.
+        assert_eq!(
+            owner_set_hash(&[a(1), a(2), a(3)]),
+            owner_set_hash(&[a(3), a(1), a(2)])
+        );
+        assert_ne!(
+            owner_set_hash(&[a(1), a(2)]),
+            owner_set_hash(&[a(1), a(2), a(3)])
+        );
+        assert_ne!(owner_set_hash(&[a(1), a(2)]), owner_set_hash(&[a(1), a(4)]));
+
+        // Domain-separated: the digest must NOT be a bare hash of the concatenated owners.
+        // The tag is what stops a value minted for this purpose from colliding with any
+        // other use of the shared quorum primitive — a property neither of the assertions
+        // above touches, which a mutation probe showed by deleting the tag and staying
+        // green.
+        let untagged: [u8; 32] = {
+            let mut h = sha2::Sha256::new();
+            for o in [a(1), a(2)] {
+                sha3::Digest::update(&mut h, o);
+            }
+            sha3::Digest::finalize(h).into()
+        };
+        assert_ne!(
+            owner_set_hash(&[a(1), a(2)]),
+            untagged,
+            "the owner-set digest must be domain-tagged, not a bare concatenation hash"
+        );
+    }
+
+    #[test]
+    fn the_derivation_requests_refuse_caller_supplied_content() {
+        // The security property is structural: a caller cannot hand a node the calldata, the
+        // hash, or the owner set. `deny_unknown_fields` makes an attempt an ERROR rather
+        // than a silent drop — a silently ignored field looks like it was honoured.
+        let with_calldata = r#"{"enclave_url":"http://127.0.0.1:9088","rpc_url":"x",
+            "safe":"0x00","chain_id":1,"epoch":1,"target_threshold":1,"step_index":0,
+            "safe_nonce":0,"calldata":"0xdeadbeef"}"#;
+        assert!(
+            serde_json::from_str::<DeriveStepRequest>(with_calldata).is_err(),
+            "supplying calldata must be refused, not ignored"
+        );
+        let with_hash = r#"{"enclave_url":"http://127.0.0.1:9088","rpc_url":"x",
+            "safe":"0x00","target_threshold":1,"owner_set_hash":"0xabcd"}"#;
+        assert!(
+            serde_json::from_str::<AttestRequest>(with_hash).is_err(),
+            "supplying the owner-set hash must be refused, not ignored"
+        );
+        // The legitimate shapes still parse.
+        let ok = r#"{"enclave_url":"http://127.0.0.1:9088","rpc_url":"x","safe":"0x00",
+            "chain_id":1,"epoch":1,"target_threshold":1,"step_index":0,"safe_nonce":0}"#;
+        assert!(serde_json::from_str::<DeriveStepRequest>(ok).is_ok());
+    }
 
     #[test]
     fn in_sync_ignores_order_but_not_content_or_threshold() {

@@ -115,6 +115,72 @@ impl SafeOp {
     }
 }
 
+/// The Safe EIP-712 transaction hash, derived here as well as in the enclave.
+///
+/// Both derivations exist ON PURPOSE. The cluster quorum signs this hash to authorise the
+/// step, and that signing happens in the orchestrator — before any enclave is asked to sign
+/// the transaction. The enclave then re-derives it from the same fields and verifies the
+/// bundle against ITS OWN derivation, never against a hash handed in. Two independent
+/// computations that must agree is what makes the quorum non-blind: a node that is fed a
+/// doctored calldata computes a different hash, its bundle contribution does not match, and
+/// the enclave refuses.
+///
+/// `value`, `operation` and every gas field are zero, exactly as the enclave pins them
+/// (`perp_reserves_publish.cpp:124,126`). `operation` is the one that matters: a non-zero
+/// value there is DELEGATECALL, i.e. a full Safe takeover regardless of the calldata.
+pub fn safe_tx_hash(
+    safe: &[u8; 20],
+    chain_id: u64,
+    to: &[u8; 20],
+    data: &[u8],
+    nonce: u64,
+) -> [u8; 32] {
+    fn word_addr(a: &[u8; 20]) -> [u8; 32] {
+        let mut w = [0u8; 32];
+        w[12..].copy_from_slice(a);
+        w
+    }
+    fn word_u64(v: u64) -> [u8; 32] {
+        let mut w = [0u8; 32];
+        w[24..].copy_from_slice(&v.to_be_bytes());
+        w
+    }
+
+    // domainSeparator = keccak(DOMAIN_TYPEHASH ‖ chainId ‖ verifyingContract)
+    let mut d = Vec::with_capacity(96);
+    d.extend_from_slice(&Keccak256::digest(
+        b"EIP712Domain(uint256 chainId,address verifyingContract)",
+    ));
+    d.extend_from_slice(&word_u64(chain_id));
+    d.extend_from_slice(&word_addr(safe));
+    let domain = Keccak256::digest(&d);
+
+    // structHash = keccak(SAFE_TX_TYPEHASH ‖ to ‖ 0 ‖ keccak(data) ‖ 0 ‖ 0,0,0 ‖ 0,0 ‖ nonce)
+    let mut st = Vec::with_capacity(32 * 11);
+    st.extend_from_slice(&Keccak256::digest(
+        b"SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)",
+    ));
+    st.extend_from_slice(&word_addr(to));
+    st.extend_from_slice(&[0u8; 32]); // value
+    st.extend_from_slice(&Keccak256::digest(data));
+    st.extend_from_slice(&[0u8; 32]); // operation = CALL
+    st.extend_from_slice(&[0u8; 32]); // safeTxGas
+    st.extend_from_slice(&[0u8; 32]); // baseGas
+    st.extend_from_slice(&[0u8; 32]); // gasPrice
+    st.extend_from_slice(&[0u8; 32]); // gasToken
+    st.extend_from_slice(&[0u8; 32]); // refundReceiver
+    st.extend_from_slice(&word_u64(nonce));
+    let struct_hash = Keccak256::digest(&st);
+
+    let mut pre = Vec::with_capacity(2 + 64);
+    pre.extend_from_slice(&[0x19, 0x01]);
+    pre.extend_from_slice(&domain);
+    pre.extend_from_slice(&struct_hash);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&Keccak256::digest(&pre));
+    out
+}
+
 /// Recover the EVM address that produced `sig` over `hash`.
 ///
 /// `sig` is Safe's 65-byte owner encoding: r ‖ s ‖ v, with v ∈ {27, 28}. (Safe also accepts
@@ -286,6 +352,71 @@ mod tests {
         for (sig, want) in cases {
             assert_eq!(selector(sig), want, "selector drift for {sig}");
         }
+    }
+
+    /// Safe's two EIP-712 typehashes, as published constants, checked against the keccak
+    /// our derivation actually computes.
+    ///
+    /// Two independent halves again: the literals are what Safe's own source documents,
+    /// the keccak is what we will hash with. Asserting only the computation would re-derive
+    /// our own mistake; asserting only the literal would not test the derivation. If they
+    /// disagree, one of the two is wrong and the test says which pair.
+    #[test]
+    fn the_eip712_typehashes_match_safes_published_constants() {
+        let domain = Keccak256::digest(b"EIP712Domain(uint256 chainId,address verifyingContract)");
+        assert_eq!(
+            hex::encode(domain),
+            "47e79534a245952e8b16893a336b85a3d9ea9fa8c573f3d803afb92a79469218",
+            "DOMAIN_TYPEHASH"
+        );
+        let safetx = Keccak256::digest(
+            b"SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)",
+        );
+        assert_eq!(
+            hex::encode(safetx),
+            "bb8310d486368db6bd6f849402fdd73ad53d316b5a4b2644ad6efe0f941286d8",
+            "SAFE_TX_TYPEHASH"
+        );
+    }
+
+    #[test]
+    fn every_field_of_the_safe_tx_hash_actually_binds() {
+        // A hash that ignored any of these would let a bundle authorising one transaction
+        // be replayed for another — a different Safe, a different chain, a different call,
+        // or the same call twice.
+        let safe = [0x11u8; 20];
+        let to = [0x22u8; 20];
+        let base = safe_tx_hash(&safe, 84532, &to, b"\x01\x02", 7);
+
+        let mut other_safe = safe;
+        other_safe[0] ^= 1;
+        assert_ne!(
+            base,
+            safe_tx_hash(&other_safe, 84532, &to, b"\x01\x02", 7),
+            "safe"
+        );
+        assert_ne!(
+            base,
+            safe_tx_hash(&safe, 1, &to, b"\x01\x02", 7),
+            "chain_id"
+        );
+        let mut other_to = to;
+        other_to[0] ^= 1;
+        assert_ne!(
+            base,
+            safe_tx_hash(&safe, 84532, &other_to, b"\x01\x02", 7),
+            "to"
+        );
+        assert_ne!(
+            base,
+            safe_tx_hash(&safe, 84532, &to, b"\x01\x03", 7),
+            "data"
+        );
+        assert_ne!(
+            base,
+            safe_tx_hash(&safe, 84532, &to, b"\x01\x02", 8),
+            "nonce"
+        );
     }
 
     #[test]

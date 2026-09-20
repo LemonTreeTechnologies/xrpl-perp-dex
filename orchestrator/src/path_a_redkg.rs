@@ -188,6 +188,17 @@ pub fn router(state: Arc<AdminState>) -> Router {
             "/admin/safe/projection",
             post(crate::safe_projection::handle_projection),
         ))
+        // Independent derivation: neither request carries calldata, a hash, or an owner
+        // set. Every node computes the content from its OWN enclave and its OWN read of
+        // the chain — which is what keeps an opaque-hash quorum from being a blind one.
+        .merge(Router::new().route(
+            "/admin/safe/derive-step",
+            post(crate::safe_projection::handle_derive_step),
+        ))
+        .merge(Router::new().route(
+            "/admin/safe/attest-projection",
+            post(crate::safe_projection::handle_attest),
+        ))
 }
 
 /// Bind a 127.0.0.1-only admin HTTP listener. Errors if `listen_addr`
