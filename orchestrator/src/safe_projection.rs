@@ -28,6 +28,21 @@
 //! Nothing here is trusted. A config entry that disagrees with its own public key is
 //! refused, and every node computes the same projection from the same sealed set — so a
 //! co-signer signs a hash it derived itself rather than one it was handed.
+//!
+//! # The secp256k1 precondition, and why it holds by failing closed
+//!
+//! The binding needs every member to be secp256k1: an ed25519 account has an AccountID but
+//! no EVM address at all, since `keccak` of an ed25519 key is not an `ecrecover` address.
+//!
+//! I looked for a reject at membership-sealing time and there is none — `sealed_signer_entry_t`
+//! stores only `account_id[20]`, a hash, and does not know the key type. The ed25519 rejects
+//! in the enclave (`xrpl_multisig_verify.cpp:121`, `path_a.cpp:1584`) are on SIGNERS
+//! presenting a key, not on membership entries.
+//!
+//! So the guarantee is not "it cannot be sealed" but **"it cannot be projected"**: an
+//! ed25519 key is not a valid SEC1 point, `identity_from_pubkey` refuses it, no known member
+//! matches that AccountID, and `project_owner_set` stops rather than deriving an address.
+//! The failure direction is refusal, never a wrong owner. Tested below rather than reasoned.
 
 use crate::safe_governance::SafeOp;
 use anyhow::{bail, Context, Result};
@@ -82,7 +97,11 @@ pub fn identity_from_pubkey(
     let account_id: [u8; 20] = Ripemd160::digest(Sha256::digest(&pk)).into();
 
     // EVM address = keccak256(uncompressed pubkey without the 0x04 tag)[12..].
-    let uncompressed = decompress(&pk).with_context(|| format!("{name}: pubkey"))?;
+    // The context is worded so it CANNOT be confused with the address cross-check below.
+    // A test asserting only "pubkey" would pass on that other error too, because its text
+    // names `compressed_pubkey` — a hollow assertion my own mutation probe caught.
+    let uncompressed = decompress(&pk)
+        .with_context(|| format!("{name}: not a projectable key (must be a secp256k1 point)"))?;
     let d = Keccak256::digest(&uncompressed[1..]);
     let mut evm_address = [0u8; 20];
     evm_address.copy_from_slice(&d[12..]);
@@ -426,6 +445,47 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string().contains("contradicts its key"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_ed25519_key_cannot_be_turned_into_a_safe_owner() {
+        // The precondition the whole no-schema-change binding rests on. An ed25519 account
+        // has an AccountID but no EVM address, so if one could be projected we would derive
+        // a meaningless owner. It cannot: 0xED is not a SEC1 prefix, so the point parse
+        // fails and the member is refused.
+        let mut ed = vec![0xEDu8];
+        ed.extend_from_slice(&[0x11u8; 32]); // 33 bytes, XRPL's ed25519 wire form
+        let err = identity_from_pubkey(
+            "node-ed",
+            &hex::encode(&ed),
+            "0x0000000000000000000000000000000000000000",
+        )
+        .unwrap_err();
+        // Assert WHERE it failed, not just that it did: the context must name the pubkey
+        // stage. Failing on the address cross-check instead would mean the key had been
+        // accepted and some address derived from it — the outcome this test exists to
+        // exclude. (k256 words its own error "crypto error"; the stage is ours.)
+        assert!(
+            err.to_string().contains("not a projectable key"),
+            "must fail deriving from the KEY, not later on the address: {err:#}"
+        );
+    }
+
+    #[test]
+    fn an_ed25519_member_refuses_the_projection_rather_than_deriving_a_wrong_owner() {
+        // End to end: a sealed member whose key is ed25519 has no projectable address, so
+        // the projection STOPS. The failure direction is what matters — never a wrong owner.
+        let (comp, evm) = real_key();
+        let good = identity_from_pubkey("node-1", &comp, &evm).unwrap();
+        let mut ed = vec![0xEDu8];
+        ed.extend_from_slice(&[0x22u8; 32]);
+        let ed_account: [u8; 20] = Ripemd160::digest(Sha256::digest(&ed)).into();
+        let err = project_owner_set(&[good.account_id, ed_account], std::slice::from_ref(&good))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no known public key"),
             "got: {err}"
         );
     }
