@@ -302,8 +302,10 @@ pub struct ProjectionRequest {
     /// each `prevOwner` correct. Sorting it before sending would silently corrupt removals.
     pub current_owners: Vec<String>,
     pub current_threshold: u64,
-    /// The sealed membership, by XRPL AccountID (20-byte hex).
-    pub sealed_members: Vec<String>,
+    /// Loopback URL of THIS node's enclave. The sealed membership is read from it, not
+    /// taken from this request — a caller that supplied both the "sealed" set and the keys
+    /// could otherwise claim any membership and converge the Safe onto it.
+    pub enclave_url: String,
     /// The cluster's known keys: (name, compressed_pubkey, declared EVM address).
     pub known_members: Vec<KnownMember>,
     /// The threshold the authority wants. Today 1 (publishing is Tier-1 single-enclave);
@@ -343,6 +345,41 @@ fn addr20(s: &str) -> Result<[u8; 20]> {
     Ok(a)
 }
 
+/// Read the membership THIS enclave has sealed.
+///
+/// Provenance is the whole point of the call: the projection must be derived from what the
+/// authority sealed, never from a list handed in alongside the keys. `bootstrapped: false`
+/// is a soft state upstream, and it is an error here — you cannot project a membership that
+/// does not exist yet, and proceeding would compute a target of nothing.
+async fn fetch_sealed_members(enclave_url: &str) -> Result<Vec<String>> {
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(format!("{enclave_url}/v1/admin/signerlist/members"))
+        .send()
+        .await
+        .context("ask the enclave for its sealed membership")?
+        .error_for_status()
+        .context("enclave refused the membership read")?
+        .json()
+        .await
+        .context("parse the enclave's membership response")?;
+    if v["bootstrapped"].as_bool() != Some(true) {
+        bail!("this enclave has no sealed membership yet — nothing to project");
+    }
+    let arr = v["members"]
+        .as_array()
+        .context("membership response has no `members` array")?;
+    if arr.is_empty() {
+        bail!("the enclave reported an empty membership");
+    }
+    arr.iter()
+        .map(|m| {
+            m.as_str()
+                .map(|s| s.to_string())
+                .context("a member entry is not a string")
+        })
+        .collect()
+}
+
 /// `POST /admin/safe/projection`
 pub async fn handle_projection(
     axum::Json(req): axum::Json<ProjectionRequest>,
@@ -355,8 +392,14 @@ pub async fn handle_projection(
         .map(|s| addr20(s))
         .collect::<Result<_>>()
         .map_err(bad)?;
-    let sealed: Vec<[u8; 20]> = req
-        .sealed_members
+    // The enclave surface is loopback-only by construction; refuse to be aimed elsewhere.
+    if !(req.enclave_url.contains("127.0.0.1") || req.enclave_url.contains("localhost")) {
+        return Err(bad(anyhow::anyhow!("enclave_url must be loopback")));
+    }
+    let sealed_hex = fetch_sealed_members(&req.enclave_url)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let sealed: Vec<[u8; 20]> = sealed_hex
         .iter()
         .map(|s| addr20(s))
         .collect::<Result<_>>()
