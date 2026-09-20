@@ -181,6 +181,96 @@ pub trait FrostAggregator: Send + Sync {
     ) -> Result<[u8; FROST_SIG_LEN]>;
 }
 
+/// How a round collects one pass from the participants.
+///
+/// The round is two gathers; whether a gather is N sequential calls or one broadcast
+/// plus a collect is a TRANSPORT detail, and the round logic must not encode either.
+/// The first cut of this module took `&[&dyn FrostParticipant]` and so quietly assumed
+/// the sequential shape — which does not fit the cluster at all, where peers are reached
+/// by one gossipsub publish and reply in whatever order they like.
+///
+/// Both implementations must return contributions carrying the signer id they came from;
+/// the round sorts and validates, so a gatherer may return them in any order.
+#[async_trait]
+pub trait FrostGatherer: Send + Sync {
+    /// Pass 1 — every participant's public nonce, bound to `msg32`.
+    async fn gather_nonces(
+        &self,
+        msg32: &[u8; 32],
+    ) -> Result<Vec<Contribution<FROST_PUBNONCE_LEN>>>;
+
+    /// Pass 2 — every participant's partial signature over the canonical set.
+    async fn gather_partials(
+        &self,
+        msg32: &[u8; 32],
+        set: &SignerSet,
+    ) -> Result<Vec<Contribution<FROST_PARTIAL_SIG_LEN>>>;
+
+    /// How many participants this gatherer intends to ask.
+    ///
+    /// Used only to refuse an obviously-short round BEFORE pass 1 burns anyone's
+    /// nonce. It is a hint, not the authority: a broadcast gatherer cannot know how
+    /// many peers will actually answer, so the round re-checks the REAL count after
+    /// pass 1 regardless. Both checks exist on purpose — the early one keeps the
+    /// common misconfiguration cheap, the late one is the one that is always right.
+    fn expected_participants(&self) -> usize;
+}
+
+/// The sequential shape: ask each participant in turn. Used for the local path and by
+/// the tests; the libp2p gatherer is the cluster one.
+pub struct SequentialGatherer<'a> {
+    participants: &'a [&'a dyn FrostParticipant],
+}
+
+impl<'a> SequentialGatherer<'a> {
+    pub fn new(participants: &'a [&'a dyn FrostParticipant]) -> Self {
+        Self { participants }
+    }
+}
+
+#[async_trait]
+impl FrostGatherer for SequentialGatherer<'_> {
+    fn expected_participants(&self) -> usize {
+        self.participants.len()
+    }
+
+    async fn gather_nonces(
+        &self,
+        msg32: &[u8; 32],
+    ) -> Result<Vec<Contribution<FROST_PUBNONCE_LEN>>> {
+        let mut out = Vec::with_capacity(self.participants.len());
+        for p in self.participants {
+            let bytes = p
+                .nonce_gen(msg32)
+                .await
+                .with_context(|| format!("FROST nonce_gen failed for signer {}", p.signer_id()))?;
+            out.push(Contribution {
+                signer_id: p.signer_id(),
+                bytes,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn gather_partials(
+        &self,
+        msg32: &[u8; 32],
+        set: &SignerSet,
+    ) -> Result<Vec<Contribution<FROST_PARTIAL_SIG_LEN>>> {
+        let mut out = Vec::with_capacity(self.participants.len());
+        for p in self.participants {
+            let bytes = p.partial_sign(msg32, set).await.with_context(|| {
+                format!("FROST partial_sign failed for signer {}", p.signer_id())
+            })?;
+            out.push(Contribution {
+                signer_id: p.signer_id(),
+                bytes,
+            });
+        }
+        Ok(out)
+    }
+}
+
 /// Process-global single-flight claim. See the module docs for why this refuses
 /// rather than queues.
 static ROUND_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -224,7 +314,7 @@ pub struct FrostRoundOutcome {
 /// would be taking the enclave's word that the enclave signed correctly, which
 /// proves nothing about the group key anyone else would check against.
 pub async fn run_round(
-    participants: &[&dyn FrostParticipant],
+    gatherer: &dyn FrostGatherer,
     aggregator: &dyn FrostAggregator,
     msg32: &[u8; 32],
     threshold: usize,
@@ -238,52 +328,60 @@ pub async fn run_round(
         );
     };
 
-    if participants.len() < threshold {
+    // Early refusal, before pass 1 burns anyone's nonce. A hint, not the authority.
+    if gatherer.expected_participants() < threshold {
         bail!(
-            "FROST round needs at least the threshold of {threshold} participants, got {}",
-            participants.len()
+            "FROST round needs at least the threshold of {threshold} participants, \
+             and the gatherer intends to ask only {}",
+            gatherer.expected_participants()
         );
     }
 
     let started = Instant::now();
 
     // ── Pass 1: nonces ──────────────────────────────────────────────────
-    let mut nonces = Vec::with_capacity(participants.len());
-    for p in participants {
-        let bytes = p
-            .nonce_gen(msg32)
-            .await
-            .with_context(|| format!("FROST nonce_gen failed for signer {}", p.signer_id()))?;
-        nonces.push(Contribution {
-            signer_id: p.signer_id(),
-            bytes,
-        });
-    }
+    let nonces = gatherer
+        .gather_nonces(msg32)
+        .await
+        .context("FROST pass 1 (nonces) failed")?;
     let set = SignerSet::new(nonces)?;
+
+    // The authoritative threshold check: a broadcast gatherer learns the real
+    // count only here. Below quorum the round stops rather than producing a
+    // signature that cannot verify.
+    if set.len() < threshold {
+        bail!(
+            "FROST round gathered {} nonces, below the threshold of {threshold}",
+            set.len()
+        );
+    }
 
     // ── Pass 2: partial signatures ──────────────────────────────────────
     //
     // Every participant is handed the identical `set`, so every one of them
     // derives the same aggregate nonce and the same challenge.
-    let mut partials: Vec<Contribution<FROST_PARTIAL_SIG_LEN>> = Vec::with_capacity(set.len());
-    for p in participants {
-        if !set.contains(p.signer_id()) {
-            // Unreachable via `run_round` (the set is built from these very
-            // participants) but asserted rather than assumed: a partial from a
-            // signer outside the set aggregates into garbage.
+    let mut partials = gatherer
+        .gather_partials(msg32, &set)
+        .await
+        .context("FROST pass 2 (partial signatures) failed")?;
+
+    // A partial from a signer outside the set aggregates into garbage, and with a
+    // broadcast gatherer a stray reply is a real possibility rather than a
+    // theoretical one — a peer that answered pass 2 but missed pass 1.
+    for c in &partials {
+        if !set.contains(c.signer_id) {
             bail!(
                 "signer {} produced a partial signature but is not in the signer set",
-                p.signer_id()
+                c.signer_id
             );
         }
-        let bytes = p
-            .partial_sign(msg32, &set)
-            .await
-            .with_context(|| format!("FROST partial_sign failed for signer {}", p.signer_id()))?;
-        partials.push(Contribution {
-            signer_id: p.signer_id(),
-            bytes,
-        });
+    }
+    if partials.len() != set.len() {
+        bail!(
+            "FROST round gathered {} partial signatures for a set of {}",
+            partials.len(),
+            set.len()
+        );
     }
     partials.sort_by_key(|c| c.signer_id);
 
@@ -550,9 +648,10 @@ pub async fn handle_frost_round(
         .collect();
     let refs: Vec<&dyn FrostParticipant> =
         parts.iter().map(|p| p as &dyn FrostParticipant).collect();
+    let gatherer = SequentialGatherer::new(&refs);
     let agg = HttpFrostAggregator::new(req.enclave_url.clone());
 
-    let out = run_round(&refs, &agg, &msg32, req.threshold, &group32)
+    let out = run_round(&gatherer, &agg, &msg32, req.threshold, &group32)
         .await
         .map_err(|e| (axum::http::StatusCode::CONFLICT, e.to_string()))?;
 
@@ -739,12 +838,13 @@ mod tests {
         let p0 = RecordingParticipant::new(0);
         let p1 = RecordingParticipant::new(1);
         let parts: Vec<&dyn FrostParticipant> = vec![&p2, &p0, &p1];
+        let gatherer = SequentialGatherer::new(&parts);
         let agg = RealSigningAggregator {
             kp,
             seen_partials: Mutex::new(Vec::new()),
         };
 
-        let out = run_round(&parts, &agg, &[0x11; 32], 2, &xonly)
+        let out = run_round(&gatherer, &agg, &[0x11; 32], 2, &xonly)
             .await
             .unwrap();
 
@@ -772,12 +872,13 @@ mod tests {
         let (kp, xonly) = real_keypair();
         let p0 = RecordingParticipant::new(0);
         let parts: Vec<&dyn FrostParticipant> = vec![&p0];
+        let gatherer = SequentialGatherer::new(&parts);
         let agg = RealSigningAggregator {
             kp,
             seen_partials: Mutex::new(Vec::new()),
         };
 
-        let err = run_round(&parts, &agg, &[0x11; 32], 2, &xonly)
+        let err = run_round(&gatherer, &agg, &[0x11; 32], 2, &xonly)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("threshold"), "got: {err}");
@@ -800,12 +901,13 @@ mod tests {
         let p0 = RecordingParticipant::new(0);
         let p1 = RecordingParticipant::new(1);
         let parts: Vec<&dyn FrostParticipant> = vec![&p0, &p1];
+        let gatherer = SequentialGatherer::new(&parts);
         let agg = RealSigningAggregator {
             kp,
             seen_partials: Mutex::new(Vec::new()),
         };
 
-        let err = run_round(&parts, &agg, &[0x11; 32], 2, &xonly)
+        let err = run_round(&gatherer, &agg, &[0x11; 32], 2, &xonly)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already in flight"), "got: {err}");
@@ -815,6 +917,115 @@ mod tests {
         drop(claim);
         // And the claim is released, not leaked.
         assert!(RoundClaim::try_acquire().is_some());
+    }
+
+    /// A gatherer that returns exactly what the test scripts, so the failure modes a
+    /// BROADCAST transport makes real — a peer that misses pass 1, a stray reply from a
+    /// peer outside the set, a short collect — can be driven without libp2p.
+    struct ScriptedGatherer {
+        expected: usize,
+        nonces: Vec<Contribution<FROST_PUBNONCE_LEN>>,
+        partials: Vec<Contribution<FROST_PARTIAL_SIG_LEN>>,
+    }
+
+    #[async_trait]
+    impl FrostGatherer for ScriptedGatherer {
+        fn expected_participants(&self) -> usize {
+            self.expected
+        }
+        async fn gather_nonces(
+            &self,
+            _m: &[u8; 32],
+        ) -> Result<Vec<Contribution<FROST_PUBNONCE_LEN>>> {
+            Ok(self.nonces.clone())
+        }
+        async fn gather_partials(
+            &self,
+            _m: &[u8; 32],
+            _s: &SignerSet,
+        ) -> Result<Vec<Contribution<FROST_PARTIAL_SIG_LEN>>> {
+            Ok(self.partials.clone())
+        }
+    }
+
+    fn psig(id: u32, fill: u8) -> Contribution<FROST_PARTIAL_SIG_LEN> {
+        Contribution {
+            signer_id: id,
+            bytes: [fill; FROST_PARTIAL_SIG_LEN],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_short_collect_is_refused_even_when_the_gatherer_promised_enough() {
+        // The hint says 3; only 1 peer actually answered pass 1. The early check passes
+        // and the LATE one has to catch it — this is the case a broadcast transport
+        // produces routinely and a sequential one never does.
+        let _serial = TEST_SERIAL.lock().await;
+        let (kp, xonly) = real_keypair();
+        let g = ScriptedGatherer {
+            expected: 3,
+            nonces: vec![contrib(0, 0xa0)],
+            partials: vec![psig(0, 0x01)],
+        };
+        let agg = RealSigningAggregator {
+            kp,
+            seen_partials: Mutex::new(Vec::new()),
+        };
+        let err = run_round(&g, &agg, &[0x11; 32], 2, &xonly)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("below the threshold"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_from_outside_the_set_is_refused() {
+        // Signer 7 never sent a nonce but answered pass 2. Aggregating it would produce
+        // a signature that simply fails to verify, with no step reporting an error.
+        let _serial = TEST_SERIAL.lock().await;
+        let (kp, xonly) = real_keypair();
+        let g = ScriptedGatherer {
+            expected: 2,
+            nonces: vec![contrib(0, 0xa0), contrib(1, 0xa1)],
+            partials: vec![psig(0, 0x01), psig(7, 0x07)],
+        };
+        let agg = RealSigningAggregator {
+            kp,
+            seen_partials: Mutex::new(Vec::new()),
+        };
+        let err = run_round(&g, &agg, &[0x11; 32], 2, &xonly)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not in the signer set"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_count_that_does_not_match_the_set_is_refused() {
+        // Two nonces, one partial: a peer answered pass 1 and then went away. Every
+        // partial present is legitimate, so only the COUNT reveals it.
+        let _serial = TEST_SERIAL.lock().await;
+        let (kp, xonly) = real_keypair();
+        let g = ScriptedGatherer {
+            expected: 2,
+            nonces: vec![contrib(0, 0xa0), contrib(1, 0xa1)],
+            partials: vec![psig(0, 0x01)],
+        };
+        let agg = RealSigningAggregator {
+            kp,
+            seen_partials: Mutex::new(Vec::new()),
+        };
+        let err = run_round(&g, &agg, &[0x11; 32], 2, &xonly)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("partial signatures for a set of"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -831,12 +1042,13 @@ mod tests {
         let p0 = RecordingParticipant::new(0);
         let p1 = RecordingParticipant::new(1);
         let parts: Vec<&dyn FrostParticipant> = vec![&p0, &p1];
+        let gatherer = SequentialGatherer::new(&parts);
         let agg = RealSigningAggregator {
             kp,
             seen_partials: Mutex::new(Vec::new()),
         };
 
-        let out = run_round(&parts, &agg, &[0x11; 32], 2, &wrong_group_key)
+        let out = run_round(&gatherer, &agg, &[0x11; 32], 2, &wrong_group_key)
             .await
             .unwrap();
         assert!(
