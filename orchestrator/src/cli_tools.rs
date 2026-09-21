@@ -1225,6 +1225,125 @@ async fn fetch_domain_ecdh_pubkey(xrpl_url: &str, account: &str) -> Result<[u8; 
         .with_context(|| format!("failed to extract Domain for {account}"))
 }
 
+/// Publish (or RE-publish) this node's ECDH identity to `AccountSet.Domain` for an
+/// account that ALREADY EXISTS.
+///
+/// `node-bootstrap --publish-domain` cannot do this: its first step is
+/// `POST /pool/generate`, so it publishes for a brand-new key. That made the record
+/// settable only at birth — the same shape as a Safe whose owners can only be chosen
+/// at creation — and it is why a key rotation had no way to correct the chain.
+///
+/// Publishes what the ENCLAVE holds right now, read live, never what the entry file
+/// records: the file is not authoritative and a rotation does not update it either.
+///
+/// Confirms by reading the record back off the ledger before reporting success. A
+/// submitted transaction is a request; the published record is the result.
+pub async fn publish_domain(
+    enclave_url: &str,
+    node_entry_path: &Path,
+    xrpl_url: &str,
+    faucet_url: Option<&str>,
+) -> Result<()> {
+    println!("Publish Domain");
+    println!("==============");
+
+    // O-L4: operator tooling talks to the LOCAL enclave. The entry file is
+    // operator-supplied, but this URL is a flag, and the same rule applies.
+    crate::http_helpers::ensure_loopback_url(enclave_url)
+        .context("publish-domain signs with the LOCAL enclave (O-L4)")?;
+    let http = crate::http_helpers::loopback_http_client(std::time::Duration::from_secs(30))?;
+
+    let local_data = std::fs::read_to_string(node_entry_path)
+        .with_context(|| format!("cannot read {}", node_entry_path.display()))?;
+    let local: SignerEntry = serde_json::from_str(&local_data)
+        .with_context(|| format!("invalid SignerEntry JSON in {}", node_entry_path.display()))?;
+    println!("  xrpl_address: {}", local.xrpl_address);
+
+    // The live enclave, not the file — see the doc comment.
+    let live_ecdh = fetch_ecdh_pubkey(&http, enclave_url)
+        .await
+        .context("cannot reach the local enclave for its current ECDH identity")?;
+    println!("  ecdh (live):  {live_ecdh}");
+    match local.ecdh_pubkey.as_deref() {
+        Some(e)
+            if e.trim_start_matches("0x")
+                .eq_ignore_ascii_case(live_ecdh.trim_start_matches("0x")) => {}
+        Some(e) => println!(
+            "  NOTE: the entry file records {e}, which is NOT what the enclave holds. \
+             Publishing the LIVE key. The entry still seeds `local_signer`, so re-run \
+             `node-bootstrap` on a fresh entry before `node-config-apply` will accept it."
+        ),
+        None => println!("  NOTE: the entry file has no ecdh_pubkey; publishing the live key."),
+    }
+
+    // The account must exist before it can carry a Domain.
+    if fetch_account_info(xrpl_url, &local.xrpl_address)
+        .await
+        .is_err()
+    {
+        match faucet_url {
+            Some(f) => {
+                println!("  account not on chain yet — funding via faucet...");
+                faucet_fund(f, &local.xrpl_address).await?;
+            }
+            None => anyhow::bail!(
+                "account {} does not exist on chain and no --faucet-url was given. An \
+                 AccountSet cannot be submitted for an account that holds no reserve.",
+                local.xrpl_address
+            ),
+        }
+    }
+
+    let signing_pubkey = hex::decode(local.compressed_pubkey.trim_start_matches("0x"))
+        .context("entry compressed_pubkey is not valid hex")?;
+    let tx_hash = submit_domain_account_set(
+        xrpl_url,
+        enclave_url,
+        &local.address,
+        &local.session_key,
+        &local.xrpl_address,
+        &signing_pubkey,
+        &live_ecdh,
+    )
+    .await
+    .context("AccountSet(Domain) submission")?;
+    println!("  submitted: {tx_hash}");
+
+    // Confirm the RESULT, not the request. A submitted tx can be dropped, and
+    // reporting success off the submission is the defect this whole sweep is about.
+    let published = fetch_domain_ecdh_pubkey(xrpl_url, &local.xrpl_address)
+        .await
+        .context("submitted, but the record could not be read back — do NOT assume it landed")?;
+    ensure_chain_matches_live(&live_ecdh, &hex::encode(published), &local.xrpl_address)?;
+    println!();
+    println!("✓ on-chain record now matches this enclave's live ECDH identity");
+    Ok(())
+}
+
+/// The on-chain record must match the key the enclave actually holds. Split out
+/// from the three-way check because `publish-domain` needs exactly this half to
+/// confirm what it just submitted actually landed.
+fn ensure_chain_matches_live(live_hex: &str, chain_hex: &str, xrpl_address: &str) -> Result<()> {
+    let norm = |s: &str| {
+        s.trim()
+            .strip_prefix("0x")
+            .unwrap_or_else(|| s.trim().strip_prefix("0X").unwrap_or(s.trim()))
+            .to_ascii_lowercase()
+    };
+    let (live, chain) = (norm(live_hex), norm(chain_hex));
+    if live != chain {
+        anyhow::bail!(
+            "on-chain ECDH record for {xrpl_address} is STALE: AccountSet.Domain publishes \
+             {chain}, this node's enclave holds {live}. Every other operator's \
+             `node-config-apply` discovers the published value, so writing a roster now \
+             spreads the retired key across the cluster and Path-A transport to this node \
+             breaks. Re-publish with `publish-domain` first (a rotation does not \
+             re-publish). Refusing to write the roster."
+        );
+    }
+    Ok(())
+}
+
 /// The three places this node's ECDH identity is recorded must agree: the LIVE
 /// enclave (the only authority), the on-chain `AccountSet.Domain` every other
 /// operator discovers it from, and the local entry file that seeds `local_signer`.
@@ -1244,17 +1363,8 @@ fn ensure_ecdh_identity_agrees(
             .unwrap_or_else(|| s.trim().strip_prefix("0X").unwrap_or(s.trim()))
             .to_ascii_lowercase()
     };
-    let (live, chain, entry) = (norm(live_hex), norm(chain_hex), norm(entry_hex));
-    if live != chain {
-        anyhow::bail!(
-            "on-chain ECDH record for {xrpl_address} is STALE: AccountSet.Domain publishes \
-             {chain}, this node's enclave holds {live}. Every other operator's \
-             `node-config-apply` discovers the published value, so writing a roster now \
-             spreads the retired key across the cluster and Path-A transport to this node \
-             breaks. Re-publish with `node-bootstrap --publish-domain` first (a rotation \
-             does not re-publish). Refusing to write the roster."
-        );
-    }
+    let (live, _chain, entry) = (norm(live_hex), norm(chain_hex), norm(entry_hex));
+    ensure_chain_matches_live(live_hex, chain_hex, xrpl_address)?;
     if live != entry {
         anyhow::bail!(
             "local node entry for {xrpl_address} is STALE: it records {entry}, this node's \
@@ -2179,7 +2289,13 @@ mod tests {
         .to_string();
         assert!(err.contains("on-chain"), "got: {err}");
         assert!(err.contains("rNode1"), "got: {err}");
-        assert!(err.contains("--publish-domain"), "got: {err}");
+        // The remedy named must be the one that WORKS on an existing account:
+        // `node-bootstrap --publish-domain` generates a fresh key first.
+        assert!(err.contains("publish-domain"), "got: {err}");
+        assert!(
+            !err.contains("node-bootstrap --publish-domain"),
+            "got: {err}"
+        );
     }
 
     #[test]

@@ -239,6 +239,30 @@ enum Command {
     /// `docs/multi-operator-architecture.md` §6.5: the orchestrator
     /// daemon then boots, joins libp2p, and coordinates with peers via
     /// the mesh — direct HTTP-to-peer-enclave is not used.
+    /// Publish (or RE-publish) this node's ECDH identity to `AccountSet.Domain`
+    /// for an account that ALREADY exists.
+    ///
+    /// `node-bootstrap --publish-domain` cannot do this — it generates a fresh
+    /// keypair first, so it only ever publishes for a brand-new account. That
+    /// left the record settable only at birth, with no way to correct it after
+    /// an `ecdh/rotate`. Publishes what the enclave holds LIVE and confirms the
+    /// record off the ledger before reporting success.
+    PublishDomain {
+        /// Local enclave REST base (loopback only, O-L4).
+        #[arg(long, default_value = "https://localhost:9088/v1")]
+        enclave_url: String,
+        /// This node's existing entry file (`node-<i>.json` / `beta_entry.json`).
+        #[arg(long)]
+        node_entry: PathBuf,
+        /// XRPL JSON-RPC URL.
+        #[arg(long)]
+        xrpl_url: String,
+        /// Faucet URL, used ONLY if the account does not exist yet. Omit on
+        /// mainnet, where operators pre-fund.
+        #[arg(long)]
+        faucet_url: Option<String>,
+    },
+
     NodeConfigApply {
         /// XRPL JSON-RPC URL.
         #[arg(long)]
@@ -685,6 +709,20 @@ async fn main() -> Result<()> {
             output,
         }) => {
             return cli_tools::config_init(&entries, &escrow_address, quorum, &output).await;
+        }
+        Some(Command::PublishDomain {
+            enclave_url,
+            node_entry,
+            xrpl_url,
+            faucet_url,
+        }) => {
+            return cli_tools::publish_domain(
+                &enclave_url,
+                &node_entry,
+                &xrpl_url,
+                faucet_url.as_deref(),
+            )
+            .await;
         }
         Some(Command::NodeConfigApply {
             xrpl_url,
