@@ -726,7 +726,10 @@ async fn handle_unl_cluster_status(
     State(state): State<Arc<MembershipAdminState>>,
 ) -> impl IntoResponse {
     info!("#131 unl-status: asking every node which §6 record it holds");
-    let collector = crate::unl_policy::LibP2PUnlStatusCollector::new(state.unl_status_tx.clone());
+    let collector = crate::unl_policy::LibP2PUnlStatusCollector::new(
+        state.unl_status_tx.clone(),
+        state.cluster_size,
+    );
     match collector.collect().await {
         Ok(status) => {
             if !status.in_sync {

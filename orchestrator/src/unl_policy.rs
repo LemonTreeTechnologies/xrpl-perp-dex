@@ -204,7 +204,7 @@ pub struct UnlStatusGroup {
 ///
 /// An indicator, never a gate: Q-FORK-3 ruled the existing split
 /// accept-and-document, so this reports and refuses nothing.
-pub fn summarise_unl_agreement(mut nodes: Vec<NodeUnlStatus>) -> ClusterUnlStatus {
+pub fn summarise_unl_agreement(mut nodes: Vec<NodeUnlStatus>, expected: usize) -> ClusterUnlStatus {
     nodes.sort_by(|a, b| a.node.cmp(&b.node));
     let unreadable = nodes.iter().filter(|n| n.error.is_some()).count();
     let mut groups: Vec<UnlStatusGroup> = Vec::new();
@@ -227,10 +227,13 @@ pub fn summarise_unl_agreement(mut nodes: Vec<NodeUnlStatus>) -> ClusterUnlStatu
             }),
         }
     }
-    // Nobody answering is not agreement, and neither is a single node answering
-    // for a cluster of three — but this function cannot know the expected size,
-    // so it reports what it saw and leaves "enough of them" to the caller.
-    let in_sync = groups.len() == 1 && unreadable == 0;
+    // Silence is not agreement. The first live run of this endpoint returned
+    // `in_sync: true` off ONE node of three, because the peers' responses were
+    // being dropped — a split cluster read as healthy to anything checking the
+    // flag instead of the prose. So the verdict requires every expected node to
+    // have answered, and the expected size is passed in rather than inferred
+    // from who happened to reply.
+    let in_sync = groups.len() == 1 && unreadable == 0 && nodes.len() == expected && expected > 0;
     ClusterUnlStatus {
         in_sync,
         responded: nodes.len(),
@@ -244,13 +247,20 @@ pub fn summarise_unl_agreement(mut nodes: Vec<NodeUnlStatus>) -> ClusterUnlStatu
 pub struct LibP2PUnlStatusCollector {
     relay_tx: tokio::sync::mpsc::Sender<crate::p2p::UnlStatusRelay>,
     timeout: std::time::Duration,
+    /// How many nodes the cluster HAS. Without it a verdict cannot tell
+    /// agreement from silence.
+    expected: usize,
 }
 
 impl LibP2PUnlStatusCollector {
-    pub fn new(relay_tx: tokio::sync::mpsc::Sender<crate::p2p::UnlStatusRelay>) -> Self {
+    pub fn new(
+        relay_tx: tokio::sync::mpsc::Sender<crate::p2p::UnlStatusRelay>,
+        expected: usize,
+    ) -> Self {
         Self {
             relay_tx,
             timeout: std::time::Duration::from_secs(10),
+            expected,
         }
     }
 
@@ -305,7 +315,7 @@ impl LibP2PUnlStatusCollector {
                 });
             }
         }
-        Ok(summarise_unl_agreement(rows))
+        Ok(summarise_unl_agreement(rows, self.expected))
     }
 }
 
@@ -514,11 +524,14 @@ mod tests {
 
     #[test]
     fn the_live_fork_is_reported_as_a_split() {
-        let out = super::summarise_unl_agreement(vec![
-            row("rLhf-node-1", LIVE_NODE1),
-            row("r4XF-node-2", LIVE_NODE2),
-            row("rNBY-node-3", LIVE_NODE2),
-        ]);
+        let out = super::summarise_unl_agreement(
+            vec![
+                row("rLhf-node-1", LIVE_NODE1),
+                row("r4XF-node-2", LIVE_NODE2),
+                row("rNBY-node-3", LIVE_NODE2),
+            ],
+            3,
+        );
         assert!(!out.in_sync, "the live cluster does NOT agree");
         assert_eq!(out.groups.len(), 2, "one group per distinct record");
         assert_eq!(out.responded, 3);
@@ -539,10 +552,13 @@ mod tests {
 
     #[test]
     fn an_agreeing_cluster_is_one_group() {
-        let out = super::summarise_unl_agreement(vec![
-            row("r4XF-node-2", LIVE_NODE2),
-            row("rNBY-node-3", LIVE_NODE2),
-        ]);
+        let out = super::summarise_unl_agreement(
+            vec![
+                row("r4XF-node-2", LIVE_NODE2),
+                row("rNBY-node-3", LIVE_NODE2),
+            ],
+            2,
+        );
         assert!(out.in_sync);
         assert_eq!(out.groups.len(), 1);
         assert_eq!(out.groups[0].nodes.len(), 2);
@@ -554,11 +570,14 @@ mod tests {
         // ones would report a healthy cluster while a third of it is unknown.
         let mut broken = row("rNBY-node-3", LIVE_NODE2);
         broken.error = Some("enclave unreachable".into());
-        let out = super::summarise_unl_agreement(vec![
-            row("rLhf-node-1", LIVE_NODE2),
-            row("r4XF-node-2", LIVE_NODE2),
-            broken,
-        ]);
+        let out = super::summarise_unl_agreement(
+            vec![
+                row("rLhf-node-1", LIVE_NODE2),
+                row("r4XF-node-2", LIVE_NODE2),
+                broken,
+            ],
+            3,
+        );
         assert!(!out.in_sync, "an unknown node is not a agreeing node");
         assert_eq!(out.unreadable, 1);
         assert_eq!(
@@ -566,6 +585,21 @@ mod tests {
             1,
             "the readable ones still group together"
         );
+    }
+
+    #[test]
+    fn one_node_answering_for_three_is_not_agreement() {
+        // The first live run returned in_sync:true off ONE node of three because
+        // the peers' responses were being dropped. Anything reading the flag
+        // rather than the prose saw a healthy cluster that is in fact split.
+        let out = super::summarise_unl_agreement(vec![row("rLhf-node-1", LIVE_NODE1)], 3);
+        assert!(
+            !out.in_sync,
+            "silence from two thirds of the cluster is not agreement"
+        );
+        assert_eq!(out.responded, 1);
+        // The one answer is still reported — the operator needs to see who DID reply.
+        assert_eq!(out.groups.len(), 1);
     }
 
     #[test]
@@ -605,7 +639,7 @@ mod tests {
             let _ = relay.responses_tx.send(mk("node-a", 999)).await;
             let _ = relay.responses_tx.send(mk("node-b", 1)).await;
         });
-        let collector = super::LibP2PUnlStatusCollector::new(relay_tx);
+        let collector = super::LibP2PUnlStatusCollector::new(relay_tx, 2);
         let out = collector.collect().await.unwrap();
         assert_eq!(out.responded, 2, "one row per node: {:?}", out.nodes);
         assert!(

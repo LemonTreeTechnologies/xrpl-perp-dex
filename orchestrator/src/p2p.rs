@@ -284,7 +284,9 @@ pub enum SigningMessage {
     /// split accept-and-document, and gating on it would halt a cluster we have
     /// decided to run forked.
     ///
-    /// `request_id` MUST start with `"unl-status-"` for response routing.
+    /// `request_id` is the exact key the requester's `pending_unl_status` map is
+    /// waiting on; unlike the signing siblings this does NOT route by prefix,
+    /// because the prefix chain only ever sees `SigningMessage::Response`.
     UnlStatusRequest {
         request_id: String,
         requester_peer_id: String,
@@ -634,7 +636,7 @@ pub struct UnlPolicyRelay {
 /// it) can be observed instead of remembered.
 #[derive(Debug)]
 pub struct UnlStatusRelay {
-    /// Unique id; MUST start with `"unl-status-"` so response routing forwards here.
+    /// Unique id; the exact key responses are matched on.
     pub request_id: String,
     pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
 }
@@ -3738,12 +3740,6 @@ impl P2PNode {
                                             let _ = tx.send(msg).await;
                                         }
                                     }
-                                } else if request_id.starts_with("unl-status-") {
-                                    if let Some(tx) = self.pending_unl_status.get(&request_id) {
-                                        if let Ok(msg) = serde_json::from_slice::<SigningMessage>(&message.data) {
-                                            let _ = tx.send(msg).await;
-                                        }
-                                    }
                                 } else if request_id.starts_with("reserves-spv-") {
                                     if let Some(tx) =
                                         self.pending_spv_baseline.get(&request_id) {
@@ -4082,10 +4078,21 @@ impl P2PNode {
                                     error!("failed to publish unl-status response: {}", e);
                                 }
                             }
-                            // Responses are routed to the waiting collector by request_id
-                            // prefix before this match; reaching here means nobody is
-                            // waiting, which is not an error worth logging per message.
-                            Ok(SigningMessage::UnlStatusResponse { .. }) => {}
+                            // Routed HERE, not by the generic prefix chain: that chain
+                            // lives inside the `SigningMessage::Response` arm and only
+                            // ever sees that variant, so a distinct response type must
+                            // carry its own routing or it is silently dropped. It WAS
+                            // dropped — the collector's unit test injects responses
+                            // straight into the channel and so never crossed this line.
+                            Ok(SigningMessage::UnlStatusResponse { request_id, .. }) => {
+                                if let Some(tx) = self.pending_unl_status.get(&request_id) {
+                                    if let Ok(msg) =
+                                        serde_json::from_slice::<SigningMessage>(&message.data)
+                                    {
+                                        let _ = tx.send(msg).await;
+                                    }
+                                }
+                            }
                             Ok(SigningMessage::SpvBaselineRequest {
                                 request_id,
                                 requester_peer_id,
