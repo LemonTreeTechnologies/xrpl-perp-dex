@@ -102,21 +102,211 @@ pub async fn cosigner_accepts(
 
 /// Read the enclave's current UNL record state — needed to chain the next update.
 pub async fn read_status(admin_base: &str) -> Result<(u64, [u8; 32], u32)> {
+    let r = read_record(admin_base).await?;
+    Ok((r.unl_epoch, r.digest, r.live_validators))
+}
+
+/// The §6 record a node currently holds. `read_status` returns the three fields
+/// the update chain needs; this carries the anchor as well, because the anchor is
+/// where a cluster split is legible (the live fork shows identical epochs and
+/// DIFFERENT anchors).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlRecord {
+    pub unl_epoch: u64,
+    pub digest: [u8; 32],
+    pub live_validators: u32,
+    pub pinned_ledger_seq: u64,
+}
+
+pub async fn read_record(admin_base: &str) -> Result<UnlRecord> {
     let http = crate::http_helpers::loopback_http_client(std::time::Duration::from_secs(20))?;
     let url = format!("{}/v1/admin/unl/status", admin_base.trim_end_matches('/'));
     let r: serde_json::Value = http.get(&url).send().await?.json().await?;
+    parse_unl_status(&r)
+}
+
+/// Split out so the wire shape is testable against a REAL response body rather
+/// than one written to match the parser.
+pub fn parse_unl_status(r: &serde_json::Value) -> Result<UnlRecord> {
     if r["status"].as_str() != Some("success") {
         bail!("unl status failed: {r}");
     }
-    let epoch = r["unl_epoch"].as_u64().context("unl_epoch")?;
-    let live = r["live_validators"].as_u64().context("live_validators")? as u32;
+    let unl_epoch = r["unl_epoch"].as_u64().context("unl_epoch")?;
+    let live_validators = r["live_validators"].as_u64().context("live_validators")? as u32;
+    let pinned_ledger_seq = r["pinned_ledger_seq"]
+        .as_u64()
+        .context("pinned_ledger_seq")?;
     let d = hex::decode(r["digest"].as_str().context("digest")?).context("digest hex")?;
     if d.len() != 32 {
         bail!("digest must be 32 bytes");
     }
-    let mut prev = [0u8; 32];
-    prev.copy_from_slice(&d);
-    Ok((epoch, prev, live))
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&d);
+    Ok(UnlRecord {
+        unl_epoch,
+        digest,
+        live_validators,
+        pinned_ledger_seq,
+    })
+}
+
+/// The p2p layer holds each node's enclave base as a `.../v1` URL while the admin
+/// reader wants the host root. Converting in one tested place rather than at each
+/// call site, because a silently wrong base would make every peer answer "cannot
+/// read my record" and look like an outage.
+pub fn enclave_root_from_v1(enclave_url: &str) -> String {
+    let t = enclave_url.trim_end_matches('/');
+    t.strip_suffix("/v1")
+        .unwrap_or(t)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// #131 sweep Finding 2 — one node's answer to the read-only status query.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct NodeUnlStatus {
+    pub node: String,
+    pub unl_epoch: u64,
+    pub digest_hex: String,
+    pub pinned_ledger_seq: u64,
+    pub live_validators: u32,
+    /// Set when that node could not read its own record. A node that cannot
+    /// answer is NOT evidence of agreement, and is counted separately.
+    pub error: Option<String>,
+}
+
+/// What the cluster looks like as a whole. `in_sync` is deliberately strict:
+/// anything other than every responding node reporting the same record is a
+/// disagreement worth showing.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct ClusterUnlStatus {
+    pub in_sync: bool,
+    pub responded: usize,
+    pub unreadable: usize,
+    /// One entry per DISTINCT record, each naming the nodes holding it. With a
+    /// split cluster this is what makes the shape legible at a glance: the live
+    /// fork reports two groups at the same epoch with different anchors.
+    pub groups: Vec<UnlStatusGroup>,
+    pub nodes: Vec<NodeUnlStatus>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct UnlStatusGroup {
+    pub unl_epoch: u64,
+    pub digest_hex: String,
+    pub pinned_ledger_seq: u64,
+    pub nodes: Vec<String>,
+}
+
+/// Group the answers by the record they report and decide whether the cluster
+/// agrees. Pure so the verdict can be tested against the REAL responses the live
+/// cluster gives rather than ones invented to match this function.
+///
+/// An indicator, never a gate: Q-FORK-3 ruled the existing split
+/// accept-and-document, so this reports and refuses nothing.
+pub fn summarise_unl_agreement(mut nodes: Vec<NodeUnlStatus>) -> ClusterUnlStatus {
+    nodes.sort_by(|a, b| a.node.cmp(&b.node));
+    let unreadable = nodes.iter().filter(|n| n.error.is_some()).count();
+    let mut groups: Vec<UnlStatusGroup> = Vec::new();
+    for n in nodes.iter().filter(|n| n.error.is_none()) {
+        // Group on the DIGEST alone, because the digest already IS the record's
+        // identity: `compute_pinned_unl_digest` hashes the escrow, epoch, prev
+        // hash, anchor, quorum and the derived validator set
+        // (`sealed_pinned_unl_canonical.cpp:56`). Adding epoch or anchor to the
+        // key would be a discriminator that can never discriminate — two records
+        // cannot share a digest and differ in either. They are reported on each
+        // group because they are what a human reads, not because they decide
+        // membership.
+        match groups.iter_mut().find(|g| g.digest_hex == n.digest_hex) {
+            Some(g) => g.nodes.push(n.node.clone()),
+            None => groups.push(UnlStatusGroup {
+                unl_epoch: n.unl_epoch,
+                digest_hex: n.digest_hex.clone(),
+                pinned_ledger_seq: n.pinned_ledger_seq,
+                nodes: vec![n.node.clone()],
+            }),
+        }
+    }
+    // Nobody answering is not agreement, and neither is a single node answering
+    // for a cluster of three — but this function cannot know the expected size,
+    // so it reports what it saw and leaves "enough of them" to the caller.
+    let in_sync = groups.len() == 1 && unreadable == 0;
+    ClusterUnlStatus {
+        in_sync,
+        responded: nodes.len(),
+        unreadable,
+        groups,
+        nodes,
+    }
+}
+
+/// Collector for the read-only status query.
+pub struct LibP2PUnlStatusCollector {
+    relay_tx: tokio::sync::mpsc::Sender<crate::p2p::UnlStatusRelay>,
+    timeout: std::time::Duration,
+}
+
+impl LibP2PUnlStatusCollector {
+    pub fn new(relay_tx: tokio::sync::mpsc::Sender<crate::p2p::UnlStatusRelay>) -> Self {
+        Self {
+            relay_tx,
+            timeout: std::time::Duration::from_secs(10),
+        }
+    }
+
+    /// Broadcast the query and gather answers until the timeout. Never errors on
+    /// a partial cluster: a node that does not answer is the very thing an
+    /// operator needs to see, so it is reported as absent rather than raised.
+    pub async fn collect(&self) -> Result<ClusterUnlStatus> {
+        use uuid::Uuid;
+        let request_id = format!("unl-status-{}", Uuid::new_v4());
+        let (responses_tx, mut responses_rx) = tokio::sync::mpsc::channel(32);
+        self.relay_tx
+            .send(crate::p2p::UnlStatusRelay {
+                request_id,
+                responses_tx,
+            })
+            .await
+            .context("send UnlStatusRelay to the p2p run-loop")?;
+
+        let mut rows: Vec<NodeUnlStatus> = Vec::new();
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let resp = match tokio::time::timeout(remaining, responses_rx.recv()).await {
+                Ok(Some(m)) => m,
+                _ => break,
+            };
+            if let crate::p2p::SigningMessage::UnlStatusResponse {
+                signer_xrpl_address,
+                unl_epoch,
+                digest_hex,
+                pinned_ledger_seq,
+                live_validators,
+                error,
+                ..
+            } = resp
+            {
+                // One row per node: a node answering twice must not turn one
+                // opinion into two, which would hide a split behind a majority.
+                if rows.iter().any(|r| r.node == signer_xrpl_address) {
+                    continue;
+                }
+                rows.push(NodeUnlStatus {
+                    node: signer_xrpl_address,
+                    unl_epoch,
+                    digest_hex,
+                    pinned_ledger_seq,
+                    live_validators,
+                    error,
+                });
+            }
+        }
+        Ok(summarise_unl_agreement(rows))
+    }
 }
 
 /// Collector for the policy ceremony — mirrors the reserves collectors.
@@ -288,6 +478,142 @@ pub async fn run_unl_policy_ceremony(
 
 #[cfg(test)]
 mod tests {
+
+    // ── #131 sweep Finding 2 — the cross-node UNL indicator ──
+    //
+    // The fixtures below are the VERBATIM bodies the three live testnet nodes
+    // returned on 2026-09-21, not bodies written to match the parser. The cluster
+    // is genuinely split 2-vs-1 at the same epoch with different anchors, which is
+    // the case the indicator exists for.
+    const LIVE_NODE1: &str = r#"{"anchored_masters":6,"digest":"dba62a986b987bfda0c07d560f84702aa160e6fba79dcd41165c20d0a5dfd18f","live_validators":6,"pinned_ledger_seq":20591270,"status":"success","unl_epoch":1}"#;
+    const LIVE_NODE2: &str = r#"{"anchored_masters":6,"digest":"1089323632beffb3289f73775b26661d152912680bef9e252a9f1a738d7ee8af","live_validators":6,"pinned_ledger_seq":20591293,"status":"success","unl_epoch":1}"#;
+
+    fn row(node: &str, body: &str) -> super::NodeUnlStatus {
+        let r = super::parse_unl_status(&serde_json::from_str(body).unwrap()).unwrap();
+        super::NodeUnlStatus {
+            node: node.into(),
+            unl_epoch: r.unl_epoch,
+            digest_hex: hex::encode(r.digest),
+            pinned_ledger_seq: r.pinned_ledger_seq,
+            live_validators: r.live_validators,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn parses_the_real_status_body() {
+        let r = super::parse_unl_status(&serde_json::from_str(LIVE_NODE1).unwrap()).unwrap();
+        assert_eq!(r.unl_epoch, 1);
+        assert_eq!(r.live_validators, 6);
+        assert_eq!(r.pinned_ledger_seq, 20591270);
+        assert_eq!(
+            hex::encode(r.digest),
+            "dba62a986b987bfda0c07d560f84702aa160e6fba79dcd41165c20d0a5dfd18f"
+        );
+    }
+
+    #[test]
+    fn the_live_fork_is_reported_as_a_split() {
+        let out = super::summarise_unl_agreement(vec![
+            row("rLhf-node-1", LIVE_NODE1),
+            row("r4XF-node-2", LIVE_NODE2),
+            row("rNBY-node-3", LIVE_NODE2),
+        ]);
+        assert!(!out.in_sync, "the live cluster does NOT agree");
+        assert_eq!(out.groups.len(), 2, "one group per distinct record");
+        assert_eq!(out.responded, 3);
+        assert_eq!(out.unreadable, 0);
+        let sizes: Vec<usize> = out.groups.iter().map(|g| g.nodes.len()).collect();
+        assert!(
+            sizes.contains(&1) && sizes.contains(&2),
+            "2-vs-1: {sizes:?}"
+        );
+        // The epochs AGREE while the anchors do not — grouping on the epoch alone
+        // would call this cluster healthy.
+        assert!(out.groups.iter().all(|g| g.unl_epoch == 1));
+        assert_ne!(
+            out.groups[0].pinned_ledger_seq,
+            out.groups[1].pinned_ledger_seq
+        );
+    }
+
+    #[test]
+    fn an_agreeing_cluster_is_one_group() {
+        let out = super::summarise_unl_agreement(vec![
+            row("r4XF-node-2", LIVE_NODE2),
+            row("rNBY-node-3", LIVE_NODE2),
+        ]);
+        assert!(out.in_sync);
+        assert_eq!(out.groups.len(), 1);
+        assert_eq!(out.groups[0].nodes.len(), 2);
+    }
+
+    #[test]
+    fn a_node_that_cannot_read_its_record_is_not_agreement() {
+        // Two nodes agree and the third cannot answer. Counting only the readable
+        // ones would report a healthy cluster while a third of it is unknown.
+        let mut broken = row("rNBY-node-3", LIVE_NODE2);
+        broken.error = Some("enclave unreachable".into());
+        let out = super::summarise_unl_agreement(vec![
+            row("rLhf-node-1", LIVE_NODE2),
+            row("r4XF-node-2", LIVE_NODE2),
+            broken,
+        ]);
+        assert!(!out.in_sync, "an unknown node is not a agreeing node");
+        assert_eq!(out.unreadable, 1);
+        assert_eq!(
+            out.groups.len(),
+            1,
+            "the readable ones still group together"
+        );
+    }
+
+    #[test]
+    fn enclave_root_drops_the_v1_suffix_once() {
+        assert_eq!(
+            super::enclave_root_from_v1("https://localhost:9088/v1"),
+            "https://localhost:9088"
+        );
+        assert_eq!(
+            super::enclave_root_from_v1("https://localhost:9088/v1/"),
+            "https://localhost:9088"
+        );
+        // Already a root: must be left alone, not have a path segment eaten.
+        assert_eq!(
+            super::enclave_root_from_v1("https://localhost:9088"),
+            "https://localhost:9088"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_collector_gives_one_row_per_node_however_often_it_answers() {
+        // A node answering twice must not turn one opinion into two: that would let
+        // a 2-vs-1 split read as 3-vs-1 and hide which side is actually bigger.
+        let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<crate::p2p::UnlStatusRelay>(4);
+        tokio::spawn(async move {
+            let relay = relay_rx.recv().await.unwrap();
+            let mk = |node: &str, anchor: u64| crate::p2p::SigningMessage::UnlStatusResponse {
+                request_id: relay.request_id.clone(),
+                signer_xrpl_address: node.into(),
+                unl_epoch: 1,
+                digest_hex: "aa".repeat(32),
+                pinned_ledger_seq: anchor,
+                live_validators: 6,
+                error: None,
+            };
+            let _ = relay.responses_tx.send(mk("node-a", 1)).await;
+            let _ = relay.responses_tx.send(mk("node-a", 999)).await;
+            let _ = relay.responses_tx.send(mk("node-b", 1)).await;
+        });
+        let collector = super::LibP2PUnlStatusCollector::new(relay_tx);
+        let out = collector.collect().await.unwrap();
+        assert_eq!(out.responded, 2, "one row per node: {:?}", out.nodes);
+        assert!(
+            out.in_sync,
+            "the duplicate carried a different anchor and must be ignored"
+        );
+    }
+
     use super::*;
 
     /// The three shapes an apply-broadcast can end in. The third is the one that matters:

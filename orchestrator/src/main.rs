@@ -1032,6 +1032,14 @@ async fn main() -> Result<()> {
         (None, None)
     };
 
+    // #131 sweep Finding 2: the READ-ONLY cluster UNL status query channel.
+    let (unl_status_rx_holder, _unl_status_tx) = if signers_config.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<p2p::UnlStatusRelay>(8);
+        (Some(rx), Some(tx))
+    } else {
+        (None, None)
+    };
+
     let peer_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     let maintenance_mode = Arc::new(std::sync::atomic::AtomicBool::new(matches!(
@@ -1502,6 +1510,7 @@ async fn main() -> Result<()> {
             _mrenclave_governance_tx.clone(),
             _spv_baseline_tx.clone(),
             _unl_policy_tx.clone(),
+            _unl_status_tx.clone(),
         ) {
             (
                 Some(cfg),
@@ -1511,6 +1520,7 @@ async fn main() -> Result<()> {
                 Some(mrenclave_governance_tx),
                 Some(spv_baseline_tx),
                 Some(unl_policy_tx),
+                Some(unl_status_tx),
             ) if !cli.membership_node_urls.is_empty() => {
                 let escrow = crate::xrpl_signer::decode_xrpl_address(&escrow_address)
                     .context("--membership-admin-listen: escrow address must decode")?;
@@ -1546,6 +1556,7 @@ async fn main() -> Result<()> {
                     mrenclave_governance_tx,
                     spv_baseline_tx,
                     unl_policy_tx,
+                    unl_status_tx,
                     operator_capital_account_ids: operator_capital_account_ids.clone(),
                 });
                 tokio::spawn(async move {
@@ -1710,6 +1721,9 @@ async fn main() -> Result<()> {
             p2p_node.set_spv_baseline_channel(rx);
         }
         // #131 §6: the UNL policy collection channel.
+        if let Some(rx) = unl_status_rx_holder {
+            p2p_node.set_unl_status_channel(rx);
+        }
         if let Some(rx) = unl_policy_rx_holder {
             p2p_node.set_unl_policy_channel(rx);
         }

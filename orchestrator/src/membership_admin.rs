@@ -21,7 +21,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -74,6 +80,10 @@ pub struct MembershipAdminState {
     pub spv_baseline_tx: mpsc::Sender<crate::p2p::SpvBaselineRelay>,
     /// #131 §6: drives `LibP2PUnlPolicyCollector` (quorum fraction + freshness anchor).
     pub unl_policy_tx: mpsc::Sender<crate::p2p::UnlPolicyRelay>,
+    /// #131 sweep Finding 2: drives `LibP2PUnlStatusCollector` — the read-only
+    /// cross-node status query. Separate channel from the ceremony above because
+    /// it proposes nothing and applies nothing.
+    pub unl_status_tx: mpsc::Sender<crate::p2p::UnlStatusRelay>,
     /// #131 AC-BASE (a): the operator-capital excluded senders as 20-byte XRPL AccountID
     /// hex (decoded from OPERATOR_CAPITAL_SENDERS — the SAME config the scanner uses),
     /// committed into the baseline marker's excluded_senders_hash.
@@ -703,6 +713,65 @@ pub struct UnlPolicyResponse {
     pub enclave: serde_json::Value,
 }
 
+/// #131 sweep Finding 2 — read-only: ask every node what §6 record it holds and
+/// report whether they agree.
+///
+/// Deliberately NOT a gate. Q-FORK-3 ruled the existing split accept-and-document,
+/// and halting a cluster we have decided to run forked would be the wrong trade.
+/// What was missing is that the accepted anomaly lived only in a ruling document:
+/// an operator looking at the cluster could not see it, so the next person to hit
+/// it would rediscover it by investigation — which is exactly how the 1-of-1 Safe
+/// was found.
+async fn handle_unl_cluster_status(
+    State(state): State<Arc<MembershipAdminState>>,
+) -> impl IntoResponse {
+    info!("#131 unl-status: asking every node which §6 record it holds");
+    let collector = crate::unl_policy::LibP2PUnlStatusCollector::new(state.unl_status_tx.clone());
+    match collector.collect().await {
+        Ok(status) => {
+            if !status.in_sync {
+                warn!(
+                    groups = status.groups.len(),
+                    unreadable = status.unreadable,
+                    "#131 unl-status: cluster does NOT agree on its UNL record"
+                );
+            }
+            let expected = state.cluster_size;
+            let message = if status.responded < expected {
+                format!(
+                    "{}/{} nodes answered — a node that did not answer is neither agreement \
+                     nor disagreement, and is absent from the groups below",
+                    status.responded, expected
+                )
+            } else if status.in_sync {
+                format!("all {expected} nodes hold the same UNL record")
+            } else {
+                format!(
+                    "cluster is SPLIT across {} distinct UNL records ({} node(s) could not \
+                     read their own) — an indicator, not a gate: see Q-FORK-3",
+                    status.groups.len(),
+                    status.unreadable
+                )
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "expected_nodes": expected,
+                    "cluster": status,
+                    "message": message,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"status": "error", "message": format!("{e:#}")})),
+        )
+            .into_response(),
+    }
+}
+
 async fn handle_unl_policy(
     State(state): State<Arc<MembershipAdminState>>,
     Json(req): Json<UnlPolicyRequest>,
@@ -761,6 +830,7 @@ pub fn router(state: Arc<MembershipAdminState>) -> Router {
         )
         .route("/admin/unl-refresh", post(handle_unl_refresh))
         .route("/admin/unl-policy", post(handle_unl_policy))
+        .route("/admin/unl-cluster-status", get(handle_unl_cluster_status))
         .with_state(state)
 }
 
