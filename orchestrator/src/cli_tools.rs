@@ -1055,11 +1055,21 @@ pub async fn node_config_apply(
     println!("Output:  {}", output.display());
     println!();
 
-    // 1. Read local node-entry to populate `local_signer`.
+    // 1. Read this node's identity. Either shape: a bare entry file, or a
+    //    `signers_config.json` whose `local_signer` holds it. Same reason as
+    //    `publish-domain` — on a live node the entry files are leftovers from
+    //    earlier rounds and none of them matches the address currently on the
+    //    SignerList. Fixed there first and not here, which is why this command
+    //    still refused after that change: a class is not fixed until every member
+    //    is checked.
     let local_data = std::fs::read_to_string(node_entry_path)
         .with_context(|| format!("cannot read {}", node_entry_path.display()))?;
-    let local: SignerEntry = serde_json::from_str(&local_data)
-        .with_context(|| format!("invalid SignerEntry JSON in {}", node_entry_path.display()))?;
+    let local = load_local_signer(&local_data).with_context(|| {
+        format!(
+            "reading this node's identity from {}",
+            node_entry_path.display()
+        )
+    })?;
     println!("[1/4] Loaded local entry");
     println!("  xrpl_address: {}", local.xrpl_address);
     if local.ecdh_pubkey.is_none() {
