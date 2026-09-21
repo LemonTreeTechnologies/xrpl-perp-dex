@@ -1255,8 +1255,12 @@ pub async fn publish_domain(
 
     let local_data = std::fs::read_to_string(node_entry_path)
         .with_context(|| format!("cannot read {}", node_entry_path.display()))?;
-    let local: SignerEntry = serde_json::from_str(&local_data)
-        .with_context(|| format!("invalid SignerEntry JSON in {}", node_entry_path.display()))?;
+    let local = load_local_signer(&local_data).with_context(|| {
+        format!(
+            "reading this node's identity from {}",
+            node_entry_path.display()
+        )
+    })?;
     println!("  xrpl_address: {}", local.xrpl_address);
 
     // The live enclave, not the file — see the doc comment.
@@ -1318,6 +1322,33 @@ pub async fn publish_domain(
     println!();
     println!("✓ on-chain record now matches this enclave's live ECDH identity");
     Ok(())
+}
+
+/// Accept either a bare entry file or a full `signers_config.json`, taking
+/// `local_signer` from the latter.
+///
+/// On a live node the entry files are leftovers from earlier rounds — on this
+/// cluster node-1 carries two, and NEITHER matches the address currently on the
+/// SignerList. The file that actually says who this node is today is
+/// `signers_config.json`. Requiring the other one would mean hand-building an
+/// artefact to satisfy the tool, which is the shape of an architectural bug, not
+/// an operator inconvenience.
+fn load_local_signer(json: &str) -> Result<SignerEntry> {
+    let v: serde_json::Value = serde_json::from_str(json).context("file is not valid JSON")?;
+    if let Some(local) = v.get("local_signer") {
+        if local.is_null() {
+            // Distinct from the parse failure below on purpose: absent and
+            // malformed have different remedies, and "invalid SignerEntry" would
+            // send an operator hunting a corrupt field that is not there.
+            anyhow::bail!(
+                "signers_config carries `local_signer: null` — this node has no identity \
+                 recorded in it, so there is nothing to publish. Regenerate the config."
+            );
+        }
+        return serde_json::from_value(local.clone())
+            .context("`local_signer` is not a valid SignerEntry");
+    }
+    serde_json::from_value(v).context("not a SignerEntry and has no `local_signer`")
 }
 
 /// The on-chain record must match the key the enclave actually holds. Split out
@@ -2259,6 +2290,38 @@ mod tests {
     fn encode_domain_v1_idempotent_on_lowercase() {
         let pk_lower = "03d3869df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57";
         assert_eq!(encode_domain_v1(pk_lower).len(), 80);
+    }
+
+    #[test]
+    fn local_signer_is_read_from_either_file_shape() {
+        let entry = r#"{"name":"n1","enclave_url":"u","address":"0xabc","session_key":"sk",
+            "compressed_pubkey":"02aa","xrpl_address":"rEntry"}"#;
+        assert_eq!(
+            super::load_local_signer(entry).unwrap().xrpl_address,
+            "rEntry"
+        );
+        // The shape a live node actually has.
+        let cfg = r#"{"escrow_address":"rEsc","escrow_seed":"","quorum":2,
+            "signer_list_set_tx_hash":"","signers":[],
+            "local_signer":{"name":"n1","enclave_url":"u","address":"0xabc",
+            "session_key":"sk","compressed_pubkey":"02aa","xrpl_address":"rLocal"}}"#;
+        assert_eq!(
+            super::load_local_signer(cfg).unwrap().xrpl_address,
+            "rLocal"
+        );
+    }
+
+    #[test]
+    fn a_config_without_a_local_signer_is_refused_not_silently_empty() {
+        // A node absent from its own config must not publish for a default
+        // identity; it must say so.
+        let cfg = r#"{"escrow_address":"rEsc","escrow_seed":"","quorum":2,
+            "signer_list_set_tx_hash":"","signers":[],"local_signer":null}"#;
+        let err = super::load_local_signer(cfg).unwrap_err().to_string();
+        // Pin the REASON, not the word: the fallback parse error also mentions
+        // `local_signer`, so asserting that alone passes with the guard deleted.
+        assert!(err.contains("no identity"), "got: {err}");
+        assert!(!err.contains("not a valid SignerEntry"), "got: {err}");
     }
 
     #[test]
