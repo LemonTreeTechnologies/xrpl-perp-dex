@@ -484,8 +484,6 @@ async fn submit_domain_account_set(
     signing_pubkey: &[u8],
     ecdh_pubkey_hex: &str,
 ) -> Result<String> {
-    use sha2::Digest;
-
     if signing_pubkey.len() != 33 {
         anyhow::bail!(
             "signing_pubkey must be 33-byte compressed secp256k1, got {} bytes",
@@ -513,27 +511,39 @@ async fn submit_domain_account_set(
     //   Account         = 1 (AccountID)
     //   SigningPubKey   = 3 (Blob)
     //   TxnSignature    = 4 (Blob)
+    // LastLedgerSequence is REQUIRED by the enclave's typed route, not optional:
+    // Sequence alone makes a signed blob one-time, but with no ledger bound a
+    // signed-and-unsubmitted AccountSet stays valid indefinitely.
+    let validated = crate::unl_policy::own_validated_ledger(xrpl_url)
+        .await
+        .context("reading the validated ledger for LastLedgerSequence")?;
+    let last_ledger = validated
+        .checked_add(LAST_LEDGER_WINDOW)
+        .context("LastLedgerSequence overflow")?;
+    let last_ledger_u32 =
+        u32::try_from(last_ledger).context("LastLedgerSequence exceeds the XRPL 32-bit field")?;
+
     let mut fields = vec![
         XrplField::uint16(2, 3),
         XrplField::uint32(4, sequence),
-        XrplField::amount_drops(8, 12),
+        XrplField::uint32(27, last_ledger_u32),
+        XrplField::amount_drops(8, ACCOUNTSET_FEE_DROPS),
         XrplField::blob(7, domain_bytes),
         XrplField::account_id(1, &account_id),
         XrplField::blob(3, signing_pubkey),
     ];
 
-    // Compute the signing hash: SHA-512Half(STX\0 || canonical(fields))
+    // Serialize the blob WITHOUT TxnSignature and hand THAT to the enclave. The
+    // enclave re-derives the signing hash itself under STX\0 — no host-supplied
+    // hash reaches a signing primitive, which is the property `no_bare_sign`
+    // exists to protect, and the reason the bare `/pool/sign` route refuses.
     fields.sort_by_key(|f| f.sort_key());
-    let mut signing_data = HASH_PREFIX_TX_SIGN.to_vec();
+    let mut unsigned_blob = Vec::new();
     for f in &fields {
-        signing_data.extend_from_slice(&f.serialize());
+        unsigned_blob.extend_from_slice(&f.serialize());
     }
-    let h = sha2::Sha512::digest(&signing_data);
-    let mut signing_hash = [0u8; 32];
-    signing_hash.copy_from_slice(&h[..32]);
-
-    // Ask the enclave to sign.
-    let sig_der = sign_via_enclave(enclave_url, eth_address, session_key, &signing_hash).await?;
+    let sig_der =
+        sign_accountset_via_enclave(enclave_url, eth_address, session_key, &unsigned_blob).await?;
 
     // Append TxnSignature, re-serialize, submit.
     fields.push(XrplField::blob(4, &sig_der));
@@ -591,38 +601,61 @@ pub fn decode_domain_v1(domain_bytes: &[u8]) -> Result<[u8; 33]> {
 
 /// Asks the operator's enclave to ECDSA-sign a 32-byte hash with the
 /// account-bound key, returns the DER-encoded signature.
-async fn sign_via_enclave(
+/// Window, in ledgers, that a published Domain transaction stays valid for.
+/// ~4s per ledger, so 40 is a couple of minutes — long enough for submission and
+/// short enough that an unsubmitted blob expires rather than lingering.
+const LAST_LEDGER_WINDOW: u64 = 40;
+/// Must stay at or below the enclave's compiled XRPL_ACCOUNTSET_MAX_FEE_DROPS.
+const ACCOUNTSET_FEE_DROPS: u64 = 12;
+
+/// Sign an AccountSet(Domain) through the enclave's TYPED route.
+///
+/// The bare `/pool/sign` route refuses every key this enclave generates
+/// (`no_bare_sign`), which is why publishing was inoperable. This route hands
+/// over the transaction BLOB; the enclave parses it under its allowlist, checks
+/// the Domain against its own live ECDH identity, re-derives the hash and signs.
+async fn sign_accountset_via_enclave(
     enclave_url: &str,
     eth_address: &str,
     session_key: &str,
-    hash: &[u8; 32],
+    tx_blob: &[u8],
 ) -> Result<Vec<u8>> {
     let http = crate::http_helpers::loopback_http_client(std::time::Duration::from_secs(30))?;
-    let resp: serde_json::Value = http
-        .post(format!("{enclave_url}/pool/sign"))
+    let resp = http
+        .post(format!("{enclave_url}/pool/sign/accountset-domain"))
         .json(&serde_json::json!({
             "from": eth_address,
-            "hash": format!("0x{}", hex::encode(hash)),
             "session_key": session_key,
+            "tx_blob": hex::encode(tx_blob),
         }))
         .send()
         .await
-        .context("/pool/sign failed")?
-        .json()
+        .context("/pool/sign/accountset-domain failed")?;
+    // The enclave answers a refusal as a civetweb banner followed by the JSON
+    // body, so parsing straight to JSON reports a decode error instead of the
+    // enclave's own message. Read the text and surface what it actually said.
+    let status = resp.status();
+    let text = resp
+        .text()
         .await
-        .context("invalid JSON from /pool/sign")?;
-    if resp["status"].as_str() != Some("success") {
-        anyhow::bail!("/pool/sign rejected: {resp}");
+        .context("reading /pool/sign/accountset-domain response")?;
+    let v: serde_json::Value = serde_json::from_str(text.trim_start_matches(|c| c != '{'))
+        .with_context(|| format!("enclave replied HTTP {status}: {}", text.trim()))?;
+    if v["status"].as_str() != Some("success") {
+        anyhow::bail!(
+            "enclave refused to sign the AccountSet: {}",
+            v["message"].as_str().unwrap_or("(no message)")
+        );
     }
-    let r_hex = resp["signature"]["r"]
+    let r_hex = v["signature"]["r"]
         .as_str()
-        .context("missing r in /pool/sign response")?;
-    let s_hex = resp["signature"]["s"]
+        .context("signature.r missing")?;
+    let s_hex = v["signature"]["s"]
         .as_str()
-        .context("missing s in /pool/sign response")?;
-    let r = hex::decode(r_hex).context("bad r hex")?;
-    let s = hex::decode(s_hex).context("bad s hex")?;
-    Ok(xrpl_signer::der_encode_signature(&r, &s))
+        .context("signature.s missing")?;
+    let r = hex::decode(r_hex.trim_start_matches("0x")).context("signature.r is not hex")?;
+    let s = hex::decode(s_hex.trim_start_matches("0x")).context("signature.s is not hex")?;
+    Ok(crate::xrpl_signer::der_encode_signature(&r, &s))
 }
 
 /// Minimal `account_info` query — returns the next sequence number we
