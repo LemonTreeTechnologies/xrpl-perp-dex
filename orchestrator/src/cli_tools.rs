@@ -607,6 +607,10 @@ pub fn decode_domain_v1(domain_bytes: &[u8]) -> Result<[u8; 33]> {
 const LAST_LEDGER_WINDOW: u64 = 40;
 /// Must stay at or below the enclave's compiled XRPL_ACCOUNTSET_MAX_FEE_DROPS.
 const ACCOUNTSET_FEE_DROPS: u64 = 12;
+/// Read-back polling: XRPL validates in ~4s, so a handful of tries covers a normal
+/// landing without masking a transaction that never did.
+const VERIFY_ATTEMPTS: u64 = 8;
+const VERIFY_INTERVAL_SECS: u64 = 5;
 
 /// Sign an AccountSet(Domain) through the enclave's TYPED route.
 ///
@@ -1348,9 +1352,33 @@ pub async fn publish_domain(
 
     // Confirm the RESULT, not the request. A submitted tx can be dropped, and
     // reporting success off the submission is the defect this whole sweep is about.
-    let published = fetch_domain_ecdh_pubkey(xrpl_url, &local.xrpl_address)
-        .await
-        .context("submitted, but the record could not be read back — do NOT assume it landed")?;
+    //
+    // Poll rather than read once: `account_info` at `ledger_index: validated` cannot
+    // see the transaction until the ledger it landed in is validated, ~4s away. A
+    // single immediate read reports "not published" on a submission that succeeded —
+    // which is a false alarm on a correct operation, and the kind that teaches an
+    // operator to ignore the check.
+    let mut published: Option<[u8; 33]> = None;
+    let mut last_err = String::new();
+    for _ in 0..VERIFY_ATTEMPTS {
+        match fetch_domain_ecdh_pubkey(xrpl_url, &local.xrpl_address).await {
+            Ok(p) => {
+                published = Some(p);
+                break;
+            }
+            Err(e) => {
+                last_err = format!("{e:#}");
+                tokio::time::sleep(std::time::Duration::from_secs(VERIFY_INTERVAL_SECS)).await;
+            }
+        }
+    }
+    let published = published.with_context(|| {
+        format!(
+            "submitted as {tx_hash}, but the record was not readable after {}s — do NOT assume \
+             it landed; last error: {last_err}",
+            VERIFY_ATTEMPTS * VERIFY_INTERVAL_SECS
+        )
+    })?;
     ensure_chain_matches_live(&live_ecdh, &hex::encode(published), &local.xrpl_address)?;
     println!();
     println!("✓ on-chain record now matches this enclave's live ECDH identity");
