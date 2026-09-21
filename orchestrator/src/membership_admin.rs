@@ -16,7 +16,6 @@
 //! apply-broadcast (`LibP2PMembershipApplier`): the driving node broadcasts ONE
 //! apply and every node applies it to its OWN localhost enclave + acks. Only the
 //! LOCAL epoch-digest read is a direct (loopback) HTTP GET.
-#![allow(dead_code)] // wired by main.rs behind the membership-admin listen flag
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,10 +29,10 @@ use tracing::{info, warn};
 use crate::membership_apply::LibP2PMembershipApplier;
 use crate::membership_canonical::SignerEntry;
 use crate::membership_coordinator::{
-    run_genesis_bootstrap, run_membership_change, LibP2PMembershipCollector,
+    run_genesis_bootstrap, run_membership_change, LibP2PMembershipCollector, NodeSealResult,
 };
 use crate::membership_http::HttpEpochDigestSource;
-use crate::membership_projection::{run_projection, ProjectionRequest};
+use crate::membership_projection::{run_projection, NodeConfirmResult, ProjectionRequest};
 use crate::membership_submit::LibP2PProjectionSubmitter;
 use crate::p2p::{MembershipApplyRelay, MembershipEpochRelay, MembershipSignerWire, SigningRelay};
 use crate::signerlist_update::fetch_account_sequence;
@@ -99,7 +98,46 @@ pub struct MembershipChangeResponse {
     pub projection_tx_hash_hex: Option<String>,
     pub projection_ledger_index: Option<u64>,
     pub confirmed_nodes: usize,
+    /// WHICH nodes did not apply, and why. Empty on full success.
+    pub failed_nodes: Vec<FailedNode>,
     pub message: String,
+}
+
+/// Operator-facing record of a node that did NOT apply.
+///
+/// Every partial-outcome message here tells the operator to "retry the failed
+/// nodes". Reporting only a COUNT makes that instruction impossible to follow
+/// from the response: the operator is told 2-of-3 and has to go find the third
+/// by hand. `NodeSealResult`/`NodeConfirmResult` carry the node and the error
+/// all the way to this boundary, where they were dropped -- the same defect as
+/// echoing the request instead of the outcome, on the paths that matter most,
+/// because a partial apply leaves the cluster's membership split.
+#[derive(Debug, Serialize)]
+pub struct FailedNode {
+    pub node: String,
+    pub error: Option<String>,
+}
+
+fn failed_seal_nodes(results: &[NodeSealResult]) -> Vec<FailedNode> {
+    results
+        .iter()
+        .filter(|r| !r.ok)
+        .map(|r| FailedNode {
+            node: r.node.clone(),
+            error: r.error.clone(),
+        })
+        .collect()
+}
+
+fn failed_confirm_nodes(results: &[NodeConfirmResult]) -> Vec<FailedNode> {
+    results
+        .iter()
+        .filter(|r| !r.ok)
+        .map(|r| FailedNode {
+            node: r.node.clone(),
+            error: r.error.clone(),
+        })
+        .collect()
 }
 
 /// Build one reqwest client that accepts the enclave's self-signed TLS (the
@@ -175,6 +213,7 @@ async fn drive_change(
             projection_tx_hash_hex: None,
             projection_ledger_index: None,
             confirmed_nodes: 0,
+            failed_nodes: failed_seal_nodes(&change.node_results),
             message: "epoch sealed on a subset of nodes; projection NOT attempted — \
                       retry the failed nodes (idempotent) before projecting"
                 .into(),
@@ -219,6 +258,7 @@ async fn drive_change(
         projection_tx_hash_hex: Some(hex::encode(proj.tx_hash)),
         projection_ledger_index: Some(proj.ledger_index),
         confirmed_nodes,
+        failed_nodes: failed_confirm_nodes(&proj.node_results),
         message: if proj.all_recorded() {
             "membership changed + projected + confirmed on all nodes".into()
         } else {
@@ -312,6 +352,7 @@ async fn drive_genesis(
         projection_tx_hash_hex: None,
         projection_ledger_index: None,
         confirmed_nodes: 0,
+        failed_nodes: failed_seal_nodes(&outcome.node_results),
         message: if outcome.all_sealed() {
             format!(
                 "genesis epoch {} sealed on all {sealed_nodes} nodes; SignerListSet already \
@@ -361,9 +402,16 @@ pub struct MrenclaveGovernRequest {
 #[derive(Debug, Serialize)]
 pub struct MrenclaveGovernResponse {
     pub status: String,
+    /// The measurement the cluster ACTUALLY governed, echoed from the outcome rather than
+    /// from the request. Reporting the request back confirms what was asked for, not what
+    /// happened — an operator who mistyped a measurement would read an identical response.
+    /// That is the same shape that let a 1-of-1 Safe look correct for a month.
+    pub mrenclave: String,
     pub allowlist_epoch: u64,
     pub repro_signers: usize,
     pub applied_nodes: usize,
+    /// WHICH nodes did not apply, and why. Empty on full success.
+    pub failed_nodes: Vec<FailedNode>,
     pub message: String,
 }
 
@@ -415,15 +463,25 @@ async fn drive_govern(
             "partial_apply"
         }
         .into(),
+        mrenclave: format!("0x{}", hex::encode(outcome.mrenclave)),
         allowlist_epoch: outcome.allowlist_epoch,
         repro_signers: outcome.repro_signers,
         applied_nodes: applied,
+        failed_nodes: failed_seal_nodes(&outcome.node_results),
+        // `outcome.op`, not `req.op`: the message must describe what the cluster did.
         message: if outcome.all_applied() {
-            format!("{} applied on all {} nodes", req.op, applied)
+            format!(
+                "op {} on 0x{} applied on all {} nodes",
+                outcome.op,
+                hex::encode(outcome.mrenclave),
+                applied
+            )
         } else {
             format!(
-                "{} applied on {applied}/{} nodes; retry (enclave ops are idempotent)",
-                req.op, state.cluster_size
+                "op {} on 0x{} applied on {applied}/{} nodes; retry (enclave ops are idempotent)",
+                outcome.op,
+                hex::encode(outcome.mrenclave),
+                state.cluster_size
             )
         },
     })
@@ -447,20 +505,14 @@ async fn handle_govern(
     }
 }
 
-// ── #131 AC-BASE — one-time custody-baseline ceremony trigger ──
-
-#[derive(Debug, Deserialize)]
-pub struct ReservesBaselineRequest {
-    /// RLUSD issuer classic r-address (pinned in the baseline hash).
-    pub rlusd_issuer: String,
-    /// Quorum required (2 on the 3-node cluster).
-    pub quorum: usize,
-    /// The ceremony roster: each participating node's baseline signing pubkey +
-    /// its OWN (distinct) XRPL endpoint. C-Q1.1 pre-flight refuses unless the
-    /// endpoints are pairwise-distinct; the driver maps accepted bundle pubkeys
-    /// back to these endpoints to assert >= quorum distinct observation sources.
-    pub nodes: Vec<BaselineNodeReq>,
-}
+// ── #131 AC-BASE — baseline ceremony roster ──
+//
+// The pre-SPV `ReservesBaselineRequest`/`ReservesBaselineResponse` pair lived here
+// with no route, no handler and no constructor: the custody baseline is driven by
+// `SpvBaselineRequest` below. Removed rather than kept, because their doc comments
+// described the C-Q1.1 pre-flight as if this were the path that runs it. It is not
+// — `reserves_baseline::{enforce_distinct_endpoints, assert_distinct_sources}` run
+// it on the SPV ceremony, which is why deleting this loses no check.
 
 #[derive(Debug, Deserialize)]
 pub struct BaselineNodeReq {
@@ -468,13 +520,6 @@ pub struct BaselineNodeReq {
     pub pubkey: String,
     /// This node's XRPL endpoint.
     pub endpoint: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ReservesBaselineResponse {
-    pub status: String,
-    pub message: String,
-    pub enclave: serde_json::Value,
 }
 
 // ── #131 AC-BASE-2″ P2-c — SPV backing-gate ceremony trigger ──
@@ -740,4 +785,70 @@ pub async fn spawn_admin_listener(
         .await
         .context("membership-admin serve error")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seal(node: &str, ok: bool, err: Option<&str>) -> NodeSealResult {
+        NodeSealResult {
+            node: node.into(),
+            ok,
+            error: err.map(Into::into),
+        }
+    }
+
+    /// The partial-outcome messages tell the operator to "retry the failed nodes".
+    /// This is the assertion that the response can actually answer *which*.
+    #[test]
+    fn a_partial_apply_names_the_node_that_failed_and_why() {
+        let results = [
+            seal("node-1", true, None),
+            seal("node-2", false, Some("ERR_SEAL_REFUSED")),
+            seal("node-3", true, None),
+        ];
+        let failed = failed_seal_nodes(&results);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].node, "node-2");
+        assert_eq!(failed[0].error.as_deref(), Some("ERR_SEAL_REFUSED"));
+    }
+
+    #[test]
+    fn a_full_success_names_nobody() {
+        let results = [seal("node-1", true, None), seal("node-2", true, None)];
+        assert!(failed_seal_nodes(&results).is_empty());
+    }
+
+    /// A node can fail without reporting a reason; it must still be NAMED, because
+    /// the name is the part the operator needs to retry.
+    #[test]
+    fn a_failure_with_no_error_string_is_still_named() {
+        let failed = failed_confirm_nodes(&[NodeConfirmResult {
+            node: "node-3".into(),
+            ok: false,
+            error: None,
+        }]);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].node, "node-3");
+        assert!(failed[0].error.is_none());
+    }
+
+    /// The defect was at the serialization boundary, not in the helper: the fields
+    /// were populated all the way here and dropped on the way out. Pin the wire shape.
+    #[test]
+    fn the_failed_nodes_reach_the_operators_json() {
+        let resp = MrenclaveGovernResponse {
+            status: "partial_apply".into(),
+            mrenclave: "0xab".into(),
+            allowlist_epoch: 4,
+            repro_signers: 2,
+            applied_nodes: 2,
+            failed_nodes: failed_seal_nodes(&[seal("node-2", false, Some("boom"))]),
+            message: "retry the failed nodes".into(),
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["failed_nodes"][0]["node"], "node-2");
+        assert_eq!(v["failed_nodes"][0]["error"], "boom");
+    }
 }
