@@ -1044,6 +1044,7 @@ pub async fn node_config_apply(
     println!("\n[3/4] Discovering ECDH pubkeys from each operator's Domain field...");
     let mut roster: Vec<SignerEntry> = Vec::with_capacity(signer_addresses.len());
     let mut local_seen = false;
+    let mut local_chain_pubkey: Option<String> = None;
     for addr in &signer_addresses {
         let pubkey = fetch_domain_ecdh_pubkey(xrpl_url, addr).await?;
         let pubkey_hex = hex::encode_upper(pubkey);
@@ -1051,6 +1052,9 @@ pub async fn node_config_apply(
         println!("    ecdh_pubkey: {pubkey_hex}");
 
         if addr == &local.xrpl_address {
+            // Keep what the CHAIN says about us — §3b proves it still matches the
+            // key this enclave actually holds before any roster is written.
+            local_chain_pubkey = Some(pubkey_hex.clone());
             roster.push(local.clone());
             local_seen = true;
         } else {
@@ -1073,6 +1077,40 @@ pub async fn node_config_apply(
             local.xrpl_address
         );
     }
+
+    // 3b. Prove this node's own on-chain record is not stale before writing a roster.
+    //
+    // `AccountSet.Domain` is not a decorative claim: this very function is how every
+    // operator discovers everyone else's ECDH key, and it runs after every node-local
+    // deploy (Phase 2.1c-C). `ecdh/rotate` changes the key inside the enclave and
+    // re-publishes nothing, so a rotated node keeps advertising a retired key on chain
+    // and the next deploy writes that retired key into every peer's roster.
+    //
+    // Each node can only prove the mirror it owns, so that is what it checks — and
+    // because all three run this, the cluster is covered. Comparing the chain against
+    // the local ENTRY FILE would be the check that cannot fire: rotation updates
+    // neither, so they agree precisely when both are wrong. The live enclave is the
+    // only witness worth asking.
+    println!("\n[3b/4] Verifying this node's on-chain ECDH record against its live enclave...");
+    let chain_pubkey = local_chain_pubkey
+        .as_deref()
+        .context("internal: local signer matched the SignerList but its Domain was not captured")?;
+    // O-L4: the entry file is operator-supplied, so the URL this check trusts must be
+    // proven loopback rather than assumed — otherwise a doctored entry points the
+    // verification at a host that will happily agree with the chain.
+    crate::http_helpers::ensure_loopback_url(&local.enclave_url)
+        .context("node-config-apply verifies against the LOCAL enclave (O-L4)")?;
+    let http = crate::http_helpers::loopback_http_client(std::time::Duration::from_secs(15))?;
+    let live_pubkey = fetch_ecdh_pubkey(&http, &local.enclave_url)
+        .await
+        .context("cannot reach the local enclave to verify the published ECDH identity")?;
+    ensure_ecdh_identity_agrees(
+        &live_pubkey,
+        chain_pubkey,
+        local.ecdh_pubkey.as_deref().unwrap_or_default(),
+        &local.xrpl_address,
+    )?;
+    println!("  live enclave matches the on-chain record");
 
     // 4. Write the merged signers_config.json.
     println!("\n[4/4] Writing {}", output.display());
@@ -1185,6 +1223,47 @@ async fn fetch_domain_ecdh_pubkey(xrpl_url: &str, account: &str) -> Result<[u8; 
         .context("invalid JSON from account_info")?;
     parse_domain_from_account_info(&resp)
         .with_context(|| format!("failed to extract Domain for {account}"))
+}
+
+/// The three places this node's ECDH identity is recorded must agree: the LIVE
+/// enclave (the only authority), the on-chain `AccountSet.Domain` every other
+/// operator discovers it from, and the local entry file that seeds `local_signer`.
+///
+/// Refuses rather than repairs. Re-publishing is an on-chain submission and
+/// rewriting the entry file is a bootstrap artefact; doing either silently inside
+/// a roster build would hide the rotation that caused the drift.
+fn ensure_ecdh_identity_agrees(
+    live_hex: &str,
+    chain_hex: &str,
+    entry_hex: &str,
+    xrpl_address: &str,
+) -> Result<()> {
+    let norm = |s: &str| {
+        s.trim()
+            .strip_prefix("0x")
+            .unwrap_or_else(|| s.trim().strip_prefix("0X").unwrap_or(s.trim()))
+            .to_ascii_lowercase()
+    };
+    let (live, chain, entry) = (norm(live_hex), norm(chain_hex), norm(entry_hex));
+    if live != chain {
+        anyhow::bail!(
+            "on-chain ECDH record for {xrpl_address} is STALE: AccountSet.Domain publishes \
+             {chain}, this node's enclave holds {live}. Every other operator's \
+             `node-config-apply` discovers the published value, so writing a roster now \
+             spreads the retired key across the cluster and Path-A transport to this node \
+             breaks. Re-publish with `node-bootstrap --publish-domain` first (a rotation \
+             does not re-publish). Refusing to write the roster."
+        );
+    }
+    if live != entry {
+        anyhow::bail!(
+            "local node entry for {xrpl_address} is STALE: it records {entry}, this node's \
+             enclave holds {live}. The entry seeds `local_signer` in signers_config, so the \
+             roster would carry a retired key for this node. Re-run `node-bootstrap` to \
+             regenerate the entry. Refusing to write the roster."
+        );
+    }
+    Ok(())
 }
 
 fn parse_domain_from_account_info(resp: &serde_json::Value) -> Result<[u8; 33]> {
@@ -2070,6 +2149,68 @@ mod tests {
     fn encode_domain_v1_idempotent_on_lowercase() {
         let pk_lower = "03d3869df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57";
         assert_eq!(encode_domain_v1(pk_lower).len(), 80);
+    }
+
+    #[test]
+    fn ecdh_identity_all_three_agree_case_and_prefix_insensitive() {
+        // The three sources are written by different code paths: the enclave returns
+        // 0x-prefixed lowercase, node-bootstrap stores uppercase, the chain carries
+        // lowercase hex. Agreement must survive that, or the check fires on formatting
+        // and operators learn to ignore it.
+        assert!(super::ensure_ecdh_identity_agrees(
+            "0x03D3869DF7C134DA8066006A6304C3F3AFB9357BABE6326F5D8655A3DD2DE0CF57",
+            "03d3869df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "03D3869DF7C134DA8066006A6304C3F3AFB9357BABE6326F5D8655A3DD2DE0CF57",
+            "rTest",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn ecdh_identity_refuses_when_the_chain_record_is_stale() {
+        // The rotation case: enclave moved on, Domain still advertises the old key.
+        let err = super::ensure_ecdh_identity_agrees(
+            "03aa69df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "03d3869df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "03aa69df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "rNode1",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("on-chain"), "got: {err}");
+        assert!(err.contains("rNode1"), "got: {err}");
+        assert!(err.contains("--publish-domain"), "got: {err}");
+    }
+
+    #[test]
+    fn ecdh_identity_refuses_when_the_entry_file_is_stale() {
+        // Distinct failure: the chain is current but the file that seeds local_signer
+        // is not, so the roster would carry a retired key for THIS node.
+        let err = super::ensure_ecdh_identity_agrees(
+            "03aa69df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "03aa69df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "03d3869df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "rNode2",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("local node entry"), "got: {err}");
+        assert!(err.contains("node-bootstrap"), "got: {err}");
+        // Must NOT blame the chain: the operator would go re-publish a correct record.
+        assert!(!err.contains("on-chain ECDH record"), "got: {err}");
+    }
+
+    #[test]
+    fn ecdh_identity_refuses_a_missing_entry_value_rather_than_passing_it() {
+        // An absent entry value arrives here as "" (unwrap_or_default). Empty must not
+        // read as agreement.
+        assert!(super::ensure_ecdh_identity_agrees(
+            "03aa69df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "03aa69df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "",
+            "rNode3",
+        )
+        .is_err());
     }
 
     #[test]
