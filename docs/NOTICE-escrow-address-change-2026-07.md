@@ -1,6 +1,30 @@
 # NOTICE — testnet escrow (deposit address) is changing
 
-**Status:** action required · **Date:** 2026-07-06 · **Scope:** testnet only
+**Status:** SUPERSEDED — historical record · **Original date:** 2026-07-06 · **Scope:** testnet only
+
+---
+
+> ## ⚠️ Superseded — read this first
+>
+> **EN.** This notice records the 2026-07-06 rotation. The address it announces as NEW
+> (`rUY1bpf7X2…`) is **no longer the escrow**: a later genesis rotated again, and the current
+> testnet deposit address is **`rfYnJDSAeFuDCUTq2oYbckbJcz3gAJTNCd`**. Do not copy any address
+> out of this page — read `deposit_address` from `GET /v1/system/status`, which serves the live
+> value.
+>
+> **This class of change is over.** A state-preserving MRENCLAVE migration (Path-A) now carries
+> the sealed keys across an enclave upgrade, so an upgrade no longer forces a fresh escrow. The
+> reason given below — "the SignerList cannot be re-pointed at the new keys" — no longer holds.
+>
+> **RU.** Это уведомление фиксирует ротацию от 2026-07-06. Адрес, объявленный в нём новым
+> (`rUY1bpf7X2…`), **больше не является эскроу**: позже был ещё один генезис, и действующий
+> адрес депозита на testnet — **`rfYnJDSAeFuDCUTq2oYbckbJcz3gAJTNCd`**. Не копируйте адрес с
+> этой страницы — читайте поле `deposit_address` из `GET /v1/system/status`.
+>
+> **Сам класс таких переездов закончился.** Миграция MRENCLAVE с сохранением состояния (Path-A)
+> переносит запечатанные ключи через обновление анклава, поэтому обновление больше не требует
+> нового эскроу. Причина, названная ниже — «SignerList нельзя перенаправить на новые ключи», —
+> больше не действует.
 
 ---
 
