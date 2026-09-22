@@ -131,7 +131,7 @@ This is multi-month architectural work inside the enclave, plus audit, plus orac
 
 ### 5.1 If we pick Variant A
 
-- **Nothing in our current documentation needs to change.** `comparison-arch-network.md`, `btc-perp-dex-feasibility.md`, `sgx-enclave-capabilities-and-limits.md` remain accurate. The investor pitch remains "in-enclave CLOB with microsecond matching, hardware-attested, FROST-settled".
+- **Nothing in our current documentation needs to change.** `comparison-arch-network.md`, `btc-perp-dex-feasibility.md`, `sgx-enclave-capabilities-and-limits.md` remain accurate. The investor pitch remains "in-enclave CLOB with microsecond matching, hardware-attested, settled by a 2-of-3 XRPL multisig".
 - **`vault_mm.rs` gets a new pricing module.** This is the post-hackathon Phase 1 work. Spec owner: Tom. Implementation owner: dev-perp (under Tom's review). Clear scope: bounded. Clear review surface: vault layer only.
 - **Maker rebates get added** to the fee logic, either in the enclave or in a settlement wrapper. Small change. Compatible with Variant A (and in fact more natural under it, because the maker/taker distinction still exists).
 - **Tom's arb bot runs externally** as described. No new enclave work to support it.

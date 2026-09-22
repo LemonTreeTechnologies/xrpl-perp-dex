@@ -10,7 +10,7 @@
 
 ## 0. Краткая сводка
 
-**Ни одно XLS-предложение на XRPL не конкурирует с тем, что мы строим.** Никто из перечисленных стандартов не предлагает перпов, off-ledger TEE-backed CLOB, FROST-кастодии, или чего-то напоминающего margin/funding/liquidation engine. Ближайшие соседи — спот-DEX/AMM примитивы (XLS-30 AMM, XLS-81 Permissioned DEX) и стагнировавшее предложение по опционам (XLS-62). Наше положение на XRPL — **first and only** для perp.
+**Ни одно XLS-предложение на XRPL не конкурирует с тем, что мы строим.** Никто из перечисленных стандартов не предлагает перпов, off-ledger TEE-backed CLOB, пороговой кастодии, или чего-то напоминающего margin/funding/liquidation engine. Ближайшие соседи — спот-DEX/AMM примитивы (XLS-30 AMM, XLS-81 Permissioned DEX) и стагнировавшее предложение по опционам (XLS-62). Наше положение на XRPL — **first and only** для perp.
 
 Из изученного: три предложения стоит интегрировать как реальные строительные блоки, два держать на watch list, остальные либо нерелевантны, либо неправильной формы, либо в другой категории.
 
@@ -299,7 +299,7 @@ Single-account batches подписывают только outer tx. Multi-accou
 
 2. **TEE-backed off-ledger CLOB с trader-grade execution semantics.** Sub-millisecond matching, реальная maker/taker динамика, atomic margin enforcement внутри энклейва. Честная формулировка: дело не в том, что другие подходы невозможны на XRPL, а в том, что они latency-bound консенсусом ledger (3–5 секунд на close) и cost-bound per-fill ledger fees. Для трейдеров деривативами, ожидающих миллисекундное execution и узкие maker-спреды, эти ограничения disqualifying. Наш дизайн — единственный на XRPL, дающий trader-grade execution semantics — и это свойство structural, не временное лидерство.
 
-3. **FROST 2-of-3 распределённая кастодия.** Лучшая модель доверия, чем issuer-controlled escrow / vault модель, которую предполагает каталог XLS. Ни один оператор не может подписать вредоносный settlement, ни один оператор не может rug'нуть протокол. Документ deployment-procedure, который мы только что написали, расширяет это свойство на deploy path.
+3. **Распределённая кастодия 2-of-3 (XRPL SignerList — независимые ECDSA-подписи операторов, не агрегированная пороговая подпись).** Лучшая модель доверия, чем issuer-controlled escrow / vault модель, которую предполагает каталог XLS. Ни один оператор не может подписать вредоносный settlement, ни один оператор не может rug'нуть протокол. Документ deployment-procedure, который мы только что написали, расширяет это свойство на deploy path.
 
 4. **XRPL settlement без on-ledger-per-fill стоимости.** Batched settlement (XLS-56, как только подключим) даёт нам лучшее из двух миров: XRPL finality и asset ecosystem, off-ledger trading скорость и экономику. Ни один on-XRPL конкурент не разделяет эти слои так чисто.
 
@@ -308,7 +308,7 @@ Single-account batches подписывают только outer tx. Multi-accou
 6. **First-mover для перпов в сети.** Не техническое преимущество, но стоит сказать: нет инкумбента, которого надо вытеснять. Что бы мы ни зашипили — это reference implementation по умолчанию.
 
 Чего у нас *нет* (честная версия):
-- Аудированного продакшен-деплоя FROST + enclave стека — это работа deploy procedure в `deployment-procedure.md`, сейчас draft.
+- Аудированного продакшен-деплоя мультиподпись + enclave стека — это работа deploy procedure в `deployment-procedure.md`, сейчас draft.
 - Ликвидности. Day-one ликвидность — нерешённая проблема вне зависимости от выбранной архитектуры. План Тома (post-hackathon vAMM + arb bot) — рабочий ответ; этот XLS обзор не меняет этих расчётов.
 - Network effects. Вся XRPL DeFi экосистема маленькая; это проблема market-making и BD, не техническая.
 

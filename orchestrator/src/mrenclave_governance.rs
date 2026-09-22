@@ -1,4 +1,3 @@
-#![allow(dead_code)] // no caller until the p2p transport + operator trigger land
 //! β4 Thread B — driving the membership-governed MRENCLAVE allowlist.
 //!
 //! The allowlist is what turns an MRENCLAVE bump from a rip-and-replace into a
@@ -175,6 +174,12 @@ impl LibP2PGovernanceBundleCollector {
         }
     }
 
+    /// Test-only, and `cfg(test)` rather than `allow(dead_code)` so that stays true.
+    /// The delegation collector's twin IS operator-settable
+    /// (`delegation_timeout_secs`), because that ceremony waits on enclave work;
+    /// this one waits on automatic p2p signatures, where 30s needs no knob. If a
+    /// production caller ever appears, the cfg must come off deliberately.
+    #[cfg(test)]
     pub fn with_timeout(mut self, t: std::time::Duration) -> Self {
         self.timeout = t;
         self
@@ -444,6 +449,60 @@ mod tests {
         );
         let (_, _, repro) = applier.seen.lock().unwrap().clone().unwrap();
         assert!(repro.is_empty(), "a veto carries no repro bundle");
+    }
+
+    /// The real libp2p collector's timeout and dedup paths.
+    ///
+    /// Its structurally identical siblings (`membership_apply`, `path_a_delegation`) have
+    /// tests like this; this one did not, and the unused `with_timeout` builder was the
+    /// only visible trace of that. A blanket `allow(dead_code)` on the module hid it — which
+    /// is how a missing test on a governance path stays invisible.
+    #[tokio::test]
+    async fn the_real_collector_dedups_by_signer_and_closes_on_timeout() {
+        use crate::p2p::{MrenclaveGovernanceRelay, MrenclaveSignKind, SigningMessage};
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        fn resp(pk: &str, der: &str) -> SigningMessage {
+            SigningMessage::Response {
+                request_id: "mrenclave-gov-x".into(),
+                signer_xrpl_address: "rTest".into(),
+                der_signature: Some(der.into()),
+                compressed_pubkey: Some(pk.into()),
+                error: None,
+            }
+        }
+
+        let (tx, mut rx) = mpsc::channel::<MrenclaveGovernanceRelay>(4);
+        let responder = tokio::spawn(async move {
+            let relay = rx.recv().await.unwrap();
+            let a = "02".to_string() + &"aa".repeat(32);
+            let b = "02".to_string() + &"bb".repeat(32);
+            // The SAME signer twice, then a second distinct one. A quorum counts distinct
+            // signers, so a duplicate must not inflate the count toward the repro floor.
+            let _ = relay.responses_tx.send(resp(&a, "3044dead")).await;
+            let _ = relay.responses_tx.send(resp(&a, "3044beef")).await;
+            let _ = relay.responses_tx.send(resp(&b, "3044f00d")).await;
+            // A third signer never answers; the window must close on its own.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let collector =
+            LibP2PGovernanceBundleCollector::new(tx).with_timeout(Duration::from_millis(300));
+        let (bundle, distinct) = collector
+            .collect(
+                MrenclaveSignKind::Governance,
+                &[0x11; 32],
+                OP_ADD,
+                7,
+                &[0x22; 32],
+            )
+            .await
+            .expect("a partial collection still returns what it got");
+
+        assert_eq!(distinct, 2, "the duplicate signer must be counted once");
+        assert!(!bundle.is_empty());
+        responder.abort();
     }
 
     #[tokio::test]

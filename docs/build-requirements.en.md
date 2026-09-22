@@ -167,7 +167,7 @@ Because Hetzner is our current build host AND our orchestrator host, and the pro
 | EPID attestation | YES (deprecated) | Intel-managed; not used in this project |
 | **DCAP attestation quote generation** | NO | requires SGX2 + Provisioning Certification |
 | ECDH-over-DCAP cross-machine peer authentication | NO | depends on DCAP |
-| Multi-operator FROST signing peer (production) | NO | requires DCAP for cross-machine peer attestation |
+| Multi-operator signing peer — XRPL multisig + FROST DKG (production) | NO | requires DCAP for cross-machine peer attestation |
 | Test-only multi-machine peering with attestation disabled | YES | only valid for development/testnet, not production |
 
 The implication for Path A testing: a single Hetzner host can run an OLD enclave + a NEW enclave side-by-side and exercise the full Path A migration ceremony, because Local Attestation does not require DCAP. This makes Hetzner a useful single-machine Path A test environment, separate from the multi-machine Azure DCsv3 testnet cluster.

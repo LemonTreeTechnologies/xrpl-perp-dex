@@ -79,6 +79,6 @@ Signing requirement on-chain escrow'а удовлетворяется native pri
 - DKLS family — Doerner, Kondi, Lee, Shelat (2018, 2019, 2023) — "Secure Two-party Threshold ECDSA from ECDSA Assumptions" и follow-ups; paper 2023 года консолидирует protocol используемый в текущих DKLS implementation'ах.
 - KOS protocol — Keller, Orsini, Scholl (2015) для OT-extension; paper 2025 года ревизирующий KOS CD-security argument был упомянут аудиторией доклада (Михаил Воронов, в чате).
 - `docs/cluster-trust-model-decision.md` — выбор DCAP cross-attestation и отказ от operator-signed roster.
-- `docs/sgx-enclave-capabilities-and-limits.md` — SGX trust model + FROST 2-of-3 framing.
+- `docs/sgx-enclave-capabilities-and-limits.md` — SGX trust model + 2-of-3 multi-operator framing (XRPL SignerList ECDSA; FROST is an enclave primitive for the Bitcoin leg).
 - `docs/multi-operator-architecture.md` §1 (trust model), §10 (subcommand classes).
 - `SECURITY-REAUDIT-4.md` X-C1 hardening — per-tx-type signing-policy pattern bounding audit surface этого слоя.

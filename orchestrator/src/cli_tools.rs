@@ -484,8 +484,6 @@ async fn submit_domain_account_set(
     signing_pubkey: &[u8],
     ecdh_pubkey_hex: &str,
 ) -> Result<String> {
-    use sha2::Digest;
-
     if signing_pubkey.len() != 33 {
         anyhow::bail!(
             "signing_pubkey must be 33-byte compressed secp256k1, got {} bytes",
@@ -513,27 +511,39 @@ async fn submit_domain_account_set(
     //   Account         = 1 (AccountID)
     //   SigningPubKey   = 3 (Blob)
     //   TxnSignature    = 4 (Blob)
+    // LastLedgerSequence is REQUIRED by the enclave's typed route, not optional:
+    // Sequence alone makes a signed blob one-time, but with no ledger bound a
+    // signed-and-unsubmitted AccountSet stays valid indefinitely.
+    let validated = crate::unl_policy::own_validated_ledger(xrpl_url)
+        .await
+        .context("reading the validated ledger for LastLedgerSequence")?;
+    let last_ledger = validated
+        .checked_add(LAST_LEDGER_WINDOW)
+        .context("LastLedgerSequence overflow")?;
+    let last_ledger_u32 =
+        u32::try_from(last_ledger).context("LastLedgerSequence exceeds the XRPL 32-bit field")?;
+
     let mut fields = vec![
         XrplField::uint16(2, 3),
         XrplField::uint32(4, sequence),
-        XrplField::amount_drops(8, 12),
+        XrplField::uint32(27, last_ledger_u32),
+        XrplField::amount_drops(8, ACCOUNTSET_FEE_DROPS),
         XrplField::blob(7, domain_bytes),
         XrplField::account_id(1, &account_id),
         XrplField::blob(3, signing_pubkey),
     ];
 
-    // Compute the signing hash: SHA-512Half(STX\0 || canonical(fields))
+    // Serialize the blob WITHOUT TxnSignature and hand THAT to the enclave. The
+    // enclave re-derives the signing hash itself under STX\0 — no host-supplied
+    // hash reaches a signing primitive, which is the property `no_bare_sign`
+    // exists to protect, and the reason the bare `/pool/sign` route refuses.
     fields.sort_by_key(|f| f.sort_key());
-    let mut signing_data = HASH_PREFIX_TX_SIGN.to_vec();
+    let mut unsigned_blob = Vec::new();
     for f in &fields {
-        signing_data.extend_from_slice(&f.serialize());
+        unsigned_blob.extend_from_slice(&f.serialize());
     }
-    let h = sha2::Sha512::digest(&signing_data);
-    let mut signing_hash = [0u8; 32];
-    signing_hash.copy_from_slice(&h[..32]);
-
-    // Ask the enclave to sign.
-    let sig_der = sign_via_enclave(enclave_url, eth_address, session_key, &signing_hash).await?;
+    let sig_der =
+        sign_accountset_via_enclave(enclave_url, eth_address, session_key, &unsigned_blob).await?;
 
     // Append TxnSignature, re-serialize, submit.
     fields.push(XrplField::blob(4, &sig_der));
@@ -591,38 +601,65 @@ pub fn decode_domain_v1(domain_bytes: &[u8]) -> Result<[u8; 33]> {
 
 /// Asks the operator's enclave to ECDSA-sign a 32-byte hash with the
 /// account-bound key, returns the DER-encoded signature.
-async fn sign_via_enclave(
+/// Window, in ledgers, that a published Domain transaction stays valid for.
+/// ~4s per ledger, so 40 is a couple of minutes — long enough for submission and
+/// short enough that an unsubmitted blob expires rather than lingering.
+const LAST_LEDGER_WINDOW: u64 = 40;
+/// Must stay at or below the enclave's compiled XRPL_ACCOUNTSET_MAX_FEE_DROPS.
+const ACCOUNTSET_FEE_DROPS: u64 = 12;
+/// Read-back polling: XRPL validates in ~4s, so a handful of tries covers a normal
+/// landing without masking a transaction that never did.
+const VERIFY_ATTEMPTS: u64 = 8;
+const VERIFY_INTERVAL_SECS: u64 = 5;
+
+/// Sign an AccountSet(Domain) through the enclave's TYPED route.
+///
+/// The bare `/pool/sign` route refuses every key this enclave generates
+/// (`no_bare_sign`), which is why publishing was inoperable. This route hands
+/// over the transaction BLOB; the enclave parses it under its allowlist, checks
+/// the Domain against its own live ECDH identity, re-derives the hash and signs.
+async fn sign_accountset_via_enclave(
     enclave_url: &str,
     eth_address: &str,
     session_key: &str,
-    hash: &[u8; 32],
+    tx_blob: &[u8],
 ) -> Result<Vec<u8>> {
     let http = crate::http_helpers::loopback_http_client(std::time::Duration::from_secs(30))?;
-    let resp: serde_json::Value = http
-        .post(format!("{enclave_url}/pool/sign"))
+    let resp = http
+        .post(format!("{enclave_url}/pool/sign/accountset-domain"))
         .json(&serde_json::json!({
             "from": eth_address,
-            "hash": format!("0x{}", hex::encode(hash)),
             "session_key": session_key,
+            "tx_blob": hex::encode(tx_blob),
         }))
         .send()
         .await
-        .context("/pool/sign failed")?
-        .json()
+        .context("/pool/sign/accountset-domain failed")?;
+    // The enclave answers a refusal as a civetweb banner followed by the JSON
+    // body, so parsing straight to JSON reports a decode error instead of the
+    // enclave's own message. Read the text and surface what it actually said.
+    let status = resp.status();
+    let text = resp
+        .text()
         .await
-        .context("invalid JSON from /pool/sign")?;
-    if resp["status"].as_str() != Some("success") {
-        anyhow::bail!("/pool/sign rejected: {resp}");
+        .context("reading /pool/sign/accountset-domain response")?;
+    let v: serde_json::Value = serde_json::from_str(text.trim_start_matches(|c| c != '{'))
+        .with_context(|| format!("enclave replied HTTP {status}: {}", text.trim()))?;
+    if v["status"].as_str() != Some("success") {
+        anyhow::bail!(
+            "enclave refused to sign the AccountSet: {}",
+            v["message"].as_str().unwrap_or("(no message)")
+        );
     }
-    let r_hex = resp["signature"]["r"]
+    let r_hex = v["signature"]["r"]
         .as_str()
-        .context("missing r in /pool/sign response")?;
-    let s_hex = resp["signature"]["s"]
+        .context("signature.r missing")?;
+    let s_hex = v["signature"]["s"]
         .as_str()
-        .context("missing s in /pool/sign response")?;
-    let r = hex::decode(r_hex).context("bad r hex")?;
-    let s = hex::decode(s_hex).context("bad s hex")?;
-    Ok(xrpl_signer::der_encode_signature(&r, &s))
+        .context("signature.s missing")?;
+    let r = hex::decode(r_hex.trim_start_matches("0x")).context("signature.r is not hex")?;
+    let s = hex::decode(s_hex.trim_start_matches("0x")).context("signature.s is not hex")?;
+    Ok(crate::xrpl_signer::der_encode_signature(&r, &s))
 }
 
 /// Minimal `account_info` query — returns the next sequence number we
@@ -1018,11 +1055,21 @@ pub async fn node_config_apply(
     println!("Output:  {}", output.display());
     println!();
 
-    // 1. Read local node-entry to populate `local_signer`.
+    // 1. Read this node's identity. Either shape: a bare entry file, or a
+    //    `signers_config.json` whose `local_signer` holds it. Same reason as
+    //    `publish-domain` — on a live node the entry files are leftovers from
+    //    earlier rounds and none of them matches the address currently on the
+    //    SignerList. Fixed there first and not here, which is why this command
+    //    still refused after that change: a class is not fixed until every member
+    //    is checked.
     let local_data = std::fs::read_to_string(node_entry_path)
         .with_context(|| format!("cannot read {}", node_entry_path.display()))?;
-    let local: SignerEntry = serde_json::from_str(&local_data)
-        .with_context(|| format!("invalid SignerEntry JSON in {}", node_entry_path.display()))?;
+    let local = load_local_signer(&local_data).with_context(|| {
+        format!(
+            "reading this node's identity from {}",
+            node_entry_path.display()
+        )
+    })?;
     println!("[1/4] Loaded local entry");
     println!("  xrpl_address: {}", local.xrpl_address);
     if local.ecdh_pubkey.is_none() {
@@ -1044,6 +1091,7 @@ pub async fn node_config_apply(
     println!("\n[3/4] Discovering ECDH pubkeys from each operator's Domain field...");
     let mut roster: Vec<SignerEntry> = Vec::with_capacity(signer_addresses.len());
     let mut local_seen = false;
+    let mut local_chain_pubkey: Option<String> = None;
     for addr in &signer_addresses {
         let pubkey = fetch_domain_ecdh_pubkey(xrpl_url, addr).await?;
         let pubkey_hex = hex::encode_upper(pubkey);
@@ -1051,6 +1099,9 @@ pub async fn node_config_apply(
         println!("    ecdh_pubkey: {pubkey_hex}");
 
         if addr == &local.xrpl_address {
+            // Keep what the CHAIN says about us — §3b proves it still matches the
+            // key this enclave actually holds before any roster is written.
+            local_chain_pubkey = Some(pubkey_hex.clone());
             roster.push(local.clone());
             local_seen = true;
         } else {
@@ -1073,6 +1124,40 @@ pub async fn node_config_apply(
             local.xrpl_address
         );
     }
+
+    // 3b. Prove this node's own on-chain record is not stale before writing a roster.
+    //
+    // `AccountSet.Domain` is not a decorative claim: this very function is how every
+    // operator discovers everyone else's ECDH key, and it runs after every node-local
+    // deploy (Phase 2.1c-C). `ecdh/rotate` changes the key inside the enclave and
+    // re-publishes nothing, so a rotated node keeps advertising a retired key on chain
+    // and the next deploy writes that retired key into every peer's roster.
+    //
+    // Each node can only prove the mirror it owns, so that is what it checks — and
+    // because all three run this, the cluster is covered. Comparing the chain against
+    // the local ENTRY FILE would be the check that cannot fire: rotation updates
+    // neither, so they agree precisely when both are wrong. The live enclave is the
+    // only witness worth asking.
+    println!("\n[3b/4] Verifying this node's on-chain ECDH record against its live enclave...");
+    let chain_pubkey = local_chain_pubkey
+        .as_deref()
+        .context("internal: local signer matched the SignerList but its Domain was not captured")?;
+    // O-L4: the entry file is operator-supplied, so the URL this check trusts must be
+    // proven loopback rather than assumed — otherwise a doctored entry points the
+    // verification at a host that will happily agree with the chain.
+    crate::http_helpers::ensure_loopback_url(&local.enclave_url)
+        .context("node-config-apply verifies against the LOCAL enclave (O-L4)")?;
+    let http = crate::http_helpers::loopback_http_client(std::time::Duration::from_secs(15))?;
+    let live_pubkey = fetch_ecdh_pubkey(&http, &local.enclave_url)
+        .await
+        .context("cannot reach the local enclave to verify the published ECDH identity")?;
+    ensure_ecdh_identity_agrees(
+        &live_pubkey,
+        chain_pubkey,
+        local.ecdh_pubkey.as_deref().unwrap_or_default(),
+        &local.xrpl_address,
+    )?;
+    println!("  live enclave matches the on-chain record");
 
     // 4. Write the merged signers_config.json.
     println!("\n[4/4] Writing {}", output.display());
@@ -1185,6 +1270,212 @@ async fn fetch_domain_ecdh_pubkey(xrpl_url: &str, account: &str) -> Result<[u8; 
         .context("invalid JSON from account_info")?;
     parse_domain_from_account_info(&resp)
         .with_context(|| format!("failed to extract Domain for {account}"))
+}
+
+/// Publish (or RE-publish) this node's ECDH identity to `AccountSet.Domain` for an
+/// account that ALREADY EXISTS.
+///
+/// `node-bootstrap --publish-domain` cannot do this: its first step is
+/// `POST /pool/generate`, so it publishes for a brand-new key. That made the record
+/// settable only at birth — the same shape as a Safe whose owners can only be chosen
+/// at creation — and it is why a key rotation had no way to correct the chain.
+///
+/// Publishes what the ENCLAVE holds right now, read live, never what the entry file
+/// records: the file is not authoritative and a rotation does not update it either.
+///
+/// Confirms by reading the record back off the ledger before reporting success. A
+/// submitted transaction is a request; the published record is the result.
+pub async fn publish_domain(
+    enclave_url: &str,
+    node_entry_path: &Path,
+    xrpl_url: &str,
+    faucet_url: Option<&str>,
+) -> Result<()> {
+    println!("Publish Domain");
+    println!("==============");
+
+    // O-L4: operator tooling talks to the LOCAL enclave. The entry file is
+    // operator-supplied, but this URL is a flag, and the same rule applies.
+    crate::http_helpers::ensure_loopback_url(enclave_url)
+        .context("publish-domain signs with the LOCAL enclave (O-L4)")?;
+    let http = crate::http_helpers::loopback_http_client(std::time::Duration::from_secs(30))?;
+
+    let local_data = std::fs::read_to_string(node_entry_path)
+        .with_context(|| format!("cannot read {}", node_entry_path.display()))?;
+    let local = load_local_signer(&local_data).with_context(|| {
+        format!(
+            "reading this node's identity from {}",
+            node_entry_path.display()
+        )
+    })?;
+    println!("  xrpl_address: {}", local.xrpl_address);
+
+    // The live enclave, not the file — see the doc comment.
+    let live_ecdh = fetch_ecdh_pubkey(&http, enclave_url)
+        .await
+        .context("cannot reach the local enclave for its current ECDH identity")?;
+    println!("  ecdh (live):  {live_ecdh}");
+    match local.ecdh_pubkey.as_deref() {
+        Some(e)
+            if e.trim_start_matches("0x")
+                .eq_ignore_ascii_case(live_ecdh.trim_start_matches("0x")) => {}
+        Some(e) => println!(
+            "  NOTE: the entry file records {e}, which is NOT what the enclave holds. \
+             Publishing the LIVE key. The entry still seeds `local_signer`, so re-run \
+             `node-bootstrap` on a fresh entry before `node-config-apply` will accept it."
+        ),
+        None => println!("  NOTE: the entry file has no ecdh_pubkey; publishing the live key."),
+    }
+
+    // The account must exist before it can carry a Domain.
+    if fetch_account_info(xrpl_url, &local.xrpl_address)
+        .await
+        .is_err()
+    {
+        match faucet_url {
+            Some(f) => {
+                println!("  account not on chain yet — funding via faucet...");
+                faucet_fund(f, &local.xrpl_address).await?;
+            }
+            None => anyhow::bail!(
+                "account {} does not exist on chain and no --faucet-url was given. An \
+                 AccountSet cannot be submitted for an account that holds no reserve.",
+                local.xrpl_address
+            ),
+        }
+    }
+
+    let signing_pubkey = hex::decode(local.compressed_pubkey.trim_start_matches("0x"))
+        .context("entry compressed_pubkey is not valid hex")?;
+    let tx_hash = submit_domain_account_set(
+        xrpl_url,
+        enclave_url,
+        &local.address,
+        &local.session_key,
+        &local.xrpl_address,
+        &signing_pubkey,
+        &live_ecdh,
+    )
+    .await
+    .context("AccountSet(Domain) submission")?;
+    println!("  submitted: {tx_hash}");
+
+    // Confirm the RESULT, not the request. A submitted tx can be dropped, and
+    // reporting success off the submission is the defect this whole sweep is about.
+    //
+    // Poll rather than read once: `account_info` at `ledger_index: validated` cannot
+    // see the transaction until the ledger it landed in is validated, ~4s away. A
+    // single immediate read reports "not published" on a submission that succeeded —
+    // which is a false alarm on a correct operation, and the kind that teaches an
+    // operator to ignore the check.
+    let mut published: Option<[u8; 33]> = None;
+    let mut last_err = String::new();
+    for _ in 0..VERIFY_ATTEMPTS {
+        match fetch_domain_ecdh_pubkey(xrpl_url, &local.xrpl_address).await {
+            Ok(p) => {
+                published = Some(p);
+                break;
+            }
+            Err(e) => {
+                last_err = format!("{e:#}");
+                tokio::time::sleep(std::time::Duration::from_secs(VERIFY_INTERVAL_SECS)).await;
+            }
+        }
+    }
+    let published = published.with_context(|| {
+        format!(
+            "submitted as {tx_hash}, but the record was not readable after {}s — do NOT assume \
+             it landed; last error: {last_err}",
+            VERIFY_ATTEMPTS * VERIFY_INTERVAL_SECS
+        )
+    })?;
+    ensure_chain_matches_live(&live_ecdh, &hex::encode(published), &local.xrpl_address)?;
+    println!();
+    println!("✓ on-chain record now matches this enclave's live ECDH identity");
+    Ok(())
+}
+
+/// Accept either a bare entry file or a full `signers_config.json`, taking
+/// `local_signer` from the latter.
+///
+/// On a live node the entry files are leftovers from earlier rounds — on this
+/// cluster node-1 carries two, and NEITHER matches the address currently on the
+/// SignerList. The file that actually says who this node is today is
+/// `signers_config.json`. Requiring the other one would mean hand-building an
+/// artefact to satisfy the tool, which is the shape of an architectural bug, not
+/// an operator inconvenience.
+fn load_local_signer(json: &str) -> Result<SignerEntry> {
+    let v: serde_json::Value = serde_json::from_str(json).context("file is not valid JSON")?;
+    if let Some(local) = v.get("local_signer") {
+        if local.is_null() {
+            // Distinct from the parse failure below on purpose: absent and
+            // malformed have different remedies, and "invalid SignerEntry" would
+            // send an operator hunting a corrupt field that is not there.
+            anyhow::bail!(
+                "signers_config carries `local_signer: null` — this node has no identity \
+                 recorded in it, so there is nothing to publish. Regenerate the config."
+            );
+        }
+        return serde_json::from_value(local.clone())
+            .context("`local_signer` is not a valid SignerEntry");
+    }
+    serde_json::from_value(v).context("not a SignerEntry and has no `local_signer`")
+}
+
+/// The on-chain record must match the key the enclave actually holds. Split out
+/// from the three-way check because `publish-domain` needs exactly this half to
+/// confirm what it just submitted actually landed.
+fn ensure_chain_matches_live(live_hex: &str, chain_hex: &str, xrpl_address: &str) -> Result<()> {
+    let norm = |s: &str| {
+        s.trim()
+            .strip_prefix("0x")
+            .unwrap_or_else(|| s.trim().strip_prefix("0X").unwrap_or(s.trim()))
+            .to_ascii_lowercase()
+    };
+    let (live, chain) = (norm(live_hex), norm(chain_hex));
+    if live != chain {
+        anyhow::bail!(
+            "on-chain ECDH record for {xrpl_address} is STALE: AccountSet.Domain publishes \
+             {chain}, this node's enclave holds {live}. Every other operator's \
+             `node-config-apply` discovers the published value, so writing a roster now \
+             spreads the retired key across the cluster and Path-A transport to this node \
+             breaks. Re-publish with `publish-domain` first (a rotation does not \
+             re-publish). Refusing to write the roster."
+        );
+    }
+    Ok(())
+}
+
+/// The three places this node's ECDH identity is recorded must agree: the LIVE
+/// enclave (the only authority), the on-chain `AccountSet.Domain` every other
+/// operator discovers it from, and the local entry file that seeds `local_signer`.
+///
+/// Refuses rather than repairs. Re-publishing is an on-chain submission and
+/// rewriting the entry file is a bootstrap artefact; doing either silently inside
+/// a roster build would hide the rotation that caused the drift.
+fn ensure_ecdh_identity_agrees(
+    live_hex: &str,
+    chain_hex: &str,
+    entry_hex: &str,
+    xrpl_address: &str,
+) -> Result<()> {
+    let norm = |s: &str| {
+        s.trim()
+            .strip_prefix("0x")
+            .unwrap_or_else(|| s.trim().strip_prefix("0X").unwrap_or(s.trim()))
+            .to_ascii_lowercase()
+    };
+    let (live, _chain, entry) = (norm(live_hex), norm(chain_hex), norm(entry_hex));
+    ensure_chain_matches_live(live_hex, chain_hex, xrpl_address)?;
+    if live != entry {
+        anyhow::bail!(
+            "local node entry for {xrpl_address} is STALE: it records {entry}, this node's \
+             enclave holds {live}. The entry seeds `local_signer` in signers_config, so the \
+             roster would carry a retired key for this node. Re-run `node-bootstrap` to \
+             regenerate the entry. Refusing to write the roster."
+        );
+    }
+    Ok(())
 }
 
 fn parse_domain_from_account_info(resp: &serde_json::Value) -> Result<[u8; 33]> {
@@ -2070,6 +2361,106 @@ mod tests {
     fn encode_domain_v1_idempotent_on_lowercase() {
         let pk_lower = "03d3869df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57";
         assert_eq!(encode_domain_v1(pk_lower).len(), 80);
+    }
+
+    #[test]
+    fn local_signer_is_read_from_either_file_shape() {
+        let entry = r#"{"name":"n1","enclave_url":"u","address":"0xabc","session_key":"sk",
+            "compressed_pubkey":"02aa","xrpl_address":"rEntry"}"#;
+        assert_eq!(
+            super::load_local_signer(entry).unwrap().xrpl_address,
+            "rEntry"
+        );
+        // The shape a live node actually has.
+        let cfg = r#"{"escrow_address":"rEsc","escrow_seed":"","quorum":2,
+            "signer_list_set_tx_hash":"","signers":[],
+            "local_signer":{"name":"n1","enclave_url":"u","address":"0xabc",
+            "session_key":"sk","compressed_pubkey":"02aa","xrpl_address":"rLocal"}}"#;
+        assert_eq!(
+            super::load_local_signer(cfg).unwrap().xrpl_address,
+            "rLocal"
+        );
+    }
+
+    #[test]
+    fn a_config_without_a_local_signer_is_refused_not_silently_empty() {
+        // A node absent from its own config must not publish for a default
+        // identity; it must say so.
+        let cfg = r#"{"escrow_address":"rEsc","escrow_seed":"","quorum":2,
+            "signer_list_set_tx_hash":"","signers":[],"local_signer":null}"#;
+        let err = super::load_local_signer(cfg).unwrap_err().to_string();
+        // Pin the REASON, not the word: the fallback parse error also mentions
+        // `local_signer`, so asserting that alone passes with the guard deleted.
+        assert!(err.contains("no identity"), "got: {err}");
+        assert!(!err.contains("not a valid SignerEntry"), "got: {err}");
+    }
+
+    #[test]
+    fn ecdh_identity_all_three_agree_case_and_prefix_insensitive() {
+        // The three sources are written by different code paths: the enclave returns
+        // 0x-prefixed lowercase, node-bootstrap stores uppercase, the chain carries
+        // lowercase hex. Agreement must survive that, or the check fires on formatting
+        // and operators learn to ignore it.
+        assert!(super::ensure_ecdh_identity_agrees(
+            "0x03D3869DF7C134DA8066006A6304C3F3AFB9357BABE6326F5D8655A3DD2DE0CF57",
+            "03d3869df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "03D3869DF7C134DA8066006A6304C3F3AFB9357BABE6326F5D8655A3DD2DE0CF57",
+            "rTest",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn ecdh_identity_refuses_when_the_chain_record_is_stale() {
+        // The rotation case: enclave moved on, Domain still advertises the old key.
+        let err = super::ensure_ecdh_identity_agrees(
+            "03aa69df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "03d3869df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "03aa69df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "rNode1",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("on-chain"), "got: {err}");
+        assert!(err.contains("rNode1"), "got: {err}");
+        // The remedy named must be the one that WORKS on an existing account:
+        // `node-bootstrap --publish-domain` generates a fresh key first.
+        assert!(err.contains("publish-domain"), "got: {err}");
+        assert!(
+            !err.contains("node-bootstrap --publish-domain"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn ecdh_identity_refuses_when_the_entry_file_is_stale() {
+        // Distinct failure: the chain is current but the file that seeds local_signer
+        // is not, so the roster would carry a retired key for THIS node.
+        let err = super::ensure_ecdh_identity_agrees(
+            "03aa69df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "03aa69df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "03d3869df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "rNode2",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("local node entry"), "got: {err}");
+        assert!(err.contains("node-bootstrap"), "got: {err}");
+        // Must NOT blame the chain: the operator would go re-publish a correct record.
+        assert!(!err.contains("on-chain ECDH record"), "got: {err}");
+    }
+
+    #[test]
+    fn ecdh_identity_refuses_a_missing_entry_value_rather_than_passing_it() {
+        // An absent entry value arrives here as "" (unwrap_or_default). Empty must not
+        // read as agreement.
+        assert!(super::ensure_ecdh_identity_agrees(
+            "03aa69df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "03aa69df7c134da8066006a6304c3f3afb9357babe6326f5d8655a3dd2de0cf57",
+            "",
+            "rNode3",
+        )
+        .is_err());
     }
 
     #[test]

@@ -10,7 +10,7 @@
 
 ## 0. Executive summary
 
-There is **no XLS proposal that competes with what we are building** — none of the listed standards offer perpetual derivatives, an off-ledger TEE-backed CLOB, FROST-custodied settlement, or anything resembling a margin/funding/liquidation engine. The closest neighbours are spot DEX/AMM primitives (XLS-30 AMM, XLS-81 Permissioned DEX) and a stagnant options proposal (XLS-62). Our market position on XRPL is **first and only** for perps.
+There is **no XLS proposal that competes with what we are building** — none of the listed standards offer perpetual derivatives, an off-ledger TEE-backed CLOB, threshold-custodied settlement, or anything resembling a margin/funding/liquidation engine. The closest neighbours are spot DEX/AMM primitives (XLS-30 AMM, XLS-81 Permissioned DEX) and a stagnant options proposal (XLS-62). Our market position on XRPL is **first and only** for perps.
 
 Of the proposals reviewed, three are worth integrating into our stack as real building blocks, two are worth keeping on a watch list, and the rest are either irrelevant, the wrong shape, or competing in a different category.
 
@@ -299,7 +299,7 @@ These are the things we have that no XLS proposal provides and no on-XRPL compet
 
 2. **TEE-backed off-ledger CLOB with trader-grade execution semantics.** Sub-millisecond matching, real maker/taker dynamics, atomic margin enforcement inside the enclave. The honest framing: it's not that other approaches are impossible on XRPL, it's that they're latency-bound to ledger consensus (3–5 seconds per close) and cost-bound by per-fill ledger fees. For derivatives traders who expect millisecond execution and tight maker spreads, those constraints are disqualifying. Our design is the only one on XRPL that gives you trader-grade execution semantics — and that property is structural, not a temporary lead.
 
-3. **FROST 2-of-3 distributed custody.** Better trust model than the issuer-controlled escrow / vault model the XLS catalogue assumes. No single operator can sign a malicious settlement, no single operator can rug the protocol. The deployment-procedure document we just wrote extends this property to the deploy path.
+3. **2-of-3 distributed custody (XRPL SignerList — independent per-operator ECDSA, not an aggregated threshold signature).** Better trust model than the issuer-controlled escrow / vault model the XLS catalogue assumes. No single operator can sign a malicious settlement, no single operator can rug the protocol. The deployment-procedure document we just wrote extends this property to the deploy path.
 
 4. **XRPL settlement without on-ledger-per-fill cost.** Batched settlement (XLS-56 once we wire it) gives us the best of both worlds: XRPL finality and asset ecosystem, off-ledger trading speed and economics. No on-XRPL competitor splits these layers this cleanly.
 
@@ -308,7 +308,7 @@ These are the things we have that no XLS proposal provides and no on-XRPL compet
 6. **First-mover for perps on the network.** Not a technical advantage but worth stating: there is no incumbent to displace. Whatever we ship is the reference implementation by default.
 
 What we *don't* have (honest version):
-- Audited production deployment of the FROST + enclave stack — that's the deploy procedure work in `deployment-procedure.md`, currently a draft.
+- Audited production deployment of the multisig + enclave stack — that's the deploy procedure work in `deployment-procedure.md`, currently a draft.
 - Liquidity. Day-one liquidity is the unsolved problem regardless of which architecture we pick. Tom's plan (post-hackathon vAMM + arb bot) is the working answer; this XLS survey doesn't change that calculus.
 - Network effects. The whole XRPL DeFi ecosystem is small; this is a market-making and BD problem, not a technical one.
 

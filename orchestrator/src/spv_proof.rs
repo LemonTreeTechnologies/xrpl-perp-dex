@@ -59,7 +59,13 @@ fn as_u64(v: &serde_json::Value) -> Option<u64> {
 /// close_time_resolution(u8) ‖ close_flags(u8). All big-endian (matches rippled + the
 /// enclave `xrpl_spv_ledger_hash`).
 pub fn serialize_ledger_header(ledger: &serde_json::Value) -> Result<[u8; HEADER_LEN]> {
-    let seq = as_u64(&ledger["ledger_index"]).context("ledger_index")? as u32;
+    // Every field below is narrowed with try_from, not `as`. This JSON comes from a
+    // rippled node we do not trust; a value past the field width means the response is
+    // not what we think it is, and truncating it would silently serialise a DIFFERENT
+    // header than the one the validators signed — which then fails quorum for a reason
+    // no log line explains. Fail here, where the cause is visible.
+    let seq = u32::try_from(as_u64(&ledger["ledger_index"]).context("ledger_index")?)
+        .context("ledger_index does not fit the header's u32 sequence field")?;
     let drops: u64 = ledger["total_coins"]
         .as_str()
         .context("total_coins")?
@@ -68,10 +74,15 @@ pub fn serialize_ledger_header(ledger: &serde_json::Value) -> Result<[u8; HEADER
     let parent = hex32(ledger, "parent_hash")?;
     let txh = hex32(ledger, "transaction_hash")?;
     let acct = hex32(ledger, "account_hash")?;
-    let pct = as_u64(&ledger["parent_close_time"]).context("parent_close_time")? as u32;
-    let ct = as_u64(&ledger["close_time"]).context("close_time")? as u32;
-    let ctr = as_u64(&ledger["close_time_resolution"]).context("close_time_resolution")? as u8;
-    let cf = as_u64(&ledger["close_flags"]).context("close_flags")? as u8;
+    let pct = u32::try_from(as_u64(&ledger["parent_close_time"]).context("parent_close_time")?)
+        .context("parent_close_time does not fit the header's u32 field")?;
+    let ct = u32::try_from(as_u64(&ledger["close_time"]).context("close_time")?)
+        .context("close_time does not fit the header's u32 field")?;
+    let ctr =
+        u8::try_from(as_u64(&ledger["close_time_resolution"]).context("close_time_resolution")?)
+            .context("close_time_resolution does not fit the header's u8 field")?;
+    let cf = u8::try_from(as_u64(&ledger["close_flags"]).context("close_flags")?)
+        .context("close_flags does not fit the header's u8 field")?;
 
     let mut out = [0u8; HEADER_LEN];
     let mut p = 0;
@@ -250,18 +261,22 @@ fn st_next(b: &[u8], pos: usize) -> Option<(u16, u16, usize, usize, usize)> {
             // VL-length-prefixed (1/2/3-byte length)
             let l0 = *b.get(i)? as usize;
             i += 1;
+            // The subtractions are guarded by the branch conditions, but written with
+            // checked_sub so the guarantee lives in the expression rather than in the
+            // `if` above it — a later edit that moves a bound cannot turn this into a
+            // silent wrap (release builds do not panic).
             let l = if l0 <= 192 {
                 l0
             } else if l0 <= 240 {
-                193 + ((l0 - 193) << 8) + *b.get(i)? as usize + {
-                    i += 1;
-                    0
-                }
+                let hi = l0.checked_sub(193)?;
+                i += 1;
+                193 + (hi << 8) + *b.get(i - 1)? as usize
             } else {
                 let a = *b.get(i)? as usize;
                 let bb = *b.get(i + 1)? as usize;
                 i += 2;
-                12481 + ((l0 - 241) << 16) + (a << 8) + bb
+                let hi = l0.checked_sub(241)?;
+                12481 + (hi << 16) + (a << 8) + bb
             };
             vstart = i;
             vlen = l;
@@ -338,26 +353,184 @@ pub fn build_xspv_blob(
     val_count: u16,
     validations: &[u8],
     proofs: &[XspvProof],
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
+    // Same defect class as build_xdep_blob — see the note there. `proofs.len() as u8`
+    // and `leaf_data.len() as u16` would each silently serialise a wrong value rather
+    // than fail.
+    let proof_count = u8::try_from(proofs.len()).context("too many proofs for a u8 count")?;
     let mut b = Vec::new();
     b.extend_from_slice(&XSPV_MAGIC);
     b.push(1); // version
-    push_be16(&mut b, HEADER_LEN as u16);
+    push_be16(&mut b, HEADER_LEN as u16); // const 118, cannot narrow
     b.extend_from_slice(header);
     push_be16(&mut b, val_count);
     b.extend_from_slice(validations);
-    b.push(proofs.len() as u8);
+    b.push(proof_count);
     for pr in proofs {
+        let leaf_len =
+            u16::try_from(pr.leaf_data.len()).context("ledger entry too large for a u16 length")?;
+        let depth = u8::try_from(pr.inner_root_to_leaf.len())
+            .context("inclusion path deeper than a u8 can express")?;
         b.push(pr.kind);
         b.extend_from_slice(&pr.leaf_index);
-        push_be16(&mut b, pr.leaf_data.len() as u16);
+        push_be16(&mut b, leaf_len);
         b.extend_from_slice(&pr.leaf_data);
-        b.push(pr.inner_root_to_leaf.len() as u8);
+        b.push(depth);
         for node in &pr.inner_root_to_leaf {
             b.extend_from_slice(node);
         }
     }
-    b
+    Ok(b)
+}
+
+/// #131 P3 — the deposit transport (`XDEP`).
+///
+/// Same attested-ledger prefix as [`build_xspv_blob`] — the header the validators
+/// signed and their signatures over it — then one transaction, its metadata, and the
+/// transaction-tree inclusion path from [`crate::tx_shamap`].
+///
+/// Deliberately ONE deposit per blob. Batching would make a partial failure ambiguous
+/// (which of N was refused, and did the others credit?), and a deposit credit is not a
+/// place to be ambiguous.
+///
+/// Note what is NOT in the blob: no tx-ID, no leaf index, no amount, no sender. The
+/// enclave derives the SHAMap key from the transaction bytes itself, so the host cannot
+/// say which transaction a proof is about — only which bytes it ships.
+///
+/// Lengths are u32, unlike XSPV's u16 leaf_len: that one sizes a ledger entry, which
+/// cannot approach 64 KiB, whereas real transaction metadata on a busy ledger can.
+pub fn build_xdep_blob(
+    header: &[u8; HEADER_LEN],
+    val_count: u16,
+    validations: &[u8],
+    tx_blob: &[u8],
+    meta: &[u8],
+    inner_root_to_leaf: &[[u8; 512]],
+) -> Result<Vec<u8>> {
+    // DEFECT FIXED, not merely hardening (audit-claude, 2026-09-17): the original
+    // `inner_root_to_leaf.len() as u8` SERIALISED A WRONG WIRE VALUE — a 256-deep path
+    // became a 0 depth byte, emitting a malformed blob with no error at the producer.
+    // The enclave refuses such a blob, so nothing unsafe reaches the TCB, but "the
+    // receiver catches it" does not make a producer that silently writes the wrong
+    // number correct. Recorded as a defect so the trail shows one, not a style note.
+    let tx_len = u32::try_from(tx_blob.len()).context("transaction too large for a u32 length")?;
+    let meta_len = u32::try_from(meta.len()).context("metadata too large for a u32 length")?;
+    let depth = u8::try_from(inner_root_to_leaf.len())
+        .context("inclusion path deeper than a u8 can express")?;
+
+    let mut b = Vec::new();
+    b.extend_from_slice(b"XDEP");
+    b.push(1); // version
+    push_be16(&mut b, HEADER_LEN as u16); // const 118, cannot narrow
+    b.extend_from_slice(header);
+    push_be16(&mut b, val_count);
+    b.extend_from_slice(validations);
+    b.extend_from_slice(&tx_len.to_be_bytes());
+    b.extend_from_slice(tx_blob);
+    b.extend_from_slice(&meta_len.to_be_bytes());
+    b.extend_from_slice(meta);
+    b.push(depth);
+    for node in inner_root_to_leaf {
+        b.extend_from_slice(node);
+    }
+    Ok(b)
+}
+
+#[cfg(test)]
+mod xspv_producer_tests {
+    use super::*;
+    use crate::spv_proof_vector as v;
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn real_proof() -> XspvProof {
+        let mut leaf_index = [0u8; 32];
+        leaf_index.copy_from_slice(&unhex(v::ESCROW_KEYLET));
+        let inner: Vec<[u8; 512]> = v::INNER_ROOT_TO_LEAF
+            .iter()
+            .map(|h| {
+                let mut n = [0u8; 512];
+                n.copy_from_slice(&unhex(h));
+                n
+            })
+            .collect();
+        XspvProof {
+            kind: 0,
+            leaf_index,
+            leaf_data: unhex(v::ESCROW_LEAF),
+            inner_root_to_leaf: inner,
+        }
+    }
+
+    /// The gap this closes: `build_xspv_blob` assembles the blob for the RESERVES path —
+    /// the one live in production since 2026-09-08 — and had no test at all. The enclave
+    /// suite tests its parser against a blob the enclave's own test builds by hand in
+    /// C++, so the Rust producer and the C++ consumer had never met. Both sides are
+    /// mine, written from one reading of the format; it works in production, which is
+    /// real evidence, but nothing would have caught a drift.
+    ///
+    /// Found by taking the auditor's question about the deposit module seriously and
+    /// asking it of the others: which module has tests on its edges and none on its
+    /// centre?
+    #[test]
+    fn the_blob_verifies_against_the_root_the_validators_signed() {
+        let p = real_proof();
+        let mut account_hash = [0u8; 32];
+        account_hash.copy_from_slice(&unhex(v::ACCOUNT_HASH));
+        assert!(
+            verify_inclusion(&p, &account_hash),
+            "the real escrow proof must reach the signed account_hash"
+        );
+    }
+
+    #[test]
+    fn the_producer_emits_what_the_parser_expects() {
+        // Mirrors the enclave parser's layout expectations byte for byte, so a change to
+        // either side that the other does not follow shows up here rather than as a
+        // refused ceremony.
+        let header = [0x11u8; HEADER_LEN];
+        let blob = build_xspv_blob(&header, 0, &[], &[real_proof()]).expect("blob builds");
+
+        assert_eq!(&blob[0..4], b"XSPV", "magic");
+        assert_eq!(blob[4], 1, "version");
+        assert_eq!(&blob[5..7], &[0, 118], "header length, big-endian");
+        assert_eq!(&blob[7..7 + HEADER_LEN], &header[..], "header verbatim");
+        let p = 7 + HEADER_LEN;
+        assert_eq!(&blob[p..p + 2], &[0, 0], "validation count");
+        assert_eq!(blob[p + 2], 1, "proof count");
+        assert_eq!(blob[p + 3], 0, "kind = AccountRoot");
+        assert_eq!(
+            &blob[p + 4..p + 36],
+            &unhex(v::ESCROW_KEYLET)[..],
+            "leaf index"
+        );
+
+        let leaf = unhex(v::ESCROW_LEAF);
+        let ll = u16::from_be_bytes([blob[p + 36], blob[p + 37]]) as usize;
+        assert_eq!(ll, leaf.len(), "leaf length");
+        assert_eq!(&blob[p + 38..p + 38 + ll], &leaf[..], "leaf verbatim");
+        assert_eq!(blob[p + 38 + ll], 7, "depth");
+        assert_eq!(
+            blob.len(),
+            p + 39 + ll + 7 * 512,
+            "no trailing bytes — the enclave refuses a blob with any"
+        );
+    }
+
+    /// A depth past what the wire format can express must refuse, not truncate. The
+    /// enclave caps depth at 64 anyway, but a producer that silently wrote a wrong byte
+    /// would emit a blob that fails inclusion for a reason nothing reports.
+    #[test]
+    fn an_inexpressible_depth_is_refused() {
+        let mut p = real_proof();
+        p.inner_root_to_leaf = vec![[0u8; 512]; 300];
+        assert!(build_xspv_blob(&[0u8; HEADER_LEN], 0, &[], &[p]).is_err());
+    }
 }
 
 // ── async fetch (ws validations + HTTP header/proof → XSPV blob) ───────────────
@@ -507,7 +680,7 @@ pub async fn fetch_spv_bundle(cfg: &SpvFetchConfig) -> Result<Vec<u8>> {
 
     // 4. assemble the XSPV blob.
     let (val_count, vals) = build_validations_section(&datas)?;
-    Ok(build_xspv_blob(&header, val_count, &vals, &[proof]))
+    build_xspv_blob(&header, val_count, &vals, &[proof])
 }
 
 #[cfg(test)]

@@ -277,6 +277,33 @@ pub enum SigningMessage {
         quorum_num: u32,
         quorum_den: u32,
     },
+    /// #131 sweep Finding 2 — READ-ONLY cluster UNL status query. Carries no
+    /// proposal and changes nothing: each peer reports the §6 record ITS OWN
+    /// enclave currently holds, so an operator can see whether the cluster
+    /// agrees. It is an indicator, never a gate — Q-FORK-3 ruled the existing
+    /// split accept-and-document, and gating on it would halt a cluster we have
+    /// decided to run forked.
+    ///
+    /// `request_id` is the exact key the requester's `pending_unl_status` map is
+    /// waiting on; unlike the signing siblings this does NOT route by prefix,
+    /// because the prefix chain only ever sees `SigningMessage::Response`.
+    UnlStatusRequest {
+        request_id: String,
+        requester_peer_id: String,
+    },
+    /// Reply to `UnlStatusRequest`. Reports rather than signs, so it carries the
+    /// record fields instead of a signature. `error` is set when the responding
+    /// node could not read its own record — a node that cannot answer must be
+    /// distinguishable from one that agrees.
+    UnlStatusResponse {
+        request_id: String,
+        signer_xrpl_address: String,
+        unl_epoch: u64,
+        digest_hex: String,
+        pinned_ledger_seq: u64,
+        live_validators: u32,
+        error: Option<String>,
+    },
     SpvBaselineRequest {
         request_id: String,
         requester_peer_id: String,
@@ -601,6 +628,16 @@ pub struct UnlPolicyRelay {
     pub pinned_ledger_seq: u64,
     pub quorum_num: u32,
     pub quorum_den: u32,
+    pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
+}
+
+/// #131 sweep Finding 2 — outbound READ-ONLY UNL status query. No proposal, no
+/// signature, nothing applied: it exists so the cluster's agreement (or lack of
+/// it) can be observed instead of remembered.
+#[derive(Debug)]
+pub struct UnlStatusRelay {
+    /// Unique id; the exact key responses are matched on.
+    pub request_id: String,
     pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
 }
 
@@ -930,6 +967,9 @@ pub struct P2PNode {
     // #131 §6 — UNL policy governance (quorum + freshness anchor)
     unl_policy_rx: Option<mpsc::Receiver<UnlPolicyRelay>>,
     pending_unl_policy: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
+    // #131 sweep Finding 2 — read-only cluster UNL status query
+    unl_status_rx: Option<mpsc::Receiver<UnlStatusRelay>>,
+    pending_unl_status: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
     /// β3.2b: outbound apply-broadcast requests (seal / confirm) from the
     /// membership-change driver — each node applies to its loopback enclave.
     membership_apply_rx: Option<mpsc::Receiver<MembershipApplyRelay>>,
@@ -1117,6 +1157,8 @@ impl P2PNode {
             pending_spv_baseline: HashMap::new(),
             unl_policy_rx: None,
             pending_unl_policy: HashMap::new(),
+            unl_status_rx: None,
+            pending_unl_status: HashMap::new(),
             membership_apply_rx: None,
             pending_membership_apply: HashMap::new(),
             events_publish_rx: None,
@@ -1260,6 +1302,10 @@ impl P2PNode {
     #[allow(dead_code)]
     pub fn set_unl_policy_channel(&mut self, rx: mpsc::Receiver<UnlPolicyRelay>) {
         self.unl_policy_rx = Some(rx);
+    }
+
+    pub fn set_unl_status_channel(&mut self, rx: mpsc::Receiver<UnlStatusRelay>) {
+        self.unl_status_rx = Some(rx);
     }
 
     /// β3.2b: wire the membership-change driver's apply-broadcast channel. The
@@ -2204,6 +2250,38 @@ impl P2PNode {
         }
     }
 
+    /// #131 sweep Finding 2 — answer a READ-ONLY status query with the §6 record
+    /// this node's own enclave holds. Reads nothing from the request but its id:
+    /// there is no proposal to validate, and nothing here can change state.
+    async fn handle_unl_status_request(
+        local_signer: &LocalSigner,
+        request_id: &str,
+    ) -> SigningMessage {
+        let root = crate::unl_policy::enclave_root_from_v1(&local_signer.enclave_url);
+        match crate::unl_policy::read_record(&root).await {
+            Ok(r) => SigningMessage::UnlStatusResponse {
+                request_id: request_id.to_string(),
+                signer_xrpl_address: local_signer.xrpl_address.clone(),
+                unl_epoch: r.unl_epoch,
+                digest_hex: hex::encode(r.digest),
+                pinned_ledger_seq: r.pinned_ledger_seq,
+                live_validators: r.live_validators,
+                error: None,
+            },
+            // A node that cannot read its own record must not look like one that
+            // agrees, so the failure is reported in place of a status.
+            Err(e) => SigningMessage::UnlStatusResponse {
+                request_id: request_id.to_string(),
+                signer_xrpl_address: local_signer.xrpl_address.clone(),
+                unl_epoch: 0,
+                digest_hex: String::new(),
+                pinned_ledger_seq: 0,
+                live_validators: 0,
+                error: Some(format!("{e}")),
+            },
+        }
+    }
+
     /// #131 §6 receiver: endorse a UNL POLICY proposal — but only after checking it.
     ///
     /// ⭐ Q-UNL-4: the freshness anchor is NOT taken on the leader's word. This node reads
@@ -2972,6 +3050,7 @@ impl P2PNode {
         let mut mrenclave_governance_rx = self.mrenclave_governance_rx.take();
         let mut spv_baseline_rx = self.spv_baseline_rx.take();
         let mut unl_policy_rx = self.unl_policy_rx.take();
+        let mut unl_status_rx = self.unl_status_rx.take();
         let mut membership_apply_rx = self.membership_apply_rx.take();
         let mut events_rx = self.events_publish_rx.take();
         let mut peer_quote_rx = self.peer_quote_publish_rx.take();
@@ -3267,6 +3346,39 @@ impl P2PNode {
                                 signer_xrpl_address: String::new(),
                                 der_signature: None,
                                 compressed_pubkey: None,
+                                error: Some(format!("P2P publish failed: {e}")),
+                            }).await;
+                        }
+                    }
+                }
+                Some(relay) = async {
+                    match &mut unl_status_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<UnlStatusRelay>>().await,
+                    }
+                } => {
+                    // Answer for ourselves first, so the operator sees this node even
+                    // if every peer is unreachable.
+                    if let Some(local) = self.local_signer.clone() {
+                        let local_response =
+                            Self::handle_unl_status_request(&local, &relay.request_id).await;
+                        let _ = relay.responses_tx.send(local_response).await;
+                    }
+                    let msg = SigningMessage::UnlStatusRequest {
+                        request_id: relay.request_id.clone(),
+                        requester_peer_id: self.peer_id.to_string(),
+                    };
+                    match self.publish_signing(&msg) {
+                        Ok(_) => { self.pending_unl_status.insert(relay.request_id, relay.responses_tx); }
+                        Err(e) => {
+                            warn!("#131 unl-status publish failed: {}", e);
+                            let _ = relay.responses_tx.send(SigningMessage::UnlStatusResponse {
+                                request_id: relay.request_id,
+                                signer_xrpl_address: String::new(),
+                                unl_epoch: 0,
+                                digest_hex: String::new(),
+                                pinned_ledger_seq: 0,
+                                live_validators: 0,
                                 error: Some(format!("P2P publish failed: {e}")),
                             }).await;
                         }
@@ -3935,6 +4047,52 @@ impl P2PNode {
                                     }
                                 }
                             }
+                            Ok(SigningMessage::UnlStatusRequest {
+                                request_id,
+                                requester_peer_id,
+                            }) => {
+                                let Some(local) = self.local_signer.clone() else { continue; };
+                                // Read-only, but still an inbound message that makes this
+                                // node do work, so it carries the same X-C1 guards as its
+                                // signing siblings rather than a weaker set.
+                                if let Some(ref allow) = self.allowed_signing_peers {
+                                    if !allow.contains(&propagation_source) {
+                                        warn!(req_id = %request_id, from = %propagation_source,
+                                              "X-C1: unl-status request from peer outside allowlist — dropped");
+                                        continue;
+                                    }
+                                }
+                                if !self.check_signing_rate(&propagation_source) {
+                                    warn!(req_id = %request_id, "X-C1: unl-status request rate-limited");
+                                    continue;
+                                }
+                                if !self.mark_signing_request_fresh(&request_id) {
+                                    warn!(req_id = %request_id, "X-C1: duplicate unl-status request_id — dropped");
+                                    continue;
+                                }
+                                info!(req_id = %request_id, from = %requester_peer_id,
+                                      "#131 unl-status request — reporting the §6 record THIS node holds");
+                                let response =
+                                    Self::handle_unl_status_request(&local, &request_id).await;
+                                if let Err(e) = self.publish_signing(&response) {
+                                    error!("failed to publish unl-status response: {}", e);
+                                }
+                            }
+                            // Routed HERE, not by the generic prefix chain: that chain
+                            // lives inside the `SigningMessage::Response` arm and only
+                            // ever sees that variant, so a distinct response type must
+                            // carry its own routing or it is silently dropped. It WAS
+                            // dropped — the collector's unit test injects responses
+                            // straight into the channel and so never crossed this line.
+                            Ok(SigningMessage::UnlStatusResponse { request_id, .. }) => {
+                                if let Some(tx) = self.pending_unl_status.get(&request_id) {
+                                    if let Ok(msg) =
+                                        serde_json::from_slice::<SigningMessage>(&message.data)
+                                    {
+                                        let _ = tx.send(msg).await;
+                                    }
+                                }
+                            }
                             Ok(SigningMessage::SpvBaselineRequest {
                                 request_id,
                                 requester_peer_id,
@@ -4249,6 +4407,48 @@ mod tests {
     /// every peer silently DROP it — the driver would report "applied on 1 node" forever
     /// and the cluster would keep diverging, with nothing in any log saying why. Pin the
     /// tag and the field names, and prove the value survives a round-trip.
+    #[test]
+    fn unl_status_wire_format_is_pinned() {
+        // These tags travel between nodes. During a rolling deploy one side is old,
+        // so a rename is a silent cross-version break: the peer fails to decode and
+        // simply never answers, which this indicator would report as an absent node
+        // rather than as its own bug.
+        let req = SigningMessage::UnlStatusRequest {
+            request_id: "unl-status-1".into(),
+            requester_peer_id: "peer".into(),
+        };
+        let j: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(j["type"], "unl_status_request");
+        assert_eq!(j["request_id"], "unl-status-1");
+
+        let resp = SigningMessage::UnlStatusResponse {
+            request_id: "unl-status-1".into(),
+            signer_xrpl_address: "rNode".into(),
+            unl_epoch: 1,
+            digest_hex: "ab".repeat(32),
+            pinned_ledger_seq: 20591293,
+            live_validators: 6,
+            error: None,
+        };
+        let j: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(j["type"], "unl_status_response");
+        assert_eq!(j["pinned_ledger_seq"], 20591293);
+        // Round-trips through the same path the run loop uses.
+        let back: SigningMessage =
+            serde_json::from_slice(&serde_json::to_vec(&resp).unwrap()).unwrap();
+        match back {
+            SigningMessage::UnlStatusResponse {
+                pinned_ledger_seq,
+                live_validators,
+                ..
+            } => {
+                assert_eq!(pinned_ledger_seq, 20591293);
+                assert_eq!(live_validators, 6);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
     #[test]
     fn unl_policy_apply_payload_wire_format() {
         let p = MembershipApplyPayload::UnlPolicy {

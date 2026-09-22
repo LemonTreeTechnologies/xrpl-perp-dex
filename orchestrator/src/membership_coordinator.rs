@@ -18,8 +18,6 @@
 //! wired separately (they reuse the delegation-bundle relay + a new enclave
 //! admin route). Deploy/cutover is β3.
 
-#![allow(dead_code)] // ceremony wiring (relay + enclave call) lands next increment
-
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -186,6 +184,9 @@ impl LibP2PMembershipCollector {
         }
     }
 
+    /// Test-only, and `cfg(test)` rather than `allow(dead_code)` so that stays
+    /// true: no production caller sets this, and one appearing must be deliberate.
+    #[cfg(test)]
     pub fn with_timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
         self
@@ -327,7 +328,6 @@ pub struct NodeSealResult {
 pub struct MembershipChangeOutcome {
     pub proposed_epoch: u64,
     pub message_hash: [u8; 32],
-    pub bundle_len: usize,
     pub node_results: Vec<NodeSealResult>,
     /// β4 Thread A (AC-β4-A1): the SAME β1 quorum bundle that authorised this
     /// epoch, hex-encoded. The β2 projection must forward it to each signer's
@@ -388,7 +388,6 @@ pub async fn run_membership_change(
     Ok(MembershipChangeOutcome {
         proposed_epoch: statement.proposed_epoch,
         message_hash: statement.message_hash,
-        bundle_len: bundle.len(),
         node_results,
         quorum_bundle_hex: hex::encode(&bundle),
     })
@@ -441,7 +440,6 @@ pub async fn run_genesis_bootstrap(
     Ok(MembershipChangeOutcome {
         proposed_epoch: statement.proposed_epoch,
         message_hash: statement.message_hash,
-        bundle_len: bundle.len(),
         node_results,
         quorum_bundle_hex: hex::encode(&bundle),
     })
@@ -750,7 +748,8 @@ mod tests {
             hex(&out.message_hash),
             "01ad9ce518f2e5dd4b970fd03746322621311acf1820d6d3f45d5b22f3c2f8f2"
         );
-        assert_eq!(out.bundle_len, 3);
+        // was `bundle_len`: the same 3-byte fact, read off the field the callers use.
+        assert_eq!(out.quorum_bundle_hex.len(), 6);
         assert!(out.all_sealed());
         assert_eq!(out.node_results.len(), 3);
 

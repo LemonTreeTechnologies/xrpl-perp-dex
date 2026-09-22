@@ -2,7 +2,7 @@
 
 **Status:** Reference document / Q&A. Written to capture what the team should know about SGX before reasoning about anything that touches the enclave — in particular, before changing code that reads or writes sealed state (like the vault).
 
-**Scope:** Practical SGX fundamentals relevant to this project (perp DEX with FROST 2-of-3 signing + sealed state). Not an exhaustive SGX reference — for that, read the Intel SGX Developer Reference and the SDK manuals.
+**Scope:** Practical SGX fundamentals relevant to this project (perp DEX with 2-of-3 threshold signing + sealed state — XRPL settlement uses a SignerList quorum of independent ECDSA signatures; FROST/Schnorr is an enclave primitive held for the Bitcoin leg). Not an exhaustive SGX reference — for that, read the Intel SGX Developer Reference and the SDK manuals.
 
 **Audience:** Technical readers (developers, operators, auditors) who haven't worked with a Trusted Execution Environment before. No prior SGX knowledge is assumed. Some familiarity with OS concepts (processes, syscalls, virtual memory) and cryptographic basics (symmetric vs asymmetric, hashes, AES-GCM) is expected.
 
@@ -38,7 +38,7 @@ If you remember the vault, everything in the rest of this document will land.
 
 ### Q: Why would a perp DEX use this specifically?
 
-Because it lets the signing key, the margin ledger, and the risk policy live in code that the operator cannot peek into or silently modify. The operator can start and stop the service, can read the on-disk encrypted blobs, can see the network traffic — but the actual private keys and the actual decision-making code are sealed from them. In a FROST 2-of-3 setup this property holds across three independent operators, each running their own enclave on their own machine. No single operator can exfiltrate keys or forge signatures, because the keys don't exist in a form any single operator can read.
+Because it lets the signing key, the margin ledger, and the risk policy live in code that the operator cannot peek into or silently modify. The operator can start and stop the service, can read the on-disk encrypted blobs, can see the network traffic — but the actual private keys and the actual decision-making code are sealed from them. In a 2-of-3 multi-operator setup this property holds across three independent operators, each running their own enclave on their own machine. No single operator can exfiltrate keys or forge signatures, because the keys don't exist in a form any single operator can read.
 
 This is the core reason the project is built on SGX: **the trust story is that no operator, not even the one running the binary, has to be trusted for the protocol to be safe**.
 
@@ -79,7 +79,7 @@ An SGX enclave is an **isolated execution region** inside an otherwise-normal Li
   - Almost every successful SGX side-channel attack published in academic literature (Plundervolt, VoltPillager, Foreshadow, SGAxe, ÆPIC Leak, and the power-analysis family) requires either **physical possession of the machine** with instrumentation attached (oscilloscopes, power probes, voltage manipulation hardware, FPGA-based memory interposers), or **root-level privileged code running on the same host** with careful tuning over hours or days.
   - None of them is a "click a link and pop the enclave" remote exploit. To mount one, an attacker has to **physically carry our server into their lab, wire it up to measurement gear, and work on it for hours or days** — or first fully compromise the host OS and then run a carefully tuned local attack. Both scenarios are in-scope of our overall threat model (we assume the host OS is hostile; this is the whole point of using SGX), but they're categorically different from the "someone on the internet got our keys" failure that most web systems need to worry about.
   - Each published attack has been mitigated by Intel shipping microcode updates, and each mitigation advances a counter called **CPUSVN** (more on that later) — so a patched server on current microcode is hardened against the *known* families of attacks.
-  - Our defence-in-depth answer to the residual risk is **FROST 2-of-3**: even a complete compromise of one enclave on one server does not expose the signing key, because no single enclave ever holds it.
+  - Our defence-in-depth answer to the residual risk is the **2-of-3 XRPL SignerList**: even a complete compromise of one enclave on one server cannot move funds, because a second operator's independent signature is required and each operator's key never leaves their own enclave.
   - The right way to think about SGX is "dramatically better than a normal process, forces any serious attacker into a lab or an insider position, but still requires the same defence-in-depth mindset as any other security boundary".
 
 ---
@@ -138,10 +138,10 @@ The enclave cannot prevent any of this because it cannot see the network. What i
 
 - **Sequence / nonce discipline** — if every signed tx must reference a monotonically increasing counter that the enclave tracks, replay is blocked at the enclave level.
 - **Deadlines baked into signed blobs** — include a `LastLedgerSequence` (XRPL-native) or equivalent so stale signatures expire.
-- **Cross-operator attestation** — in a FROST 2-of-3 setup, two of three operators are needed to sign, so a single malicious host cannot fabricate a signature at all.
+- **Cross-operator attestation** — in a 2-of-3 setup, two of three operators are needed to authorise a transaction, so a single malicious host cannot fabricate a valid settlement at all.
 - **Audit trail** — the enclave can log signed tx hashes to its own sealed state, so an auditor can later verify that every sealed-logged tx appears on chain.
 
-This is why our custody is FROST, not a single-enclave signer: the "compromised host withholds signed bytes" attack is mitigated by requiring two independent hosts to collaborate.
+This is why our custody is a 2-of-3 SignerList quorum rather than a single-enclave signer: the "compromised host withholds signed bytes" attack is mitigated by requiring two independent hosts to collaborate. (The quorum is XRPL-native multisig — independent per-operator ECDSA — not a FROST aggregate.)
 
 ### Q: What about time? Can the enclave trust its own clock?
 
@@ -272,7 +272,7 @@ Simplified: the quote is a structure signed by a per-CPU attestation key (provis
 Two things:
 
 1. **DCAP attestation endpoint** — the orchestrator exposes a REST endpoint that returns a fresh quote proving the enclave is running. A client can verify this before trusting the orchestrator with deposits.
-2. **Cross-node attestation for FROST** — two enclaves that are about to perform distributed signing verify each other's quotes first. If a peer comes up with an unexpected MRENCLAVE (say, because someone deployed a backdoored build to that node), the other peers refuse to sign with it. See `deployment-procedure.md` section 3.5 for how this integrates with the deploy pipeline.
+2. **Cross-node attestation** — two enclaves that are about to perform distributed signing (XRPL multisig round, or FROST DKG / share transport) verify each other's quotes first. If a peer comes up with an unexpected MRENCLAVE (say, because someone deployed a backdoored build to that node), the other peers refuse to sign with it. See `deployment-procedure.md` section 3.5 for how this integrates with the deploy pipeline.
 
 ---
 
@@ -377,13 +377,13 @@ The only mitigation path is to export the plaintext through the old enclave befo
    e. New enclave re-seals under the new MRSIGNER.
 3. After the ceremony, old sealed files are deleted.
 
-For a FROST 2-of-3 setup, this ceremony has to be performed on each of the three nodes, ideally simultaneously or at least before the signing quorum resumes, to avoid the cluster getting stuck with one node on old-key-sealed state and two on new-key-sealed state.
+For a 2-of-3 multi-operator setup, this ceremony has to be performed on each of the three nodes, ideally simultaneously or at least before the signing quorum resumes, to avoid the cluster getting stuck with one node on old-key-sealed state and two on new-key-sealed state.
 
 ### Q: What happens if I just YOLO a rebuild and the new enclave can't read the old blob?
 
 Depends what was in the blob:
 
-- **FROST key shares** — catastrophic. You cannot sign anything anymore. You also cannot participate in a FROST quorum because you don't have your share. The only recovery is DKG from scratch, which means a new account (new multisig address), which means any funds in the old account are stuck unless the threshold of surviving operators can still sign a recovery tx on the old account (which requires *their* enclaves to still work, i.e., they didn't YOLO at the same time).
+- **FROST key shares** — you drop out of the FROST group and cannot participate in a FROST quorum, because you don't have your share. (XRPL settlement signing is a *separate* mechanism and is not affected by this alone — losing your per-operator XRPL pool key is what stops you signing settlement.) The only recovery is DKG from scratch, which means a new account (new multisig address), which means any funds in the old account are stuck unless the threshold of surviving operators can still sign a recovery tx on the old account (which requires *their* enclaves to still work, i.e., they didn't YOLO at the same time).
 - **Vault state** — bad but not terminal. You can reconstruct position state from the XRPL transaction history (every position was the result of a signed tx on chain) with significant manual effort. You lose any in-enclave state that wasn't on-chain (e.g., unsubmitted orders, volatile internal counters).
 - **User margin ledger** — very bad. Unlike the vault, margin is mutated by internal logic between on-chain events, so you cannot reconstruct it purely from chain history without replaying every deposit, withdrawal, funding payment, and fee in order. Possible but brittle.
 
@@ -413,7 +413,7 @@ There's a trade-off: rollback tolerance means a sealed blob from a vulnerable CP
 From `project_fork_and_deploy.md` and the current codebase:
 
 - **Enclave (C/C++) — `77ph/xrpl-perp-dex-enclave`**
-  Holds FROST key shares, signs XRPL transactions, manages the per-user margin ledger (per the plan in `plans/jiggly-mapping-starfish.md`), maintains the vault state, runs the liquidation and funding logic. Sealed state for shares + vault + margin.
+  Holds FROST key shares (Bitcoin-leg primitive) and the per-operator XRPL pool key that actually signs XRPL transactions, manages the per-user margin ledger (per the plan in `plans/jiggly-mapping-starfish.md`), maintains the vault state, runs the liquidation and funding logic. Sealed state for shares + vault + margin.
 
 - **Orchestrator (Rust) — `LemonTreeTechnologies/xrpl-perp-dex`**
   Runs on the host outside the enclave. Owns the matching engine, user sessions, WebSocket + REST API, XRPL client (monitors ledger close events, submits signed txs returned from the enclave, relays results back via ECALL). Holds no key material.
@@ -434,7 +434,7 @@ Every sealed blob in this project is **MRENCLAVE-bound**. This is a deliberate p
 
 | Blob | Contains | Policy | Upgrade path |
 |---|---|---|---|
-| `frost_share.sealed` | FROST key share for this node | MRENCLAVE | Node generates a fresh share under the new MRENCLAVE during the rotation ceremony; SignerListSet replaces the old on-chain signer with the new one (`deployment-procedure.md` §11.5) |
+| `frost_share.sealed` | FROST key share for this node (Bitcoin-leg primitive; not on the XRPL SignerList) | MRENCLAVE | Node generates a fresh share under the new MRENCLAVE during the rotation ceremony. The on-chain signer swap is a *separate* step on the XRPL pool key: `SignerListSet` replaces the old on-chain signer with the new one (`deployment-procedure.md` §11.5) |
 | `vault_state.sealed` | Vault balance sheet + open positions | MRENCLAVE | Reconstructed inside the new enclave during the ceremony via the same export/import-over-local-attestation pattern used for the FROST share; or, in the worst case, rebuilt from chain history |
 | `margin_ledger.sealed` | Per-user margin accounts | MRENCLAVE | Same export/import pathway as vault state — replayed into the new enclave before the old is shredded (§11.5 step 8 "golden rule" soak) |
 | `tx_dedup.sealed` | Processed tx hash table (deposit replay guard) | MRENCLAVE | Same export/import pathway; must be preserved across the ceremony to keep the replay guarantee |
@@ -466,7 +466,7 @@ The three historical "ceremony warranted" cases (signing-key rotation, invariant
 4. **EPC is not infinite.** Older SGX CPUs cap EPC at ~128MB. Newer server CPUs (Ice Lake Xeon and later) support up to 512GB, but you pay in page eviction if you exceed the hardware EPC. Eviction is transparent but slow — the CPU re-encrypts pages as they move in and out. For our vault with a few thousand positions this is not a concern, but for a CLOB with millions of resting orders it would be.
 5. **Target platform is server Xeon only.** SGX was deprecated on consumer Core CPUs (11th/12th gen) in 2021 and isn't a viable development target. Server SGX on Xeon Scalable remains the supported platform; Intel's public position is that there are no plans to deprecate it (Intel support article 000089326). Don't try to run this on a laptop. Note also that Intel's legacy **EPID** attestation service was EOL'd on 2 April 2025 — DCAP is the only path for remote attestation now, and our design already assumes this.
 6. **Every SGX vulnerability bumps CPUSVN.** If your sealing policy doesn't allow rollback, every microcode update is a mini-migration event. We've chosen rollback tolerance for long-lived state for this reason.
-7. **Attack surface is not zero.** Side-channel attacks on SGX keep being discovered. SGX raises the bar substantially against the OS and physical attacker, but it is not a magical "unhackable" box. The FROST 2-of-3 design is our insurance against any single-enclave compromise.
+7. **Attack surface is not zero.** Side-channel attacks on SGX keep being discovered. SGX raises the bar substantially against the OS and physical attacker, but it is not a magical "unhackable" box. The 2-of-3 multi-operator design is our insurance against any single-enclave compromise.
 
 ### Q: How do we currently build and deploy the enclave?
 
@@ -494,7 +494,7 @@ It is a multi-month engineering project, significantly larger than the SGX work 
 
 3. **Replacement for the ECALL/OCALL boundary.** There are no ecalls in TDX. The narrow, auditable attack surface that `Enclave.edl` gives us has to be reconstructed as an explicit RPC protocol (e.g. Protobuf over vsock) with equally strict validation, fuzzing, and a single entry point. **If this boundary is not designed and audited as carefully as the EDL is today**, it becomes the new weak link — an over-broad gRPC surface or a sloppy parser inside the TD is just as dangerous as a bug in the enclave, and has the same blast radius.
 
-4. **Replacement for the attestation pipeline.** TDX quotes are DCAP-verifiable (same verification infrastructure as SGX, different quote format), but the client-side verifier, the quote-retrieval endpoint, and the release-signing pipeline all need TDX-specific code paths. The `deployment-procedure.md` ceremony survives in structure (FROST 2-of-3 signs a release manifest whose hash is the TD's MRTD instead of an enclave's MRENCLAVE), but every tool in the chain needs a TDX backend.
+4. **Replacement for the attestation pipeline.** TDX quotes are DCAP-verifiable (same verification infrastructure as SGX, different quote format), but the client-side verifier, the quote-retrieval endpoint, and the release-signing pipeline all need TDX-specific code paths. The `deployment-procedure.md` ceremony survives in structure (the 2-of-3 release ceremony signs a manifest whose hash is the TD's MRTD instead of an enclave's MRENCLAVE), but every tool in the chain needs a TDX backend.
 
 5. **Rewritten threat model and audit pass.** The trust boundary is moving from "one process" to "one VM". Every assumption in our current threat model has to be re-examined: host-hypervisor interactions, IOMMU protection, TD-to-TD isolation, guest-kernel exposure, live-migration trust, microcode rollback semantics. This is **not** a documentation exercise — it is a real security audit with real effort, and it has to be budgeted.
 
@@ -536,7 +536,7 @@ Physically, yes. *Securely*, **no — and it must be called out unambiguously**.
 - **EPID** — Older remote attestation scheme using group signatures; Intel-run attestation service required.
 - **DCAP** — Datacenter Attestation Primitives; newer PKI-based remote attestation usable offline.
 - **AESM** — Application Enclave Services Manager, the Intel-shipped daemon on the host that brokers attestation-related operations.
-- **FROST** — Flexible Round-Optimized Schnorr Threshold signatures; our 2-of-3 scheme.
+- **FROST** — Flexible Round-Optimized Schnorr Threshold signatures. Implemented in our enclave as a primitive for the planned Bitcoin/Taproot leg; **XRPL settlement does not use it** (that is a SignerList quorum of independent ECDSA signatures).
 - **DKG** — Distributed Key Generation; how the FROST shares are created without anyone holding the full key.
 - **TDX** — Intel Trust Domain Extensions; VM-level TEE that protects an entire guest VM instead of a single process. Complementary to SGX, not a drop-in replacement.
 - **TD** — Trust Domain; a single guest VM running under TDX.

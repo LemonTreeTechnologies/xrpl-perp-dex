@@ -76,6 +76,10 @@ pub struct AppState {
     pub peer_count: Arc<std::sync::atomic::AtomicU32>,
     /// Start time for uptime reporting.
     pub start_time: std::time::Instant,
+    /// Q-BND-3: the figures from the last PUBLISHED reserves commitment, so the public
+    /// attestation endpoint can quantify the custody-minus-liabilities gap rather than
+    /// only describing it in prose. None until the first publish of this process.
+    pub reserves_figures: Option<crate::reserves_publisher::ReservesFiguresCache>,
     /// Maintenance flag surfaced by `/v1/system/status` so frontends can show a banner
     /// without needing a redeploy. Toggled via `PERP_MAINTENANCE` env at startup.
     pub maintenance_mode: Arc<AtomicBool>,
@@ -413,7 +417,29 @@ async fn attestation_quote(
 
 /// Get latest state commitment info (for on-chain verification).
 /// Public endpoint — no auth needed.
-async fn attestation_commitment() -> impl IntoResponse {
+async fn attestation_commitment(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let figures = state
+        .reserves_figures
+        .as_ref()
+        .and_then(|c| c.lock().ok().and_then(|g| *g))
+        .map(|f| {
+            // Checked subtraction: these come from the enclave and the endpoint is
+            // public, so a wrap here would publish a fabricated gap. There is no honest
+            // number to print if it does not fit, so the field says so instead.
+            let rlusd_gap = f.custody_rlusd.checked_sub(f.rlusd_liabilities);
+            let xrp_gap = f.custody_xrp.checked_sub(f.xrp_liabilities);
+            serde_json::json!({
+                "epoch": f.epoch,
+                "rlusd_liabilities_fp8": f.rlusd_liabilities,
+                "xrp_liabilities_fp8": f.xrp_liabilities,
+                "custody_rlusd_fp8": f.custody_rlusd,
+                "custody_xrp_fp8": f.custody_xrp,
+                "custody_minus_liabilities_rlusd_fp8": rlusd_gap,
+                "custody_minus_liabilities_xrp_fp8": xrp_gap,
+                "note": "FP8 (1e8 = 1 unit). custody_minus_liabilities is the ceiling on any operational reconciliation of pre-baseline deposits; null means the figure did not fit and nothing honest can be stated."
+            })
+        });
+
     // #131: retargeted Ethereum-Sepolia → Base-Sepolia; V4 → ReservesRegistry.
     //
     // The claim here must track what the system actually proves, in BOTH directions.
@@ -435,14 +461,29 @@ async fn attestation_commitment() -> impl IntoResponse {
         "chain_id": crate::commitment::BASE_SEPOLIA_CHAIN_ID,
         "registry": registry,
         "artifact": "proof-of-liabilities (in-TEE, enclave-signed merkle root over sealed state) + SPV-PROVEN custody BASELINE (the XRPL escrow balance the enclave derived itself from a ledger attested by >=80% of the pinned validator UNL; flows since are enclave-tracked - see limits)",
-        "description": "ReservesRegistry — periodic, 2-of-3-Safe-gated, monotonic-epoch liabilities root",
-        "limits": "Custody is SPV-proven as a BASELINE at one validator-attested ledger - not continuously. Deposits and withdrawals since that ledger are tracked by the enclave's own accounting and are NOT yet independently SPV-proven (per-flow on-chain proofs are a later phase), so the live figure is a proven baseline plus enclave-tracked flows. Re-derive the escrow balance on XRPL for the current on-chain figure. Liabilities are an in-TEE assertion over the enclave's OWN sealed state: a third party can verify that their account is INCLUDED in the published root, not that the root enumerates every liability. The 2-of-3 Safe gate is key-custody plus a structural publish gate - it is not independent economic validation of the figures.",
+        "description": "ReservesRegistry — periodic, Safe-gated (1-of-1: the Safe's sole owner is the sequencer enclave's own EVM key), monotonic-epoch liabilities root",
+        "limits": "Custody is SPV-proven as a BASELINE at one validator-attested ledger - not continuously. Deposits and withdrawals since that ledger are tracked by the enclave's own accounting and are NOT yet independently SPV-proven (per-flow on-chain proofs are a later phase), so the live figure is a proven baseline plus enclave-tracked flows. Re-derive the escrow balance on XRPL for the current on-chain figure. Liabilities are an in-TEE assertion over the enclave's OWN sealed state: a third party can verify that their account is INCLUDED in the published root, not that the root enumerates every liability. The Safe publish gate is 1-of-1 today: the Safe's sole owner is the sequencer enclave's own EVM key, which signs the Safe EIP-712 hash in-enclave, so the gas-paying host key cannot forge a publish. That is key-custody plus a structural publish gate - NOT independent economic validation of the figures, and NOT a second independent signer. A 2-of-3 Safe across the three enclaves is planned (a Safe governance change - add owners, raise the threshold; no contract change) and is gated on full-state replication.",
         "how_to_verify": {
             "1": "Read latestReserves() on the ReservesRegistry (Base-Sepolia)",
             "2": "Verify your account's inclusion via the Q-22 merkle proof against latestRoot",
             "3": "Use /v1/attestation/quote to verify enclave identity (DCAP)",
             "4": "Check the escrow balance on XRPL yourself — the custody figure is the balance the enclave proved against a validator-attested ledger, not a number we assert"
         },
+        /* Q-BND-3: the gap, in numbers.
+         *
+         * `custody_minus_liabilities` is the ceiling on what an operational
+         * reconciliation may legitimately restore — a pre-baseline deposit that was
+         * never credited is permanently uncreditable through SPV (the boundary refuses
+         * it, correctly, because crediting it would double-count a payment already
+         * inside the proven balance), so the remedy is operational and bounded by
+         * exactly this number. Stated so that "reconcile no more than the observed gap"
+         * is a rule anyone can check rather than one we assert.
+         *
+         * These are the figures from the last PUBLISHED commitment, not a fresh read:
+         * the endpoint must describe what is actually on-chain. A fresher number would
+         * invite someone to check it against the registry and find a mismatch we
+         * created ourselves. `null` before this process has published once. */
+        "last_published_figures": figures,
         "contract_abi": "publishReserves(uint64 epoch, bytes32 root, bytes32 snapshotHash)",
         "basescan": "https://sepolia.basescan.org/",
     })).into_response()
@@ -1499,4 +1540,61 @@ async fn get_markets(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         }]
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod attestation_gap_tests {
+    use crate::reserves_publisher::ReservesFigures;
+
+    /// The gap is computed with checked_sub because the endpoint is PUBLIC and the
+    /// operands come from the enclave. A wrap would publish a fabricated ceiling for
+    /// operational reconciliation — the one number an operator is supposed to be able
+    /// to bound their actions by.
+    fn gap(f: &ReservesFigures) -> (Option<i64>, Option<i64>) {
+        (
+            f.custody_rlusd.checked_sub(f.rlusd_liabilities),
+            f.custody_xrp.checked_sub(f.xrp_liabilities),
+        )
+    }
+
+    #[test]
+    fn ordinary_gap_is_the_difference() {
+        // The live cluster's actual figures: 101.951976 XRP proven against 100.0 owed.
+        let f = ReservesFigures {
+            rlusd_liabilities: 0,
+            xrp_liabilities: 10_000_000_000,
+            custody_rlusd: 0,
+            custody_xrp: 10_195_197_600,
+            epoch: 7,
+        };
+        assert_eq!(gap(&f), (Some(0), Some(195_197_600)));
+    }
+
+    #[test]
+    fn a_shortfall_is_reported_as_negative_not_hidden() {
+        // Under-custody is exactly what an operator needs to see. Clamping it at zero
+        // would turn the most important case into the least visible one.
+        let f = ReservesFigures {
+            rlusd_liabilities: 500,
+            xrp_liabilities: 0,
+            custody_rlusd: 200,
+            custody_xrp: 0,
+            epoch: 1,
+        };
+        assert_eq!(gap(&f).0, Some(-300));
+    }
+
+    #[test]
+    fn an_unrepresentable_gap_is_null_rather_than_wrapped() {
+        // Corrupt figures must not produce a plausible-looking number. `None` renders as
+        // JSON null, which is checkable; a wrapped i64 is a lie with a straight face.
+        let f = ReservesFigures {
+            rlusd_liabilities: i64::MIN,
+            xrp_liabilities: 0,
+            custody_rlusd: 1,
+            custody_xrp: 0,
+            epoch: 1,
+        };
+        assert_eq!(gap(&f).0, None);
+    }
 }

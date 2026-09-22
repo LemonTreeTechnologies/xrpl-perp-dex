@@ -4,7 +4,9 @@
 //! #131 chunk 2 (alloy tx-path). This module is now ONLY the alloy transaction /
 //! query layer — it does NOT produce or sign the root. Per RESP AC-4 the root is
 //! built + signed INSIDE the enclave (a new ecall, chunk 3), and the actual
-//! `publishReserves` call is authorised by the cluster's 2-of-3 Safe (chunk 5), so
+//! `publishReserves` call is authorised by the cluster's Safe (chunk 5) — 1-of-1
+//! today, its sole owner being the sequencer enclave's own EVM key; 2-of-3 across
+//! the three enclaves is a planned Safe governance change, not the live shape — so
 //! the earlier orchestrator-side `compute_state_hashes` / `sign_commitment` path —
 //! which computed the root outside the TEE and had the enclave blind-sign it — is
 //! deleted. The old ethers-rs stack (43 crates, the cargo-audit ethereum tail) is
@@ -42,6 +44,10 @@ sol! {
     #[sol(rpc)]
     contract GnosisSafe {
         function nonce() external view returns (uint256);
+        // Read back for the owner-set PROJECTION: every node derives the convergence step
+        // from the chain itself rather than from a peer's claim about it.
+        function getOwners() external view returns (address[] memory);
+        function getThreshold() external view returns (uint256);
         // Gnosis Safe v1.3.0/1.4.1 — the enclave signs the SafeTxHash; this orchestrator
         // only relays the owner signature + pays gas (AC-R2-1). operation=0 (CALL),
         // gas fields 0, gasToken/refundReceiver = zero address.
@@ -89,7 +95,7 @@ pub async fn query_latest_reserves(rpc_url: &str, registry: &str) -> Result<Late
 }
 
 /// Encode the `publishReserves(epoch, root, snapshotHash)` calldata. This is what
-/// the 2-of-3 Safe execTransaction wraps (chunk 5); returning the calldata keeps
+/// the Safe execTransaction wraps (chunk 5); returning the calldata keeps
 /// this module signer-free — the enclave-produced root goes in, the Safe (not this
 /// orchestrator) authorises the send.
 #[allow(dead_code)] // wired by the 3d publisher (Safe execTransaction data)
@@ -122,6 +128,81 @@ pub async fn query_safe_nonce(rpc_url: &str, safe: &str) -> Result<u64> {
 /// `owner_sig` is the enclave's 65-byte `[r‖s‖v]` over the SafeTxHash (v ∈ {27,28}),
 /// which is exactly the Safe's expected ECDSA owner-signature encoding. `gas_key` is
 /// a gas-paying EOA private key (hex) — NOT the enclave key: it is only `msg.sender`
+/// Read the Safe's CURRENT owner set and threshold.
+///
+/// `getOwners()` returns the linked-list order, and that order is load-bearing: `removeOwner`
+/// and `swapOwner` need each owner's predecessor, so sorting this before planning would
+/// silently produce operations that revert on-chain. It is returned as the chain gives it.
+pub async fn read_safe_owners(rpc_url: &str, safe: &str) -> Result<(Vec<[u8; 20]>, u64)> {
+    let safe_addr: Address = safe.parse().context("invalid safe address")?;
+    let provider = ProviderBuilder::new()
+        .connect(rpc_url)
+        .await
+        .context("connect Base-Sepolia RPC (read-only)")?;
+    let s = GnosisSafe::new(safe_addr, &provider);
+    let owners = s.getOwners().call().await.context("Safe getOwners()")?;
+    let threshold = s
+        .getThreshold()
+        .call()
+        .await
+        .context("Safe getThreshold()")?;
+    let out: Vec<[u8; 20]> = owners.iter().map(|a| a.into_array()).collect();
+    Ok((out, threshold.to::<u64>()))
+}
+
+/// Submit a Safe owner-management transaction — a SELF-call.
+///
+/// `to` is the Safe itself, which is not a choice made here: every Safe owner-management
+/// function is `authorized`, i.e. requires a self-call, and the enclave derived the
+/// SafeTxHash with `to = safe` too. Passing anything else would produce a hash the
+/// enclave never signed, so the Safe would reject it — the two ends agree by construction
+/// rather than by convention.
+///
+/// `signatures` must already be ordered by ascending owner address; see
+/// `safe_governance::order_signatures`, which recovers the owner from each signature
+/// rather than trusting a label.
+pub async fn submit_safe_selfcall(
+    rpc_url: &str,
+    gas_key: &str,
+    safe: &str,
+    data: Vec<u8>,
+    signatures: Vec<u8>,
+) -> Result<String> {
+    let safe_addr: Address = safe.parse().context("invalid safe address")?;
+    let signer: PrivateKeySigner = gas_key
+        .trim_start_matches("0x")
+        .parse()
+        .context("parse gas EOA key")?;
+    let provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(signer))
+        .connect(rpc_url)
+        .await
+        .context("connect Base-Sepolia RPC (wallet)")?;
+
+    let s = GnosisSafe::new(safe_addr, &provider);
+    let pending = s
+        .execTransaction(
+            safe_addr,         // to = the Safe ITSELF (owner management is a self-call)
+            U256::ZERO,        // value
+            Bytes::from(data), // data = the owner-management call
+            0u8,               // operation = CALL
+            U256::ZERO,        // safeTxGas
+            U256::ZERO,        // baseGas
+            U256::ZERO,        // gasPrice
+            Address::ZERO,     // gasToken
+            Address::ZERO,     // refundReceiver
+            Bytes::from(signatures),
+        )
+        .send()
+        .await
+        .context("send Safe self-call execTransaction")?;
+    let receipt = pending
+        .get_receipt()
+        .await
+        .context("await self-call receipt")?;
+    Ok(format!("{:#x}", receipt.transaction_hash))
+}
+
 /// for `execTransaction` and pays Base-Sepolia gas; the Safe verifies the owner sig,
 /// so this orchestrator can never forge the authorised call (AC-R2-1).
 #[allow(dead_code)] // wired by the 3d publisher

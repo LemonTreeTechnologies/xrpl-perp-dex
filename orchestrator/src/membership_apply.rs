@@ -15,7 +15,6 @@
 //! `HttpProjectionConfirmer` adapters pointed at localhost (inside the p2p
 //! run-loop's `handle_membership_apply`); this module is only the broadcast +
 //! ack-collection half.
-#![allow(dead_code)] // constructed by the β3.2b membership-change admin trigger
 
 use std::time::Duration;
 
@@ -76,6 +75,9 @@ impl LibP2PMembershipApplier {
         }
     }
 
+    /// Test-only, and `cfg(test)` rather than `allow(dead_code)` so that stays
+    /// true: no production caller sets this, and one appearing must be deliberate.
+    #[cfg(test)]
     pub fn with_timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
         self

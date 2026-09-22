@@ -11,8 +11,10 @@ mod bootstrap_join;
 mod cli_tools;
 mod commitment;
 mod db;
+mod deposit_spv; // #131 P3 — assemble SPV deposit proofs for the enclave
 mod dkg_coordinate;
 mod election;
+mod frost_round; // FROST threshold-Schnorr signing round driver
 mod http_helpers;
 mod membership_admin;
 mod membership_apply;
@@ -38,11 +40,18 @@ mod price_feed;
 mod rate_limit;
 mod reserves_baseline; // AC-BASE — one-time custody-baseline ceremony (hash + recovery + bundle)
 mod reserves_publisher; // #131 3d — Tier-1 reserves publisher
+mod safe_governance; // #131 Safe owner-management calldata + signature ordering
+mod safe_projection; // #131 the Safe owner set as a projection of sealed membership
 pub mod shard_router;
 mod signerlist_update;
 mod singleton;
 mod spv_proof; // AC-BASE-2″ P2-d — XRPL SPV proof builder/fetcher
+#[cfg(test)]
+mod spv_proof_vector; // the live reserves-path vectors, mirrored from the enclave suite
 mod trading;
+mod tx_shamap; // #131 P3 — rebuild a ledger's tx SHAMap + read inclusion paths off it
+#[cfg(test)]
+mod tx_shamap_vector; // real ledger 20808565, golden vector for the rebuild
 mod types;
 mod unl_policy; // AC-BASE-2″ §6 — UNL policy ceremony (quorum + freshness anchor)
 mod validator_manifests; // AC-BASE-2″ §6 — feed the enclave's measured-anchor validator root
@@ -230,6 +239,30 @@ enum Command {
     /// `docs/multi-operator-architecture.md` §6.5: the orchestrator
     /// daemon then boots, joins libp2p, and coordinates with peers via
     /// the mesh — direct HTTP-to-peer-enclave is not used.
+    /// Publish (or RE-publish) this node's ECDH identity to `AccountSet.Domain`
+    /// for an account that ALREADY exists.
+    ///
+    /// `node-bootstrap --publish-domain` cannot do this — it generates a fresh
+    /// keypair first, so it only ever publishes for a brand-new account. That
+    /// left the record settable only at birth, with no way to correct it after
+    /// an `ecdh/rotate`. Publishes what the enclave holds LIVE and confirms the
+    /// record off the ledger before reporting success.
+    PublishDomain {
+        /// Local enclave REST base (loopback only, O-L4).
+        #[arg(long, default_value = "https://localhost:9088/v1")]
+        enclave_url: String,
+        /// This node's existing entry file (`node-<i>.json` / `beta_entry.json`).
+        #[arg(long)]
+        node_entry: PathBuf,
+        /// XRPL JSON-RPC URL.
+        #[arg(long)]
+        xrpl_url: String,
+        /// Faucet URL, used ONLY if the account does not exist yet. Omit on
+        /// mainnet, where operators pre-fund.
+        #[arg(long)]
+        faucet_url: Option<String>,
+    },
+
     NodeConfigApply {
         /// XRPL JSON-RPC URL.
         #[arg(long)]
@@ -677,6 +710,20 @@ async fn main() -> Result<()> {
         }) => {
             return cli_tools::config_init(&entries, &escrow_address, quorum, &output).await;
         }
+        Some(Command::PublishDomain {
+            enclave_url,
+            node_entry,
+            xrpl_url,
+            faucet_url,
+        }) => {
+            return cli_tools::publish_domain(
+                &enclave_url,
+                &node_entry,
+                &xrpl_url,
+                faucet_url.as_deref(),
+            )
+            .await;
+        }
         Some(Command::NodeConfigApply {
             xrpl_url,
             escrow_address,
@@ -1023,12 +1070,26 @@ async fn main() -> Result<()> {
         (None, None)
     };
 
+    // #131 sweep Finding 2: the READ-ONLY cluster UNL status query channel.
+    let (unl_status_rx_holder, _unl_status_tx) = if signers_config.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<p2p::UnlStatusRelay>(8);
+        (Some(rx), Some(tx))
+    } else {
+        (None, None)
+    };
+
     let peer_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     let maintenance_mode = Arc::new(std::sync::atomic::AtomicBool::new(matches!(
         std::env::var("PERP_MAINTENANCE").ok().as_deref(),
         Some("1") | Some("true") | Some("yes")
     )));
+
+    // Q-BND-3: the last PUBLISHED reserves figures, so /v1/attestation/commitment can
+    // state the custody-minus-liabilities gap instead of only describing it. Declared
+    // here because AppState needs it and the publisher fills it later.
+    let reserves_figures_cache: reserves_publisher::ReservesFiguresCache =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
 
     let app_state = Arc::new(AppState {
         engine,
@@ -1050,6 +1111,7 @@ async fn main() -> Result<()> {
         shard_router: shard_router.clone(),
         peer_count: peer_count.clone(),
         start_time: Instant::now(),
+        reserves_figures: Some(reserves_figures_cache.clone()),
         maintenance_mode: maintenance_mode.clone(),
     });
 
@@ -1486,6 +1548,7 @@ async fn main() -> Result<()> {
             _mrenclave_governance_tx.clone(),
             _spv_baseline_tx.clone(),
             _unl_policy_tx.clone(),
+            _unl_status_tx.clone(),
         ) {
             (
                 Some(cfg),
@@ -1495,6 +1558,7 @@ async fn main() -> Result<()> {
                 Some(mrenclave_governance_tx),
                 Some(spv_baseline_tx),
                 Some(unl_policy_tx),
+                Some(unl_status_tx),
             ) if !cli.membership_node_urls.is_empty() => {
                 let escrow = crate::xrpl_signer::decode_xrpl_address(&escrow_address)
                     .context("--membership-admin-listen: escrow address must decode")?;
@@ -1530,6 +1594,7 @@ async fn main() -> Result<()> {
                     mrenclave_governance_tx,
                     spv_baseline_tx,
                     unl_policy_tx,
+                    unl_status_tx,
                     operator_capital_account_ids: operator_capital_account_ids.clone(),
                 });
                 tokio::spawn(async move {
@@ -1694,6 +1759,9 @@ async fn main() -> Result<()> {
             p2p_node.set_spv_baseline_channel(rx);
         }
         // #131 §6: the UNL policy collection channel.
+        if let Some(rx) = unl_status_rx_holder {
+            p2p_node.set_unl_status_channel(rx);
+        }
         if let Some(rx) = unl_policy_rx_holder {
             p2p_node.set_unl_policy_channel(rx);
         }
@@ -2084,6 +2152,30 @@ async fn main() -> Result<()> {
     if reserves_publisher_cfg.is_some() {
         info!("reserves publisher ENABLED (Tier-1 single attested-enclave, sequencer-only)");
     }
+
+    // #131 P3 — SPV-proven deposits. Opt-in via PERP_DEPOSIT_SPV=1: until an operator
+    // has armed the boundary every submission refuses with -85, so a driver running by
+    // default would fill the log with refusals on every upgraded node.
+    //
+    // The collector starts regardless of role and never stops. rippled serves no
+    // validation history, so a signature missed while we were not listening is gone and
+    // the deposit it would have proven becomes uncreditable — a follower that is
+    // promoted later needs the buffer already warm, not started at promotion.
+    if let Some(dcfg) = deposit_spv::DepositDriverConfig::from_env(&escrow_address) {
+        let buffer =
+            std::sync::Arc::new(std::sync::Mutex::new(deposit_spv::ValidationBuffer::new()));
+        tokio::spawn(deposit_spv::run_validation_collector(
+            dcfg.ws_url.clone(),
+            buffer.clone(),
+        ));
+        tokio::spawn(deposit_spv::run_deposit_scanner(
+            dcfg,
+            perp.clone(),
+            buffer,
+            is_sequencer.clone(),
+        ));
+        info!("deposit-spv ENABLED (collector always; scanner sequencer-only)");
+    }
     let mut last_reserves_commit = Instant::now();
 
     let price_interval = Duration::from_secs(cli.price_interval);
@@ -2332,6 +2424,7 @@ async fn main() -> Result<()> {
                             &signer.address,
                             &signer.session_key,
                             &operator_capital_account_ids,
+                            Some(&reserves_figures_cache),
                         )
                         .await
                         {

@@ -12,7 +12,7 @@
 
 Компонент Тома подключается к **нашему instance того же окружения**, никогда не пересекает окружения:
 
-- Tom-**testnet** client → наш **testnet** API (Azure DCsv3 кластер, escrow `rbqCUxgi…`, faucet-funded, multi-operator FROST 2-of-3, текущий код на `master` HEAD).
+- Tom-**testnet** client → наш **testnet** API (Azure DCsv3 кластер, escrow `rbqCUxgi…`, faucet-funded, multi-operator XRPL SignerList 2-of-3 (независимые ECDSA-подписи операторов, не FROST), текущий код на `master` HEAD).
 - Tom-**mainnet-sandbox** client → наш **mainnet-sandbox** API (Hetzner mainnet stack) — только после graduation gate в §4.
 - Tom-**production** client → out of scope этого документа; production имеет свой launch playbook per `development-operating-model.md` §1.3.
 

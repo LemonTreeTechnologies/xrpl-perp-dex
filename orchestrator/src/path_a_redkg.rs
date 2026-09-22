@@ -168,6 +168,37 @@ pub fn router(state: Arc<AdminState>) -> Router {
     Router::new()
         .route("/admin/path-a/share-export", post(handle_share_export))
         .with_state(state)
+        // FROST signing-round probe. Stateless (the caller names the enclave,
+        // the signer set and the group key), so it is merged rather than
+        // sharing AdminState.
+        .merge(Router::new().route(
+            "/admin/frost/round",
+            post(crate::frost_round::handle_frost_round),
+        ))
+        // #131 Safe governance: order the owner signatures and submit the self-call.
+        // Stateless like the FROST probe; configuration comes from the same env the
+        // publisher reads, so there is no second place to hold the gas key.
+        .merge(Router::new().route(
+            "/admin/safe/exec",
+            post(crate::safe_governance::handle_safe_exec),
+        ))
+        // What owner set does the sealed membership imply, and are we in sync? The
+        // operator reads the plan here and relays it; they do not compose an operation.
+        .merge(Router::new().route(
+            "/admin/safe/projection",
+            post(crate::safe_projection::handle_projection),
+        ))
+        // Independent derivation: neither request carries calldata, a hash, or an owner
+        // set. Every node computes the content from its OWN enclave and its OWN read of
+        // the chain — which is what keeps an opaque-hash quorum from being a blind one.
+        .merge(Router::new().route(
+            "/admin/safe/derive-step",
+            post(crate::safe_projection::handle_derive_step),
+        ))
+        .merge(Router::new().route(
+            "/admin/safe/attest-projection",
+            post(crate::safe_projection::handle_attest),
+        ))
 }
 
 /// Bind a 127.0.0.1-only admin HTTP listener. Errors if `listen_addr`
