@@ -22,7 +22,7 @@ curl https://api-dev.xperp.fi/v1/system/status
 ```json
 {
   "network": "testnet",
-  "deposit_address": "rUY1bpf7X2ySfY1AL2PFKCSXyQKNpMWQGD",
+  "deposit_address": "rfYnJDSAeFuDCUTq2oYbckbJcz3gAJTNCd",
   "is_in_maintenance": false,
   "market": "XRP-USD-PERP",
   "escrow_quorum": 2,
@@ -465,7 +465,7 @@ Returns the current network, deposit address, and maintenance flag. Call this at
 ```json
 {
     "network": "testnet",
-    "deposit_address": "rUY1bpf7X2ySfY1AL2PFKCSXyQKNpMWQGD",
+    "deposit_address": "rfYnJDSAeFuDCUTq2oYbckbJcz3gAJTNCd",
     "is_in_maintenance": false,
     "market": "XRP-USD-PERP",
     "escrow_quorum": 2,
