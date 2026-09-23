@@ -1,8 +1,8 @@
-# Vault yield bands measured against the trailing twelve months
+# Vault revenue sources measured over the trailing twelve months
 
 **Scope.** Tier A of `docs/vault-backtest-plan.md`. A closed-form pass over
-historical market data to test whether three advertised APY bands are consistent
-with what the market paid between **2025-09-23 and 2026-09-23**.
+historical market data measuring what each vault strategy's revenue source paid
+between **2025-09-23 and 2026-09-23**.
 
 **Status.** This is a measurement, not a backtest of deployed infrastructure, and
 not a forecast. It reports what the data supports, what it contradicts, and what
@@ -12,17 +12,21 @@ it cannot settle either way.
 
 ## 1. The question
 
-Three vaults are offered with targeted annual yields:
+`docs/vault-design-spec.md` defines three vault strategies. Each monetises a
+different revenue source, and this document measures **what that source actually
+paid** over the window:
 
-| vault | advertised band |
+| vault | revenue source measured here |
 |---|---|
-| Market-making (MM) | 12–18 % |
-| Delta-Neutral (DN) | 15–25 % |
-| Delta One | 20–35 % |
+| Market-making (MM) | spread captured on taker flow crossing the quoted band |
+| Delta-Neutral (DN) | that spread, plus funding accruing on the resulting inventory |
+| Delta One | funding carry on a levered position, less borrow on the levered part |
 
-These bands appear on the product's UI cards. They are **not** stated in this
-repository — not in `docs/vault-design-spec.md`, not in `docs/perp-dex-faq-ru.md`.
-This document does not establish where they came from; it tests them.
+Yield bands of 12–18 / 15–25 / 20–35 % circulate on the product's UI cards. They
+are not stated anywhere in this repository, and this document does not establish
+their origin or treat them as a specification. They appear below only as
+comparison points, because a measurement of a revenue source is easier to read
+next to a number someone expects.
 
 ## 2. Data
 
@@ -63,7 +67,7 @@ is the carry an always-on position would have collected. `capture_efficiency`
 (0.85 headline) discounts slippage on entering and rolling. Leverage is swept at
 1.5 / 2.0 / 3.0.
 
-The same formula inverted gives the funding level the advertised band requires:
+Inverted, the same formula gives the funding level a given target requires:
 
 ```
 funding_needed = (target + borrow_apr × (leverage − 1)) / (leverage × capture_efficiency)
@@ -135,8 +139,8 @@ its own 95th percentile in essentially every period for twelve months.
 
 DN's revenue over MM is funding accruing on inventory left by market-making —
 the same series that summed to 0.19 %. Under this method DN and MM differ by
-less than 0.1 % of notional over the window. The advertised 3–7 point premium
-over the MM band has no measurable source in this data.
+less than 0.1 % of notional over the window. A DN premium over MM of several
+points has no measurable source in this data.
 
 ### 4.3 Market-making
 
@@ -163,8 +167,8 @@ cannot speak to.
   and the clamp bounds it at ±5 bp — but this is an argument, not a measurement.
 - **One window, one regime.** Funding was flat and near-symmetric across these
   twelve months. Sustained-basis regimes occur and would change §4.1 materially.
-  The result is that the advertised Delta One band did not hold in this window,
-  not that it cannot hold in any window.
+  The result is that the Delta One carry was absent in this window, not that it
+  is absent in every window.
 - **Delta One models absent infrastructure.** Spot RLUSD/XRP and lending are not
   built. The borrow series is a reference rate, not a quote obtainable against
   XRP collateral on XRPL today.
