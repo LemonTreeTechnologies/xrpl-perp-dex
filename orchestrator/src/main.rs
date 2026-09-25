@@ -5,6 +5,7 @@
 //!   2. Background loop — price feeds, deposit monitoring, liquidations, funding
 
 mod api;
+mod attested_clock;
 mod auth;
 mod bootstrap_http;
 mod bootstrap_join;
@@ -969,6 +970,7 @@ async fn main() -> Result<()> {
     // signal is readable by an operator with curl rather than only by a log scraper this
     // repo does not ship. See api::ReplicationHealth.
     let replication_health = Arc::new(crate::api::ReplicationHealth::default());
+    let clock_health = Arc::new(crate::attested_clock::ClockHealth::default());
     let mark_price = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let funding_rate = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let last_funding_time = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1126,6 +1128,7 @@ async fn main() -> Result<()> {
         peer_count: peer_count.clone(),
         start_time: Instant::now(),
         replication: replication_health.clone(),
+        attested_clock: clock_health.clone(),
         reserves_figures: Some(reserves_figures_cache.clone()),
         maintenance_mode: maintenance_mode.clone(),
     });
@@ -2265,20 +2268,45 @@ async fn main() -> Result<()> {
     // validation history, so a signature missed while we were not listening is gone and
     // the deposit it would have proven becomes uncreditable — a follower that is
     // promoted later needs the buffer already warm, not started at promotion.
-    if let Some(dcfg) = deposit_spv::DepositDriverConfig::from_env(&escrow_address) {
+    //
+    // The attested-clock driver consumes the SAME validation stream (trusted-price part
+    // (2) step 3), so the collector is started when EITHER driver is on and the buffer is
+    // shared. Two collectors on one rippled would double the subscription for no gain.
+    let deposit_cfg = deposit_spv::DepositDriverConfig::from_env(&escrow_address);
+    let clock_cfg = attested_clock::ClockDriverConfig::from_env();
+    if deposit_cfg.is_some() || clock_cfg.is_some() {
+        let ws_url = deposit_cfg
+            .as_ref()
+            .map(|d| d.ws_url.clone())
+            .or_else(|| clock_cfg.as_ref().map(|c| c.ws_url.clone()))
+            .expect("one of the two configs is present");
         let buffer =
             std::sync::Arc::new(std::sync::Mutex::new(deposit_spv::ValidationBuffer::new()));
         tokio::spawn(deposit_spv::run_validation_collector(
-            dcfg.ws_url.clone(),
+            ws_url,
             buffer.clone(),
         ));
-        tokio::spawn(deposit_spv::run_deposit_scanner(
-            dcfg,
-            perp.clone(),
-            buffer,
-            is_sequencer.clone(),
-        ));
-        info!("deposit-spv ENABLED (collector always; scanner sequencer-only)");
+        if let Some(dcfg) = deposit_cfg {
+            tokio::spawn(deposit_spv::run_deposit_scanner(
+                dcfg,
+                perp.clone(),
+                buffer.clone(),
+                is_sequencer.clone(),
+            ));
+            info!("deposit-spv ENABLED (collector always; scanner sequencer-only)");
+        }
+        if let Some(ccfg) = clock_cfg {
+            // Deliberately NOT sequencer-gated: each node advances its own clock from a
+            // header it verified itself. A cluster cosign would buy nothing here and
+            // would cost liveness on the path whose stalling halts trading.
+            tokio::spawn(attested_clock::run_attested_clock(
+                ccfg,
+                perp.clone(),
+                buffer,
+                clock_health.clone(),
+            ));
+            info!("attested-clock ENABLED (every node, not only the sequencer)");
+        }
     }
     let mut last_reserves_commit = Instant::now();
 

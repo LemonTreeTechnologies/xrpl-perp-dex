@@ -436,6 +436,133 @@ pub fn build_xdep_blob(
     Ok(b)
 }
 
+/// Trusted-price — the clock transport (`XCLK`).
+///
+/// The attested prefix and **nothing after it**: magic, version, the 118-byte header the
+/// validators signed, and their signatures over it.
+///
+/// A third sibling format rather than `XSPV` with `proof_count = 0`, and the distinction is
+/// load-bearing on the receiving side: the enclave's parser refuses trailing bytes, so a
+/// custody proof cannot ride in on a call whose only job is learning what time it is. This
+/// producer therefore appends nothing, and there is no parameter through which it could.
+///
+/// See `xrpl_spv_parse_clock_transport` in the enclave for the reading half.
+pub fn build_xclk_blob(
+    header: &[u8; HEADER_LEN],
+    val_count: u16,
+    validations: &[u8],
+) -> Result<Vec<u8>> {
+    let mut b = Vec::with_capacity(9 + HEADER_LEN + validations.len());
+    b.extend_from_slice(b"XCLK");
+    b.push(1); // version
+    push_be16(&mut b, HEADER_LEN as u16); // const 118, cannot narrow
+    b.extend_from_slice(header);
+    push_be16(&mut b, val_count);
+    b.extend_from_slice(validations);
+    Ok(b)
+}
+
+#[cfg(test)]
+mod xclk_producer_tests {
+    use super::*;
+
+    fn fixture() -> ([u8; HEADER_LEN], Vec<Vec<u8>>) {
+        let mut h = [0u8; HEADER_LEN];
+        for (i, b) in h.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7);
+        }
+        (h, vec![vec![0xAA; 40], vec![0xBB; 33]])
+    }
+
+    #[test]
+    fn the_blob_is_the_attested_prefix_and_nothing_after_it() {
+        let (h, vals) = fixture();
+        let flat: Vec<u8> = vals.iter().flatten().copied().collect();
+        let blob = build_xclk_blob(&h, vals.len() as u16, &flat).unwrap();
+
+        assert_eq!(&blob[0..4], b"XCLK", "magic");
+        assert_eq!(blob[4], 1, "version");
+        assert_eq!(u16::from_be_bytes([blob[5], blob[6]]), HEADER_LEN as u16);
+        assert_eq!(&blob[7..7 + HEADER_LEN], &h[..], "header verbatim");
+        let vc_at = 7 + HEADER_LEN;
+        assert_eq!(u16::from_be_bytes([blob[vc_at], blob[vc_at + 1]]), 2);
+        assert_eq!(&blob[vc_at + 2..], &flat[..], "validations verbatim");
+
+        // The property the format exists for: the length is fully accounted for, so
+        // nothing can be appended without the enclave's parser seeing trailing bytes.
+        assert_eq!(
+            blob.len(),
+            9 + HEADER_LEN + flat.len(),
+            "no slack in the blob"
+        );
+    }
+
+    #[test]
+    fn it_is_not_the_deposit_transport() {
+        // A reader that only checked "starts with X" would take one for the other; the
+        // magic is the thing keeping a custody proof off the clock path.
+        let (h, vals) = fixture();
+        let flat: Vec<u8> = vals.iter().flatten().copied().collect();
+        let clk = build_xclk_blob(&h, vals.len() as u16, &flat).unwrap();
+        let dep = build_xdep_blob(&h, vals.len() as u16, &flat, &[1, 2, 3], &[4, 5], &[]).unwrap();
+        assert_ne!(&clk[0..4], &dep[0..4]);
+        assert!(
+            dep.len() > clk.len(),
+            "the deposit transport carries payload the clock transport has no room for"
+        );
+    }
+
+    /// CROSS-LANGUAGE VECTOR. The same hex is parsed by a C++ test in the enclave repo
+    /// (`test_xrpl_spv.cpp`, "the producer's bytes"), so the two sides are pinned to one
+    /// byte string rather than to two independent readings of a comment. A layout both
+    /// sides agreed on because both were written from the same paragraph is exactly the
+    /// co-deluded fixture this guards against: if either changes, one of the two tests
+    /// goes red instead of both staying green.
+    ///
+    /// The header is REAL — our own rippled 3.1.3, testnet ledger 21038626,
+    /// close_time 843653980 (Ripple epoch) = 2026-09-25T12:19:40Z. The validation entries
+    /// are structural fillers, because the transport layout is what a PRODUCER controls;
+    /// whether a signature verifies is the enclave's own territory and not ours to fake.
+    const XCLK_VECTOR: &str = "58434C4B010076014106220163455E948617B432C5B74631AB7C120172A918C5A23CA5B32DE27202D3EA62E3A795500EE4A5EB3F6570C1F9CEA1889D00F8C4462F31820A87A723198F38EF301AE8B243E3FF074286408431A7AA5268500679DF31767F7832DC9775E4E15CB2566699B7583AF6324923543249235C0A00000211111111111111111111111111111111111111111111111111111111111111111146A0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E50028505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767722222222222222222222222222222222222222222222222222222222222222222246A0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E50028505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F7071727374757677";
+
+    #[test]
+    fn the_producer_emits_the_vector_the_enclave_parser_is_tested_against() {
+        let hdr_hex = &XCLK_VECTOR[14..14 + HEADER_LEN * 2];
+        let mut header = [0u8; HEADER_LEN];
+        for (i, b) in header.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&hdr_hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        let tail_at = 14 + HEADER_LEN * 2;
+        let val_count = u16::from_str_radix(&XCLK_VECTOR[tail_at..tail_at + 4], 16).unwrap();
+        let flat_hex = &XCLK_VECTOR[tail_at + 4..];
+        let flat: Vec<u8> = (0..flat_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&flat_hex[i..i + 2], 16).unwrap())
+            .collect();
+
+        let produced = build_xclk_blob(&header, val_count, &flat).unwrap();
+        assert_eq!(
+            hex::encode_upper(&produced),
+            XCLK_VECTOR,
+            "the producer no longer emits the bytes the enclave test parses"
+        );
+    }
+
+    #[test]
+    fn an_empty_validation_set_still_produces_a_well_formed_blob() {
+        // Refusing is the ENCLAVE's job (it fails quorum), not the producer's: a producer
+        // that silently dropped the call would hide a node that is not receiving
+        // validations behind "the clock just isn't advancing".
+        let (h, _) = fixture();
+        let blob = build_xclk_blob(&h, 0, &[]).unwrap();
+        assert_eq!(blob.len(), 9 + HEADER_LEN);
+        assert_eq!(
+            u16::from_be_bytes([blob[7 + HEADER_LEN], blob[8 + HEADER_LEN]]),
+            0
+        );
+    }
+}
+
 #[cfg(test)]
 mod xspv_producer_tests {
     use super::*;

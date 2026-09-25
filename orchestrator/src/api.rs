@@ -109,6 +109,8 @@ pub struct AppState {
     pub start_time: std::time::Instant,
     /// Validator replication health, readable on /v1/system/status.
     pub replication: Arc<ReplicationHealth>,
+    /// The attested clock, as the ENCLAVE reports it — read back, not what we last sent.
+    pub attested_clock: Arc<crate::attested_clock::ClockHealth>,
     /// Q-BND-3: the figures from the last PUBLISHED reserves commitment, so the public
     /// attestation endpoint can quantify the custody-minus-liabilities gap rather than
     /// only describing it in prose. None until the first publish of this process.
@@ -330,6 +332,17 @@ async fn system_status(State(state): State<Arc<AppState>>) -> impl IntoResponse 
             "state_hash_mismatches": state.replication.state_hash_mismatches.load(Ordering::Relaxed),
             "unverified_orders": state.replication.unverified_orders.load(Ordering::Relaxed),
             "last_batch_seq": state.replication.last_batch_seq.load(Ordering::Relaxed),
+        },
+        // The attested clock, reported whether or not a driver runs here. A node with the
+        // driver switched off must not be indistinguishable from one whose clock is stuck.
+        "attested_clock": {
+            "driver_enabled": state.attested_clock.driver_enabled.load(Ordering::Relaxed),
+            "advances": state.attested_clock.advances.load(Ordering::Relaxed),
+            "refusals": state.attested_clock.refusals.load(Ordering::Relaxed),
+            "last_refusal_rc": state.attested_clock.last_refusal_rc.load(Ordering::Relaxed),
+            "attested_ledger_seq": state.attested_clock.attested_ledger_seq.load(Ordering::Relaxed),
+            // Ripple epoch, NAMED — a renderer that assumes Unix is 946684800 seconds wrong.
+            "attested_close_time_ripple_epoch": state.attested_clock.attested_close_time.load(Ordering::Relaxed),
         },
     }))
 }
