@@ -15,6 +15,35 @@ use crate::perp_client::PerpClient;
 use crate::types::{Side, FP8};
 
 /// Trading engine: orderbook + enclave integration + P2P batch publishing.
+/// WHAT AUTHORISES THIS ORDER TO ENTER THE MATCHABLE BOOK.
+///
+/// Mandatory and compiler-enforced, because the question "who said this order should
+/// exist?" was previously answerable only by reading the HTTP layer — and one of the
+/// answers there was "a session token the server itself holds". An order the sequencer
+/// can manufacture is not confined to itself: a fake counter-order fills a GENUINE user's
+/// order at a chosen price, so a single unverifiable order degrades every fill it touches
+/// (audit Q6, 2026-09-25).
+///
+/// Gating happens HERE, where the order enters the book, rather than at persistence —
+/// a matchable order is already dangerous whether or not it is ever written to disk.
+#[derive(Debug, Clone)]
+pub enum OrderAuthorization {
+    /// A per-order signature by the user's own key, which a validator can verify for
+    /// itself without trusting this node. The only kind that can carry the honest label.
+    ClientSigned(Box<crate::auth::OrderSignatureBinding>),
+    /// A protocol-owned vault (reserved user_id). NOT independently verifiable today, and
+    /// deliberately named rather than quietly allowed: the vault market-maker places
+    /// orders with no user behind them, so a validator has nothing to check them against.
+    ///
+    /// OPEN QUESTION, with the auditor: the clean answer is probably that vault quotes
+    /// become DERIVED rather than replicated — a pure function of (agreed price, agreed
+    /// time, sealed config, own state), the same treatment funding and liquidation get —
+    /// so every node computes the same quotes and nothing needs verifying. Giving the
+    /// vault a server-held signing key would instead reproduce exactly the family this
+    /// enum exists to close.
+    ProtocolVault,
+}
+
 pub struct TradingEngine {
     pub book: Mutex<OrderBook>,
     perp: PerpClient,
@@ -67,6 +96,7 @@ impl TradingEngine {
     #[allow(clippy::too_many_arguments)]
     pub async fn submit_order(
         &self,
+        authorization: OrderAuthorization,
         user_id: String,
         side: Side,
         order_type: OrderType,
@@ -77,6 +107,20 @@ impl TradingEngine {
         reduce_only: bool,
         client_order_id: Option<String>,
     ) -> Result<OrderResult> {
+        // The authorization is not decorative: the order's owner must be the party who
+        // SIGNED for it. Checked here rather than only at the HTTP layer, because this is
+        // where the order becomes matchable and because a caller handing in a mismatched
+        // pair is exactly what a compromised front-end path would look like.
+        if let OrderAuthorization::ClientSigned(ref binding) = authorization {
+            if binding.signer_address != user_id {
+                anyhow::bail!(
+                    "order owner {user_id} does not match the signer {} — an order may \
+                     only be placed by the key that signed for it",
+                    binding.signer_address
+                );
+            }
+        }
+
         self.submit_order_inner(
             user_id,
             side,
@@ -97,12 +141,25 @@ impl TradingEngine {
     #[allow(clippy::too_many_arguments)]
     pub async fn submit_close_order(
         &self,
+        authorization: OrderAuthorization,
         user_id: String,
         close_side: Side,
         size: FP8,
         leverage: u32,
         close_position_id: u32,
     ) -> Result<OrderResult> {
+        // A close is a matchable order like any other (closes route through the CLOB by
+        // design), so it gets the identical ownership check. Splitting the gate across two
+        // entry points and guarding only one is how the blind co-sign happened.
+        if let OrderAuthorization::ClientSigned(ref binding) = authorization {
+            if binding.signer_address != user_id {
+                anyhow::bail!(
+                    "close-order owner {user_id} does not match the signer {}",
+                    binding.signer_address
+                );
+            }
+        }
+
         self.submit_order_inner(
             user_id,
             close_side,
@@ -476,6 +533,54 @@ impl TradingEngine {
 
 #[cfg(test)]
 mod tests {
+    /// Tests exercise the SIGNED path, because that is the only path production allows.
+    /// The binding is synthetic — nothing here verifies it — but using ProtocolVault would
+    /// silently route every test down the one branch that skips verification, which is how
+    /// a gate ends up covered by nothing.
+    /// AUDIT Q6: an order may only be placed by the key that signed for it. Without this,
+    /// a caller holding ANY valid signature could place orders spending SOMEONE ELSE's
+    /// balance — the signature would be real, just not for this order's owner. The HTTP
+    /// layer checks it too; this asserts the engine does not depend on that, because the
+    /// engine is where the order becomes matchable.
+    #[tokio::test]
+    async fn an_order_may_not_be_placed_on_behalf_of_another_user() {
+        let base = spawn_mock_enclave("100.00000000").await;
+        let eng = engine(&base);
+        let res = eng
+            .submit_order(
+                test_authorization_for("alice"),
+                "bob".into(),
+                Side::Long,
+                OrderType::Limit,
+                FP8::from_f64(0.55),
+                FP8::from_f64(1.0),
+                1,
+                TimeInForce::Gtc,
+                false,
+                None,
+            )
+            .await;
+        let msg = res
+            .expect_err("alice must not place an order owned by bob")
+            .to_string();
+        assert!(
+            msg.contains("does not match the signer"),
+            "refusal should name the mismatch, got: {msg}"
+        );
+    }
+
+    fn test_authorization_for(user: &str) -> OrderAuthorization {
+        OrderAuthorization::ClientSigned(Box::new(crate::auth::OrderSignatureBinding {
+            signed_body_hex: String::new(),
+            signature_hex: String::new(),
+            timestamp: String::new(),
+            // MUST match the order's user_id — the engine refuses a mismatch, and a helper
+            // that quietly papered over that would disable the check for every test.
+            signer_address: user.to_string(),
+            signer_pubkey_hex: String::new(),
+        }))
+    }
+
     use super::*;
     use crate::orderbook::OrderType;
     use axum::{routing::get, Json, Router};
@@ -522,6 +627,7 @@ mod tests {
         let eng = engine(&base);
         let res = eng
             .submit_order(
+                test_authorization_for("broke"),
                 "broke".into(),
                 Side::Long,
                 OrderType::Limit,
@@ -551,6 +657,7 @@ mod tests {
         let eng = engine(&base);
         let first = eng
             .submit_order(
+                test_authorization_for("whale"),
                 "whale".into(),
                 Side::Long,
                 OrderType::Limit,
@@ -567,6 +674,7 @@ mod tests {
 
         let second = eng
             .submit_order(
+                test_authorization_for("whale"),
                 "whale".into(),
                 Side::Long,
                 OrderType::Limit,

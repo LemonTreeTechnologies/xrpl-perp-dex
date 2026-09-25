@@ -854,9 +854,27 @@ async fn submit_order(
         return err(StatusCode::BAD_REQUEST, "leverage must be 1-20").into_response();
     }
 
+    // AUDIT Q6 (2026-09-25): an order may not enter the matchable book without a per-order
+    // signature a validator can verify for itself. A Bearer session token is a credential
+    // the SERVER holds, so an order placed with one is indistinguishable from an order the
+    // sequencer manufactured — and a manufactured counter-order fills a genuine user's
+    // order at a chosen price, degrading every fill it touches rather than only itself.
+    // Owner's ruling (2026-09-25): sign every order. Scope-bounded session-key delegation
+    // stays on the table as a later ergonomics fix; a plain session token does not.
+    let Some(binding) = signature_binding.clone() else {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "orders require a per-order XRPL signature (X-XRPL-Address / -PublicKey / \
+             -Signature / -Timestamp); a session token authenticates you to this server \
+             but cannot prove to any other node that you placed this order",
+        )
+        .into_response();
+    };
+
     match state
         .engine
         .submit_order(
+            crate::trading::OrderAuthorization::ClientSigned(Box::new(binding)),
             req.user_id,
             side,
             order_type,
@@ -1153,6 +1171,22 @@ async fn close_position(
         Some(u) => u.xrpl_address.clone(),
         None => return err(StatusCode::UNAUTHORIZED, "authentication required").into_response(),
     };
+    // AUDIT Q6: a close is a matchable order, so it needs the same per-order signature as
+    // an open. Gating only the open side would leave the manufactured-order hole wide on
+    // the other half of the book.
+    let Some(close_binding) = request
+        .extensions()
+        .get::<auth::OrderSignatureBinding>()
+        .cloned()
+    else {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "closing a position requires a per-order XRPL signature; a session token \
+             authenticates you to this server but cannot prove to any other node that \
+             you asked for this close",
+        )
+        .into_response();
+    };
 
     let balance = match state.perp.get_balance(&caller).await {
         Ok(v) => v,
@@ -1213,6 +1247,7 @@ async fn close_position(
     match state
         .engine
         .submit_close_order(
+            crate::trading::OrderAuthorization::ClientSigned(Box::new(close_binding)),
             caller.clone(),
             close_side,
             pos_size,
