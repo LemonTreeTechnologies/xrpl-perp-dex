@@ -16,6 +16,19 @@ pub struct PerpClient {
     client: reqwest::Client,
 }
 
+/// Pull the enclave's refusal code out of an error string the handlers format as
+/// `(rc=-89)`. Separate from the client so the parsing is testable, and shared rather
+/// than re-implemented per driver — `deposit_spv::outcome_from_error` grew its own copy
+/// and a second divergent one is how two drivers end up disagreeing about what -89 means.
+pub fn rc_from_error(msg: &str) -> Option<i64> {
+    let i = msg.find("rc=")?;
+    let rest = &msg[i + 3..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '-')
+        .unwrap_or(rest.len());
+    rest[..end].parse::<i64>().ok()
+}
+
 impl PerpClient {
     /// Create a new client. TLS verification is relaxed because the
     /// enclave serves a self-signed cert; `ensure_loopback_url` gates
@@ -202,6 +215,22 @@ impl PerpClient {
             serde_json::json!({ "proof_blob": hex::encode(proof_blob) }),
         )
         .await
+    }
+
+    /// Trusted-price — feed a quorum-signed XRPL ledger header ('XCLK') so the enclave
+    /// can learn the time from something it verifies rather than something we assert.
+    pub async fn attested_clock_advance(&self, clock_blob: &[u8]) -> Result<Value> {
+        self.post(
+            "/perp/attested-clock/advance",
+            serde_json::json!({ "clock_blob": hex::encode(clock_blob) }),
+        )
+        .await
+    }
+
+    /// Read the clock back out of the enclave. The point of having it: "the clock is
+    /// advancing" has to be observable, not inferred from an absence of errors.
+    pub async fn attested_clock_status(&self) -> Result<Value> {
+        self.get("/perp/attested-clock/status").await
     }
 
     #[allow(clippy::too_many_arguments)]
