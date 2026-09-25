@@ -955,6 +955,10 @@ async fn main() -> Result<()> {
     engine = engine.with_batch_publisher(trade_batch_tx.clone());
 
     let is_sequencer = Arc::new(AtomicBool::new(cli.priority == 0));
+    // Validator replication health, shared with the HTTP status handler so the divergence
+    // signal is readable by an operator with curl rather than only by a log scraper this
+    // repo does not ship. See api::ReplicationHealth.
+    let replication_health = Arc::new(crate::api::ReplicationHealth::default());
     let mark_price = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let funding_rate = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let last_funding_time = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1111,6 +1115,7 @@ async fn main() -> Result<()> {
         shard_router: shard_router.clone(),
         peer_count: peer_count.clone(),
         start_time: Instant::now(),
+        replication: replication_health.clone(),
         reserves_figures: Some(reserves_figures_cache.clone()),
         maintenance_mode: maintenance_mode.clone(),
     });
@@ -1928,6 +1933,7 @@ async fn main() -> Result<()> {
     let validator_perp = PerpClient::new(&cli.enclave_url)?;
     let validator_db = app_state.db.clone();
     let validator_leader_rx = leader_rx.clone();
+    let validator_replication = replication_health.clone();
     let _validator_handle = tokio::spawn(async move {
         let mut last_seq: u64 = 0;
         // O-H2: per-sequencer mismatch counter. Exposed via tracing events
@@ -1935,6 +1941,20 @@ async fn main() -> Result<()> {
         // can alert on a compromised or buggy sequencer.
         let mut state_hash_mismatches: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
+        // A replay that FAILS means this validator's enclave state has diverged from the
+        // sequencer's and cannot know it. Until now that was a bare `warn!` — invisible to
+        // anything but a human reading logs, which is the worst place for a divergence
+        // signal to live. Counted here and emitted under `metric =
+        // "replay_failures_total"`, the same shape as the mismatch counter above, so a
+        // scraper can alert on it.
+        //
+        // This does NOT close the replication gap (`docs/trust-gaps-before-production.en.md`
+        // §Gap 2, private enclave repo). It stops the gap being SILENT, which is a
+        // different and much cheaper thing. Spec: `docs/audit/REQ-validator-replica-
+        // completeness.md` Q4, same private repo.
+        let mut replay_failures: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        let mut replay_ok_total: u64 = 0;
         while let Some(batch) = batch_rx.recv().await {
             if is_seq_validator.load(Ordering::Relaxed) {
                 continue; // sequencer doesn't replay its own batches
@@ -1988,12 +2008,25 @@ async fn main() -> Result<()> {
                 );
             }
             last_seq = batch.seq_num;
+            validator_replication
+                .batches_seen
+                .fetch_add(1, Ordering::Relaxed);
+            validator_replication
+                .last_batch_seq
+                .store(batch.seq_num, Ordering::Relaxed);
 
-            // O-H2: verify state_hash BEFORE any replay. A mismatch means
-            // the batch contents the sequencer signed-off don't match what
-            // we'd produce locally — replaying would corrupt validator
-            // state and poison the trade-history PG row. Skip the batch
-            // entirely and surface on a counter metric.
+            // O-H2: verify state_hash BEFORE any replay, and be precise about what this
+            // does prove. Every input to the hash below — seq_num, the fills, the
+            // timestamp — is a field of the batch the SEQUENCER sent, so recomputing it
+            // proves the message arrived intact. It proves nothing about the sequencer's
+            // honesty, because both sides of the comparison have the same author.
+            //
+            // The comment here used to say the check compared against "what we'd produce
+            // locally", which is the one thing it cannot do: producing that locally would
+            // mean re-running the matcher against the order flow, and validators never see
+            // the order flow. Corrected 2026-09-25; the claim had outlived the code it
+            // described. A mismatch still means skip — a corrupted batch would poison both
+            // validator state and the trade-history PG row.
             {
                 use sha2::{Digest, Sha256};
                 let mut hasher = Sha256::new();
@@ -2016,6 +2049,9 @@ async fn main() -> Result<()> {
                         .entry(batch.sequencer_id.clone())
                         .and_modify(|c| *c += 1)
                         .or_insert(1);
+                    validator_replication
+                        .state_hash_mismatches
+                        .fetch_add(1, Ordering::Relaxed);
                     error!(
                         metric = "state_hash_mismatches_total",
                         sequencer_id = %batch.sequencer_id,
@@ -2054,12 +2090,29 @@ async fn main() -> Result<()> {
                         )
                         .await
                     {
-                        warn!(
+                        let c = replay_failures
+                            .entry(batch.sequencer_id.clone())
+                            .and_modify(|c| *c += 1)
+                            .or_insert(1);
+                        validator_replication
+                            .replay_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        error!(
+                            metric = "replay_failures_total",
+                            sequencer_id = %batch.sequencer_id,
+                            value = *c,
+                            replayed_ok = replay_ok_total,
+                            leg = "taker",
                             trade_id = fill.trade_id,
                             user = %order.user_id,
-                            "taker replay failed: {}",
+                            "REPLAY FAILED — this validator's enclave state has diverged from the sequencer's: {}",
                             e
                         );
+                    } else {
+                        replay_ok_total += 1;
+                        validator_replication
+                            .replays_ok
+                            .fetch_add(1, Ordering::Relaxed);
                     }
 
                     // Open maker position
@@ -2073,12 +2126,29 @@ async fn main() -> Result<()> {
                         )
                         .await
                     {
-                        warn!(
+                        let c = replay_failures
+                            .entry(batch.sequencer_id.clone())
+                            .and_modify(|c| *c += 1)
+                            .or_insert(1);
+                        validator_replication
+                            .replay_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        error!(
+                            metric = "replay_failures_total",
+                            sequencer_id = %batch.sequencer_id,
+                            value = *c,
+                            replayed_ok = replay_ok_total,
+                            leg = "maker",
                             trade_id = fill.trade_id,
                             user = %fill.maker_user_id,
-                            "maker replay failed: {}",
+                            "REPLAY FAILED — this validator's enclave state has diverged from the sequencer's: {}",
                             e
                         );
+                    } else {
+                        replay_ok_total += 1;
+                        validator_replication
+                            .replays_ok
+                            .fetch_add(1, Ordering::Relaxed);
                     }
 
                     // Passive replication: every validator writes the same
