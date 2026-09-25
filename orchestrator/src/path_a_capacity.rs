@@ -76,8 +76,12 @@ pub mod limits {
     pub const PERP_META_B12_LEN: u64 = 144;
     /// β14 = β12 + 8 (#131 P3 C-P3-5 spv_deposits_mandatory_from).
     pub const PERP_META_B14_LEN: u64 = 152;
-    /// β15 = β14 + 8 (#131 Safe projection base_projection_confirmed_epoch) — current.
+    /// β15 = β14 + 8 (#131 Safe projection base_projection_confirmed_epoch).
     pub const PERP_META_B15_LEN: u64 = 160;
+    /// β16 = β15 + 16 (trusted-price attested clock: attested_ledger_seq + attested_close_time).
+    pub const PERP_META_B16_LEN: u64 = 176;
+    /// β17 = β16 + 8 (trusted-price price_publisher_disabled_mask, the RESTRICT dial) — current.
+    pub const PERP_META_B17_LEN: u64 = 184;
 }
 
 /// One limit check with the numbers behind the verdict.
@@ -160,8 +164,21 @@ pub enum MetaSchema {
     /// (`scripts/check-meta-sizes-vs-enclave.sh`) exists because a lockstep comment did
     /// not prevent it.
     LegacyB14,
-    /// == 160: the β15 schema. Already current — nothing to upgrade.
-    AlreadyB15,
+    /// == 160: the β15 schema. It was "already current" until β16 appended the attested
+    /// clock and β17 the publisher RESTRICT dial. The schema-aware load upgrades it in
+    /// place, zero-filling both — which means a migrated enclave starts with NO attested
+    /// time. That is the fail-safe reading and it is inert today, because the split halt
+    /// that would refuse on a stale mark lives behind `PRICE_SIGNED_PATH_ENABLED` and no
+    /// publishers are anchored. It stops being inert the moment they are. Migratable.
+    LegacyB15,
+    /// == 176: the β16 schema (attested clock, no RESTRICT dial). Upgrades in place,
+    /// zero-filling `price_publisher_disabled_mask` — i.e. no publisher inherits a
+    /// disabled bit, which is the safe direction: a migration cannot silently carry a
+    /// RESTRICT nobody re-authorised, and cannot silently drop one either, since at zero
+    /// anchored publishers the mask means nothing yet. Migratable.
+    LegacyB16,
+    /// == 184: the β17 schema. Already current — nothing to upgrade.
+    AlreadyB17,
     /// Any other length, an unreadable header, or a size that doesn't reconcile with the
     /// file. The current enclave load HARD-FAILS this (AC-CHUNK3-3) — so promoting a node
     /// in this state would strand it. STOP before the point of no return.
@@ -229,7 +246,9 @@ fn classify_perp_meta(payload_len: Option<u64>) -> MetaSchema {
         Some(limits::PERP_META_B10_LEN) => MetaSchema::LegacyB10,
         Some(limits::PERP_META_B12_LEN) => MetaSchema::LegacyB12,
         Some(limits::PERP_META_B14_LEN) => MetaSchema::LegacyB14,
-        Some(limits::PERP_META_B15_LEN) => MetaSchema::AlreadyB15,
+        Some(limits::PERP_META_B15_LEN) => MetaSchema::LegacyB15,
+        Some(limits::PERP_META_B16_LEN) => MetaSchema::LegacyB16,
+        Some(limits::PERP_META_B17_LEN) => MetaSchema::AlreadyB17,
         _ => MetaSchema::Unknown,
     }
 }
@@ -392,8 +411,10 @@ pub fn render(report: &CapacityReport) -> String {
                 MetaSchema::LegacyB12 => {
                     "β12/β13 (144B) → migratable: β14 load zero-fills spv_deposits_mandatory_from (LEGACY_B12)"
                 }
-                MetaSchema::LegacyB14 => "β14 (152B) → upgrades to β15 (160B): zero-fills base_projection_confirmed_epoch, which HALTS publishing until a Base projection is confirmed",
-                MetaSchema::AlreadyB15 => "β15 (160B) → already current schema (no-op)",
+                MetaSchema::LegacyB14 => "β14 (152B) → upgrades to β17 (184B): zero-fills base_projection_confirmed_epoch, which HALTS publishing until a Base projection is confirmed, plus the attested clock and the publisher RESTRICT mask",
+                MetaSchema::LegacyB15 => "β15 (160B) → upgrades to β17 (184B): zero-fills the attested clock (the migrated enclave starts with NO verified time) and the publisher RESTRICT mask. Inert while no publishers are anchored; the split halt reads a zero clock as NOT FRESH the moment they are",
+                MetaSchema::LegacyB16 => "β16 (176B) → upgrades to β17 (184B): zero-fills price_publisher_disabled_mask, so no publisher inherits a RESTRICT nobody re-authorised",
+                MetaSchema::AlreadyB17 => "β17 (184B) → already current schema (no-op)",
                 MetaSchema::Unknown => {
                     "UNKNOWN size → NON-migratable — current load HARD-FAILS (STOP)"
                 }
@@ -574,6 +595,95 @@ mod tests {
         assert!(r.ok(), "β14 meta must pass: {}", render(&r));
         assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::LegacyB14);
         assert!(meta_check(&r).ok);
+    }
+
+    /// The constants are pinned to LITERALS here, not to themselves.
+    ///
+    /// Found by probing: every other schema test writes its fixture with the same constant
+    /// it then asserts on, so changing `PERP_META_B17_LEN` from 184 to 192 left the whole
+    /// suite green. That is the tautological fixture — the test agrees with the code
+    /// because both read one value, and neither is tied to the enclave.
+    ///
+    /// The authoritative source is `perp_meta_schema.h`'s static_asserts, and
+    /// `scripts/check-meta-sizes-vs-enclave.sh` is what actually compares against them.
+    /// This test cannot reach the enclave header, so it does the one thing it can: make a
+    /// silent edit to a mirrored constant fail without running that script.
+    #[test]
+    fn the_mirrored_meta_sizes_are_the_enclave_numbers() {
+        assert_eq!(limits::PERP_META_LEGACY_B7_LEN, 88);
+        assert_eq!(limits::PERP_META_B8_LEN, 120);
+        assert_eq!(limits::PERP_META_B9_LEN, 128);
+        assert_eq!(limits::PERP_META_B10_LEN, 136);
+        assert_eq!(limits::PERP_META_B12_LEN, 144);
+        assert_eq!(limits::PERP_META_B14_LEN, 152);
+        assert_eq!(limits::PERP_META_B15_LEN, 160);
+        assert_eq!(limits::PERP_META_B16_LEN, 176);
+        assert_eq!(limits::PERP_META_B17_LEN, 184);
+        // Each bump appends whole u64 fields, so the sizes must be strictly increasing and
+        // 8-aligned. A new entry that breaks either is a transcription error, not a schema.
+        let all = [
+            limits::PERP_META_LEGACY_B7_LEN,
+            limits::PERP_META_B8_LEN,
+            limits::PERP_META_B9_LEN,
+            limits::PERP_META_B10_LEN,
+            limits::PERP_META_B12_LEN,
+            limits::PERP_META_B14_LEN,
+            limits::PERP_META_B15_LEN,
+            limits::PERP_META_B16_LEN,
+            limits::PERP_META_B17_LEN,
+        ];
+        for w in all.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "meta sizes must increase: {} then {}",
+                w[0],
+                w[1]
+            );
+        }
+        for n in all {
+            assert_eq!(n % 8, 0, "meta size {n} is not 8-aligned");
+        }
+    }
+
+    #[test]
+    fn perp_meta_b15_is_migratable_not_already_current() {
+        // THE REGRESSION THIS FILE KEEPS HAVING. 160 bytes was "already current" until the
+        // enclave grew the attested clock (β16) and the RESTRICT dial (β17). Classified as
+        // current, the pre-flight tells the operator "no-op" about a migration that
+        // actually zero-fills two fields — and this cluster's live meta is exactly 160.
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        write_sealed_meta(d, "s0_perp_meta.sealed", limits::PERP_META_B15_LEN);
+        let r = assess_accounts_dir(d).unwrap();
+        assert!(r.ok(), "β15 meta must pass: {}", render(&r));
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::LegacyB15);
+        assert!(meta_check(&r).ok);
+        // The operator reads this line before authorising an irreversible ceremony, so
+        // the two fields it zero-fills are named, not implied.
+        let text = render(&r);
+        assert!(text.contains("attested clock"), "rendered: {text}");
+        assert!(text.contains("184B"), "rendered: {text}");
+    }
+
+    #[test]
+    fn perp_meta_b16_is_migratable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        write_sealed_meta(d, "s0_perp_meta.sealed", limits::PERP_META_B16_LEN);
+        let r = assess_accounts_dir(d).unwrap();
+        assert!(r.ok(), "β16 meta must pass: {}", render(&r));
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::LegacyB16);
+    }
+
+    #[test]
+    fn perp_meta_already_b17_is_the_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        write_sealed_meta(d, "s0_perp_meta.sealed", limits::PERP_META_B17_LEN);
+        let r = assess_accounts_dir(d).unwrap();
+        assert!(r.ok(), "β17 meta must pass: {}", render(&r));
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB17);
+        assert!(render(&r).contains("no-op"));
     }
 
     #[test]
