@@ -330,6 +330,11 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
                 if let Err(e) = state
                     .engine
                     .submit_order(
+                        // No user stands behind a vault quote, so there is no signature to
+                        // carry. Named rather than silently permitted — see
+                        // OrderAuthorization::ProtocolVault for the open question about
+                        // making these DERIVED instead of merely allowed.
+                        crate::trading::OrderAuthorization::ProtocolVault,
                         config.user_id.clone(),
                         Side::Long,
                         OrderType::Limit,
@@ -351,6 +356,11 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
                 if let Err(e) = state
                     .engine
                     .submit_order(
+                        // No user stands behind a vault quote, so there is no signature to
+                        // carry. Named rather than silently permitted — see
+                        // OrderAuthorization::ProtocolVault for the open question about
+                        // making these DERIVED instead of merely allowed.
+                        crate::trading::OrderAuthorization::ProtocolVault,
                         config.user_id.clone(),
                         Side::Short,
                         OrderType::Limit,
