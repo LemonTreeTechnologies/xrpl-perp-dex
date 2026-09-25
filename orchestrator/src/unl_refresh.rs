@@ -50,14 +50,23 @@ pub struct UnlRefreshConfig {
 }
 
 impl UnlRefreshConfig {
-    /// Opt-in via `PERP_UNL_REFRESH=1`, matching the other enclave-touching drivers.
+    /// **Default ON.** Set `PERP_UNL_REFRESH=0` to disable it, which you should not.
     ///
-    /// Opt-in is the house pattern, but it is the wrong long-run default for this one and
-    /// the PR says so: being off is a SILENT decay of the trust root, while being on and
-    /// wrong is a loud refusal that changes nothing. `enabled` on the status endpoint is
-    /// what keeps "off" from reading as "healthy".
+    /// This deliberately breaks the house opt-in pattern the other enclave-touching
+    /// drivers follow, because the asymmetry runs the other way here and the auditor ruled
+    /// it so (`RESP-unl-manifest-refresh-attack2-2026-09-25.md`):
+    ///
+    /// - **Off** is a SILENT decay of the trust root, and SPV deposits ALREADY depend on
+    ///   that set — so "nothing depends on it yet" is not true here the way it is for the
+    ///   clock.
+    /// - **On and wrong** is a benign no-op: every manifest is gated on the measured master
+    ///   anchor and on a strictly-newer sequence, so an unknown master is ignored and a
+    ///   replayed old manifest is refused. It is not the `-70` flood the clock's opt-in
+    ///   default exists to avoid — that reason does not transfer.
+    ///
+    /// A default has to agree with "`enabled: false` is not healthy", and opt-in did not.
     pub fn from_env() -> Option<Self> {
-        if std::env::var("PERP_UNL_REFRESH").ok().as_deref() != Some("1") {
+        if std::env::var("PERP_UNL_REFRESH").ok().as_deref() == Some("0") {
             return None;
         }
         Some(Self {
@@ -225,6 +234,32 @@ mod tests {
 
     /// A real manifest for nHBQ3CT3EWYZ…, base64 exactly as rippled returns it.
     const MANIFEST: &str = r#"{"result":{"details":{"ephemeral_key":"n9K7fyu8uvmCoWvW4ZQVCWgW2zrz7sh33Ao7ceNkL7iQGDYtuwTU","master_key":"nHBQ3CT3EWYZ4uzbnL3k6TRf9bBPhWRFVcK1F5NjtwCBksMEt5yy","seq":2},"manifest":"JAAAAAJxIe0GHstRtb1iZl9dGl2xpir4RGS+1353KCNaelUdRTXnFw==","status":"success"}}"#;
+
+    /// The default is a security property here, not a convenience, so it is asserted
+    /// rather than left to whoever reads `from_env`. Deliberately exercises the real
+    /// env-var contract: absent → on, "0" → off, anything else → on.
+    #[test]
+    fn the_refresh_driver_is_on_unless_explicitly_disabled() {
+        // Serialised by running the three cases in one test: env vars are process-global
+        // and a parallel test flipping the same key would make this flap.
+        let prev = std::env::var("PERP_UNL_REFRESH").ok();
+        std::env::remove_var("PERP_UNL_REFRESH");
+        assert!(
+            UnlRefreshConfig::from_env().is_some(),
+            "absent must mean ON — off is a silent decay of the trust root"
+        );
+        std::env::set_var("PERP_UNL_REFRESH", "0");
+        assert!(
+            UnlRefreshConfig::from_env().is_none(),
+            "\"0\" must disable it"
+        );
+        std::env::set_var("PERP_UNL_REFRESH", "1");
+        assert!(UnlRefreshConfig::from_env().is_some(), "\"1\" stays ON");
+        match prev {
+            Some(v) => std::env::set_var("PERP_UNL_REFRESH", v),
+            None => std::env::remove_var("PERP_UNL_REFRESH"),
+        }
+    }
 
     #[test]
     fn the_real_validators_response_yields_six_masters() {

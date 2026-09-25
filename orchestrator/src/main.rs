@@ -2324,6 +2324,13 @@ async fn main() -> Result<()> {
             unl_health.clone(),
         ));
         info!("unl-refresh ENABLED (validator manifests kept current)");
+    } else {
+        warn!(
+            metric = "unl_refresh_disabled",
+            "unl-refresh is DISABLED (PERP_UNL_REFRESH=0): the enclave's derived validator \
+             set will age with nothing refreshing it, and SPV deposits already depend on \
+             it. One stale signing key is the whole 5-of-6 margin."
+        );
     }
     let mut last_reserves_commit = Instant::now();
 
