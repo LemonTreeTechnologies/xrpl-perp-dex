@@ -152,6 +152,20 @@ pub enum SigningMessage {
         /// `#[serde(default)]` so a message without the field still decodes.
         #[serde(default)]
         quorum_bundle: Option<String>,
+        /// NO-BLIND CO-SIGN (audit 2026-09-25). For a `Payment` the receiving enclave
+        /// will not sign on the blob alone: it checks the user and the amount against
+        /// its OWN sealed state first, and it cannot do that without being told which
+        /// user and how much. Mirrors `quorum_bundle` exactly — required for one
+        /// transaction type, `None` for the other, and its absence is a REJECTION
+        /// rather than a fallback to signing blind.
+        ///
+        /// `amount_fp8` is a raw FP8 integer as a decimal string, never "1.0": the
+        /// enclave compares it to the blob's Amount exactly, and a second decimal
+        /// parser on this wire is precisely the disagreement the check exists to catch.
+        #[serde(default)]
+        withdrawal_user_id: Option<String>,
+        #[serde(default)]
+        withdrawal_amount_fp8: Option<String>,
     },
     Response {
         request_id: String,
@@ -527,6 +541,22 @@ pub struct SigningRelay {
     /// path verifies it against the retained outgoing set); `None` for a
     /// `Payment`, which the value path signs without one.
     pub quorum_bundle: Option<String>,
+    /// NO-BLIND CO-SIGN: which user's balance this Payment spends, and how much (raw
+    /// FP8). REQUIRED for a `Payment` — a peer that is not told cannot check, and a
+    /// peer that cannot check must not sign. `None` for `SignerListSet`.
+    pub withdrawal_user_id: Option<String>,
+    pub withdrawal_amount_fp8: Option<String>,
+}
+
+/// What a co-signer needs in order to CHECK a Payment instead of merely signing it:
+/// whose balance it spends, and how much. A struct rather than two loose parameters
+/// because they are one fact — a caller that has the user but not the amount has nothing
+/// checkable, and the pair travelling together is what the enclave binds to the blob.
+#[derive(Debug, Clone, Copy)]
+pub struct WithdrawalClaim<'a> {
+    pub user_id: &'a str,
+    /// Raw FP8 integer as a decimal string, never "1.0" — see SigningMessage::Request.
+    pub amount_fp8: &'a str,
 }
 
 /// REQ-8 PRG-2 part 3/4: outbound Path A delegation collection request.
@@ -2892,6 +2922,7 @@ impl P2PNode {
         unsigned_tx: &serde_json::Value,
         signer_account_id_hex: &str,
         quorum_bundle: Option<&str>,
+        claim: Option<WithdrawalClaim<'_>>,
     ) -> SigningMessage {
         let reject = |msg: String| SigningMessage::Response {
             request_id: request_id.to_string(),
@@ -2940,14 +2971,33 @@ impl P2PNode {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let (sign_path, sign_body) = match tx_type {
-            "Payment" => (
-                "/pool/sign/withdrawal-payment",
-                serde_json::json!({
-                    "from": local_signer.address,
-                    "session_key": local_signer.session_key_hex(),
-                    "tx_blob": tx_blob_hex,
-                }),
-            ),
+            "Payment" => {
+                /* Symmetric with the SignerListSet arm below: a request that does not
+                 * carry what the enclave needs in order to CHECK is refused here rather
+                 * than forwarded to be signed on faith. Before 2026-09-25 this arm
+                 * forwarded the blob alone and the enclave signed it — that is the hole
+                 * this rejection closes. */
+                let Some(WithdrawalClaim {
+                    user_id: uid,
+                    amount_fp8: amt,
+                }) = claim
+                else {
+                    return reject(
+                        "Payment request carries no withdrawal claim (user_id + amount_fp8) —                          the enclave co-sign checks both against its own state and will not                          sign a payment it cannot verify"
+                            .to_string(),
+                    );
+                };
+                (
+                    "/pool/sign/withdrawal-payment",
+                    serde_json::json!({
+                        "from": local_signer.address,
+                        "session_key": local_signer.session_key_hex(),
+                        "user_id": uid,
+                        "amount_fp8": amt,
+                        "tx_blob": tx_blob_hex,
+                    }),
+                )
+            }
             "SignerListSet" => {
                 let Some(bundle) = quorum_bundle else {
                     return reject(
@@ -3122,6 +3172,10 @@ impl P2PNode {
                                 &relay.unsigned_tx,
                                 &relay.signer_account_id_hex,
                                 relay.quorum_bundle.as_deref(),
+                                match (relay.withdrawal_user_id.as_deref(), relay.withdrawal_amount_fp8.as_deref()) {
+                                    (Some(user_id), Some(amount_fp8)) => Some(WithdrawalClaim { user_id, amount_fp8 }),
+                                    _ => None,
+                                },
                             ).await;
                             let _ = relay.response_tx.send(response);
                             continue;
@@ -3135,6 +3189,8 @@ impl P2PNode {
                         signer_account_id_hex: relay.signer_account_id_hex,
                         signer_xrpl_address: relay.signer_xrpl_address,
                         quorum_bundle: relay.quorum_bundle,
+                        withdrawal_user_id: relay.withdrawal_user_id,
+                        withdrawal_amount_fp8: relay.withdrawal_amount_fp8,
                     };
                     match self.publish_signing(&msg) {
                         Ok(_) => {
@@ -3633,6 +3689,8 @@ impl P2PNode {
                                 signer_account_id_hex,
                                 signer_xrpl_address,
                                 quorum_bundle,
+                                withdrawal_user_id,
+                                withdrawal_amount_fp8,
                             }) => {
                                 // Is this request addressed to our local signer?
                                 // Clone up-front so subsequent borrows can mutate
@@ -3693,6 +3751,10 @@ impl P2PNode {
                                     &unsigned_tx,
                                     &signer_account_id_hex,
                                     quorum_bundle.as_deref(),
+                                    match (withdrawal_user_id.as_deref(), withdrawal_amount_fp8.as_deref()) {
+                                        (Some(user_id), Some(amount_fp8)) => Some(WithdrawalClaim { user_id, amount_fp8 }),
+                                        _ => None,
+                                    },
                                 ).await;
                                 if let Err(e) = self.publish_signing(&response) {
                                     error!("failed to publish signing response: {}", e);
@@ -5090,6 +5152,25 @@ mod tests {
     /// reach it again. Asserting `hash` is absent turns any regression back to
     /// hash-on-the-wire into a test failure. `require_bundle` additionally
     /// enforces AC-β4-A1 on the governance route.
+    /// `require_claim` is the value path: a Payment body must carry the withdrawal claim
+    /// the co-signing enclave checks against its own state. Before 2026-09-25 it carried
+    /// only the blob and the enclave signed it blind, so this assertion is the wire-level
+    /// half of that fix — without it the body could quietly lose the fields again.
+    fn assert_typed_sign_body_full(body: &JsonValue, require_bundle: bool, require_claim: bool) {
+        if require_claim {
+            assert!(
+                body["user_id"].as_str().is_some_and(|u| !u.is_empty()),
+                "value signing must name the user whose balance this Payment spends"
+            );
+            let amt = body["amount_fp8"].as_str().unwrap_or("");
+            assert!(
+                !amt.is_empty() && amt.chars().all(|c| c.is_ascii_digit()),
+                "amount_fp8 must be a raw FP8 integer as a decimal string, got {amt:?}"
+            );
+        }
+        assert_typed_sign_body(body, require_bundle)
+    }
+
     fn assert_typed_sign_body(body: &JsonValue, require_bundle: bool) {
         assert!(
             body.get("hash").is_none(),
@@ -5135,7 +5216,7 @@ mod tests {
                     let hits = hits_value.clone();
                     async move {
                         hits.fetch_add(1, Ordering::SeqCst);
-                        assert_typed_sign_body(&body, false);
+                        assert_typed_sign_body_full(&body, false, true);
                         canned_signature()
                     }
                 }),
@@ -5172,6 +5253,7 @@ mod tests {
             &good_signerlist_tx(),
             &signer_acct_id_hex(),
             Some(TEST_BUNDLE_HEX),
+            None,
         )
         .await;
 
@@ -5216,6 +5298,7 @@ mod tests {
             &tx,
             &signer_acct_id_hex(),
             Some(TEST_BUNDLE_HEX),
+            None,
         )
         .await;
 
@@ -5254,6 +5337,7 @@ mod tests {
             &tx,
             &signer_acct_id_hex(),
             Some(TEST_BUNDLE_HEX),
+            None,
         )
         .await;
 
@@ -5270,6 +5354,64 @@ mod tests {
             }
             _ => panic!("expected Response variant"),
         }
+    }
+
+    /// NO-BLIND CO-SIGN (audit High/Critical, 2026-09-25): a Payment request that
+    /// carries no withdrawal claim must be refused HERE, before the enclave is touched.
+    /// Exactly the shape of the SignerListSet-without-bundle test below, and for the
+    /// same reason — each transaction type must arrive with what makes it checkable, and
+    /// arriving without it is a rejection rather than a quiet fall back to signing blind.
+    /// Asserts the enclave saw ZERO hits, so the refusal is genuinely local.
+    #[tokio::test]
+    async fn wire_payment_without_withdrawal_claim_rejected_before_enclave() {
+        let (base_url, hits) = spawn_mock_enclave().await;
+        let mut signer = test_local_signer();
+        signer.enclave_url = base_url;
+
+        let payment = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": TEST_ESCROW,
+            "Destination": "rJGj4G5ekU9YS2HWzwXTVFQSWNewokACjm",
+            "Amount": "1000000",
+            "Fee": "60",
+            "Sequence": 1,
+            "SigningPubKey": ""
+        });
+
+        let resp = P2PNode::handle_signing_request(
+            &signer,
+            Some(TEST_ESCROW),
+            "wire-payment-no-claim",
+            &payment,
+            &signer_acct_id_hex(),
+            None,
+            None, // no withdrawal claim — the whole point of this test
+        )
+        .await;
+
+        match resp {
+            SigningMessage::Response {
+                error,
+                der_signature,
+                ..
+            } => {
+                assert!(
+                    der_signature.is_none(),
+                    "a claimless Payment must not be signed"
+                );
+                let msg = error.unwrap_or_default();
+                assert!(
+                    msg.contains("withdrawal claim"),
+                    "rejection should name the missing claim, got: {msg}"
+                );
+            }
+            other => panic!("expected a Response, got {other:?}"),
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the enclave must not have been asked at all"
+        );
     }
 
     /// β4 Thread A (AC-β4-A1, RESP-β4-impl §5): a SignerListSet request WITHOUT
@@ -5289,6 +5431,7 @@ mod tests {
             &good_signerlist_tx(),
             &signer_acct_id_hex(),
             None, // governance request with no bundle
+            None,
         )
         .await;
 
@@ -5328,6 +5471,8 @@ mod tests {
             signer_account_id_hex: signer_acct_id_hex(),
             signer_xrpl_address: test_local_signer().xrpl_address,
             quorum_bundle: Some(TEST_BUNDLE_HEX.to_string()),
+            withdrawal_user_id: None,
+            withdrawal_amount_fp8: None,
         };
         let wire = serde_json::to_string(&req).expect("serialize");
         let parsed: SigningMessage = serde_json::from_str(&wire).expect("deserialize");
