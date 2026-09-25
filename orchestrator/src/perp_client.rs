@@ -233,6 +233,24 @@ impl PerpClient {
         self.get("/perp/attested-clock/status").await
     }
 
+    /// Trusted-price — which publishers are anchored, and therefore WHICH PRICE PATH IS
+    /// LIVE. `threshold` is non-zero exactly when the signed path is compiled in; the
+    /// enclave ties the two with a `static_assert` so this cannot drift. Asking rather
+    /// than carrying our own copy of the switch is the point: a second knob that has to
+    /// agree with a compile-time constant is one that eventually does not.
+    pub async fn price_publisher_status(&self) -> Result<Value> {
+        self.get("/perp/price-publishers/status").await
+    }
+
+    /// Trusted-price — feed a signed quote bundle to the median consumer.
+    pub async fn update_price_signed(&self, quote_blob: &[u8], market_id: u32) -> Result<Value> {
+        self.post(
+            "/perp/price-signed",
+            serde_json::json!({ "quote_blob": hex::encode(quote_blob), "market_id": market_id }),
+        )
+        .await
+    }
+
     /// §6 — ferry validator manifests to the enclave so it can re-derive each validator's
     /// signing key. Permissionless in the enclave (a forged manifest cannot pass ed25519
     /// against the measured master anchor), so no session key and no quorum here either.
