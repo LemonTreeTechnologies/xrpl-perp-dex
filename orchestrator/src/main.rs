@@ -2334,6 +2334,9 @@ async fn main() -> Result<()> {
     }
     let mut last_reserves_commit = Instant::now();
 
+    // Which price path the enclave is running. Asked once and cached: it can only change
+    // across an enclave rebuild, and asking every tick would be noise.
+    let mut live_price_path: Option<price_feed::LivePricePath> = None;
     let price_interval = Duration::from_secs(cli.price_interval);
     let liquidation_interval = Duration::from_secs(cli.liquidation_interval);
 
@@ -2418,8 +2421,54 @@ async fn main() -> Result<()> {
                         _ => price,
                     };
                     let mark_fp8 = float_to_fp8_string(mark);
-                    if let Err(e) = perp.update_price(&mark_fp8, &index_fp8, now_ts).await {
-                        error!("price update failed: {}", e);
+                    // DERIVE which price path is live; do not carry our own copy of the
+                    // switch. Publishers are anchored by a RECOMPILE of the enclave, and
+                    // that same constant turns ecall_perp_update_price into a -94 refusal
+                    // — so a config flag here would have to agree with a constant we
+                    // cannot see, and the two would eventually disagree. Ask instead.
+                    //
+                    // Cached because it only changes across an enclave rebuild, and a
+                    // status call on every price tick would be pure noise. Unknown means
+                    // "we have not been told yet", not "operator feed": pushing the raw
+                    // feed at an enclave that has moved on is how the mark goes stale
+                    // while every call still returns a tidy error.
+                    if live_price_path.is_none() {
+                        match perp.price_publisher_status().await {
+                            Ok(v) => match price_feed::live_price_path(&v) {
+                                Ok(p) => {
+                                    info!(path = ?p, "price path derived from the enclave");
+                                    live_price_path = Some(p);
+                                }
+                                Err(e) => warn!("publisher status unreadable: {e}"),
+                            },
+                            // An older enclave has no such route. That is not an error: it
+                            // predates the signed track entirely, so the operator feed IS
+                            // the path, and saying so once beats asking forever.
+                            Err(e) => {
+                                info!(
+                                    "no publisher-status route ({e}) — treating this \
+                                     enclave as operator-fed"
+                                );
+                                live_price_path = Some(price_feed::LivePricePath::OperatorFeed);
+                            }
+                        }
+                    }
+                    match live_price_path {
+                        Some(price_feed::LivePricePath::OperatorFeed) => {
+                            if let Err(e) = perp.update_price(&mark_fp8, &index_fp8, now_ts).await {
+                                error!("price update failed: {}", e);
+                            }
+                        }
+                        Some(price_feed::LivePricePath::SignedMedian) => {
+                            // Publishers are anchored: this feed is no longer allowed to
+                            // set the mark, and pretending otherwise would earn -94 every
+                            // tick. Signed quotes arrive by their own path; there is
+                            // nothing for this loop to push.
+                            tracing::debug!(
+                                "signed-median path is live; not pushing the operator feed"
+                            );
+                        }
+                        None => {}
                     }
                     app_state
                         .mark_price
