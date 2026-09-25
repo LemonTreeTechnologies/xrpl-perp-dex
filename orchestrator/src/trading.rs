@@ -107,21 +107,8 @@ impl TradingEngine {
         reduce_only: bool,
         client_order_id: Option<String>,
     ) -> Result<OrderResult> {
-        // The authorization is not decorative: the order's owner must be the party who
-        // SIGNED for it. Checked here rather than only at the HTTP layer, because this is
-        // where the order becomes matchable and because a caller handing in a mismatched
-        // pair is exactly what a compromised front-end path would look like.
-        if let OrderAuthorization::ClientSigned(ref binding) = authorization {
-            if binding.signer_address != user_id {
-                anyhow::bail!(
-                    "order owner {user_id} does not match the signer {} — an order may \
-                     only be placed by the key that signed for it",
-                    binding.signer_address
-                );
-            }
-        }
-
         self.submit_order_inner(
+            authorization,
             user_id,
             side,
             order_type,
@@ -148,19 +135,8 @@ impl TradingEngine {
         leverage: u32,
         close_position_id: u32,
     ) -> Result<OrderResult> {
-        // A close is a matchable order like any other (closes route through the CLOB by
-        // design), so it gets the identical ownership check. Splitting the gate across two
-        // entry points and guarding only one is how the blind co-sign happened.
-        if let OrderAuthorization::ClientSigned(ref binding) = authorization {
-            if binding.signer_address != user_id {
-                anyhow::bail!(
-                    "close-order owner {user_id} does not match the signer {}",
-                    binding.signer_address
-                );
-            }
-        }
-
         self.submit_order_inner(
+            authorization,
             user_id,
             close_side,
             OrderType::Market,
@@ -178,6 +154,7 @@ impl TradingEngine {
     #[allow(clippy::too_many_arguments)]
     async fn submit_order_inner(
         &self,
+        authorization: OrderAuthorization,
         user_id: String,
         side: Side,
         order_type: OrderType,
@@ -189,6 +166,24 @@ impl TradingEngine {
         client_order_id: Option<String>,
         close_position_id: Option<u32>,
     ) -> Result<OrderResult> {
+        // ONE gate for every path into the book. It used to sit on the two outer entry
+        // points; that is the shape that produced the blind co-sign — two legs of the same
+        // action, guarded separately, one of them eventually not at all. An order becomes
+        // matchable here, so the check lives here.
+        //
+        // The owner of the order must be the party who SIGNED for it: a caller holding ANY
+        // valid signature could otherwise place orders spending someone else's balance —
+        // the signature real, just not for this order's owner.
+        if let OrderAuthorization::ClientSigned(ref binding) = authorization {
+            if binding.signer_address != user_id {
+                anyhow::bail!(
+                    "order owner {user_id} does not match the signer {} — an order may \
+                     only be placed by the key that signed for it",
+                    binding.signer_address
+                );
+            }
+        }
+
         // Step 0a: fetch available margin from the enclave BEFORE matching (skip
         // for close orders). Async — no book lock held here.
         //
@@ -415,6 +410,16 @@ impl TradingEngine {
                         size: order.size.to_string(),
                         leverage: order.leverage,
                         status: format!("{:?}", order.status),
+                        // Travels with the order so a validator can verify the user really
+                        // placed it, instead of replaying a fill on our word.
+                        authorization: Some(match &authorization {
+                            OrderAuthorization::ClientSigned(b) => {
+                                crate::p2p::WireOrderAuthorization::ClientSigned((**b).clone())
+                            }
+                            OrderAuthorization::ProtocolVault => {
+                                crate::p2p::WireOrderAuthorization::ProtocolVault
+                            }
+                        }),
                         fills: trades
                             .iter()
                             .map(|t| FillMessage {

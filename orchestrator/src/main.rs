@@ -2072,6 +2072,26 @@ async fn main() -> Result<()> {
             // in the same batch but is sufficient for historical display.
             let batch_timestamp_ms = batch.timestamp.saturating_mul(1000);
             for order in &batch.orders {
+                // AUDIT part-2: do NOT replay an order this node cannot verify the user
+                // actually placed. Replaying it would fold an unjustifiable input into our
+                // own state — and our state is what we later refuse or agree to co-sign
+                // with. Skipping is the fail-safe: our derived state diverges from a
+                // cheating sequencer, which is exactly the outcome that protects funds.
+                if let Err(why) = p2p::verify_replicated_order(order) {
+                    validator_replication
+                        .unverified_orders
+                        .fetch_add(1, Ordering::Relaxed);
+                    error!(
+                        metric = "unverified_orders_total",
+                        sequencer_id = %batch.sequencer_id,
+                        seq = batch.seq_num,
+                        order_id = order.order_id,
+                        user = %order.user_id,
+                        "REFUSING TO REPLAY an order this node cannot verify: {}",
+                        why
+                    );
+                    continue;
+                }
                 for fill in &order.fills {
                     // Determine maker/taker sides
                     let (taker_side, maker_side) = match fill.taker_side.as_str() {

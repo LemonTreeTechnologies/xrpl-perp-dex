@@ -71,6 +71,11 @@ pub struct ReplicationHealth {
     pub replay_failures: std::sync::atomic::AtomicU64,
     /// Batches skipped because the transport-integrity hash did not match.
     pub state_hash_mismatches: std::sync::atomic::AtomicU64,
+    /// Orders this node REFUSED to replay because it could not verify the user actually
+    /// placed them. Non-zero means the sequencer is publishing orders it cannot justify —
+    /// the loudest signal in this struct, and the one that says the book you are being
+    /// asked to agree with is not one you could have derived.
+    pub unverified_orders: std::sync::atomic::AtomicU64,
     /// Highest batch sequence number seen.
     pub last_batch_seq: std::sync::atomic::AtomicU64,
 }
@@ -211,7 +216,7 @@ fn err(code: StatusCode, msg: &str) -> impl IntoResponse {
     )
 }
 
-fn parse_side(s: &str) -> Result<Side, String> {
+pub(crate) fn parse_side(s: &str) -> Result<Side, String> {
     match s.to_lowercase().as_str() {
         "buy" | "long" => Ok(Side::Long),
         "sell" | "short" => Ok(Side::Short),
@@ -323,6 +328,7 @@ async fn system_status(State(state): State<Arc<AppState>>) -> impl IntoResponse 
             "replays_ok": state.replication.replays_ok.load(Ordering::Relaxed),
             "replay_failures": state.replication.replay_failures.load(Ordering::Relaxed),
             "state_hash_mismatches": state.replication.state_hash_mismatches.load(Ordering::Relaxed),
+            "unverified_orders": state.replication.unverified_orders.load(Ordering::Relaxed),
             "last_batch_seq": state.replication.last_batch_seq.load(Ordering::Relaxed),
         },
     }))
