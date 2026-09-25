@@ -49,6 +49,32 @@ use crate::ws::{self, WsEvent};
 
 // ── App state ───────────────────────────────────────────────────
 
+/// Validator replication health — the readable half of the divergence signal.
+///
+/// The `metric = ...` tracing fields the replay task emits are only as useful as whatever
+/// scrapes them, and this repo ships no scraper: `state_hash_mismatches_total` has been
+/// emitted into the void since it was added. Counters that nobody can read are not
+/// observability, so these are also surfaced on `/v1/system/status`, where an operator
+/// with curl can see them.
+///
+/// Atomics because the validator replay task writes them from a different task than the
+/// HTTP handler that reads them.
+#[derive(Default)]
+pub struct ReplicationHealth {
+    /// Batches this node has received from the sequencer.
+    pub batches_seen: std::sync::atomic::AtomicU64,
+    /// Fill legs replayed into the local enclave successfully.
+    pub replays_ok: std::sync::atomic::AtomicU64,
+    /// Fill legs that FAILED to replay. Non-zero means this node's enclave state has
+    /// diverged from the sequencer's — see `docs/audit/REQ-validator-replica-completeness.md`
+    /// in the private enclave repo.
+    pub replay_failures: std::sync::atomic::AtomicU64,
+    /// Batches skipped because the transport-integrity hash did not match.
+    pub state_hash_mismatches: std::sync::atomic::AtomicU64,
+    /// Highest batch sequence number seen.
+    pub last_batch_seq: std::sync::atomic::AtomicU64,
+}
+
 pub struct AppState {
     pub engine: TradingEngine,
     pub perp: PerpClient,
@@ -76,6 +102,8 @@ pub struct AppState {
     pub peer_count: Arc<std::sync::atomic::AtomicU32>,
     /// Start time for uptime reporting.
     pub start_time: std::time::Instant,
+    /// Validator replication health, readable on /v1/system/status.
+    pub replication: Arc<ReplicationHealth>,
     /// Q-BND-3: the figures from the last PUBLISHED reserves commitment, so the public
     /// attestation endpoint can quantify the custody-minus-liabilities gap rather than
     /// only describing it in prose. None until the first publish of this process.
@@ -287,6 +315,16 @@ async fn system_status(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         "escrow_quorum": quorum,
         "escrow_signer_count": signer_count,
         "version": env!("CARGO_PKG_VERSION"),
+        // Validator replication health. `replay_failures > 0` means this node's enclave
+        // state has diverged from the sequencer's and it can no longer be said to be
+        // independently carrying the book — which matters, because this node co-signs.
+        "replication": {
+            "batches_seen": state.replication.batches_seen.load(Ordering::Relaxed),
+            "replays_ok": state.replication.replays_ok.load(Ordering::Relaxed),
+            "replay_failures": state.replication.replay_failures.load(Ordering::Relaxed),
+            "state_hash_mismatches": state.replication.state_hash_mismatches.load(Ordering::Relaxed),
+            "last_batch_seq": state.replication.last_batch_seq.load(Ordering::Relaxed),
+        },
     }))
 }
 
