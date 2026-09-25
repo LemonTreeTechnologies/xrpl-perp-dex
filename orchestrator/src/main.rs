@@ -879,6 +879,16 @@ async fn main() -> Result<()> {
     }
 
     let cli = cli.run;
+
+    // Before anything starts: a vault may not be enabled while a validator cannot verify
+    // what its quotes claim. Checked here rather than left to the operational fact that
+    // nobody has enabled one — an empty config is not a safety property, and a config
+    // change must not be able to re-open a forge surface.
+    if let Err(why) =
+        vault_mm::refuse_unless_vault_quotes_are_verifiable(cli.vault_mm, cli.vault_dn)
+    {
+        anyhow::bail!(why);
+    }
     // Resolve escrow address
     let escrow_address = match cli.escrow_address {
         Some(addr) => addr,

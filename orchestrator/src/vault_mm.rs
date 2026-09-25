@@ -78,6 +78,49 @@ fn default_vault_user_id() -> String {
     "vault:mm".into()
 }
 
+/// Whether a validator can VERIFY a vault quote rather than accept it on its label.
+///
+/// It cannot, today. `p2p::verify_replicated_order` admits a `ProtocolVault` order from a
+/// configured vault user id with its **price unchecked**, so a sequencer that can publish
+/// such an order can fill a genuine user's order at any price it likes. The only thing
+/// keeping that surface dormant is that no node has a vault configured.
+///
+/// "Safe because the config is currently empty" is the pattern this project keeps removing,
+/// so the emptiness is not left as the safety: `refuse_unless_vault_quotes_are_verifiable`
+/// below turns this constant into a startup refusal. Flip it to `true` in the same change
+/// that makes the vault-quote path derive-or-refuse (bound the quote to `mark ± spread`
+/// from each node's own agreed mark) — and not before.
+pub const VAULT_QUOTES_ARE_VERIFIABLE: bool = false;
+
+/// Structural gate on enabling a vault, per the auditor's condition (c) on
+/// `docs/audit/RESP-input-replication-item1-impl-review-2026-09-25.md` (private repo).
+///
+/// A config change must not be able to re-open the forge surface. So the node REFUSES TO
+/// START with a vault flag while validators cannot verify what a vault quote claims,
+/// rather than starting and hoping nobody notices which door that opened.
+pub fn refuse_unless_vault_quotes_are_verifiable(
+    vault_mm: bool,
+    vault_dn: bool,
+) -> Result<(), String> {
+    if VAULT_QUOTES_ARE_VERIFIABLE || !(vault_mm || vault_dn) {
+        return Ok(());
+    }
+    let which = match (vault_mm, vault_dn) {
+        (true, true) => "--vault-mm and --vault-dn",
+        (true, false) => "--vault-mm",
+        _ => "--vault-dn",
+    };
+    Err(format!(
+        "refusing to start with {which}: a vault quote carries no user signature, and a \
+         validator cannot yet verify its price — it accepts the quote on its label. \
+         Enabling a vault would hand a compromised sequencer the power to fill genuine \
+         user orders at a price of its choosing, across the whole book. Land the \
+         derive-or-refuse path (bound the quote to mark ± spread from each node's own \
+         agreed mark, in p2p::verify_replicated_order) and set \
+         vault_mm::VAULT_QUOTES_ARE_VERIFIABLE in the same change."
+    ))
+}
+
 /// The vault user_ids whose resting orders must be cancelled when this node
 /// loses the sequencer role. Derived from the same flags that gate the vault
 /// singletons in `main`, so the two stay in lock-step. On demotion the
@@ -442,6 +485,30 @@ async fn compute_gross_inventory(perp: &crate::perp_client::PerpClient, user_id:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_vault_cannot_be_enabled_while_its_quotes_are_unverifiable() {
+        // No vault asked for: nothing to refuse, whatever the constant says.
+        assert!(refuse_unless_vault_quotes_are_verifiable(false, false).is_ok());
+
+        // The loop below is the tripwire, not a restatement of the constant: flipping
+        // VAULT_QUOTES_ARE_VERIFIABLE without landing derive-or-refuse turns every
+        // `expect_err` here red, so the flip cannot pass CI quietly — it has to arrive
+        // with this test rewritten, which is visible in review.
+        for (mm, dn, needle) in [
+            (true, false, "--vault-mm"),
+            (false, true, "--vault-dn"),
+            (true, true, "--vault-mm and --vault-dn"),
+        ] {
+            let e = refuse_unless_vault_quotes_are_verifiable(mm, dn)
+                .expect_err("a vault must not start while its quotes cannot be verified");
+            assert!(e.contains(needle), "got: {e}");
+            assert!(
+                e.contains("mark ± spread"),
+                "the refusal must name the fix: {e}"
+            );
+        }
+    }
 
     #[test]
     fn enabled_vault_user_ids_matches_configured_singletons() {
