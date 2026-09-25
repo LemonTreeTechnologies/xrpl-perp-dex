@@ -98,6 +98,12 @@ impl LibP2PProjectionSubmitter {
                     // signer's enclave requires the β1 bundle that authorised the
                     // epoch we are projecting.
                     quorum_bundle: Some(quorum_bundle_hex.to_string()),
+                    // A SignerListSet spends nobody's balance, so there is no withdrawal
+                    // claim to make. The enclave's governance path checks the bundle
+                    // instead — each transaction type is verified against what it can
+                    // actually be verified against.
+                    withdrawal_user_id: None,
+                    withdrawal_amount_fp8: None,
                 })
                 .await
                 .is_err()

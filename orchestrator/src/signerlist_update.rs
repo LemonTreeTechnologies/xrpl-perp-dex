@@ -364,6 +364,9 @@ async fn drive(
                 // bootstrap_from_quorum_attestation shape (RESP-β4-threadA-impl.1
                 // option 2) instead of a pre-seal pool-key SignerListSet.
                 quorum_bundle: None,
+                // No withdrawal claim: a SignerListSet spends nobody's balance.
+                withdrawal_user_id: None,
+                withdrawal_amount_fp8: None,
             })
             .await
             .is_err()
@@ -729,6 +732,9 @@ async fn drive_bootstrap_rotate(
                 // bootstrap_from_quorum_attestation shape (RESP-β4-threadA-impl.1
                 // option 2) instead of a pre-seal pool-key SignerListSet.
                 quorum_bundle: None,
+                // No withdrawal claim: a SignerListSet spends nobody's balance.
+                withdrawal_user_id: None,
+                withdrawal_amount_fp8: None,
             })
             .await
             .is_err()

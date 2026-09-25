@@ -86,6 +86,8 @@ async fn sign_with_enclave(
     http: &reqwest::Client,
     signer: &SignerConfig,
     tx_map: &serde_json::Map<String, serde_json::Value>,
+    user_id: &str,
+    amount_fp8: u64,
 ) -> Result<(String, String)> {
     let mut blob = Vec::new();
     xrpl_mithril_codec::serializer::serialize_json_object(tx_map, &mut blob, true)
@@ -99,6 +101,11 @@ async fn sign_with_enclave(
         .json(&serde_json::json!({
             "from": signer.address,
             "session_key": signer.session_key,
+            // The co-signer checks BOTH against its own sealed state before signing.
+            // Without them it would be signing a payment it cannot dispute, which is
+            // exactly what this path used to do (audit High/Critical, 2026-09-25).
+            "user_id": user_id,
+            "amount_fp8": amount_fp8.to_string(),
             "tx_blob": hex::encode(&blob),
         }))
         .timeout(std::time::Duration::from_secs(30))
@@ -145,6 +152,8 @@ async fn sign_via_p2p(
     unsigned_tx: &serde_json::Value,
     account_id: &[u8; 20],
     timeout_secs: u64,
+    user_id: &str,
+    amount_fp8: u64,
 ) -> Result<(String, String)> {
     let request_id = format!("{:016x}", rand::random::<u64>());
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
@@ -158,6 +167,11 @@ async fn sign_via_p2p(
             response_tx: resp_tx,
             // Value path: a Payment needs no β1 bundle (β4 Thread A AC-β4-A2).
             quorum_bundle: None,
+            // …but it DOES need the withdrawal claim: the peer's enclave will not sign
+            // a Payment without being told whose balance it spends and how much, because
+            // it checks both against its own state first.
+            withdrawal_user_id: Some(user_id.to_string()),
+            withdrawal_amount_fp8: Some(amount_fp8.to_string()),
         })
         .await
         .map_err(|_| anyhow::anyhow!("P2P signing channel closed"))?;
@@ -216,11 +230,18 @@ pub async fn process_withdrawal(
 
     // Fee for multisig = base_fee * (1 + N_signers). Use generous fee.
     let fee = format!("{}", 12 * (1 + signers_config.quorum as u64));
+    // Derive the drops ONCE and use the same number for the blob and for the co-sign
+    // claim. Each peer's enclave now re-derives FP8 from the blob's Amount and refuses
+    // if it does not equal the claimed amount, so computing the two figures by separate
+    // routes would turn a rounding difference into a refused withdrawal. One number, one
+    // derivation — which is the same reason the claim travels as a raw integer.
+    let amount_drops = (req.amount.parse::<f64>().unwrap_or(0.0) * 1_000_000.0) as u64;
+    let amount_fp8 = amount_drops.saturating_mul(100);
     let mut tx_json = serde_json::json!({
         "TransactionType": "Payment",
         "Account": escrow_address,
         "Destination": req.destination,
-        "Amount": format!("{}", (req.amount.parse::<f64>().unwrap_or(0.0) * 1_000_000.0) as u64),
+        "Amount": format!("{}", amount_drops),
         "Fee": fee,
         "Sequence": sequence,
         "SigningPubKey": ""
@@ -323,9 +344,18 @@ pub async fn process_withdrawal(
         // let the ENCLAVE derive the hash (β4 Thread A AC-β4-A2) — neither ever
         // puts a digest on the wire.
         let sign_result = if let Some(stx) = signing_tx {
-            sign_via_p2p(stx, signer, &tx_json, &account_id, 30).await
+            sign_via_p2p(
+                stx,
+                signer,
+                &tx_json,
+                &account_id,
+                30,
+                &req.user_id,
+                amount_fp8,
+            )
+            .await
         } else {
-            sign_with_enclave(&http, signer, tx_map).await
+            sign_with_enclave(&http, signer, tx_map, &req.user_id, amount_fp8).await
         };
 
         match sign_result {
