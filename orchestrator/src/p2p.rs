@@ -90,6 +90,116 @@ pub struct OrderBatch {
     pub sequencer_id: String,
 }
 
+/// WHAT AUTHORISED A REPLICATED ORDER, carried so a validator can check it for ITSELF
+/// instead of taking the sequencer's word that a user placed it.
+///
+/// Mirrors `trading::OrderAuthorization` on the wire. `ProtocolVault` is explicit rather
+/// than expressed as an absent field, because "no authorisation present" and "authorised
+/// by the protocol" must not look the same to a receiver — the first is a refusal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireOrderAuthorization {
+    /// The user's own per-order signature. A validator verifies it against the order's
+    /// terms; a binding that verifies for DIFFERENT terms proves nothing about this order.
+    ClientSigned(crate::auth::OrderSignatureBinding),
+    /// A protocol-owned vault quote — no user behind it, nothing to verify yet. See
+    /// `trading::OrderAuthorization::ProtocolVault` for the open question.
+    ProtocolVault,
+}
+
+/// Verify that a replicated order was genuinely authorised by its owner, FOR THESE TERMS.
+///
+/// A signature alone proves only that the user signed *something*. The terms check is what
+/// binds it to this order: without it the sequencer could attach a real binding from a
+/// small order to a large one, and every downstream check would pass. Same shape as the
+/// withdrawal co-sign's amount==claim bind.
+///
+/// Numeric terms are compared as VALUES, not strings: the batch carries an FP8 rendering
+/// while the client signed whatever it typed ("0.55" vs "0.55000000"), and a string
+/// comparison would reject honest orders while proving nothing extra.
+///
+/// Returns Ok only for an order a validator may replay as the user's own.
+pub fn verify_replicated_order(
+    order: &OrderMessage,
+    vault_user_ids: &[String],
+) -> Result<(), String> {
+    let Some(auth) = &order.authorization else {
+        return Err("no authorization carried — order is UNVERIFIED".to_string());
+    };
+    let binding = match auth {
+        // A vault quote has no user behind it, so there is no signature to check — which
+        // means a compromised sequencer could label ANY order `ProtocolVault` and every
+        // validator would take it. It does not need the vault singleton to be running to
+        // do that: the flag governs the honest producer, not our acceptance. So narrow it
+        // to the vault user ids THIS node's own config enables. With no vault configured
+        // that set is empty and every such order is refused, which is the state of the
+        // testnet cluster today.
+        //
+        // Still not derivation — a quote from a configured vault id is accepted on its
+        // label, and its PRICE is unchecked. Deriving `mark ± spread` from own mark and
+        // inventory is the real fix; see trading::OrderAuthorization::ProtocolVault.
+        WireOrderAuthorization::ProtocolVault => {
+            return if vault_user_ids.iter().any(|u| u == &order.user_id) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "vault quote from {} — not a vault this node has configured",
+                    order.user_id
+                ))
+            }
+        }
+        WireOrderAuthorization::ClientSigned(b) => b,
+    };
+
+    crate::auth::verify_signature_only(binding)?;
+    if binding.signer_address != order.user_id {
+        return Err(format!(
+            "signer {} is not the order owner {}",
+            binding.signer_address, order.user_id
+        ));
+    }
+
+    let body: serde_json::Value = {
+        let raw = hex::decode(&binding.signed_body_hex).map_err(|_| "signed body is not hex")?;
+        serde_json::from_slice(&raw).map_err(|_| "signed body is not JSON")?
+    };
+    let sget = |k: &str| {
+        body.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    if sget("user_id") != order.user_id {
+        return Err("signed body names a different user".to_string());
+    }
+    let signed_side = crate::api::parse_side(&sget("side")).map_err(|e| e.to_string())?;
+    if format!("{signed_side}") != order.side {
+        return Err(format!(
+            "signed side {signed_side} != replicated side {}",
+            order.side
+        ));
+    }
+    let num = |s: &str| {
+        s.parse::<crate::types::FP8>()
+            .map(|f| f.raw())
+            .unwrap_or(i64::MIN)
+    };
+    if num(&sget("size")) != num(&order.size) {
+        return Err("signed size does not match the replicated size".to_string());
+    }
+    // A market order carries no price in the signed body; only a priced order is checked.
+    let signed_price = sget("price");
+    if !signed_price.is_empty() && num(&signed_price) != num(&order.price) {
+        return Err("signed price does not match the replicated price".to_string());
+    }
+    let signed_lev = body.get("leverage").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+    if signed_lev != order.leverage {
+        return Err("signed leverage does not match the replicated leverage".to_string());
+    }
+    Ok(())
+}
+
 /// Single order within a batch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderMessage {
@@ -103,6 +213,10 @@ pub struct OrderMessage {
     pub status: String,
     /// Fills produced by this order.
     pub fills: Vec<FillMessage>,
+    /// What authorised this order. `#[serde(default)]` so a message from an older peer
+    /// still decodes — but a receiver must treat `None` as UNVERIFIED, never as fine.
+    #[serde(default)]
+    pub authorization: Option<WireOrderAuthorization>,
 }
 
 /// Fill (trade) produced by matching.
@@ -4557,6 +4671,7 @@ mod tests {
                 size: "100.00000000".into(),
                 leverage: 5,
                 status: "filled".into(),
+                authorization: None, // test fixture: an UNVERIFIED order, which is what a receiver must refuse
                 fills: vec![FillMessage {
                     trade_id: 1,
                     maker_order_id: 10,
@@ -5156,6 +5271,223 @@ mod tests {
     /// the co-signing enclave checks against its own state. Before 2026-09-25 it carried
     /// only the blob and the enclave signed it blind, so this assertion is the wire-level
     /// half of that fix — without it the body could quietly lose the fields again.
+    // ── part-2: a validator verifies a replicated order for ITSELF ────────────────
+    //
+    // Real keypair, real ECDSA, real DER — the scheme the client actually uses. A stubbed
+    // signature would test the plumbing and nothing about whether we can tell a genuine
+    // order from one the sequencer wrote.
+    fn signed_order_msg(
+        user: &str,
+        side: &str,
+        size: &str,
+        price: &str,
+        leverage: u32,
+    ) -> (OrderMessage, String) {
+        use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
+        use k256::elliptic_curve::rand_core::OsRng;
+        use sha2::{Digest, Sha256};
+
+        let sk = SigningKey::random(&mut OsRng);
+        let pubkey_bytes = sk.verifying_key().to_sec1_bytes();
+        let address = if user.is_empty() {
+            crate::auth::pubkey_to_xrpl_address(&pubkey_bytes)
+        } else {
+            user.to_string()
+        };
+        let signer_address = crate::auth::pubkey_to_xrpl_address(&pubkey_bytes);
+
+        let body = serde_json::json!({
+            "user_id": signer_address, "side": side, "type": "limit",
+            "price": price, "size": size, "leverage": leverage,
+        })
+        .to_string();
+        let ts = "1758800000".to_string();
+        let mut h = Sha256::new();
+        h.update(body.as_bytes());
+        h.update(ts.as_bytes());
+        let (sig, _): (Signature, _) = sk.sign_prehash(&h.finalize()).unwrap();
+
+        let binding = crate::auth::OrderSignatureBinding {
+            signed_body_hex: hex::encode(body.as_bytes()),
+            signature_hex: hex::encode(sig.to_der()),
+            timestamp: ts,
+            signer_address: signer_address.clone(),
+            signer_pubkey_hex: hex::encode(&pubkey_bytes),
+        };
+        let msg = OrderMessage {
+            order_id: 1,
+            user_id: address,
+            side: side.to_string(),
+            order_type: "Limit".to_string(),
+            price: price.to_string(),
+            size: size.to_string(),
+            leverage,
+            status: "Open".to_string(),
+            fills: vec![],
+            authorization: Some(WireOrderAuthorization::ClientSigned(binding)),
+        };
+        (msg, signer_address)
+    }
+
+    #[test]
+    fn a_genuinely_signed_order_verifies() {
+        let (msg, _) = signed_order_msg("", "long", "10.0", "0.55", 3);
+        verify_replicated_order(&msg, NO_VAULTS)
+            .expect("a real signature over these terms must verify");
+    }
+
+    #[test]
+    fn an_order_with_no_authorization_is_refused() {
+        let (mut msg, _) = signed_order_msg("", "long", "10.0", "0.55", 3);
+        msg.authorization = None;
+        let e = verify_replicated_order(&msg, NO_VAULTS).unwrap_err();
+        assert!(e.contains("UNVERIFIED"), "got: {e}");
+    }
+
+    /// The testnet cluster's actual configuration: no vault singleton on any node.
+    const NO_VAULTS: &[String] = &[];
+
+    #[test]
+    fn a_vault_quote_from_a_configured_vault_is_accepted() {
+        let (mut msg, _) = signed_order_msg("", "long", "10.0", "0.55", 3);
+        msg.user_id = "vault:mm".to_string();
+        msg.authorization = Some(WireOrderAuthorization::ProtocolVault);
+        let configured = vec!["vault:mm".to_string()];
+        verify_replicated_order(&msg, &configured)
+            .expect("a quote from a vault this node runs is allowed for now");
+    }
+
+    // The label is free for the sequencer to write, so it must not be the whole check.
+    // A node with no vault configured — which is every node on the testnet cluster today —
+    // refuses every ProtocolVault order.
+    #[test]
+    fn a_vault_quote_from_an_unconfigured_vault_is_refused() {
+        let (mut msg, _) = signed_order_msg("", "long", "10.0", "0.55", 3);
+        msg.user_id = "vault:mm".to_string();
+        msg.authorization = Some(WireOrderAuthorization::ProtocolVault);
+        let e = verify_replicated_order(&msg, NO_VAULTS).unwrap_err();
+        assert!(
+            e.contains("not a vault this node has configured"),
+            "got: {e}"
+        );
+
+        // ...and configuring a DIFFERENT vault does not admit this one.
+        let other = vec!["vault:dn".to_string()];
+        verify_replicated_order(&msg, &other)
+            .expect_err("a quote labelled for another vault must not be admitted");
+    }
+
+    #[test]
+    fn a_signature_from_someone_else_is_refused() {
+        let (mut msg, _) = signed_order_msg("", "long", "10.0", "0.55", 3);
+        msg.user_id = "rSomeoneElseEntirely".to_string();
+        let e = verify_replicated_order(&msg, NO_VAULTS).unwrap_err();
+        assert!(e.contains("not the order owner"), "got: {e}");
+    }
+
+    #[test]
+    fn a_tampered_signature_is_refused() {
+        let (mut msg, _) = signed_order_msg("", "long", "10.0", "0.55", 3);
+        let Some(WireOrderAuthorization::ClientSigned(b)) = msg.authorization.as_mut() else {
+            panic!("fixture must be client-signed");
+        };
+        // Flip the last byte of the DER signature. Proves this function really calls the
+        // signature check and does not just read the binding's self-reported fields.
+        let mut raw = hex::decode(&b.signature_hex).unwrap();
+        *raw.last_mut().unwrap() ^= 0x01;
+        b.signature_hex = hex::encode(raw);
+        verify_replicated_order(&msg, NO_VAULTS).expect_err("a tampered signature must not verify");
+    }
+
+    // The binding's own metadata is sequencer-editable too: making signer_address agree
+    // with the order while the SIGNED body names someone else must not get through.
+    #[test]
+    fn a_body_naming_a_different_user_is_refused() {
+        use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
+        use k256::elliptic_curve::rand_core::OsRng;
+        use sha2::{Digest, Sha256};
+
+        let sk = SigningKey::random(&mut OsRng);
+        let pubkey_bytes = sk.verifying_key().to_sec1_bytes();
+        let signer = crate::auth::pubkey_to_xrpl_address(&pubkey_bytes);
+        let body = serde_json::json!({
+            "user_id": "rVictimAccountOfSomeoneElse", "side": "long", "type": "limit",
+            "price": "0.55", "size": "10.0", "leverage": 3u32,
+        })
+        .to_string();
+        let ts = "1758800000".to_string();
+        let mut h = Sha256::new();
+        h.update(body.as_bytes());
+        h.update(ts.as_bytes());
+        let (sig, _): (Signature, _) = sk.sign_prehash(&h.finalize()).unwrap();
+
+        let (mut msg, _) = signed_order_msg("", "long", "10.0", "0.55", 3);
+        msg.user_id = signer.clone();
+        msg.authorization = Some(WireOrderAuthorization::ClientSigned(
+            crate::auth::OrderSignatureBinding {
+                signed_body_hex: hex::encode(body.as_bytes()),
+                signature_hex: hex::encode(sig.to_der()),
+                timestamp: ts,
+                signer_address: signer,
+                signer_pubkey_hex: hex::encode(&pubkey_bytes),
+            },
+        ));
+        let e = verify_replicated_order(&msg, NO_VAULTS).unwrap_err();
+        assert!(e.contains("names a different user"), "got: {e}");
+    }
+
+    // Wire compatibility, stated as a test rather than assumed: a batch published by an
+    // OLD sequencer has no `authorization` field at all. It must still decode — and then
+    // be refused — rather than failing to parse into something we silently ignore.
+    #[test]
+    fn an_old_batch_without_the_field_decodes_and_is_then_refused() {
+        let json = r#"{
+            "order_id": 7, "user_id": "rOldSequencerOrder", "side": "long",
+            "order_type": "Limit", "price": "0.55", "size": "10.0",
+            "leverage": 3, "status": "Open", "fills": []
+        }"#;
+        let msg: OrderMessage = serde_json::from_str(json).expect("old wire form must decode");
+        assert!(msg.authorization.is_none());
+        let e = verify_replicated_order(&msg, NO_VAULTS).unwrap_err();
+        assert!(e.contains("UNVERIFIED"), "got: {e}");
+    }
+
+    // THE ones that matter: a real signature lifted onto DIFFERENT terms. Without the
+    // terms bind, the sequencer could attach a genuine binding from a small order to a
+    // large one and every other check would pass.
+    #[test]
+    fn a_real_signature_does_not_authorise_different_terms() {
+        /// A field to tamper with, how to tamper with it, and the refusal it must draw.
+        type TermMutation = (&'static str, fn(&mut OrderMessage), &'static str);
+        let cases: [TermMutation; 4] = [
+            (
+                "size",
+                |m| m.size = "999.0".into(),
+                "signed size does not match",
+            ),
+            (
+                "price",
+                |m| m.price = "0.99".into(),
+                "signed price does not match",
+            ),
+            ("side", |m| m.side = "short".into(), "!= replicated side"),
+            (
+                "leverage",
+                |m| m.leverage = 20,
+                "signed leverage does not match",
+            ),
+        ];
+        for (field, mutate, expected) in cases {
+            let (mut msg, _) = signed_order_msg("", "long", "10.0", "0.55", 3);
+            mutate(&mut msg);
+            let e = match verify_replicated_order(&msg, NO_VAULTS) {
+                Ok(()) => panic!("{field}: a changed term must not verify"),
+                Err(e) => e,
+            };
+            assert!(e.contains(expected), "{field}: got {e}");
+        }
+    }
+
     fn assert_typed_sign_body_full(body: &JsonValue, require_bundle: bool, require_claim: bool) {
         if require_claim {
             assert!(
