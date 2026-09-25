@@ -233,6 +233,18 @@ impl PerpClient {
         self.get("/perp/attested-clock/status").await
     }
 
+    /// §6 — ferry validator manifests to the enclave so it can re-derive each validator's
+    /// signing key. Permissionless in the enclave (a forged manifest cannot pass ed25519
+    /// against the measured master anchor), so no session key and no quorum here either.
+    /// The response's `changed` is how many entries actually moved the derived state.
+    pub async fn submit_validator_manifests(&self, manifests_hex: &[String]) -> Result<Value> {
+        self.post(
+            "/admin/unl/submit-manifests",
+            serde_json::json!({ "manifests": manifests_hex }),
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn reserves_commit(
         &self,

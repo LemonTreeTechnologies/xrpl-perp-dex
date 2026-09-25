@@ -55,6 +55,7 @@ mod tx_shamap; // #131 P3 — rebuild a ledger's tx SHAMap + read inclusion path
 mod tx_shamap_vector; // real ledger 20808565, golden vector for the rebuild
 mod types;
 mod unl_policy; // AC-BASE-2″ §6 — UNL policy ceremony (quorum + freshness anchor)
+mod unl_refresh;
 mod validator_manifests; // AC-BASE-2″ §6 — feed the enclave's measured-anchor validator root
 mod vault_mm;
 mod withdrawal;
@@ -971,6 +972,7 @@ async fn main() -> Result<()> {
     // repo does not ship. See api::ReplicationHealth.
     let replication_health = Arc::new(crate::api::ReplicationHealth::default());
     let clock_health = Arc::new(crate::attested_clock::ClockHealth::default());
+    let unl_health = Arc::new(crate::unl_refresh::UnlRefreshHealth::default());
     let mark_price = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let funding_rate = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let last_funding_time = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1129,6 +1131,7 @@ async fn main() -> Result<()> {
         start_time: Instant::now(),
         replication: replication_health.clone(),
         attested_clock: clock_health.clone(),
+        unl_refresh: unl_health.clone(),
         reserves_figures: Some(reserves_figures_cache.clone()),
         maintenance_mode: maintenance_mode.clone(),
     });
@@ -2307,6 +2310,20 @@ async fn main() -> Result<()> {
             ));
             info!("attested-clock ENABLED (every node, not only the sequencer)");
         }
+    }
+
+    // The trust root under BOTH of the above: the enclave derives each validator's signing
+    // key from a manifest, and a validator that rotates its key leaves a stale entry. With
+    // 6 anchored masters and an >=80% floor the quorum is 5-of-6 — ONE stale entry is the
+    // whole margin. Permissionless in the enclave, so this needs no ceremony; it needs a
+    // caller, which it has never had.
+    if let Some(ucfg) = unl_refresh::UnlRefreshConfig::from_env() {
+        tokio::spawn(unl_refresh::run_unl_refresh(
+            ucfg,
+            perp.clone(),
+            unl_health.clone(),
+        ));
+        info!("unl-refresh ENABLED (validator manifests kept current)");
     }
     let mut last_reserves_commit = Instant::now();
 

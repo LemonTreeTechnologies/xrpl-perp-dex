@@ -111,6 +111,9 @@ pub struct AppState {
     pub replication: Arc<ReplicationHealth>,
     /// The attested clock, as the ENCLAVE reports it — read back, not what we last sent.
     pub attested_clock: Arc<crate::attested_clock::ClockHealth>,
+    /// Whether the enclave's derived validator set is being kept current — the trust root
+    /// under both the attested clock and SPV deposits.
+    pub unl_refresh: Arc<crate::unl_refresh::UnlRefreshHealth>,
     /// Q-BND-3: the figures from the last PUBLISHED reserves commitment, so the public
     /// attestation endpoint can quantify the custody-minus-liabilities gap rather than
     /// only describing it in prose. None until the first publish of this process.
@@ -343,6 +346,16 @@ async fn system_status(State(state): State<Arc<AppState>>) -> impl IntoResponse 
             "attested_ledger_seq": state.attested_clock.attested_ledger_seq.load(Ordering::Relaxed),
             // Ripple epoch, NAMED — a renderer that assumes Unix is 946684800 seconds wrong.
             "attested_close_time_ripple_epoch": state.attested_clock.attested_close_time.load(Ordering::Relaxed),
+        },
+        // The trust root both of the above rest on. `enabled: false` is not "healthy" —
+        // it means the enclave's derived validator set is ageing with nothing refreshing
+        // it, and a 5-of-6 floor spends its whole margin on ONE stale signing key.
+        "unl_refresh": {
+            "enabled": state.unl_refresh.enabled.load(Ordering::Relaxed),
+            "submissions": state.unl_refresh.submissions.load(Ordering::Relaxed),
+            "changed_total": state.unl_refresh.changed_total.load(Ordering::Relaxed),
+            "failures": state.unl_refresh.failures.load(Ordering::Relaxed),
+            "masters_seen": state.unl_refresh.masters_seen.load(Ordering::Relaxed),
         },
     }))
 }
