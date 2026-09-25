@@ -56,7 +56,9 @@ check "β9"  "PerpMetaLegacyB9"  "PERP_META_B9_LEN"
 check "β10" "PerpMetaLegacyB10" "PERP_META_B10_LEN"
 check "β12" "PerpMetaLegacyB12" "PERP_META_B12_LEN"
 check "β14" "PerpMetaLegacyB14" "PERP_META_B14_LEN"
-check "β15" "PerpMeta"          "PERP_META_B15_LEN"
+check "β15" "PerpMetaLegacyB15" "PERP_META_B15_LEN"
+check "β16" "PerpMetaLegacyB16" "PERP_META_B16_LEN"
+check "β17" "PerpMeta"          "PERP_META_B17_LEN"
 
 
 # ── The CAPACITY limits, same reasoning one axis over ────────────────────────
