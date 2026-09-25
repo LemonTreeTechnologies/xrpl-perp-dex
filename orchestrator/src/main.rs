@@ -1934,6 +1934,10 @@ async fn main() -> Result<()> {
     let validator_db = app_state.db.clone();
     let validator_leader_rx = leader_rx.clone();
     let validator_replication = replication_health.clone();
+    // A vault quote carries no user signature, so the only thing standing between a
+    // sequencer-invented "vault" order and our state is which vaults WE are configured to
+    // run. Empty here means every ProtocolVault order in a batch is refused.
+    let validator_vault_users = vault_mm::enabled_vault_user_ids(cli.vault_mm, cli.vault_dn);
     let _validator_handle = tokio::spawn(async move {
         let mut last_seq: u64 = 0;
         // O-H2: per-sequencer mismatch counter. Exposed via tracing events
@@ -2077,7 +2081,7 @@ async fn main() -> Result<()> {
                 // own state — and our state is what we later refuse or agree to co-sign
                 // with. Skipping is the fail-safe: our derived state diverges from a
                 // cheating sequencer, which is exactly the outcome that protects funds.
-                if let Err(why) = p2p::verify_replicated_order(order) {
+                if let Err(why) = p2p::verify_replicated_order(order, &validator_vault_users) {
                     validator_replication
                         .unverified_orders
                         .fetch_add(1, Ordering::Relaxed);

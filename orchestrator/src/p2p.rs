@@ -119,15 +119,35 @@ pub enum WireOrderAuthorization {
 /// comparison would reject honest orders while proving nothing extra.
 ///
 /// Returns Ok only for an order a validator may replay as the user's own.
-pub fn verify_replicated_order(order: &OrderMessage) -> Result<(), String> {
+pub fn verify_replicated_order(
+    order: &OrderMessage,
+    vault_user_ids: &[String],
+) -> Result<(), String> {
     let Some(auth) = &order.authorization else {
         return Err("no authorization carried — order is UNVERIFIED".to_string());
     };
     let binding = match auth {
-        // A vault quote has no user behind it. Accepted for now and NAMED, not silently
-        // waved through; see trading::OrderAuthorization::ProtocolVault for the open
-        // question about deriving these instead.
-        WireOrderAuthorization::ProtocolVault => return Ok(()),
+        // A vault quote has no user behind it, so there is no signature to check — which
+        // means a compromised sequencer could label ANY order `ProtocolVault` and every
+        // validator would take it. It does not need the vault singleton to be running to
+        // do that: the flag governs the honest producer, not our acceptance. So narrow it
+        // to the vault user ids THIS node's own config enables. With no vault configured
+        // that set is empty and every such order is refused, which is the state of the
+        // testnet cluster today.
+        //
+        // Still not derivation — a quote from a configured vault id is accepted on its
+        // label, and its PRICE is unchecked. Deriving `mark ± spread` from own mark and
+        // inventory is the real fix; see trading::OrderAuthorization::ProtocolVault.
+        WireOrderAuthorization::ProtocolVault => {
+            return if vault_user_ids.iter().any(|u| u == &order.user_id) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "vault quote from {} — not a vault this node has configured",
+                    order.user_id
+                ))
+            }
+        }
         WireOrderAuthorization::ClientSigned(b) => b,
     };
 
@@ -5312,29 +5332,56 @@ mod tests {
     #[test]
     fn a_genuinely_signed_order_verifies() {
         let (msg, _) = signed_order_msg("", "long", "10.0", "0.55", 3);
-        verify_replicated_order(&msg).expect("a real signature over these terms must verify");
+        verify_replicated_order(&msg, NO_VAULTS)
+            .expect("a real signature over these terms must verify");
     }
 
     #[test]
     fn an_order_with_no_authorization_is_refused() {
         let (mut msg, _) = signed_order_msg("", "long", "10.0", "0.55", 3);
         msg.authorization = None;
-        let e = verify_replicated_order(&msg).unwrap_err();
+        let e = verify_replicated_order(&msg, NO_VAULTS).unwrap_err();
         assert!(e.contains("UNVERIFIED"), "got: {e}");
     }
 
+    /// The testnet cluster's actual configuration: no vault singleton on any node.
+    const NO_VAULTS: &[String] = &[];
+
     #[test]
-    fn a_vault_quote_is_accepted_and_named() {
+    fn a_vault_quote_from_a_configured_vault_is_accepted() {
         let (mut msg, _) = signed_order_msg("", "long", "10.0", "0.55", 3);
+        msg.user_id = "vault:mm".to_string();
         msg.authorization = Some(WireOrderAuthorization::ProtocolVault);
-        verify_replicated_order(&msg).expect("a protocol vault quote is allowed for now");
+        let configured = vec!["vault:mm".to_string()];
+        verify_replicated_order(&msg, &configured)
+            .expect("a quote from a vault this node runs is allowed for now");
+    }
+
+    // The label is free for the sequencer to write, so it must not be the whole check.
+    // A node with no vault configured — which is every node on the testnet cluster today —
+    // refuses every ProtocolVault order.
+    #[test]
+    fn a_vault_quote_from_an_unconfigured_vault_is_refused() {
+        let (mut msg, _) = signed_order_msg("", "long", "10.0", "0.55", 3);
+        msg.user_id = "vault:mm".to_string();
+        msg.authorization = Some(WireOrderAuthorization::ProtocolVault);
+        let e = verify_replicated_order(&msg, NO_VAULTS).unwrap_err();
+        assert!(
+            e.contains("not a vault this node has configured"),
+            "got: {e}"
+        );
+
+        // ...and configuring a DIFFERENT vault does not admit this one.
+        let other = vec!["vault:dn".to_string()];
+        verify_replicated_order(&msg, &other)
+            .expect_err("a quote labelled for another vault must not be admitted");
     }
 
     #[test]
     fn a_signature_from_someone_else_is_refused() {
         let (mut msg, _) = signed_order_msg("", "long", "10.0", "0.55", 3);
         msg.user_id = "rSomeoneElseEntirely".to_string();
-        let e = verify_replicated_order(&msg).unwrap_err();
+        let e = verify_replicated_order(&msg, NO_VAULTS).unwrap_err();
         assert!(e.contains("not the order owner"), "got: {e}");
     }
 
@@ -5349,7 +5396,7 @@ mod tests {
         let mut raw = hex::decode(&b.signature_hex).unwrap();
         *raw.last_mut().unwrap() ^= 0x01;
         b.signature_hex = hex::encode(raw);
-        verify_replicated_order(&msg).expect_err("a tampered signature must not verify");
+        verify_replicated_order(&msg, NO_VAULTS).expect_err("a tampered signature must not verify");
     }
 
     // The binding's own metadata is sequencer-editable too: making signer_address agree
@@ -5385,7 +5432,7 @@ mod tests {
                 signer_pubkey_hex: hex::encode(&pubkey_bytes),
             },
         ));
-        let e = verify_replicated_order(&msg).unwrap_err();
+        let e = verify_replicated_order(&msg, NO_VAULTS).unwrap_err();
         assert!(e.contains("names a different user"), "got: {e}");
     }
 
@@ -5401,7 +5448,7 @@ mod tests {
         }"#;
         let msg: OrderMessage = serde_json::from_str(json).expect("old wire form must decode");
         assert!(msg.authorization.is_none());
-        let e = verify_replicated_order(&msg).unwrap_err();
+        let e = verify_replicated_order(&msg, NO_VAULTS).unwrap_err();
         assert!(e.contains("UNVERIFIED"), "got: {e}");
     }
 
@@ -5433,7 +5480,7 @@ mod tests {
         for (field, mutate, expected) in cases {
             let (mut msg, _) = signed_order_msg("", "long", "10.0", "0.55", 3);
             mutate(&mut msg);
-            let e = match verify_replicated_order(&msg) {
+            let e = match verify_replicated_order(&msg, NO_VAULTS) {
                 Ok(()) => panic!("{field}: a changed term must not verify"),
                 Err(e) => e,
             };
