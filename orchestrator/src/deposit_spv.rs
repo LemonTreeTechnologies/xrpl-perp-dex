@@ -175,14 +175,11 @@ pub fn build_deposit_proof(
         .inclusion_proof(&key)
         .context("read the inclusion path off the rebuilt map")?;
 
-    let val_count = u16::try_from(validations.len())
-        .context("more validations than a u16 count can express")?;
-    let flat: Vec<u8> = validations.iter().flatten().copied().collect();
-
+    // FRAMED, not concatenated — the same defect the clock driver shipped with. This
+    // path had never run, so nothing had ever refused it.
     let blob = build_xdep_blob(
         &header,
-        val_count,
-        &flat,
+        validations,
         tx_blob,
         meta,
         &proof.inner_root_to_leaf,
