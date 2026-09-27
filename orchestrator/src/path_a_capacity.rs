@@ -80,8 +80,16 @@ pub mod limits {
     pub const PERP_META_B15_LEN: u64 = 160;
     /// β16 = β15 + 16 (trusted-price attested clock: attested_ledger_seq + attested_close_time).
     pub const PERP_META_B16_LEN: u64 = 176;
-    /// β17 = β16 + 8 (trusted-price price_publisher_disabled_mask, the RESTRICT dial) — current.
+    /// β17 = β16 + 8 (trusted-price price_publisher_disabled_mask, the RESTRICT dial).
     pub const PERP_META_B17_LEN: u64 = 184;
+    /// β18 = β17 + 8 (`save_seq`, the torn-set discriminator) — current.
+    ///
+    /// The section-version stamp lives in each section's sealed AAD precisely so the meta
+    /// size would NOT move — and then the discriminator had to be re-keyed from
+    /// `state_version` to a save counter, which needed a home in meta. So the size moves
+    /// after all, and this mirror is exactly the thing that has been two schemas behind the
+    /// enclave once before and surfaced as a false STOP under live-migration pressure.
+    pub const PERP_META_B18_LEN: u64 = 192;
 }
 
 /// One limit check with the numbers behind the verdict.
@@ -177,8 +185,13 @@ pub enum MetaSchema {
     /// RESTRICT nobody re-authorised, and cannot silently drop one either, since at zero
     /// anchored publishers the mask means nothing yet. Migratable.
     LegacyB16,
-    /// == 184: the β17 schema. Already current — nothing to upgrade.
-    AlreadyB17,
+    /// == 184: the β17 schema. Migratable — the β18 load zero-fills `save_seq`, so the
+    /// first β18 save writes 1 and stamps every section. Until that save happens no section
+    /// carries a stamp and the cross-section check stays disarmed, which is correct: there
+    /// is no reference value to compare against yet.
+    LegacyB17,
+    /// == 192: the β18 schema. Already current — nothing to upgrade.
+    AlreadyB18,
     /// Any other length, an unreadable header, or a size that doesn't reconcile with the
     /// file. The current enclave load HARD-FAILS this (AC-CHUNK3-3) — so promoting a node
     /// in this state would strand it. STOP before the point of no return.
@@ -248,7 +261,8 @@ fn classify_perp_meta(payload_len: Option<u64>) -> MetaSchema {
         Some(limits::PERP_META_B14_LEN) => MetaSchema::LegacyB14,
         Some(limits::PERP_META_B15_LEN) => MetaSchema::LegacyB15,
         Some(limits::PERP_META_B16_LEN) => MetaSchema::LegacyB16,
-        Some(limits::PERP_META_B17_LEN) => MetaSchema::AlreadyB17,
+        Some(limits::PERP_META_B17_LEN) => MetaSchema::LegacyB17,
+        Some(limits::PERP_META_B18_LEN) => MetaSchema::AlreadyB18,
         _ => MetaSchema::Unknown,
     }
 }
@@ -414,7 +428,8 @@ pub fn render(report: &CapacityReport) -> String {
                 MetaSchema::LegacyB14 => "β14 (152B) → upgrades to β17 (184B): zero-fills base_projection_confirmed_epoch, which HALTS publishing until a Base projection is confirmed, plus the attested clock and the publisher RESTRICT mask",
                 MetaSchema::LegacyB15 => "β15 (160B) → upgrades to β17 (184B): zero-fills the attested clock (the migrated enclave starts with NO verified time) and the publisher RESTRICT mask. Inert while no publishers are anchored; the split halt reads a zero clock as NOT FRESH the moment they are",
                 MetaSchema::LegacyB16 => "β16 (176B) → upgrades to β17 (184B): zero-fills price_publisher_disabled_mask, so no publisher inherits a RESTRICT nobody re-authorised",
-                MetaSchema::AlreadyB17 => "β17 (184B) → already current schema (no-op)",
+                MetaSchema::LegacyB17 => "β17 (184B) → upgrades to β18 (192B): zero-fills save_seq, so the first β18 save writes 1 and stamps every sealed section; the torn-set check is disarmed until then because no section carries a stamp",
+                MetaSchema::AlreadyB18 => "β18 (192B) → already current schema (no-op)",
                 MetaSchema::Unknown => {
                     "UNKNOWN size → NON-migratable — current load HARD-FAILS (STOP)"
                 }
@@ -619,6 +634,7 @@ mod tests {
         assert_eq!(limits::PERP_META_B15_LEN, 160);
         assert_eq!(limits::PERP_META_B16_LEN, 176);
         assert_eq!(limits::PERP_META_B17_LEN, 184);
+        assert_eq!(limits::PERP_META_B18_LEN, 192);
         // Each bump appends whole u64 fields, so the sizes must be strictly increasing and
         // 8-aligned. A new entry that breaks either is a transcription error, not a schema.
         let all = [
@@ -631,6 +647,7 @@ mod tests {
             limits::PERP_META_B15_LEN,
             limits::PERP_META_B16_LEN,
             limits::PERP_META_B17_LEN,
+            limits::PERP_META_B18_LEN,
         ];
         for w in all.windows(2) {
             assert!(
@@ -676,14 +693,28 @@ mod tests {
     }
 
     #[test]
-    fn perp_meta_already_b17_is_the_no_op() {
+    fn perp_meta_already_b18_is_the_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        write_sealed_meta(d, "s0_perp_meta.sealed", limits::PERP_META_B18_LEN);
+        let r = assess_accounts_dir(d).unwrap();
+        assert!(r.ok(), "β18 meta must pass: {}", render(&r));
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB18);
+        assert!(render(&r).contains("no-op"));
+    }
+
+    /// β17 must read as MIGRATABLE, not as current. Left as AlreadyB17 it would clear a
+    /// migration that then loads a 184-byte record as a 192-byte one, and `save_seq` — the
+    /// torn-set reference — would be whatever followed it in memory.
+    #[test]
+    fn perp_meta_b17_is_now_a_legacy_upgrade() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         write_sealed_meta(d, "s0_perp_meta.sealed", limits::PERP_META_B17_LEN);
         let r = assess_accounts_dir(d).unwrap();
-        assert!(r.ok(), "β17 meta must pass: {}", render(&r));
-        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB17);
-        assert!(render(&r).contains("no-op"));
+        assert!(r.ok(), "β17 meta must still be migratable: {}", render(&r));
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::LegacyB17);
+        assert!(render(&r).contains("zero-fills save_seq"));
     }
 
     #[test]
