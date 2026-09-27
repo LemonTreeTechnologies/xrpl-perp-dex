@@ -36,8 +36,19 @@ pub enum ClockOutcome {
     /// check ANY header until an operator pins the validator set, so this is a setup
     /// state, not a transient fault — it will repeat forever until someone acts.
     NoPinnedUnl,
-    /// `-72`/`-73`/`-74`: the bundle did not parse, the header did not hash, or the
-    /// validators' quorum did not verify. Something is wrong with what we are feeding.
+    /// Something is wrong with what we are feeding: the bundle did not parse, the header
+    /// did not hash, or the validators' quorum did not verify.
+    ///
+    /// Two encodings reach us. `-201..-219` carry the CAUSE (the enclave's
+    /// `XRPL_SPV_HOST_RC_BASE + XRPL_SPV_ERR_*`), and `-72`/`-73`/`-74` are the old
+    /// flattened trio, still returned by any enclave built before 2026-09-27 — including
+    /// the one deployed today, since a new code only arrives with an MRENCLAVE bump. Both
+    /// are classified, because dropping the old ones would blind this driver against the
+    /// enclave that is actually running.
+    ///
+    /// The BEHAVIOUR is the same for every cause on purpose: retry the next ledger. What
+    /// the cause changes is what the log says, and that is the whole point — `-72` cost a
+    /// source read to diagnose. [`spv_cause`] names it.
     BadBundle,
     /// `-90`: close_time went backwards. A healthy XRPL never produces this.
     TimeWentBackwards,
@@ -55,8 +66,54 @@ pub fn classify_clock_rc(rc: i64) -> ClockOutcome {
         -70 | -71 => ClockOutcome::NoPinnedUnl,
         -74..=-72 => ClockOutcome::BadBundle,
         -90 => ClockOutcome::TimeWentBackwards,
+        rc if spv_cause(rc).is_some() => ClockOutcome::BadBundle,
         _ => ClockOutcome::Other,
     }
+}
+
+/// The base of the enclave's shared SPV cause band — `XRPL_SPV_HOST_RC_BASE` in
+/// `xrpl_spv.h`. Mirrored, and pinned against the enclave by a test below.
+pub const SPV_HOST_RC_BASE: i64 = -200;
+
+/// Name the cause behind a `-201..-219` refusal, or `None` if `rc` is not in the band.
+///
+/// The enclave used to flatten every one of these into `-72`, and on 2026-09-27 that cost
+/// a diagnosis: the clock refused 100% of ledgers and the only way to learn that the
+/// producer was shipping unframed validations was to read the enclave's parser. An
+/// operator will not do that, so the cause now reaches the log.
+pub fn spv_cause(rc: i64) -> Option<&'static str> {
+    Some(match rc - SPV_HOST_RC_BASE {
+        -1 => "a null argument reached the SPV layer",
+        -2 => {
+            "truncated — a field ran past the end of the blob (an unframed \
+               validations section looks exactly like this)"
+        }
+        -3 => "wrong magic for this transport",
+        -4 => "unknown transport version",
+        -5 => "trailing bytes after the last field",
+        -6 => "a count exceeded its cap",
+        -7 => "the header length is not 118",
+        -8 => "under quorum — too few distinct valid validations",
+        -9 => "a validation signs a different ledger hash",
+        -10 => "a validation signature failed to verify",
+        -11 => "a signer is not in the pinned UNL (ours may be stale)",
+        -12 => "the SHAMap path does not hash to the state root",
+        -13 => "the proof binds a key other than the derived keylet",
+        -14 => "a non-canonical STAmount",
+        -15 => "RLUSD from a non-pinned issuer",
+        -16 => "an IOU→fixed-point conversion would overflow",
+        -17 => "a required field is missing or malformed",
+        -18 => "a variable-length prefix is out of range",
+        -19 => "not a Payment, or the destination is not the escrow",
+        // The list does not stop at -19. Mirroring only the first nineteen is how an
+        // incomplete set looks complete; the cross-repo gate caught it here, in the
+        // enclave's own band test, and in a static_assert that named the wrong extreme.
+        -20 => "a partial payment — delivered less than the Amount",
+        -21 => "the transaction did not succeed in the ledger",
+        -22 => "an IOU deposit while XRP-only",
+        -99 => "an internal SPV error",
+        _ => return None,
+    })
 }
 
 /// Counters for `/v1/system/status`, so "the clock is advancing" is something an operator
@@ -263,6 +320,9 @@ pub async fn run_attested_clock(
                         rc,
                         ledger = index,
                         outcome = ?other,
+                        // Empty for an enclave old enough to still flatten to -72/-74.
+                        // Saying so beats printing "unknown", which reads like a defect.
+                        cause = spv_cause(rc).unwrap_or("(this enclave does not report a cause)"),
                         "attested clock refused"
                     );
                 }
@@ -342,5 +402,74 @@ mod tests {
         }
         assert_eq!(classify_clock_rc(-90), ClockOutcome::TimeWentBackwards);
         assert_eq!(classify_clock_rc(-1), ClockOutcome::Other);
+    }
+
+    /// The whole band classifies, and every code in it can be NAMED.
+    ///
+    /// `-72` used to stand for six different structural refusals, and on 2026-09-27 that
+    /// cost a diagnosis: the clock refused every ledger and the cause — unframed
+    /// validations, which truncate the section walk — was legible only in the enclave's
+    /// source. A code the operator cannot read is a code the operator cannot act on.
+    /// Mirrors the enclave's `XRPL_SPV_ERR_*` values. Not contiguous — it runs 1..=22 and
+    /// then jumps to 99 — which is exactly why the earlier `1..=19` loop looked complete
+    /// and was not. The cross-repo gate asserts this list against the enclave's header.
+    const SPV_CAUSE_OFFSETS: [i64; 23] = [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 99,
+    ];
+
+    #[test]
+    fn the_whole_spv_cause_band_classifies_and_every_code_has_a_name() {
+        let mut names = std::collections::HashSet::new();
+        for e in SPV_CAUSE_OFFSETS {
+            let rc = SPV_HOST_RC_BASE - e;
+            assert_eq!(
+                classify_clock_rc(rc),
+                ClockOutcome::BadBundle,
+                "rc {rc} must classify; an unclassified band member falls to Other and the \
+                 driver treats a structural refusal as a transport blip"
+            );
+            let name = spv_cause(rc).unwrap_or_else(|| panic!("rc {rc} has no cause name"));
+            assert!(
+                names.insert(name),
+                "rc {rc} reuses another cause's text — the band's only job is to tell \
+                 causes APART, so two codes sharing a name is the -72 problem again"
+            );
+        }
+        assert_eq!(names.len(), SPV_CAUSE_OFFSETS.len(), "one name per cause");
+    }
+
+    /// The band's edges. Without this, widening the range by one would go unnoticed and
+    /// `-200` — which the enclave reserves for success, never a refusal — would start
+    /// reading as a cause.
+    #[test]
+    fn the_band_ends_where_the_enclave_says_it_does() {
+        assert_eq!(spv_cause(SPV_HOST_RC_BASE), None, "-200 is not a cause");
+        assert!(
+            spv_cause(SPV_HOST_RC_BASE - 1).is_some(),
+            "-201 is the first cause"
+        );
+        assert!(
+            spv_cause(SPV_HOST_RC_BASE - 22).is_some(),
+            "-222 is a cause; the band does not end at -219, which is what the first \
+             version of this test wrongly asserted"
+        );
+        assert!(
+            spv_cause(SPV_HOST_RC_BASE - 99).is_some(),
+            "-299 is the farthest cause"
+        );
+        // the gaps are gaps, not causes
+        for gap in [23i64, 50, 98] {
+            assert_eq!(
+                spv_cause(SPV_HOST_RC_BASE - gap),
+                None,
+                "-{} is not a defined cause",
+                200 + gap
+            );
+        }
+        // and the band must not reach the ecalls' own codes, or a parse failure would be
+        // indistinguishable from -89 "already at or ahead"
+        for rc in [-70i64, -71, -72, -89, -90] {
+            assert_eq!(spv_cause(rc), None, "rc {rc} is an ecall code, not a cause");
+        }
     }
 }

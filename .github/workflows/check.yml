@@ -48,3 +48,10 @@ jobs:
 
       - name: cargo test
         run: cargo test --locked
+
+      # RESP-wire-format-seam-class-ruling-2026-09-27 Q2. The builders' signature makes
+      # an unframed producer unrepresentable for today's three; this asserts it for the
+      # next one, which could assemble the prefix by hand and never touch the helper.
+      # The cross-repo half SKIPS here (no enclave checkout) and runs before a migration.
+      - name: prefix framing gate
+        run: scripts/ci_prefix_framing.py
