@@ -29,10 +29,12 @@
 set -euo pipefail
 
 DRY=0
+DISARM=0
 case "${1:-}" in
   --dry-run) DRY=1 ;;
+  --disarm)  DISARM=1 ;;
   "") ;;
-  *) echo "usage: $0 [--dry-run]"; exit 2 ;;
+  *) echo "usage: $0 [--dry-run|--disarm]"; exit 2 ;;
 esac
 
 BASTION="${BASTION:-andrey@94.130.18.162}"
@@ -45,6 +47,7 @@ CONF="$HERE/perp-dex-orchestrator.service.d/10-attested-clock.conf"
 echo "bastion : $BASTION"
 echo "drop-in : $CONF"
 [ "$DRY" = 1 ] && echo "mode    : DRY RUN — reads only, changes nothing"
+[ "$DISARM" = 1 ] && echo "mode    : DISARM — remove the drop-in and restart"
 echo
 
 CONF_B64="$(base64 -w0 "$CONF")"
@@ -53,7 +56,7 @@ CONF_SHA="$(sha256sum "$CONF" | cut -d" " -f1)"
 DRIVER="$(mktemp)"
 trap 'rm -f "$DRIVER"' EXIT
 {
-  printf 'CONF_B64=%s\nCONF_SHA=%s\nDRY=%s\n' "$CONF_B64" "$CONF_SHA" "$DRY"
+  printf 'CONF_B64=%s\nCONF_SHA=%s\nDRY=%s\nDISARM=%s\n' "$CONF_B64" "$CONF_SHA" "$DRY" "$DISARM"
   cat <<'DRIVER_BODY'
 set -uo pipefail
 
@@ -113,6 +116,57 @@ if [ "$bad" -ne 0 ]; then
   exit 1
 fi
 say "  all three healthy."
+
+# ── DISARM ───────────────────────────────────────────────────────────────────
+# The reverse of the cutover, scripted for the same reason the cutover is: it has
+# to be verifiable, and on 2026-09-27 it had to be done in minutes on an auditor's
+# ruling. Removing the drop-in restores the node to exactly its prior state; the
+# driver is opt-in, so absence of the file IS off.
+if [ "${DISARM:-0}" = 1 ]; then
+  rule; say "DISARMING"; rule
+  for entry in $NODES; do
+    ip="${entry%%:*}"; want="${entry##*:}"
+    # NO -n HERE. The heredoc IS this call's stdin; -n points stdin at /dev/null, so
+    # `bash -s` read nothing, ran nothing, exited 0 and the step reported success while
+    # doing absolutely nothing. I wrote that bug into the disarm path minutes after
+    # adding -n everywhere else to stop ssh swallowing the driver script. The -n belongs
+    # on calls with NO heredoc; here it silently disables the work.
+    out="$(ssh -o ConnectTimeout=15 -o BatchMode=yes azureuser@"$ip" bash -s -- "$want" <<'NODE'
+set -uo pipefail
+want="$1"
+[ "$(hostname)" = "$want" ] || { echo "WRONG-HOST $(hostname) != $want"; exit 1; }
+f=/etc/systemd/system/perp-dex-orchestrator.service.d/10-attested-clock.conf
+if [ -f "$f" ]; then sudo rm -f "$f"; echo -n "drop-in removed; "; else echo -n "drop-in already absent; "; fi
+sudo systemctl daemon-reload
+sudo systemctl restart perp-dex-orchestrator
+echo -n "restarted; "
+# `grep -c` exits 1 when the count is 0, and with pipefail that became the whole block's
+# status: the disarm SUCCEEDED and reported FAILED. Count into a variable so the status
+# belongs to the work, not to whether a grep matched.
+n="$(systemctl show perp-dex-orchestrator -p Environment --value | tr ' ' '\n' | grep -c ATTESTED || true)"
+echo "ATTESTED vars now: $n"
+NODE
+)" || { say "  $want ($ip): FAILED"; say "$out"; exit 1; }
+    say "  $want ($ip): $(echo "$out" | tr '\n' ' ')"
+  done
+  # The point of the exercise: the driver must report itself OFF.
+  say "  waiting for the APIs..."
+  for _ in $(seq 1 15); do sleep 4; done
+  bad=0
+  for entry in $NODES; do
+    ip="${entry%%:*}"; want="${entry##*:}"
+    en="$(clock_field "$ip" driver_enabled)"
+    say "  $want ($ip): driver_enabled=$en"
+    [ "$en" = "False" ] || bad=1
+  done
+  rule
+  if [ "$bad" -ne 0 ]; then
+    say "DISARM INCOMPLETE — at least one node still reports the driver enabled."
+    exit 1
+  fi
+  say "DISARMED on all nodes. Re-enable by running this script with no arguments."
+  exit 0
+fi
 
 # ── DRY RUN ──────────────────────────────────────────────────────────────────
 # Rehearse the read half. Everything below this point writes, so a dry run stops
