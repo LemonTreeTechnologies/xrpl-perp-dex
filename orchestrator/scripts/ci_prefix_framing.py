@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""ci_prefix_framing.py — every producer of the shared attested-ledger prefix must route
-through the framing helper.
+"""ci_prefix_framing.py — the SPV wire contract between this repo and the enclave.
+
+Two halves, both from RESP-wire-format-seam-class-ruling-2026-09-27:
+  (Q2) every producer of the shared attested-ledger prefix must route through the framing
+       helper;
+  (Q4) the host-visible cause band mirrored here must be the band the enclave defines.
 
 WHY THIS EXISTS (RESP-wire-format-seam-class-ruling-2026-09-27, Q2).
 
@@ -160,6 +164,47 @@ else:
         )
     if not missing:
         notes.append(f"cross-repo OK: enclave parses {parsed}, all framing-routed here.")
+
+# ── 7. CROSS-REPO: the mirrored cause band must be the enclave's ─────────────
+# attested_clock.rs mirrors XRPL_SPV_HOST_RC_BASE and names one cause per XRPL_SPV_ERR_*.
+# A mirror that lags is how the meta sizes produced a false STOP under live-migration
+# pressure; here it would print the wrong cause for a real refusal, which is worse than
+# printing none.
+clock_rs = SRC / "attested_clock.rs"
+spv_h = enclave / "EthSignerEnclave" / "Enclave" / "xrpl_spv.h"
+if not spv_h.is_file():
+    notes.append(f"SKIP cause-band check: {spv_h} not found.")
+else:
+    h = spv_h.read_text()
+    m = re.search(r"#define XRPL_SPV_HOST_RC_BASE\s*\((-?\d+)\)", h)
+    if not m:
+        fail(f"XRPL_SPV_HOST_RC_BASE not found in {spv_h} — has the band been removed?")
+    else:
+        enc_base = int(m.group(1))
+        rs = clock_rs.read_text()
+        m2 = re.search(r"pub const SPV_HOST_RC_BASE: i64 = (-?\d+);", rs)
+        if not m2:
+            fail("SPV_HOST_RC_BASE is gone from attested_clock.rs")
+        elif int(m2.group(1)) != enc_base:
+            fail(
+                f"cause-band base drifted: enclave {enc_base}, orchestrator {m2.group(1)}. "
+                "Every refusal would be named wrongly."
+            )
+        causes = sorted(
+            int(v) for v in re.findall(r"#define XRPL_SPV_ERR_\w+\s+(-\d+)", h)
+        )
+        named = sorted(int(v) for v in re.findall(r"^\s+(-\d+) =>", rs, re.M))
+        missing = [c for c in causes if c not in named]
+        if missing:
+            fail(
+                f"the enclave defines causes the orchestrator cannot name: {missing}. "
+                "An unnamed cause reaches the log as a bare number, which is the -72 "
+                "problem in a new costume."
+            )
+        if not failures:
+            notes.append(
+                f"cause-band OK: base {enc_base}, {len(causes)} causes, all named here."
+            )
 
 for n in notes:
     print(f"  {n}")
