@@ -16,7 +16,13 @@ on:
       - 'feat/**'
       - 'audit/**'
       - 'infra/**'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   schedule:
     - cron: '0 6 * * 1' # Mondays 06:00 UTC
 
