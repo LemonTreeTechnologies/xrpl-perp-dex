@@ -248,7 +248,17 @@ pub enum SubmitOutcome {
 /// Unknown NEGATIVE codes are treated as PERMANENT, not transient. That is the
 /// conservative direction here: a new refusal we do not recognise is far more likely to
 /// be a new gate than a hiccup, and retrying it forever would bury the message that
-/// something needs attention.
+/// something needs attention. It is also what keeps the enclave's banded SPV causes
+/// (`-201..-299`) from being mistaken for anything benign.
+///
+/// THE -2 AMBIGUITY, now closed in the enclave and worth recording here. The enclave used
+/// to return `xrpl_spv_parse_deposit_payment`'s raw code, and `XRPL_SPV_ERR_TRUNCATED` is
+/// -2 — the very number this function maps to `AlreadySettled`, "expected in normal
+/// operation and never worth logging as a failure". A malformed deposit payload therefore
+/// read as a benign repeat and was swallowed. The enclave now bands that return, so -2
+/// means only the dedup ring. Against an enclave built before 2026-09-27 the ambiguity is
+/// unavoidable from here — nothing in the number distinguishes the two — which is why the
+/// fix had to be on the enclave side.
 pub fn classify_submit(rc: i32) -> SubmitOutcome {
     match rc {
         -2 | -86 => SubmitOutcome::AlreadySettled,
@@ -520,8 +530,19 @@ async fn scan_one_ledger(
                 SubmitOutcome::BoundaryNotArmed => {
                     bail!("the SPV-deposit boundary is not armed — no deposit can credit until an operator arms it")
                 }
-                other => tracing::warn!(ledger = index, tx = idx, outcome = ?other,
-                                        "deposit-spv: refused"),
+                other => {
+                    // Name the cause when the enclave banded it. A bare "-202" in the log
+                    // is the -72 problem again, one path over.
+                    let cause = match &other {
+                        SubmitOutcome::PermanentRefusal(rc) => {
+                            crate::attested_clock::spv_cause(*rc as i64)
+                        }
+                        _ => None,
+                    };
+                    tracing::warn!(ledger = index, tx = idx, outcome = ?other,
+                                   cause = cause.unwrap_or("(no banded cause)"),
+                                   "deposit-spv: refused")
+                }
             },
         }
     }
@@ -658,6 +679,27 @@ mod tests {
         // The conservative direction: an unrecognised refusal is more likely a new gate
         // than a hiccup, and retrying forever would bury it.
         assert_eq!(classify_submit(-19), SubmitOutcome::PermanentRefusal(-19));
+
+        // The banded SPV causes must NOT land anywhere benign. -202 is a truncated blob;
+        // before the enclave banded it, it arrived as -2 and this function called it
+        // AlreadySettled — a structural refusal read as a normal repeat.
+        for e in [2i32, 17, 19, 20, 22, 99] {
+            let rc = -200 - e;
+            assert_eq!(
+                classify_submit(rc),
+                SubmitOutcome::PermanentRefusal(rc),
+                "banded cause {rc} must be a refusal, never AlreadySettled"
+            );
+            assert!(
+                crate::attested_clock::spv_cause(rc as i64).is_some(),
+                "banded cause {rc} must be nameable in the log"
+            );
+        }
+        assert_ne!(
+            classify_submit(-202),
+            SubmitOutcome::AlreadySettled,
+            "a truncated blob is not a settled deposit"
+        );
         assert_eq!(
             classify_submit(-12345),
             SubmitOutcome::PermanentRefusal(-12345)
