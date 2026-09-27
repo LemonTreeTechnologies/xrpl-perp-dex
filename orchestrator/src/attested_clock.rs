@@ -189,10 +189,11 @@ async fn advance_once(
         bail!("no buffered validations yet for ledger {index} ({ledger_hash})");
     };
 
-    let val_count = u16::try_from(validations.len())
-        .context("more validations than a u16 count can express")?;
-    let flat: Vec<u8> = validations.iter().flatten().copied().collect();
-    let blob = build_xclk_blob(&header, val_count, &flat)?;
+    // The buffered blobs are raw STValidations and the enclave reads a FRAMED section
+    // (pubkey33 | sig_len | sig | vbody_len | vbody). Handing over the raw concatenation
+    // is what made this driver refuse 100% of ledgers with -72; the builder frames them
+    // and derives the count from what it framed, so the two cannot disagree.
+    let blob = build_xclk_blob(&header, &validations)?;
 
     let rc = match perp.attested_clock_advance(&blob).await {
         Ok(_) => 0i64,

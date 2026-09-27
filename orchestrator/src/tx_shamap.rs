@@ -524,7 +524,7 @@ mod tests {
             .unwrap();
         let (tx, meta) = &items[deep];
         let proof = map.inclusion_proof(&tx_id(tx)).unwrap();
-        let blob = build_xdep_blob(&header, 0, &[], tx, meta, &proof.inner_root_to_leaf).unwrap();
+        let blob = build_xdep_blob(&header, &[], tx, meta, &proof.inner_root_to_leaf).unwrap();
 
         println!(
             "/* XDEP blob, ledger {} tx[{}], emitted by orchestrator build_xdep_blob */",

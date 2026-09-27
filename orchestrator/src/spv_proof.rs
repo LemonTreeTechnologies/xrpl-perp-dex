@@ -328,7 +328,7 @@ pub fn validation_entry(data: &[u8]) -> Result<([u8; 33], Vec<u8>, Vec<u8>)> {
 /// Build the XSPV validations section (`val_count`, concatenated entries) from the raw
 /// `data` blobs collected for one ledger. Each entry: pubkey33 ‖ sig_len u8 ‖ sig ‖
 /// vbody_len u16 ‖ vbody. The enclave dedups + checks each against the pinned UNL.
-pub fn build_validations_section(datas: &[Vec<u8>]) -> Result<(u16, Vec<u8>)> {
+fn build_validations_section(datas: &[Vec<u8>]) -> Result<(u16, Vec<u8>)> {
     let mut out = Vec::new();
     let mut count: u16 = 0;
     for d in datas {
@@ -349,6 +349,30 @@ pub fn build_validations_section(datas: &[Vec<u8>]) -> Result<(u16, Vec<u8>)> {
 /// Assemble the `XSPV` transport blob the enclave parses. `validations` is the
 /// concatenated validation entries (pubkey33|sig_len|sig|vbody_len|vbody)*.
 pub fn build_xspv_blob(
+    header: &[u8; HEADER_LEN],
+    validations: &[Vec<u8>],
+    proofs: &[XspvProof],
+) -> Result<Vec<u8>> {
+    let (val_count, vals) = build_validations_section(validations)?;
+    build_xspv_blob_framed(header, val_count, &vals, proofs)
+}
+
+/// The same bytes from an ALREADY-FRAMED section plus a separately-supplied count.
+///
+/// Private, and it is the shape of this signature that caused a live defect rather than
+/// anything in its body: taking `&[u8]` and a `u16` let two of the three callers pass
+/// the collector's RAW `data` blobs with a count of however many there were. The bytes
+/// were well-formed as a concatenation and meaningless as a validations section, so the
+/// enclave refused every one of them with "the bundle does not parse" — the attested
+/// clock refused 100% of ledgers live on 2026-09-27, and the deposit path would have
+/// done the same the moment it was switched on. Only the reserves path framed properly,
+/// and it is the only one that had ever run.
+///
+/// The public entry points take `&[Vec<u8>]` and derive the count from what they framed,
+/// so the count cannot disagree with the bytes and the framing cannot be skipped. This
+/// one stays for the cross-language vectors, whose filler entries are not real
+/// validations and so cannot be produced by framing anything.
+fn build_xspv_blob_framed(
     header: &[u8; HEADER_LEN],
     val_count: u16,
     validations: &[u8],
@@ -401,6 +425,18 @@ pub fn build_xspv_blob(
 /// cannot approach 64 KiB, whereas real transaction metadata on a busy ledger can.
 pub fn build_xdep_blob(
     header: &[u8; HEADER_LEN],
+    validations: &[Vec<u8>],
+    tx_blob: &[u8],
+    meta: &[u8],
+    inner_root_to_leaf: &[[u8; 512]],
+) -> Result<Vec<u8>> {
+    let (val_count, vals) = build_validations_section(validations)?;
+    build_xdep_blob_framed(header, val_count, &vals, tx_blob, meta, inner_root_to_leaf)
+}
+
+/// Framed-section form — see [`build_xspv_blob_framed`] for why it is private.
+fn build_xdep_blob_framed(
+    header: &[u8; HEADER_LEN],
     val_count: u16,
     validations: &[u8],
     tx_blob: &[u8],
@@ -447,7 +483,13 @@ pub fn build_xdep_blob(
 /// producer therefore appends nothing, and there is no parameter through which it could.
 ///
 /// See `xrpl_spv_parse_clock_transport` in the enclave for the reading half.
-pub fn build_xclk_blob(
+pub fn build_xclk_blob(header: &[u8; HEADER_LEN], validations: &[Vec<u8>]) -> Result<Vec<u8>> {
+    let (val_count, vals) = build_validations_section(validations)?;
+    build_xclk_blob_framed(header, val_count, &vals)
+}
+
+/// Framed-section form — see [`build_xspv_blob_framed`] for why it is private.
+fn build_xclk_blob_framed(
     header: &[u8; HEADER_LEN],
     val_count: u16,
     validations: &[u8],
@@ -478,7 +520,7 @@ mod xclk_producer_tests {
     fn the_blob_is_the_attested_prefix_and_nothing_after_it() {
         let (h, vals) = fixture();
         let flat: Vec<u8> = vals.iter().flatten().copied().collect();
-        let blob = build_xclk_blob(&h, vals.len() as u16, &flat).unwrap();
+        let blob = build_xclk_blob_framed(&h, vals.len() as u16, &flat).unwrap();
 
         assert_eq!(&blob[0..4], b"XCLK", "magic");
         assert_eq!(blob[4], 1, "version");
@@ -503,8 +545,9 @@ mod xclk_producer_tests {
         // magic is the thing keeping a custody proof off the clock path.
         let (h, vals) = fixture();
         let flat: Vec<u8> = vals.iter().flatten().copied().collect();
-        let clk = build_xclk_blob(&h, vals.len() as u16, &flat).unwrap();
-        let dep = build_xdep_blob(&h, vals.len() as u16, &flat, &[1, 2, 3], &[4, 5], &[]).unwrap();
+        let clk = build_xclk_blob_framed(&h, vals.len() as u16, &flat).unwrap();
+        let dep =
+            build_xdep_blob_framed(&h, vals.len() as u16, &flat, &[1, 2, 3], &[4, 5], &[]).unwrap();
         assert_ne!(&clk[0..4], &dep[0..4]);
         assert!(
             dep.len() > clk.len(),
@@ -540,7 +583,7 @@ mod xclk_producer_tests {
             .map(|i| u8::from_str_radix(&flat_hex[i..i + 2], 16).unwrap())
             .collect();
 
-        let produced = build_xclk_blob(&header, val_count, &flat).unwrap();
+        let produced = build_xclk_blob_framed(&header, val_count, &flat).unwrap();
         assert_eq!(
             hex::encode_upper(&produced),
             XCLK_VECTOR,
@@ -554,7 +597,7 @@ mod xclk_producer_tests {
         // that silently dropped the call would hide a node that is not receiving
         // validations behind "the clock just isn't advancing".
         let (h, _) = fixture();
-        let blob = build_xclk_blob(&h, 0, &[]).unwrap();
+        let blob = build_xclk_blob(&h, &[]).unwrap();
         assert_eq!(blob.len(), 9 + HEADER_LEN);
         assert_eq!(
             u16::from_be_bytes([blob[7 + HEADER_LEN], blob[8 + HEADER_LEN]]),
@@ -621,7 +664,7 @@ mod xspv_producer_tests {
         // either side that the other does not follow shows up here rather than as a
         // refused ceremony.
         let header = [0x11u8; HEADER_LEN];
-        let blob = build_xspv_blob(&header, 0, &[], &[real_proof()]).expect("blob builds");
+        let blob = build_xspv_blob(&header, &[], &[real_proof()]).expect("blob builds");
 
         assert_eq!(&blob[0..4], b"XSPV", "magic");
         assert_eq!(blob[4], 1, "version");
@@ -656,7 +699,7 @@ mod xspv_producer_tests {
     fn an_inexpressible_depth_is_refused() {
         let mut p = real_proof();
         p.inner_root_to_leaf = vec![[0u8; 512]; 300];
-        assert!(build_xspv_blob(&[0u8; HEADER_LEN], 0, &[], &[p]).is_err());
+        assert!(build_xspv_blob(&[0u8; HEADER_LEN], &[], &[p]).is_err());
     }
 }
 
@@ -806,8 +849,7 @@ pub async fn fetch_spv_bundle(cfg: &SpvFetchConfig) -> Result<Vec<u8>> {
     }
 
     // 4. assemble the XSPV blob.
-    let (val_count, vals) = build_validations_section(&datas)?;
-    build_xspv_blob(&header, val_count, &vals, &[proof])
+    build_xspv_blob(&header, &datas, &[proof])
 }
 
 #[cfg(test)]
@@ -880,6 +922,114 @@ mod tests {
 
     // A real full-validation `data` for ledger 1124A120… (signing key 027F285B…).
     const VAL_DATA: &str = "228000000126013949042932300C863A2D270CF98511C639511124A12059FA1D708D4CB718767B5C2C1971E6D644F7731BD8D60B8666538532501700000000000000000000000000000000000000000000000000000000000000005019696E5F5288E3EE08676023DB69CFA2E333692B0F7E97D87553CB0312D9C5C0767321027F285B8BB33F0E8B025BF955C29A7CFA8A0995831EE4AD93A9BD572A7C8EEDCD76463044022018975AFA77A0F6D273D8E36F5FDCB4876491FF3CD2719CE5C30D3A464F6CD33B0220383E44ECCAAB37930DBE272AA2586B1CBD287C872E31FEF587D5218142E44554";
+
+    /// Walk a validations section exactly as the enclave's `parse_attested_prefix` does,
+    /// returning how many bytes it consumed. Deliberately a re-implementation and not a
+    /// call into shared code: the point is to hold the producer against the CONSUMER's
+    /// reading of the format, and shared code would let one drift while both stayed green.
+    fn walk_framed(section: &[u8], count: u16) -> Result<usize> {
+        let mut p = 0usize;
+        for _ in 0..count {
+            let rem = section
+                .len()
+                .checked_sub(p)
+                .context("walked past the end")?;
+            if rem < 34 {
+                bail!("truncated at pubkey+sig_len");
+            }
+            p += 33;
+            let sig_len = section[p] as usize;
+            p += 1;
+            let rem = section
+                .len()
+                .checked_sub(p)
+                .context("walked past the end")?;
+            if sig_len > 72 || rem < sig_len + 2 {
+                bail!("truncated at signature");
+            }
+            p += sig_len;
+            let vbody_len = u16::from_be_bytes([section[p], section[p + 1]]) as usize;
+            p += 2;
+            let rem = section
+                .len()
+                .checked_sub(p)
+                .context("walked past the end")?;
+            if rem < vbody_len {
+                bail!("truncated at vbody");
+            }
+            p += vbody_len;
+        }
+        Ok(p)
+    }
+
+    /// THE SEAM, which nothing tested and which cost a live outage.
+    ///
+    /// The collector buffers raw STValidation `data` blobs; the enclave parses a FRAMED
+    /// section (pubkey33 | sig_len | sig | vbody_len | vbody). The step between them lived
+    /// in `build_validations_section`, and two of the three producers never called it —
+    /// they concatenated the raw blobs and passed a count of however many there were. On
+    /// 2026-09-27 the attested clock refused 100% of ledgers with -72 for exactly this,
+    /// and the deposit path would have done the same the moment it was switched on.
+    ///
+    /// Why the existing tests all stayed green: each side was tested against the format as
+    /// its own author read it, and the cross-language vector could not help, because its
+    /// entries are fillers already in wire form rather than anything framed from real
+    /// data. Feeding the vector back through the builder proves the builder copies bytes.
+    ///
+    /// So this starts from a REAL validation and requires the produced section to parse
+    /// under the consumer's own loop and to end EXACTLY at the blob's end — the enclave
+    /// returns TRAILING_GARBAGE for anything else.
+    #[test]
+    fn the_validations_section_is_framed_not_the_raw_data() {
+        let data = hex::decode(VAL_DATA).unwrap();
+        let header = [0x11u8; HEADER_LEN];
+        let blob = build_xclk_blob(&header, std::slice::from_ref(&data)).unwrap();
+
+        let count = u16::from_be_bytes([blob[7 + HEADER_LEN], blob[8 + HEADER_LEN]]);
+        assert_eq!(
+            count, 1,
+            "the builder derives the count from what it framed"
+        );
+        let at = 9 + HEADER_LEN;
+        let consumed = walk_framed(&blob[at..], count).expect("the framed section must parse");
+        assert_eq!(
+            at + consumed,
+            blob.len(),
+            "the section must end exactly at the blob's end"
+        );
+
+        // and the framed entry must carry the REAL content, not merely parse
+        let (pk, sig, vbody) = validation_entry(&data).unwrap();
+        assert_eq!(&blob[at..at + 33], &pk[..], "signing pubkey");
+        assert_eq!(blob[at + 33] as usize, sig.len(), "signature length");
+        assert_eq!(&blob[at + 34..at + 34 + sig.len()], &sig[..], "signature");
+        let vb_at = at + 34 + sig.len();
+        assert_eq!(
+            u16::from_be_bytes([blob[vb_at], blob[vb_at + 1]]) as usize,
+            vbody.len(),
+            "vbody length"
+        );
+    }
+
+    /// PROBE for the test above: the shipped bug must actually fail the same walk.
+    ///
+    /// Without this, `the_validations_section_is_framed_not_the_raw_data` could be passing
+    /// because the walk accepts almost anything. Raw STValidation bytes are a valid blob
+    /// and an invalid section, and this is what the enclave saw for every ledger.
+    #[test]
+    fn the_raw_concatenation_the_clock_shipped_would_not_parse() {
+        let data = hex::decode(VAL_DATA).unwrap();
+        let end = walk_framed(&data, 1);
+        match end {
+            Err(_) => {}
+            Ok(n) => assert_ne!(
+                n,
+                data.len(),
+                "raw `data` must NOT walk cleanly to its end, or the framing check above \
+                 cannot distinguish the bug from the fix"
+            ),
+        }
+    }
 
     #[test]
     fn validation_entry_vbody_verifies() {
