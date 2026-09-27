@@ -30,12 +30,68 @@ set -euo pipefail
 
 DRY=0
 DISARM=0
+ARM_ANYWAY=0
 case "${1:-}" in
-  --dry-run) DRY=1 ;;
-  --disarm)  DISARM=1 ;;
+  --dry-run)    DRY=1 ;;
+  --disarm)     DISARM=1 ;;
+  --arm-anyway) ARM_ANYWAY=1 ;;
   "") ;;
-  *) echo "usage: $0 [--dry-run|--disarm]"; exit 2 ;;
+  *) echo "usage: $0 [--dry-run|--disarm|--arm-anyway]"; exit 2 ;;
 esac
+
+# ── ARMING PRECONDITION ──────────────────────────────────────────────────────
+# The clock was DISARMED on 2026-09-27 on an audit ruling, and the reason does not live
+# in this file's git history where nobody will look — it lives HERE, because the next
+# person to run this with no arguments is re-arming it, and that person may be me in a
+# week with the reason gone from my head.
+#
+# Arming makes the enclave re-seal its state every ~5 seconds instead of a handful of
+# times an hour. Nothing serialised those writes, so two could interleave and leave a
+# MIXED sealed set — sections from two different saves — which the loader accepts
+# SILENTLY, because it checks that sections are PRESENT and not that they are from the
+# same VERSION. That is either a node that will not boot or fund accounting assembled
+# from two different moments with nothing reporting it.
+#
+# Two fixes, and BOTH must be DEPLOYED before arming:
+#   layer 1 — a recursive lock over COMPUTE->CHECK->COMMIT->SAVE. Merged, enclave main
+#             df323f5 (77ph/xrpl-perp-dex-enclave#154). Closes the concurrency cause.
+#   layer 2 — each sealed section stamped with state_version so the loader REFUSES a
+#             mixed set instead of loading it. A sealed-FORMAT change, so it arrives
+#             with a schema bump (β18) and a migration. Design:
+#             docs/audit/REQ-section-version-stamp.md in the enclave repo.
+#
+# Both are enclave changes, so neither is live until a migration has run. Merged is not
+# deployed — check the running enclave, never this comment.
+#
+# Owner's decision, 2026-09-27: ONE migration carrying the SPV cause band, the lock and
+# the section stamp together, and the clock returns after it.
+#
+# TODO when β18 exists: replace this honour-system refusal with a real check — pin β18's
+# MRENCLAVE here and compare it against the live enclave, so arming before the fix is
+# IMPOSSIBLE rather than merely discouraged. It cannot be written yet because β18 has
+# not been built, and writing a placeholder that always passes would be worse than this.
+if [ "$DRY" = 0 ] && [ "$DISARM" = 0 ] && [ "$ARM_ANYWAY" = 0 ]; then
+  cat <<'WHY'
+REFUSING TO ARM.
+
+The attested clock is deliberately off. Arming it makes the enclave re-seal its state
+about twelve times a minute on every node, and until the section-version stamp is
+DEPLOYED, a crash in the wrong millisecond can leave a mixed sealed set that the loader
+accepts silently: inconsistent balances, with nothing reporting it.
+
+Both of these must be live on the cluster first:
+  1. the perp-state lock            (enclave PR #154, main df323f5)
+  2. the per-section version stamp  (beta-18 — not written yet)
+
+Neither is live until a migration has run. Verify against the deployed MRENCLAVE, not
+against this message.
+
+  ./enable-attested-clock.sh --dry-run      see what would change, touch nothing
+  ./enable-attested-clock.sh --disarm       turn it off (idempotent)
+  ./enable-attested-clock.sh --arm-anyway   arm regardless, having read the above
+WHY
+  exit 3
+fi
 
 BASTION="${BASTION:-andrey@94.130.18.162}"
 SSH_OPTS=(-o ConnectTimeout=20)
