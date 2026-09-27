@@ -157,3 +157,50 @@ OLD's `recent_nonces.sealed` is updated AFTER successful encrypt + LA-report pro
 - Seal-policy incident + cutover: `docs/audit/INCIDENT-2026-05-20-mrsigner-seal-policy.md`, REQ-16, REQ-17 (private).
 - Implementation: `EthSignerEnclave/Enclave/path_a.cpp`; `orchestrator/src/node_deploy.rs`, `path_a_migrate_admin.rs`, `path_a_delegation.rs`.
 - Project invariants: `docs/audit/PROJECT-INVARIANTS.md`.
+
+## 10. The NEXT migration — β17 → β18, one bundle (decided 2026-09-27)
+
+**Not yet schedulable.** Layer 2 below is still a design awaiting an audit ruling, so β18
+has no MRENCLAVE and no meta size yet. This section exists so the bundle is decided BEFORE
+anyone is under ceremony pressure, not during.
+
+### 10.1 What rides in β18
+
+| change | why it needs a migration | state |
+|---|---|---|
+| SPV cause band (`xrpl_spv_host_rc`) | any enclave change moves the MRENCLAVE | merged, `ad90ce4` |
+| perp-state lock (recursive, all 31 state-touching ecalls) | same | merged, `df323f5` |
+| per-section `state_version` stamp | **sealed-format** change, so the loader and the sealed files must move together | design filed, `REQ-section-version-stamp.md` |
+
+### 10.2 Why one migration and not three
+
+A migration is the expensive, risky step — we have already paid for one failed bump, where a
+dry run that never BOOTED the new enclave on migrated state cleared a ceremony the enclaves
+then refused. Three bumps is three exposures to that for no gain: nobody is waiting on any
+of the three individually, and the third is the one that gates everything else.
+
+### 10.3 What β18 unblocks
+
+- **The attested clock comes back.** It is deliberately disarmed until the stamp is DEPLOYED
+  (not merged — deployed). `orchestrator/scripts/enable-attested-clock.sh` refuses to arm by
+  default and prints why; `--arm-anyway` is the override.
+- **The trusted-price path (option B) can be cut over.** Certificate validity needs a
+  trustworthy time, so a stale clock cannot validate a cert and the price path would halt on
+  every poll. W5 and the live cutover therefore sit behind the clock, which sits behind β18.
+
+One migration is on the critical path for two tracks. That is the reason to get it right
+rather than to get it early.
+
+### 10.4 Preflight items this bundle adds
+
+- `orchestrator/src/path_a_capacity.rs` needs the β18 meta size, and
+  `orchestrator/scripts/check-meta-sizes-vs-enclave.sh` must pass with `ENCLAVE_REPO` set.
+  That mirror has been two schemas behind the enclave once already and surfaced as a
+  false STOP under live-migration pressure — run the gate with BOTH trees present, not just
+  the orchestrator's CI where it skips.
+- `scripts/ci_perp_state_lock.py` and `scripts/ci_no_reason_on_the_wire.py` (enclave repo)
+  run in `enclave-build`; `orchestrator/scripts/ci_prefix_framing.py` needs `ENCLAVE_REPO`
+  to check its cross-repo half.
+- Step 5a of §3 — BOOT the new enclave on migrated state during the dry run. This is the
+  step whose absence cost a bump; the stamp makes it more load-bearing, not less, because a
+  stamp mismatch is a refusal to boot by design.
