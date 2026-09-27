@@ -204,3 +204,30 @@ rather than to get it early.
 - Step 5a of §3 — BOOT the new enclave on migrated state during the dry run. This is the
   step whose absence cost a bump; the stamp makes it more load-bearing, not less, because a
   stamp mismatch is a refusal to boot by design.
+
+### 10.5 A PRE-MIGRATION GATE, not a nice-to-have: the two-binary upgrade corpus
+
+β18's falsification corpus runs in the SIM container and covers everything a SINGLE build
+can: a torn set refuses, a tampered stamp refuses differently, an absent optional section
+still loads, an intra-section tear refuses. It cannot cover the case this migration actually
+performs — a β17 set loading into a β18 enclave — because producing an UNSTAMPED section needs
+a β17 BINARY, and the stamp lives in MAC-covered AAD so one cannot be forged from a β18 file.
+
+The mid-upgrade FALSE-REJECT logic is covered exhaustively on the host against the same
+accumulator the enclave runs, so the reasoning is tested. What is not tested end to end is the
+thing the ceremony does.
+
+**So before β18 is SCHEDULED, build both binaries and run the upgrade for real:**
+
+1. build β17 (the commit before the stamp) and β18 from source in one job;
+2. drive a β17 server through the real save path to produce a genuine β17 sealed set;
+3. load that set into β18 — assert it LOADS, reports the legacy schema, and re-seals every
+   section stamped (`needs_upgrade`);
+4. load a second time — assert a clean load with the cross-section check now ARMED;
+5. kill the β18 upgrade mid-`rename_chunks` and load again — assert it LOADS and re-upgrades,
+   which is the case that bricked a node in review and the one a single build cannot produce;
+6. assert a β17 blob reads back byte-for-byte through the file-size-probing `unseal_part` —
+   that read path changed for EVERY section, not only the stamped ones.
+
+Step 5 is the reason this is a gate and not a test: the failure it guards is a node that will
+not boot after a routine upgrade, discovered mid-ceremony.
