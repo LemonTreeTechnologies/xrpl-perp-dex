@@ -501,14 +501,18 @@ mod tests {
     ///
     ///   cargo test --locked emit_xdep_vector -- --ignored --nocapture
     ///
-    /// `val_count = 0`: this vector exercises the TRANSPORT and the inclusion path, not
-    /// the quorum — validator signatures are verified by machinery that already has its
-    /// own real-manifest tests, and stapling six signatures in here would make the
-    /// vector huge without testing anything the other suite does not.
+    /// ONE real framed validation, not zero and not six. Zero was the old choice and its
+    /// stated reason — "this vector exercises the transport, not the quorum" — was true and
+    /// still left the vector unable to notice a producer that never framed the validations
+    /// at all, which is the defect that refused every ledger live on 2026-09-27. Six would
+    /// bloat the vector to test what the quorum suite already covers with real manifests.
+    /// One frames real bytes through the shipping path and pins the layout the enclave reads
+    /// (RESP-wire-format-seam-class-ruling-2026-09-27 Q3).
     #[test]
     #[ignore = "vector generator, not an assertion"]
     fn emit_xdep_vector() {
-        use crate::spv_proof::build_xdep_blob;
+        use crate::spv_proof::{build_xdep_blob, REAL_VALIDATION_HEX};
+        let validation = unhex(REAL_VALIDATION_HEX);
         let items = ledger_items();
         let map = TxShaMap::build(&items).unwrap();
         let hdr_v = unhex(v::LEDGER_HEADER);
@@ -524,7 +528,14 @@ mod tests {
             .unwrap();
         let (tx, meta) = &items[deep];
         let proof = map.inclusion_proof(&tx_id(tx)).unwrap();
-        let blob = build_xdep_blob(&header, &[], tx, meta, &proof.inner_root_to_leaf).unwrap();
+        let blob = build_xdep_blob(
+            &header,
+            std::slice::from_ref(&validation),
+            tx,
+            meta,
+            &proof.inner_root_to_leaf,
+        )
+        .unwrap();
 
         println!(
             "/* XDEP blob, ledger {} tx[{}], emitted by orchestrator build_xdep_blob */",
@@ -544,6 +555,13 @@ mod tests {
             }
         }
         println!("\n}};");
+        // The length of the framed validations section, taken as the DIFFERENCE between
+        // the blob with and without it rather than recomputed from field widths. The
+        // enclave tests locate tx_len/meta_len by adding this to the fixed prefix; they
+        // used to hardcode `valcount(0)` and silently pointed at the wrong field the
+        // moment the vector grew a validation.
+        let without = build_xdep_blob(&header, &[], tx, meta, &proof.inner_root_to_leaf).unwrap();
+        println!("#define kXdepValLen {}", blob.len() - without.len());
         println!("#define kXdepTxLen {}", tx.len());
         println!("#define kXdepMetaLen {}", meta.len());
         println!("#define kXdepDepth {}", proof.inner_root_to_leaf.len());
