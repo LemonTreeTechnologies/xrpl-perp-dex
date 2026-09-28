@@ -116,8 +116,23 @@ async fn sign_with(
     signer: &CorpusSigner,
     mut body: serde_json::Value,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
+    // THE TWO FIELDS HAVE OPPOSITE CONVENTIONS, which is why this bug keeps recurring.
+    //
+    // `from` MUST keep its 0x: the enclave checks strlen(account_id) == 42 && [0] == '0' &&
+    // [1] == 'x' and refuses anything else. `session_key` must NOT have it: the enclave
+    // from_hex()es the string and then checks the SIZE, so a 0x-prefixed key decodes to the wrong
+    // length and the refusal reads "Invalid session key size" — which names the size and not the
+    // prefix, so the cause is a guess unless you read the enclave's log.
+    //
+    // /pool/generate returns the session key 0x-PREFIXED, so passing it through unmodified fails.
+    // This project has already lost a genesis ceremony to exactly this (recorded as the
+    // session_key 0x-prefix bug), and it recurred here. Normalised once, at the one place every
+    // signing call goes through, rather than at each caller.
     body["from"] = serde_json::json!(signer.address);
-    body["session_key"] = serde_json::json!(signer.session_key_hex);
+    body["session_key"] = serde_json::json!(signer
+        .session_key_hex
+        .trim_start_matches("0x")
+        .trim_start_matches("0X"));
     let url = format!("{}{}", base.trim_end_matches('/'), path);
     let resp = http
         .post(&url)
@@ -485,6 +500,29 @@ mod tests {
         assert!(check_loopback("https://localhost.evil.example/v1").is_err());
         // …and a userinfo segment must not smuggle a host past the check.
         assert!(check_loopback("https://localhost@10.0.0.5/v1").is_err());
+    }
+
+    #[test]
+    fn the_session_key_is_sent_without_0x_and_the_address_with_it() {
+        // Not cosmetic: the enclave refuses a 0x-prefixed session key with "Invalid session key
+        // size" — a message about the length, not the prefix — and requires the ADDRESS to keep
+        // its prefix. Opposite conventions in adjacent fields, which is how this recurs.
+        let s = CorpusSigner {
+            address: "0x18bac6444d7b815756b883a77200ded21b2cb9ae".into(),
+            session_key_hex: "0xfdd90377d937d6630d526365ac24e4b4e49b4366ece1dc487541fd245e927015"
+                .into(),
+            compressed_pubkey: vec![2u8; 33],
+        };
+        let sent = s.session_key_hex.trim_start_matches("0x");
+        assert!(
+            !sent.starts_with("0x"),
+            "the session key must lose its prefix"
+        );
+        assert_eq!(sent.len(), 64, "32 bytes of hex once the prefix is gone");
+        assert!(
+            s.address.starts_with("0x") && s.address.len() == 42,
+            "the address must KEEP its prefix and be 42 chars"
+        );
     }
 
     #[test]
