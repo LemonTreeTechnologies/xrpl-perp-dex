@@ -143,16 +143,14 @@ fn parse_signing_response(msg: &SigningMessage) -> Option<QuorumEntry> {
 ///   u32 version = 1
 ///   u32 entry_count
 ///   for each: pk_compressed[33] || u8 sig_len(8..=72) || sig[sig_len]
+/// Thin alias over the one canonical producer — see `crate::quorum_bundle`. The mapping to
+/// tuples is the only thing this adds; the byte layout is not restated here.
 fn build_quorum_bundle(entries: &[QuorumEntry]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&1u32.to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for e in entries {
-        out.extend_from_slice(&e.pk);
-        out.push(e.sig.len() as u8);
-        out.extend_from_slice(&e.sig);
-    }
-    out
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = entries
+        .iter()
+        .map(|e| (e.pk.clone(), e.sig.clone()))
+        .collect();
+    crate::quorum_bundle::build(&pairs)
 }
 
 // ── collector: gather off-chain consent over the libp2p relay ────

@@ -287,15 +287,11 @@ fn parse_delegation_response(msg: &SigningMessage) -> Option<DelegationEntry> {
 ///     uint8_t sig_len               (8..72)
 ///     uint8_t sig[sig_len]
 fn build_delegation_bundle(entries: &[DelegationEntry]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&1u32.to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for entry in entries {
-        out.extend_from_slice(&entry.pk);
-        out.push(entry.sig.len() as u8);
-        out.extend_from_slice(&entry.sig);
-    }
-    out
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = entries
+        .iter()
+        .map(|e| (e.pk.clone(), e.sig.clone()))
+        .collect();
+    crate::quorum_bundle::build(&pairs)
 }
 
 // ── tests ────────────────────────────────────────────────────────
