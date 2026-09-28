@@ -257,16 +257,9 @@ impl LibP2PGovernanceBundleCollector {
 /// format the enclave's `seal_verify_quorum_bundle` consumes:
 ///   u32 version=1 || u32 count || { pk[33] || u8 sig_len || sig[sig_len] }…
 /// (little-endian, matching `membership_coordinator::build_quorum_bundle`).
+/// Thin alias — the bytes live in `crate::quorum_bundle`.
 fn build_quorum_bundle(entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&1u32.to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (pk, sig) in entries {
-        out.extend_from_slice(pk);
-        out.push(sig.len() as u8);
-        out.extend_from_slice(sig);
-    }
-    out
+    crate::quorum_bundle::build(entries)
 }
 
 #[async_trait]

@@ -126,16 +126,10 @@ pub fn recover_pubkey_and_der(
 /// Wire format `seal_verify_quorum_bundle_with_set` consumes:
 ///   u32 version=1 || u32 count || { pk[33] || u8 sig_len || sig[sig_len] }…
 /// (matches `mrenclave_governance::build_quorum_bundle`). Entries must be distinct.
+/// Thin alias kept so existing callers and their tests are untouched. The BYTES are written
+/// in exactly one place — see `crate::quorum_bundle`, and the note there on why.
 pub fn build_quorum_bundle(entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&1u32.to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (pk, sig) in entries {
-        out.extend_from_slice(pk);
-        out.push(sig.len() as u8);
-        out.extend_from_slice(sig);
-    }
-    out
+    crate::quorum_bundle::build(entries)
 }
 
 /// backing is AC-BASE-2″ (in-enclave XRPL-SPV), mainnet-forward.
