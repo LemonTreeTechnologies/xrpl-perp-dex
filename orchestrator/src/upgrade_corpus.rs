@@ -360,28 +360,18 @@ pub async fn corpus_admit_new_on_old(
     check_loopback(old_base)?;
     let http = client()?;
 
-    // Chain onto the allowlist head OLD currently holds; a stale prev hash is refused.
-    let status_url = format!(
-        "{}/v1/admin/mrenclaves/status",
-        old_base.trim_end_matches('/')
-    );
-    let v: serde_json::Value = http
-        .get(&status_url)
-        .send()
-        .await
-        .with_context(|| format!("GET {status_url}"))?
-        .json()
-        .await
-        .with_context(|| format!("decode {status_url}"))?;
-    let epoch = v["epoch"].as_u64().unwrap_or(0);
-    let head_hex = v["allowlist_hash"].as_str().unwrap_or("");
-    let mut prev = [0u8; 32];
-    if !head_hex.is_empty() {
-        let raw = hex::decode(head_hex).context("allowlist_hash not hex")?;
-        if raw.len() == 32 {
-            prev.copy_from_slice(&raw);
-        }
-    }
+    // Chain onto the allowlist head OLD currently holds; a stale prev hash is refused with
+    // PREVHASH_MISMATCH (-5). Read through the PRODUCTION source rather than by parsing the
+    // status JSON here: my own reader looked for "epoch" and "allowlist_hash" while the route
+    // answers "allowlist_epoch" and "allowlist_digest", so it silently saw a zero head and
+    // proposed epoch 1 onto a chain already at 1. A second reader of the same response is a
+    // second thing to keep in step with the route.
+    use crate::mrenclave_governance::AllowlistStatusSource;
+    let (epoch, prev) =
+        crate::membership_http::HttpAllowlistStatusSource::new(client()?, old_base.to_string())
+            .current()
+            .await
+            .context("read OLD's current allowlist head")?;
 
     let op = crate::mrenclave_governance::GovernanceOp {
         op: 1, // ADD
