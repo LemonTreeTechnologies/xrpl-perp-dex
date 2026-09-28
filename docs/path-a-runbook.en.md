@@ -284,3 +284,36 @@ This is written down because the defect the fix corrects was **a comment a futur
 — one that inferred a consequence which held in one case and not the other. A merged commit invites
 exactly the same mistake in exactly the same direction, so the claim is stated here in words
 rather than left to a reader's inference.
+
+
+### 10.5.2 The gate HAS been run — what it witnessed, and how to re-run it
+
+**Run 2026-09-28 on the build host, and cleared by audit in substance.** A real β17→β18 Path-A
+ceremony was performed between two SIM servers: genesis, β18's measurement admitted onto β17's
+allowlist, export, import, and then the six steps asserted against the imported set.
+
+    EthSignerEnclave/scripts/two-binary-upgrade-corpus.sh <b17-dir> <b18-dir> [old-port] [new-port]
+    # ORCH_BIN=<orchestrator binary>, KEEP_DIR=1 to preserve the run directory
+
+Each directory needs that build's **own** `enclave.signed.so` *and* `perp-dex-server` — the two
+host binaries are not identical across the commits, so a shared host tests a combination that
+will never ship.
+
+**What it witnessed.** β18 loads a β17-produced set; the schema upgrades (the re-sealed meta
+grows by exactly 8 bytes, β17's 184-byte record becoming β18's 192); the set re-seals stamped and
+reloads cleanly; a **migration-boot tear is refused** with `-33`; an **interrupted import fails
+closed** on unseal (`-30`); and two different sealed shapes both read back.
+
+**That it discriminates** — the property a gate needs and the one easiest to lack. Run against a
+**pre-fix** β18, three assertions fail: the imported meta comes back unstamped, the meta's growth
+is +24 rather than +8, and the migration-boot tear **LOADS** instead of being refused. Step 5 was
+repointed *because* its first form passed on both builds and therefore witnessed nothing — found
+by running the old binary, not by reading the script.
+
+**What it does not establish, and must never be cited for:** reproducible builds (one machine
+built both binaries, and two accounts on one enclave signed the reproducibility proof — that
+bundle asserts a falsehood and is contained only by its keys being throwaway accounts no
+production SignerList holds), a t-of-n quorum, or operator independence in any form.
+
+**The gate clears the migration; it does not schedule it.** Whether and when β18 is deployed
+remains a separate decision with its own consequences.
