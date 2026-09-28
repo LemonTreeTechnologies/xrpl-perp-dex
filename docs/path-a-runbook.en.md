@@ -372,3 +372,34 @@ the real keys.
 **Do not shortcut step 2 by relaxing the admission rule.** The rule is what makes the reproducible
 -build foundation load-bearing rather than aspirational, and the cost of honouring it is one build
 and a comparison.
+
+### 11.4 The allowlist step may not be required at all — CHECK THIS FIRST on resume
+
+**Evidence found after the stop, and it corrects an assumption of mine.** The live accounts
+directory holds `migration_manifest.sealed` — the M4 manifest a **completed** Path-A import
+writes — alongside 14 retired backup sets carrying retired-markers. So the live state **arrived
+through real state-carrying migrations**. And `trusted_mrenclaves.sealed` is **ABSENT**: the
+governed allowlist has never been sealed on this cluster at all.
+
+Those two facts together mean the prior migrations **completed with no allowlist in existence**.
+Either the allowlist gate postdates them, or it is not on the path the export actually takes.
+
+**I asserted the allowlist step was required by reading the current `main` source, not by testing
+the RUNNING binary** (`aead7ecf…`, an older build). That was an assumption dressed as a finding,
+and it is exactly the thing this runbook keeps telling its reader not to do.
+
+**On resume, before anything else:** determine empirically whether the OLD binary enforces the
+allowlist on export — e.g. by letting the **dry run** reach the export step and reading the
+return code. `-25` (`PATH_A_ERR_MRENCLAVE_NOT_ADMITTED`) means it does; a successful export means
+it does not.
+
+**If it does not, the reproducibility dilemma disappears entirely.** No allowlist entry is needed,
+so nothing has to sign "two distinct reproducers confirmed this measurement", and the migration
+proceeds on the GHA-verified build without minting any credential at all. The Oct-1 GHA
+comparison is still worth doing — it is what makes the build trustworthy — but it would no longer
+be the thing standing between here and the ceremony.
+
+**If it does**, §11.3 stands unchanged and the stop was correct on both grounds.
+
+Either way the ethical ground is untouched: *if* an admission credential is needed, it must not be
+a falsehood signed by production keys.
