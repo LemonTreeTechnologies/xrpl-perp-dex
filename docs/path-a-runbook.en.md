@@ -317,3 +317,58 @@ production SignerList holds), a t-of-n quorum, or operator independence in any f
 
 **The gate clears the migration; it does not schedule it.** Whether and when β18 is deployed
 remains a separate decision with its own consequences.
+
+## 11. β18 is PREPARED and STOPPED at the reproducibility gate (2026-09-28)
+
+The pre-flight is complete and the migration was **not** started. Nothing on the live cluster was
+changed — every command in the pre-flight was a read.
+
+### 11.1 Where it stopped, and why it is a hard stop
+
+`trusted_mrenclave_is_admitted` trusts **SELF always** and otherwise requires the governed
+allowlist; with none sealed, *"pre-governance behaviour is exactly the pre-β4 rigid self-match —
+fail-safe by default"*. The live allowlist is **empty on all three nodes** (`entry_count: 0`,
+`allowlist_epoch: 0`), so β18's measurement is not admitted and the export would refuse with
+`PATH_A_ERR_MRENCLAVE_NOT_ADMITTED` (-25).
+
+Admitting it needs `TRUSTED_MRENCLAVES_REPRO_MIN = 2` **distinct reproducers** signing
+`compute_repro_proof_message_hash(MRENCLAVE)`. The live nodes hold operator accounts in the
+SignerList and their orchestrators can collect that quorum automatically — so it is *mechanically*
+available.
+
+**And that is exactly why it is a stop rather than a step.** One machine built this measurement.
+Collecting those signatures would have the **live cluster's production operator keys** sign the
+statement *"two distinct reproducers confirmed this measurement"* — which would be **false**, and
+unlike a test bundle it would be **valid everywhere**: any production enclave handed it admits the
+measurement with `repro_count = 2`. That is precisely the reproducibility bypass `REPRO_MIN`
+exists to prevent, minted by a single builder. A signature is contained by its KEY, and these are
+the real keys.
+
+### 11.2 What is ready
+
+| | |
+|---|---|
+| live cluster | 3 nodes on `aead7ecf…`, **β17-schema** state (meta 744 B), 176 perp sections each, services active, 18–19 GB free |
+| SignerList | bootstrapped, **2-of-3**, version 5 |
+| allowlist | **empty** — this is the stop |
+| β18 hardware build | `367cabb24ea4ae60b58075c4ec974b805077b0f6fac293b9e9954f8287baa308`, MRSIGNER `6a3a3765…`, preserved on the build host at `~/b18-candidate/` with `SHA256SUMS` and a build note |
+| meta-size drift gate | 14/14 constants match, β18 = 192 |
+| NEW-side setup | `perp-next/`, its config and the `perp-dex-enclave-next` unit present on **all three** |
+| orchestrator flags | `--migrate-admin-listen 127.0.0.1:7095` and `--signers-config` set on all three |
+| §10.5 corpus | run, passing, and **discriminating** — it rehearsed this exact schema transition |
+
+### 11.3 Resume procedure — 2026-10-01, when the Actions quota resets
+
+1. **Build β18 through the GHA pipeline** from the same git ref.
+2. **Compare its MRENCLAVE to `367cabb2…`** — the preserved first reproduction.
+   - **Identical** → two reproductions have genuinely occurred, the operator signatures then
+     attest something TRUE, and the repro bundle is honest. Proceed.
+   - **Different** → the build is **not reproducible**, which is a finding in its own right and a
+     harder stop than this one. Do not proceed; investigate the divergence.
+3. Govern the measurement onto all three allowlists (2-of-3 over the orchestrators' relay).
+4. §3.1 side-by-side deploy, then a **dry run** including step 5a — BOOT the new enclave on
+   migrated state — and only on a dry-run PASS, §3.2 in **parallel** on all three nodes.
+
+**Do not shortcut step 2 by relaxing the admission rule.** The rule is what makes the reproducible
+-build foundation load-bearing rather than aspirational, and the cost of honouring it is one build
+and a comparison.
