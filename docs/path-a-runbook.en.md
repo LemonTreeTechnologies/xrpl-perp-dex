@@ -256,3 +256,31 @@ consequence is filed for audit ruling rather than assumed. So the corpus must dr
 and import, which requires a delegation quorum against a sealed SignerList — there is no shortcut
 that is not a forged signature, and a forged one would test the harness instead of the system.
 
+
+
+### 10.5.1 MERGED ≠ MIGRATION-VALIDATED — read this before citing the fix as evidence
+
+The stamp-at-import fix that this gate exists to exercise is **merged into the enclave repo's
+`main`** (PR #172). That is deliberately **not** evidence that it works, and the distinction is
+the reason this subsection exists rather than being left to be inferred.
+
+**What merging it established:** the enclave builds with it; the pure pre-scan's 24 host
+assertions pass with six live mutations firing under AddressSanitizer; the audit ruled the design
+and verified the code firsthand. All of that is evidence about the **code**.
+
+**What merging it did NOT establish:** that a β17 set survives the ceremony into a β18 enclave.
+Nothing in the repository has yet performed a migration. The changed code is migration-path-only —
+`apply_section_reseal_and_check` runs once per section inside the import ecall, and
+`path_a_m3_self_check` is the migration self-check — so it sits **dormant** on a running cluster
+and merging it altered no live behaviour. Dormant is not validated.
+
+**So `main` containing the fix does not satisfy this gate, and no amount of green CI does.** The
+gate is satisfied by the six steps above having been RUN, and specifically by step 5 asserting the
+**post-fix refusal**: a spliced `save_seq = 0` chunk in a `save_seq = 1` set under a stamped meta
+must be refused. That single assertion is what demonstrates the migration-boot check is armed, and
+it is the reason the fix was written.
+
+This is written down because the defect the fix corrects was **a comment a future reader trusted**
+— one that inferred a consequence which held in one case and not the other. A merged commit invites
+exactly the same mistake in exactly the same direction, so the claim is stated here in words
+rather than left to a reader's inference.
