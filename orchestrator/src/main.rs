@@ -2734,15 +2734,22 @@ async fn cli_upgrade_corpus_ceremony(
 
     let mut signers = Vec::new();
     for spec in signer_specs {
-        let parts: Vec<&str> = spec.split(':').collect();
-        if parts.len() != 3 {
-            bail!("--signer wants address:session_key_hex:compressed_pubkey_hex, got {spec:?}");
+        // splitn(4) and not split(): the fourth field is a URL and keeps its own colons.
+        let parts: Vec<&str> = spec.splitn(4, ':').collect();
+        if parts.len() != 4 {
+            bail!(
+                "--signer wants address:session_key_hex:compressed_pubkey_hex:node_base_url, got \
+                 {spec:?}. The node base is required because each enclave can only sign for keys \
+                 IT holds, and the founding set has one account per node."
+            );
         }
+        upgrade_corpus::check_loopback(parts[3])?;
         signers.push(CorpusSigner {
             address: parts[0].to_string(),
             session_key_hex: parts[1].to_string(),
             compressed_pubkey: hex::decode(parts[2])
                 .with_context(|| format!("signer {} pubkey not hex", parts[0]))?,
+            base: parts[3].to_string(),
         });
     }
 

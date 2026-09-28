@@ -49,18 +49,31 @@ pub struct CorpusSigner {
     /// 33-byte compressed secp256k1 pubkey — the bundle carries it; the signing
     /// response does not, so it is captured at account creation.
     pub compressed_pubkey: Vec<u8>,
+    /// WHICH NODE holds this account's private key, as a bare origin.
+    ///
+    /// Necessary, not incidental: sealing a founding set makes each enclave enumerate its OWN
+    /// pool and refuse with NOT_PARTICIPANT unless a member is a key it holds, so the set has one
+    /// account per node — and then a signature can only be requested from the node that holds
+    /// that key. Asking one node for every signature fails on the accounts it does not have.
+    pub base: String,
 }
 
 impl CorpusSigner {
+    /// The XRPL AccountID — RIPEMD160(SHA256(compressed_pubkey)) — and NOT the Ethereum address.
+    ///
+    /// This is the third encoding in the same request body, and getting it wrong is what made the
+    /// founding seal fail with NOT_PARTICIPANT: `SealedSignerList.signers[].account_id` stores the
+    /// AccountID, and the enclave compares it against RIPEMD160(SHA256()) over the keys in its own
+    /// pool. An ETH address is keccak-derived and never matches. Uses the centralised helper,
+    /// which carries the XRPL spec's own test vectors, rather than a fourth local derivation.
     pub fn account_id(&self) -> Result<[u8; 20]> {
-        let raw = self.address.trim_start_matches("0x");
-        let bytes = hex::decode(raw).context("signer address is not hex")?;
-        let mut out = [0u8; 20];
-        if bytes.len() != 20 {
-            bail!("signer address is {} bytes, expected 20", bytes.len());
+        if self.compressed_pubkey.len() != 33 {
+            bail!(
+                "compressed pubkey is {} bytes, expected 33",
+                self.compressed_pubkey.len()
+            );
         }
-        out.copy_from_slice(&bytes);
-        Ok(out)
+        Ok(crate::auth::pubkey_to_account_id(&self.compressed_pubkey))
     }
 }
 
@@ -118,11 +131,11 @@ fn client() -> Result<reqwest::Client> {
 /// reads like a missing route rather than a doubled prefix.
 async fn sign_with(
     http: &reqwest::Client,
-    base: &str,
     path: &str,
     signer: &CorpusSigner,
     mut body: serde_json::Value,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
+    let base = signer.base.as_str();
     // THE TWO FIELDS HAVE OPPOSITE CONVENTIONS, which is why this bug keeps recurring.
     //
     // `from` MUST keep its 0x: the enclave checks strlen(account_id) == 42 && [0] == '0' &&
@@ -161,7 +174,6 @@ async fn sign_with(
 
 /// Collects membership consent over loopback HTTP instead of gossipsub.
 pub struct CorpusConsentCollector {
-    pub base: String,
     pub signers: Vec<CorpusSigner>,
 }
 
@@ -185,14 +197,7 @@ impl MembershipBundleCollector for CorpusConsentCollector {
                 "proposed_epoch": statement.proposed_epoch,
                 "prev_epoch_hash": hex::encode(statement.prev_epoch_hash),
             });
-            let e = sign_with(
-                &http,
-                &self.base,
-                "/v1/admin/signerlist/sign-consent",
-                signer,
-                body,
-            )
-            .await?;
+            let e = sign_with(&http, "/v1/admin/signerlist/sign-consent", signer, body).await?;
             if !entries.iter().any(|(pk, _)| *pk == e.0) {
                 entries.push(e);
             }
@@ -237,7 +242,6 @@ impl ClusterGenesisApplier for CorpusGenesisApplier {
 
 /// Collects Path-A delegation over loopback HTTP instead of gossipsub.
 pub struct CorpusDelegationCollector {
-    pub base: String,
     pub signers: Vec<CorpusSigner>,
 }
 
@@ -255,14 +259,7 @@ impl DelegationCollector for CorpusDelegationCollector {
                 "mrenclave_new": hex::encode(mrenclave_new),
                 "ceremony_nonce": hex::encode(ceremony_nonce),
             });
-            let e = sign_with(
-                &http,
-                &self.base,
-                "/v1/pool/sign/patha-delegation",
-                signer,
-                body,
-            )
-            .await?;
+            let e = sign_with(&http, "/v1/pool/sign/patha-delegation", signer, body).await?;
             if !entries.iter().any(|(pk, _)| *pk == e.0) {
                 entries.push(e);
             }
@@ -294,7 +291,6 @@ pub async fn corpus_genesis(
         })
         .collect();
     let collector = CorpusConsentCollector {
-        base: old_base.to_string(),
         signers: signers.to_vec(),
     };
     let applier = CorpusGenesisApplier {
@@ -327,7 +323,6 @@ pub async fn corpus_genesis(
 /// here, used immediately by the governance call, and never returned to a caller that could
 /// persist it.
 async fn corpus_repro_bundle(
-    base: &str,
     signers: &[CorpusSigner],
     mrenclave_new: &[u8; 32],
 ) -> Result<Vec<u8>> {
@@ -335,14 +330,7 @@ async fn corpus_repro_bundle(
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     for signer in signers {
         let body = serde_json::json!({ "mrenclave": hex::encode(mrenclave_new) });
-        let e = sign_with(
-            &http,
-            base,
-            "/v1/admin/mrenclaves/sign-repro-proof",
-            signer,
-            body,
-        )
-        .await?;
+        let e = sign_with(&http, "/v1/admin/mrenclaves/sign-repro-proof", signer, body).await?;
         if !entries.iter().any(|(pk, _)| *pk == e.0) {
             entries.push(e);
         }
@@ -414,20 +402,13 @@ pub async fn corpus_admit_new_on_old(
             "proposed_epoch": op.proposed_epoch,
             "prev_allowlist_hash": hex::encode(op.prev_allowlist_hash),
         });
-        let e = sign_with(
-            &http,
-            old_base,
-            "/v1/admin/mrenclaves/sign-governance",
-            signer,
-            body,
-        )
-        .await?;
+        let e = sign_with(&http, "/v1/admin/mrenclaves/sign-governance", signer, body).await?;
         if !gov.iter().any(|(pk, _)| *pk == e.0) {
             gov.push(e);
         }
     }
     let gov_bundle = crate::quorum_bundle::build(&gov);
-    let repro_bundle = corpus_repro_bundle(old_base, signers, mrenclave_new).await?;
+    let repro_bundle = corpus_repro_bundle(signers, mrenclave_new).await?;
 
     crate::membership_http::HttpGovernSink::new(client()?)
         .govern_on_node(old_base, &op, &gov_bundle, &repro_bundle)
@@ -453,7 +434,6 @@ pub async fn corpus_ceremony(
     let http = crate::path_a_http_client::HttpEnclaveApi::new()
         .map_err(|e| anyhow!("HttpEnclaveApi: {e}"))?;
     let delegation = CorpusDelegationCollector {
-        base: old_base.to_string(),
         signers: signers.to_vec(),
     };
     let api = crate::path_a_delegation::ComposedEnclaveApi { http, delegation };
@@ -522,6 +502,7 @@ mod tests {
             session_key_hex: "0xfdd90377d937d6630d526365ac24e4b4e49b4366ece1dc487541fd245e927015"
                 .into(),
             compressed_pubkey: vec![2u8; 33],
+            base: "https://localhost:9097".into(),
         };
         let sent = s.session_key_hex.trim_start_matches("0x");
         assert!(
@@ -536,18 +517,28 @@ mod tests {
     }
 
     #[test]
-    fn account_id_requires_twenty_bytes() {
-        let mk = |addr: &str| CorpusSigner {
-            address: addr.to_string(),
+    fn account_id_is_the_xrpl_derivation_not_the_eth_address() {
+        // The enclave compares signers[].account_id against RIPEMD160(SHA256(pubkey)) over its own
+        // pool. Using the ETH address here is what produced NOT_PARTICIPANT on a real run.
+        let pk = vec![2u8; 33];
+        let s = CorpusSigner {
+            address: "0x1111111111111111111111111111111111111111".into(),
             session_key_hex: "00".into(),
-            compressed_pubkey: vec![2u8; 33],
+            compressed_pubkey: pk.clone(),
+            base: "https://localhost:9097".into(),
         };
-        assert!(mk("0x1111111111111111111111111111111111111111")
-            .account_id()
-            .is_ok());
-        assert!(mk("0x1111").account_id().is_err(), "short address");
-        assert!(mk("0xzz11111111111111111111111111111111111111")
-            .account_id()
-            .is_err());
+        let got = s.account_id().expect("33-byte pubkey derives");
+        assert_eq!(got, crate::auth::pubkey_to_account_id(&pk));
+        assert_ne!(
+            got.to_vec(),
+            hex::decode("1111111111111111111111111111111111111111").unwrap(),
+            "it must NOT be the ETH address"
+        );
+
+        let bad = CorpusSigner {
+            compressed_pubkey: vec![2u8; 32],
+            ..s
+        };
+        assert!(bad.account_id().is_err(), "a 32-byte pubkey is refused");
     }
 }
