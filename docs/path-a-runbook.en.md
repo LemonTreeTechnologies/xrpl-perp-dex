@@ -231,3 +231,28 @@ thing the ceremony does.
 
 Step 5 is the reason this is a gate and not a test: the failure it guards is a node that will
 not boot after a routine upgrade, discovered mid-ceremony.
+
+**Step 1 has two prerequisites that are not obvious, both found by running it (2026-09-28):**
+
+- **The signing key must be staged into the second checkout.** `Enclave/Enclave_private.pem` is a
+  gitignored local file, so a fresh `git worktree` or clone of the older commit does not have it and
+  the build fails at *"Failed to open file Enclave/Enclave_private.pem — Error happened while
+  signing the enclave"* — a signing failure, not a compile error, which reads like a code problem
+  and is not one. Using the **same** key for both builds is correct: it fixes MRSIGNER while
+  MRENCLAVE differs by code, which is what one operator signing two releases actually looks like.
+- **Each binary must run with its OWN host.** The two `perp-dex-server` binaries are **not**
+  identical between the two commits, so a harness that builds two enclaves and reuses one host is
+  testing a combination that will never ship.
+
+Verified on the first run of this gate: the two measurements do differ (β17 `1e5529eb…`, β18
+`0183b242…`) under one MRSIGNER, which is what makes steps 3–6 meaningful — and also *why* they
+cannot be done by loading β17's files directly. See the note below.
+
+**Why steps 3–6 need the CEREMONY and not just a file copy.** Every section seals with
+`SGX_KEYPOLICY_MRENCLAVE`, so β18 cannot unseal what β17 sealed — "load that set into β18" is
+impossible as a file operation. It works because the Path-A import **re-seals** the exported
+plaintext under β18's key, which is also why an imported set arrives with no section stamp. The
+consequence is filed for audit ruling rather than assumed. So the corpus must drive a real export
+and import, which requires a delegation quorum against a sealed SignerList — there is no shortcut
+that is not a forged signature, and a forged one would test the harness instead of the system.
+
