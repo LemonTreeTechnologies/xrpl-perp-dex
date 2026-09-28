@@ -57,6 +57,7 @@ mod tx_shamap_vector; // real ledger 20808565, golden vector for the rebuild
 mod types;
 mod unl_policy; // AC-BASE-2″ §6 — UNL policy ceremony (quorum + freshness anchor)
 mod unl_refresh;
+mod upgrade_corpus;
 mod validator_manifests; // AC-BASE-2″ §6 — feed the enclave's measured-anchor validator root
 mod vault_mm;
 mod withdrawal;
@@ -396,6 +397,38 @@ enum Command {
         #[arg(long)]
         accounts_dir: PathBuf,
     },
+
+    /// §10.5 PRE-MIGRATION GATE — the β18 two-binary upgrade corpus, ceremony half.
+    ///
+    /// LOOPBACK ONLY, and refused otherwise before anything is contacted: this performs a REAL
+    /// Path-A migration between two throwaway SIM servers on this host. Aimed at the cluster it
+    /// would export and retire a live node.
+    ///
+    /// It proves the LOADER and the ceremony mechanics. It proves NOTHING about reproducible
+    /// builds or operator independence — one machine builds both binaries and two accounts on one
+    /// enclave sign the reproducibility proof, so that bundle asserts a falsehood and is contained
+    /// by its keys being throwaway accounts no production SignerList holds.
+    UpgradeCorpusCeremony {
+        /// OLD (β17) enclave REST base, e.g. https://localhost:9097/v1
+        #[arg(long)]
+        old_url: String,
+        /// NEW (β18) enclave REST base, e.g. https://localhost:9098/v1
+        #[arg(long)]
+        new_url: String,
+        /// NEW's MRENCLAVE, 64 hex chars
+        #[arg(long)]
+        mrenclave_new: String,
+        /// Escrow account id, 40 hex chars — any value for a corpus run; it only binds the epoch.
+        #[arg(long)]
+        escrow: String,
+        /// Repeatable: `address:session_key_hex:compressed_pubkey_hex`. At least TWO are required,
+        /// because the allowlist's reproducibility floor is 2 distinct signers.
+        #[arg(long = "signer", action = clap::ArgAction::Append, num_args = 1..)]
+        signers: Vec<String>,
+        /// Skip genesis when a SignerList is already sealed on both nodes.
+        #[arg(long)]
+        skip_genesis: bool,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -704,6 +737,24 @@ async fn main() -> Result<()> {
         }
         Some(Command::Balance { api, seed }) => {
             return cli_tools::cli_balance(&api, &seed).await;
+        }
+        Some(Command::UpgradeCorpusCeremony {
+            old_url,
+            new_url,
+            mrenclave_new,
+            escrow,
+            signers,
+            skip_genesis,
+        }) => {
+            return cli_upgrade_corpus_ceremony(
+                &old_url,
+                &new_url,
+                &mrenclave_new,
+                &escrow,
+                &signers,
+                skip_genesis,
+            )
+            .await;
         }
         Some(Command::ConfigInit {
             entries,
@@ -2652,4 +2703,76 @@ async fn main() -> Result<()> {
             last_state_save = Instant::now();
         }
     }
+}
+
+/// §10.5 corpus, ceremony half. Parses the signer triples, seals the founding epoch, admits NEW's
+/// measurement onto OLD's allowlist, and runs the real ceremony. Every step refuses a non-loopback
+/// base before it contacts anything.
+async fn cli_upgrade_corpus_ceremony(
+    old_url: &str,
+    new_url: &str,
+    mrenclave_new_hex: &str,
+    escrow_hex: &str,
+    signer_specs: &[String],
+    skip_genesis: bool,
+) -> anyhow::Result<()> {
+    use anyhow::{bail, Context};
+    use upgrade_corpus::CorpusSigner;
+
+    upgrade_corpus::check_loopback(old_url)?;
+    upgrade_corpus::check_loopback(new_url)?;
+
+    // The floor is structural, not a preference: adding anything to the governed allowlist needs
+    // TRUSTED_MRENCLAVES_REPRO_MIN = 2 DISTINCT reproducers, and a one-signer list can never
+    // satisfy it. Refused here with the reason rather than as an opaque enclave error later.
+    if signer_specs.len() < 2 {
+        bail!(
+            "at least two --signer are required: the allowlist's reproducibility floor is 2 \
+             DISTINCT signers, so a one-signer SignerList cannot admit NEW's measurement at all"
+        );
+    }
+
+    let mut signers = Vec::new();
+    for spec in signer_specs {
+        let parts: Vec<&str> = spec.split(':').collect();
+        if parts.len() != 3 {
+            bail!("--signer wants address:session_key_hex:compressed_pubkey_hex, got {spec:?}");
+        }
+        signers.push(CorpusSigner {
+            address: parts[0].to_string(),
+            session_key_hex: parts[1].to_string(),
+            compressed_pubkey: hex::decode(parts[2])
+                .with_context(|| format!("signer {} pubkey not hex", parts[0]))?,
+        });
+    }
+
+    let escrow_raw = hex::decode(escrow_hex.trim_start_matches("0x")).context("escrow not hex")?;
+    if escrow_raw.len() != 20 {
+        bail!("escrow is {} bytes, expected 20", escrow_raw.len());
+    }
+    let mut escrow = [0u8; 20];
+    escrow.copy_from_slice(&escrow_raw);
+
+    let mre_raw = hex::decode(mrenclave_new_hex).context("mrenclave_new not hex")?;
+    if mre_raw.len() != 32 {
+        bail!("mrenclave_new is {} bytes, expected 32", mre_raw.len());
+    }
+    let mut mrenclave_new = [0u8; 32];
+    mrenclave_new.copy_from_slice(&mre_raw);
+
+    if skip_genesis {
+        println!("corpus: genesis SKIPPED on request");
+    } else {
+        upgrade_corpus::corpus_genesis(escrow, &signers, signers.len() as u32, old_url, new_url)
+            .await?;
+        println!("corpus: founding epoch sealed on both nodes");
+    }
+
+    upgrade_corpus::corpus_admit_new_on_old(old_url, &signers, escrow, &mrenclave_new).await?;
+    println!("corpus: NEW's measurement admitted onto OLD's allowlist");
+
+    let nonce =
+        upgrade_corpus::corpus_ceremony(old_url, new_url, mrenclave_new_hex, &signers).await?;
+    println!("corpus: ceremony COMPLETE, nonce={nonce}");
+    Ok(())
 }
