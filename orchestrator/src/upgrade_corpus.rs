@@ -109,6 +109,13 @@ fn client() -> Result<reqwest::Client> {
 /// so the bytes the enclave verifies are produced the same way — the transport is the only
 /// difference, and on one host the enclave admin API is directly reachable, which is exactly why
 /// the production applier uses p2p (X-C1: it is never network-exposed).
+/// The base URL convention, stated once because mixing the two cost a run.
+///
+/// Every path here — and every path constant in membership_http, and every URL HttpEnclaveApi
+/// builds — INCLUDES the `/v1` prefix, so the base must be the bare origin
+/// (`https://localhost:9097`) and never `https://localhost:9097/v1`. Passing the prefixed form
+/// produced `https://localhost:9097/v1/v1/admin/...` and the node answered "Not found", which
+/// reads like a missing route rather than a doubled prefix.
 async fn sign_with(
     http: &reqwest::Client,
     base: &str,
@@ -181,7 +188,7 @@ impl MembershipBundleCollector for CorpusConsentCollector {
             let e = sign_with(
                 &http,
                 &self.base,
-                "/admin/signerlist/sign-consent",
+                "/v1/admin/signerlist/sign-consent",
                 signer,
                 body,
             )
@@ -251,7 +258,7 @@ impl DelegationCollector for CorpusDelegationCollector {
             let e = sign_with(
                 &http,
                 &self.base,
-                "/pool/sign/patha-delegation",
+                "/v1/pool/sign/patha-delegation",
                 signer,
                 body,
             )
@@ -331,7 +338,7 @@ async fn corpus_repro_bundle(
         let e = sign_with(
             &http,
             base,
-            "/admin/mrenclaves/sign-repro-proof",
+            "/v1/admin/mrenclaves/sign-repro-proof",
             signer,
             body,
         )
@@ -366,7 +373,10 @@ pub async fn corpus_admit_new_on_old(
     let http = client()?;
 
     // Chain onto the allowlist head OLD currently holds; a stale prev hash is refused.
-    let status_url = format!("{}/admin/mrenclaves/status", old_base.trim_end_matches('/'));
+    let status_url = format!(
+        "{}/v1/admin/mrenclaves/status",
+        old_base.trim_end_matches('/')
+    );
     let v: serde_json::Value = http
         .get(&status_url)
         .send()
@@ -407,7 +417,7 @@ pub async fn corpus_admit_new_on_old(
         let e = sign_with(
             &http,
             old_base,
-            "/admin/mrenclaves/sign-governance",
+            "/v1/admin/mrenclaves/sign-governance",
             signer,
             body,
         )
