@@ -403,3 +403,25 @@ be the thing standing between here and the ceremony.
 
 Either way the ethical ground is untouched: *if* an admission credential is needed, it must not be
 a falsehood signed by production keys.
+
+#### 11.4.1 The Oct-1 comparison is load-bearing on BOTH branches
+
+Sharpened by audit, and it is the cleanest argument for doing the comparison because it does not
+depend on the return code at all.
+
+**If the export refuses with `-25`** — the gate is live in the running binary, an admission
+credential is required, and the GHA reproduction is what makes that credential **true** rather
+than a falsehood signed with production keys.
+
+**If the export succeeds** — the gate is present in source and absent from the running binary, and
+has therefore never executed on the cluster it governs, through four completed migrations. Two
+things follow. First, **a protection that exists in the code and has never once run is untested
+and currently ineffective**, which is worth knowing on its own: it reads as safe and is not.
+Second, **β18's own migration is ungated** — the export runs in pre-gate code, so the enclave does
+not check that β18 is admitted or reproduced at all. The only things vouching for β18 are then the
+operators' 2-of-3 delegation and the GHA reproduction, which makes the comparison against
+`367cabb2…` **the sole reproducibility check β18 receives.**
+
+The gate only begins protecting from β18 onward, once a gated binary is the one running.
+
+So: required-and-true, or sole-check. Do the comparison either way.
