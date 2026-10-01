@@ -431,3 +431,17 @@ operators' 2-of-3 delegation and the GHA reproduction, which makes the compariso
 The gate only begins protecting from β18 onward, once a gated binary is the one running.
 
 So: required-and-true, or sole-check. Do the comparison either way.
+
+#### 11.3.1 Pin the git ref for the comparison — `main` has already moved
+
+The preserved measurement `367cabb24ea4ae60b58075c4ec974b805077b0f6fac293b9e9954f8287baa308` was
+built from enclave **`113cba2`**. By 2026-10-01 the enclave's `main` had already advanced past it.
+
+**So the GHA build must target `113cba2` explicitly, not `main`.** A build of a later ref produces
+a different measurement **for a legitimate reason** — different code — and that divergence would
+look exactly like a reproducibility failure while proving nothing about reproducibility. The
+comparison only means something when both sides build the same source.
+
+If β18 is instead respun from a newer ref, that is a decision to make deliberately: the preserved
+measurement no longer applies, the first reproduction is void, and **two fresh independent builds
+of the new ref are needed** before the comparison means anything again.
