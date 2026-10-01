@@ -357,7 +357,13 @@ the real keys.
 | orchestrator flags | `--migrate-admin-listen 127.0.0.1:7095` and `--signers-config` set on all three |
 | §10.5 corpus | run, passing, and **discriminating** — it rehearsed this exact schema transition |
 
-### 11.3 Resume procedure — 2026-10-01, when the Actions quota resets
+### 11.3 Resume procedure — **2026-10-06** (owner's hold, extended 2026-10-01)
+
+> **The blocker has CHANGED and the distinction matters.** The GitHub Actions quota reset on
+> 2026-10-01 as expected, so the GHA pipeline is available — the technical obstacle is gone. The
+> hold from 2026-10-01 to 2026-10-06 is the **owner's scheduling decision**, not a constraint.
+> Nothing was done on 2026-10-01; a reader finding this later should not infer that the Oct-1 steps
+> were taken and should not look for their results.
 
 1. **Build β18 through the GHA pipeline** from the same git ref.
 2. **Compare its MRENCLAVE to `367cabb2…`** — the preserved first reproduction.
