@@ -445,3 +445,33 @@ comparison only means something when both sides build the same source.
 If β18 is instead respun from a newer ref, that is a decision to make deliberately: the preserved
 measurement no longer applies, the first reproduction is void, and **two fresh independent builds
 of the new ref are needed** before the comparison means anything again.
+
+#### 11.3.2 RESULT — the second reproduction MATCHED (2026-10-04)
+
+The owner lifted the quota limit early, so the comparison ran on 2026-10-04 rather than 10-06.
+
+| builder | sign-key | MRENCLAVE |
+|---|---|---|
+| Hetzner host, `docker -f Dockerfile.azure` | operator | `367cabb24ea4ae60b58075c4ec974b805077b0f6fac293b9e9954f8287baa308` |
+| GitHub runner, `docker -f Dockerfile.azure` | ephemeral CI | `367cabb24ea4ae60b58075c4ec974b805077b0f6fac293b9e9954f8287baa308` |
+
+**Bit-identical. Two independent reproductions of `113cba2` exist**, so the reproducibility
+prerequisite (§2.1) is satisfied for β18 and an operator repro-proof signature over this
+measurement would now attest something **true**.
+
+Two things were demonstrated rather than assumed on the way:
+
+- **MRENCLAVE is content-determined and independent of the sign-key.** The two builds used
+  different keys and produced different MRSIGNERs; the measurement matched. That is the premise
+  which makes a CI-signed artefact comparable to an operator-signed one at all, and it had been
+  asserted in the workflow's header rather than shown.
+- **CI configuration is not an input to the measurement.** The GHA build ran from `113cba2` plus a
+  comment in `.github/workflows/enclave-build.yml` — needed because a branch pushed *at* an
+  existing commit fires no workflow — and still matched. If that comment had moved the
+  measurement, the comparison would have been meaningless; it did not.
+
+The run also failed *after* the measurement, on the coverage ratchet, which was a real defect in
+the merged corpus suite (it was absent from the `coverage` target's list, so it was compiled,
+scored 0% and dropped the total from 97.37% to 95.70%). Fixed in enclave `#175` and mechanised, so
+the measurement above is from a run whose later failure was unrelated to the enclave build: the
+docker build and all seven build gates passed, and the dump step succeeded.
