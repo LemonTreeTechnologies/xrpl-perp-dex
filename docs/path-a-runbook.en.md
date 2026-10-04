@@ -108,6 +108,35 @@ Do not co-mingle other applications' sealed state into this scrub — only perp-
 
 ---
 
+### 6.1 §6 does not clear `perp-next/`, and the NEXT deploy refuses because of it
+
+Found on 2026-10-04 while preparing β18, and it would otherwise have surfaced mid-ceremony.
+
+`node-deploy --side-by-side` refuses when `perp-next/` holds anything beyond the node's provisioned
+identity (`config.json`, `perp.pem`). After the previous cycle all three nodes still held:
+
+    accounts/              (EMPTY — 0 files, verified)
+    enclave.signed.so      stale, a different build from the one being deployed
+    perp-dex-orchestrator  stale
+    perp-dex-server        stale
+    civetweb_access.log, enclave.log
+
+So **the deploy refuses on every node until `perp-next/` is cleared**, and nothing in §6 says to
+clear it. The failure arrives at the first step of the next migration, under exactly the time
+pressure a ceremony has.
+
+**It is safe to clear, and that was verified rather than assumed.** `perp/` and `perp/accounts`
+are real directories, not symlinks into `perp-next/`, so the live state is independent of it; and
+`perp-next/accounts` is **empty**, so there is no sealed state in there to lose. What gets removed
+is an empty directory, two logs and three stale binaries.
+
+**Add to §6, after OLD is decommissioned:** clear `perp-next/` down to `config.json` and
+`perp.pem` — those two are the one-time machine setup from §2.5 and must stay. Check
+`perp-next/accounts` is empty before removing it; if it is NOT empty, stop and find out why,
+because that would mean a promoted set was left behind rather than moved.
+
+---
+
 ## 7. Failure modes and recovery
 
 | Symptom | Cause | Recovery |
