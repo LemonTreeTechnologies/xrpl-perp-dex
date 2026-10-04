@@ -394,8 +394,17 @@ Either the allowlist gate postdates them, or it is not on the path the export ac
 the RUNNING binary** (`aead7ecf…`, an older build). That was an assumption dressed as a finding,
 and it is exactly the thing this runbook keeps telling its reader not to do.
 
-**On resume, before anything else:** determine empirically whether the OLD binary enforces the
-allowlist on export — e.g. by letting the **dry run** reach the export step and reading the
+**On resume — and note the order is forced, not preferred.** The empirical read happens AT the
+export step of the dry run, which means the **side-by-side deploy must come first**: the ceremony
+needs NEW's `target_info` and its ephemeral keypair to reach the export at all, so NEW has to be
+running on 9089. The deploy is the non-destructive prerequisite (`OLD is NOT touched`; it writes
+only into `perp-next/`), not a step that can be deferred behind the measurement.
+
+An earlier wording here said *"before anything else"*, which reads as *"before the deploy"* and
+sends a careful reader down a path that cannot execute. Audit took it that way; the order is
+**deploy → dry run → read the rc**.
+
+So: determine empirically whether the OLD binary enforces the allowlist on export — e.g. by letting the **dry run** reach the export step and reading the
 return code. `-25` (`PATH_A_ERR_MRENCLAVE_NOT_ADMITTED`) means it does; a successful export means
 it does not.
 
