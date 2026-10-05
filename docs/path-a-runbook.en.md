@@ -126,6 +126,36 @@ Promote NEW into the canonical `:9088` slot so the orchestrator (which targets `
 
 ---
 
+### 5.3 Re-govern the MRENCLAVE allowlist — MANDATORY after promotion
+
+**Path-A does not carry `trusted_mrenclaves.sealed`.** Found on 2026-10-05 by the dry run's
+inventory diff: OLD holds 183 sealed files and the migration writes 182, and the one left behind
+is the governed allowlist. `kPathASectionTable` has no entry for it — note that
+`recent_nonces.sealed` carries an explicit INTENTIONALLY-NOT-MIGRATED decision with a written
+rationale and this file carries nothing, so it is an omission rather than a choice. It also
+explains §11.4's observation that a cluster with 14 completed migrations had no allowlist at all.
+
+**Nothing breaks on promotion.** SELF is always implicitly admitted — "the cluster must never be
+able to lock itself out, not even with an empty or rolled-back allowlist" — so the promoted NEW
+serves normally, and a node joining with the SAME measurement is admitted without any allowlist.
+
+**What is lost is the governance round**, and its only consumer is the NEXT MRENCLAVE bump, whose
+export refuses with `-25` until the allowlist is governed again. So re-run it after promotion:
+
+```
+bash orchestrator/scripts/govern-b18-and-dryrun.sh      # with MRENCLAVE set to the NEW measurement
+```
+
+Do it now rather than at the next bump, or the next bump starts by looking broken for a reason
+that has nothing to do with it. The dry run reports this as a `followups` entry on every run, so
+it is handed to the operator rather than remembered.
+
+**The forward fix** is a section-table entry for it, mirroring `pinned_unl.sealed` (optional=true,
+added for exactly this reason — "the governance-pinned XRPL UNL must survive MRENCLAVE bumps").
+That is an enclave change, so it belongs in the next bump, not this one.
+
+---
+
 ## 6. OLD decommission — MANDATORY
 
 Decommissioning the OLD enclave is **not optional and not "keep a backup for a few weeks."** `accounts.OLD-…` is a stale copy of customer state; an enclave binary for OLD's MRENCLAVE is reproducible from source, so OLD's sealed state is not cryptographically guaranteed inert. Stale sealed-state copies are a residue and an exposure surface — this is a direct lesson of the MRSIGNER seal-policy incident (INCIDENT-2026-05-20).

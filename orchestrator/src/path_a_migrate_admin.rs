@@ -82,6 +82,11 @@ pub struct MigrateStateResponse {
     /// Why step 5a failed, when it did. `status` alone would not say.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boot_failure: Option<String>,
+    /// Things a SOUND migration still leaves for the operator to redo. In the response
+    /// and not just the log, because a mandatory follow-up nobody is handed is one that
+    /// gets forgotten.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub followups: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -160,6 +165,7 @@ async fn handle_migrate_state(
         Ok(success) => {
             let mut boot_proof = None;
             let mut boot_failure = None;
+            let mut followups: Vec<String> = Vec::new();
             let status: &'static str = if success.dry_run {
                 info!(
                     mrenclave_new = %success.mrenclave_new_hex,
@@ -195,6 +201,16 @@ async fn handle_migrate_state(
                                     "admin: step 5a PASS — NEW booted on the migrated state \
                                        through the startup load path"
                                 );
+                                // A sound migration can still leave REQUIRED follow-up.
+                                // At WARN and in the response both: a mandatory step that
+                                // lives only in someone's memory is not a step.
+                                for f in crate::node_deploy::boot_followups(
+                                    boot_proof.as_ref().expect("set just above"),
+                                ) {
+                                    tracing::warn!(followup = %f,
+                                        "admin: REQUIRED after promotion");
+                                    followups.push(f);
+                                }
                                 // Part C: reset NEW to empty so the REAL ceremony starts clean.
                                 // OLD stayed byte-for-byte inert throughout.
                                 match crate::node_deploy::reset_new_side_after_dry_run().await {
@@ -242,6 +258,7 @@ async fn handle_migrate_state(
                     dry_run: success.dry_run,
                     boot_proof,
                     boot_failure,
+                    followups,
                 }),
             )
                 .into_response()
