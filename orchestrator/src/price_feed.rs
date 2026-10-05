@@ -95,8 +95,15 @@ pub enum DepegVerdict {
     /// no samples, and so does one whose USD venues have all gone quiet. The distinction is
     /// why `samples` exists at all.
     NotMeasured,
-    /// Measured, never over the threshold.
-    Quiet,
+    /// Measured, and not over the threshold SINCE THIS ENCLAVE PROCESS STARTED.
+    ///
+    /// The scope is in the name on purpose. The enclave is deliberately not the system of
+    /// record for alarm history — the counters are process-local, which is the right call for
+    /// a monitoring number that would otherwise cost a sealed-state migration — so a bare
+    /// `Quiet` reading after a restart would mean "nothing since boot" while sounding like
+    /// "never depegged". Retention is the monitor's job, and `updates` below is how a restart
+    /// is detected: it only ever climbs within one process, so a DROP is a restart.
+    QuietSinceStart,
     /// Fired, but not recently. Worth reading the logs for; not worth waking anyone.
     FiredEarlier { age_secs: u64 },
     /// Fired inside the current window. This is the one to act on.
@@ -119,7 +126,13 @@ pub struct DepegHealth {
     /// Accepted price updates that could NOT be measured — no USD baseline at the time.
     /// A number that climbs here means the alarm is going blind while the mark keeps moving.
     pub unmeasured: u64,
+    /// Alarms SINCE THIS PROCESS STARTED — see `QuietSinceStart`. Zero is not "never".
     pub alarm_count: u64,
+    /// Accepted signed price updates since this process started. Surfaced so a caller that
+    /// retains history can tell a restart from a quiet feed: within one process this only
+    /// climbs, so a value LOWER than the previous poll's means the enclave restarted and
+    /// every "since start" number above it reset with it.
+    pub updates: u64,
 }
 
 /// Read a u64 the enclave sent as a decimal STRING.
@@ -178,7 +191,7 @@ pub fn depeg_health(status: &serde_json::Value) -> anyhow::Result<DepegHealth> {
             _ => DepegVerdict::FiredAgeUnknown,
         }
     } else if samples > 0 {
-        DepegVerdict::Quiet
+        DepegVerdict::QuietSinceStart
     } else {
         DepegVerdict::NotMeasured
     };
@@ -189,6 +202,7 @@ pub fn depeg_health(status: &serde_json::Value) -> anyhow::Result<DepegHealth> {
         samples,
         unmeasured,
         alarm_count,
+        updates,
     })
 }
 
@@ -228,6 +242,10 @@ pub async fn cli_price_health(enclave_url: &str) -> anyhow::Result<()> {
         );
     }
     println!("  alarms since start       : {}", h.alarm_count);
+    println!(
+        "  updates since start      : {}  (a DROP between polls means a restart)",
+        h.updates
+    );
 
     match h.verdict {
         DepegVerdict::NotMeasured => {
@@ -236,8 +254,11 @@ pub async fn cli_price_health(enclave_url: &str) -> anyhow::Result<()> {
             println!("  publishers to form a baseline. Zero divergence is not being claimed.");
             Ok(())
         }
-        DepegVerdict::Quiet => {
-            println!("\nverdict: QUIET — measured, and never over the alarm threshold.");
+        DepegVerdict::QuietSinceStart => {
+            println!("\nverdict: QUIET SINCE THIS START — measured, and not over the threshold");
+            println!("  since the enclave process started. That is NOT \"never depegged\": these");
+            println!("  counters are process-local by design, so a restart resets them. Keeping");
+            println!("  the history is the monitor's job, not the enclave's.");
             Ok(())
         }
         DepegVerdict::FiredEarlier { age_secs } => {
@@ -345,11 +366,48 @@ mod tests {
     }
 
     #[test]
-    fn measured_and_never_over_threshold_is_quiet() {
+    fn measured_and_never_over_threshold_is_quiet_since_this_start() {
         let h = depeg_health(&status(13, 400, 0, 0, 1_000_000, 400)).unwrap();
-        assert_eq!(h.verdict, DepegVerdict::Quiet);
+        assert_eq!(h.verdict, DepegVerdict::QuietSinceStart);
         assert_eq!(h.divergence_bp, 13);
         assert_eq!(h.unmeasured, 0);
+    }
+
+    #[test]
+    fn a_restart_is_detectable_because_updates_is_surfaced() {
+        // The enclave is NOT the system of record for alarm history: the counters are
+        // process-local, so a restart resets them and a bare "quiet" would then sound like
+        // "never depegged". A caller that retains history needs to tell those apart, and the
+        // only signal available is that `updates` climbs within a process and never falls.
+        //
+        // So: two polls, the second with FEWER updates and a reset alarm count — exactly what
+        // a restart looks like from outside. The verdict is QuietSinceStart both times, which
+        // is why the scope lives in the variant's NAME; the number is what makes the reset
+        // visible, and it must therefore be surfaced rather than consumed internally.
+        // samples and updates are deliberately DIFFERENT numbers here. With them equal this
+        // test could not tell `updates` from `samples` and would pass against either field —
+        // the drifts-with-subject shape. Probing proved it: with both at 4_000, taking the
+        // field from `samples` instead stayed green.
+        let before = depeg_health(&status(13, 3_900, 2, 999_000, 1_000_000, 4_000)).unwrap();
+        let after = depeg_health(&status(0, 2, 0, 0, 1_000_100, 3)).unwrap();
+        assert_eq!(
+            before.updates, 4_000,
+            "updates, not samples (which is 3_900)"
+        );
+        assert_eq!(
+            before.unmeasured, 100,
+            "and the gap between them is still reported"
+        );
+        assert_eq!(
+            after.updates, 3,
+            "a lower count than the previous poll is the restart"
+        );
+        assert!(after.updates < before.updates);
+        assert_eq!(
+            after.alarm_count, 0,
+            "the earlier alarms did not survive the restart"
+        );
+        assert_eq!(after.verdict, DepegVerdict::QuietSinceStart);
     }
 
     #[test]
