@@ -234,6 +234,19 @@ rather than to get it early.
   step whose absence cost a bump; the stamp makes it more load-bearing, not less, because a
   stamp mismatch is a refusal to boot by design.
 
+  **This line asserted something that was not true of the implementation until 2026-10-05, and
+  it was found by running it rather than by reading.** The dry run did export → import → the M3
+  durability self-check, which unseals INSIDE the already-running NEW process, and then
+  `reset_new_side_after_dry_run` deleted the migrated set and restarted NEW onto an EMPTY
+  directory. So the only restart in the whole rehearsal booted on nothing, while this runbook
+  said the rehearsal covered step 5a. For β18 that gap was the entire risk: the change under
+  test IS a startup-load check, so the one thing that could refuse to boot was the one thing
+  never exercised. The dry run now performs the boot BEFORE the reset, judges it (sealed set
+  present and unchanged, came back, said it verified the migration manifest, printed no
+  refusal), and returns a `boot_proof` in the response. A dry run is a PASS only if 5a passed:
+  `dry-run-ok` now means both, and `dry-run-boot-failed` / `dry-run-boot-not-run` are distinct
+  statuses because an unrun check and a passed check must never share a string.
+
 ### 10.5 A PRE-MIGRATION GATE, not a nice-to-have: the two-binary upgrade corpus
 
 β18's falsification corpus runs in the SIM container and covers everything a SINGLE build
@@ -403,6 +416,9 @@ the real keys.
 3. Govern the measurement onto all three allowlists (2-of-3 over the orchestrators' relay).
 4. §3.1 side-by-side deploy, then a **dry run** including step 5a — BOOT the new enclave on
    migrated state — and only on a dry-run PASS, §3.2 in **parallel** on all three nodes.
+   Read `status` AND `boot_proof` in the response: `dry-run-ok` is the only PASS, and it now
+   requires the 5a boot. `"status":"dry-run-ok"` was previously returned without any boot on
+   migrated state having happened.
 
 **Do not shortcut step 2 by relaxing the admission rule.** The rule is what makes the reproducible
 -build foundation load-bearing rather than aspirational, and the cost of honouring it is one build

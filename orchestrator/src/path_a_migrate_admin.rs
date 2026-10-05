@@ -74,6 +74,14 @@ pub struct MigrateStateResponse {
     /// True if this was a dry-run rehearsal (OLD NOT retired). The operator UI
     /// must show "ready to migrate" only after a dry-run PASS (OPS-AM-5).
     pub dry_run: bool,
+    /// Step 5a — what BOOTING the new enclave on the migrated state proved. Present on a
+    /// dry-run, and carried in the RESPONSE rather than only the log so a skipped or failed
+    /// boot cannot be read as a pass by anyone looking at the one line this returns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_proof: Option<crate::node_deploy::BootProof>,
+    /// Why step 5a failed, when it did. `status` alone would not say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_failure: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -150,26 +158,70 @@ async fn handle_migrate_state(
 
     match driver.run(&params).await {
         Ok(success) => {
+            let mut boot_proof = None;
+            let mut boot_failure = None;
             let status: &'static str = if success.dry_run {
                 info!(
                     mrenclave_new = %success.mrenclave_new_hex,
                     ceremony_nonce = %success.ceremony_nonce_hex,
-                    "admin: DRY-RUN PASS — export+import+durability rehearsed, OLD NOT retired \
-                     (point of no return not crossed)."
+                    "admin: export+import+durability rehearsed, OLD NOT retired (point of no \
+                     return not crossed). Step 5a next — this is NOT yet a dry-run PASS."
                 );
-                // Part C: reset NEW to empty so the REAL ceremony starts clean
-                // (the rehearsal's import populated + loaded NEW's state). OLD
-                // stayed byte-for-byte inert through the dry-run.
-                match crate::node_deploy::reset_new_side_after_dry_run().await {
-                    Ok(()) => {
-                        info!("admin: NEW reset to empty — real ceremony is cleared to run");
-                        "dry-run-ok"
+                // STEP 5A, AND IT RUNS BEFORE THE RESET — the ordering is the whole point.
+                //
+                // The reset below deletes the migrated set so the real ceremony starts clean.
+                // Until this commit it ran immediately, which meant the only restart in the
+                // rehearsal booted NEW on an EMPTY directory while the runbook claimed the dry
+                // run included "BOOT the new enclave on migrated state". The startup load — the
+                // place β18 verifies its section stamp, and the place a mismatch refuses to boot
+                // by design — was never exercised by the thing gating the ceremony.
+                //
+                // A dry run is only a PASS if this passes too. On failure the migrated set is
+                // deliberately LEFT in place for diagnosis; the next rehearsal's reset clears it.
+                match crate::node_deploy::boot_new_on_migrated_state().await {
+                    Ok(proof) => {
+                        let verdict = crate::node_deploy::judge_boot_proof(&proof);
+                        boot_proof = Some(proof);
+                        match verdict {
+                            Err(why) => {
+                                error!(reason = %why, "admin: STEP 5A FAILED — the dry run is NOT \
+                                    a pass. NEW's migrated set is left in place for diagnosis. \
+                                    Do NOT run the real ceremony.");
+                                boot_failure = Some(why);
+                                "dry-run-boot-failed"
+                            }
+                            Ok(()) => {
+                                info!(
+                                    "admin: step 5a PASS — NEW booted on the migrated state \
+                                       through the startup load path"
+                                );
+                                // Part C: reset NEW to empty so the REAL ceremony starts clean.
+                                // OLD stayed byte-for-byte inert throughout.
+                                match crate::node_deploy::reset_new_side_after_dry_run().await {
+                                    Ok(()) => {
+                                        info!(
+                                            "admin: DRY-RUN PASS — NEW reset to empty, real \
+                                               ceremony is cleared to run"
+                                        );
+                                        "dry-run-ok"
+                                    }
+                                    Err(e) => {
+                                        error!(error = %e, "admin: DRY-RUN PASSED but NEW-reset \
+                                            FAILED — operator MUST clear perp-next/accounts + \
+                                            restart perp-dex-enclave-next before the real ceremony");
+                                        "dry-run-ok-reset-failed"
+                                    }
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
-                        error!(error = %e, "admin: DRY-RUN PASSED but NEW-reset FAILED — operator \
-                            MUST clear perp-next/accounts + restart perp-dex-enclave-next before \
-                            the real ceremony");
-                        "dry-run-ok-reset-failed"
+                        // Could not even perform the boot. NOT a pass: an unrun check and a
+                        // passed check must never share a status string.
+                        error!(error = %e, "admin: step 5a could not be RUN — the dry run is not \
+                            a pass and NEW's set is left in place");
+                        boot_failure = Some(format!("step 5a could not be run: {e:#}"));
+                        "dry-run-boot-not-run"
                     }
                 }
             } else {
@@ -188,6 +240,8 @@ async fn handle_migrate_state(
                     mrenclave_new_hex: success.mrenclave_new_hex,
                     manifest_hash_hex: success.manifest_hash_hex,
                     dry_run: success.dry_run,
+                    boot_proof,
+                    boot_failure,
                 }),
             )
                 .into_response()

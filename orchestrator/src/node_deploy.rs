@@ -494,6 +494,145 @@ pub async fn deploy_local_side_by_side(
     })
 }
 
+/// What a step-5a boot actually proved. Returned and surfaced in the admin response so an
+/// operator cannot mistake a boot that was SKIPPED for one that PASSED — the distinction that
+/// cost a bump once already.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BootProof {
+    /// Sealed files in NEW's accounts dir before the restart. A migrated set is ~180 files; a
+    /// count of 0 or 1 means there is nothing to boot ON, and booting anyway proves nothing.
+    pub sealed_files_before: usize,
+    /// After. A boot must READ the set, never consume or rewrite it.
+    pub sealed_files_after: usize,
+    /// Did NEW answer /version again within the budget.
+    pub came_back: bool,
+    pub mrenclave_after: Option<String>,
+    /// Did the enclave say, on THIS boot, that it verified the migration manifest. This is what
+    /// separates "it booted" from "it booted ON THE MIGRATED STATE": an empty NEW boots
+    /// perfectly happily and says `sealed SignerList absent` instead.
+    pub post_migration_marker: bool,
+    /// The enclave's own refusal sentence, if it printed one on this boot.
+    pub load_refusal: Option<String>,
+}
+
+/// The verdict, PURE and separate from the I/O above so every branch can be probed without a
+/// cluster. Ok(()) means step 5a passed; Err carries what an operator must read.
+pub fn judge_boot_proof(p: &BootProof) -> Result<(), String> {
+    // Order matters: the "nothing to boot on" case must be caught BEFORE the came-back check,
+    // or an empty NEW that starts fine would report a PASS. That is the can't-discriminate
+    // shape, and it is the exact failure this whole function exists to refuse.
+    if p.sealed_files_before <= 1 {
+        return Err(format!(
+            "nothing to boot ON: {} sealed file(s) in NEW's accounts dir. A migrated set is ~180 \
+             files. An empty NEW boots perfectly happily, so a PASS here would mean nothing.",
+            p.sealed_files_before
+        ));
+    }
+    if !p.came_back {
+        return Err(match &p.load_refusal {
+            Some(line) => format!(
+                "NEW did NOT come back with the migrated set present, and refused in its own \
+                 words: {line}. For β18 this is the gate working: the section stamp is verified \
+                 at STARTUP LOAD and a mismatch is a refusal to boot by design."
+            ),
+            None => "NEW did NOT come back with the migrated set present, and printed no refusal \
+                     sentence. Read perp-next/enclave.log before anything else."
+                .to_string(),
+        });
+    }
+    if p.sealed_files_after != p.sealed_files_before {
+        return Err(format!(
+            "the sealed set CHANGED across the boot: {} files before, {} after. A load reads the \
+             set; it must not consume or rewrite it.",
+            p.sealed_files_before, p.sealed_files_after
+        ));
+    }
+    if let Some(line) = &p.load_refusal {
+        return Err(format!(
+            "NEW came back BUT printed a refusal on this boot: {line}. A live port is not a \
+             loaded state."
+        ));
+    }
+    if !p.post_migration_marker {
+        return Err(
+            "NEW came back and printed no refusal, but never said it verified the migration \
+             manifest — so it may have booted WITHOUT adopting the migrated state. That reads \
+             identically to success from the outside, which is why this check exists."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn count_files(dir: &str) -> usize {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => entries.flatten().filter(|e| e.path().is_file()).count(),
+        Err(_) => 0,
+    }
+}
+
+/// Runbook §3 step 5a — BOOT the new enclave on migrated state, during the dry run.
+///
+/// WHY THIS FUNCTION HAD TO EXIST. The dry run proved export → import → the M3 durability
+/// self-check, and that self-check unseals INSIDE the already-running NEW process. It never
+/// exercised the STARTUP LOAD path. Then `reset_new_side_after_dry_run` deleted the migrated
+/// set and restarted NEW onto an EMPTY directory — so the only restart in the whole rehearsal
+/// booted on nothing. The runbook asserted the dry run included step 5a; the implementation
+/// did the opposite, and nothing said so.
+///
+/// For β18 that gap is the whole risk: the change under test IS a startup-load check (the
+/// section stamp keyed on save_seq), and a stamp mismatch is a refusal to boot BY DESIGN. The
+/// one thing that could refuse was the one thing never exercised.
+///
+/// So this runs BEFORE the reset, while the migrated set is still on disk, and it is ordered
+/// that way deliberately: the reset is what makes the real ceremony start clean, and it must
+/// not happen until the boot it would erase has been proven.
+pub async fn boot_new_on_migrated_state() -> Result<BootProof> {
+    let accounts_dir = format!("{DEPLOY_DIR_NEW}/accounts");
+    let log_path = format!("{DEPLOY_DIR_NEW}/enclave.log");
+
+    let sealed_files_before = count_files(&accounts_dir);
+    // Only the lines THIS boot writes are evidence. Starting the scan at the current length
+    // keeps an earlier boot's marker — or an earlier refusal — from being read as this one's.
+    let log_offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+
+    info!(
+        sealed_files_before,
+        "step 5a: restarting {ENCLAVE_UNIT_NEW} to BOOT it on the migrated state"
+    );
+    sudo_systemctl(&["stop", ENCLAVE_UNIT_NEW]).await?;
+    sudo_systemctl(&["start", ENCLAVE_UNIT_NEW]).await?;
+
+    // A refusal to boot is an EXPECTED outcome here, not an error: it is what a β18 stamp
+    // mismatch looks like. So a timeout is captured as `came_back: false` and judged, never
+    // propagated as a transport failure that would hide the finding.
+    let mrenclave_after = curl_version_with_retry(ENCLAVE_PORT_NEW, Duration::from_secs(60))
+        .await
+        .ok();
+    let came_back = mrenclave_after.is_some();
+    let sealed_files_after = count_files(&accounts_dir);
+
+    let fresh = std::fs::read(&log_path)
+        .map(|b| String::from_utf8_lossy(&b[(log_offset as usize).min(b.len())..]).to_string())
+        .unwrap_or_default();
+    let post_migration_marker = fresh.contains("migration manifest verified");
+    let load_refusal = fresh
+        .lines()
+        .find(|l| l.contains("FATAL") || l.contains("perpLoadState failed"))
+        .map(|l| l.trim().to_string());
+
+    let proof = BootProof {
+        sealed_files_before,
+        sealed_files_after,
+        came_back,
+        mrenclave_after,
+        post_migration_marker,
+        load_refusal,
+    };
+    info!(?proof, "step 5a: boot proof");
+    Ok(proof)
+}
+
 /// REQ-β4.2 Part C — reset the NEW enclave to empty after a dry-run rehearsal,
 /// so the subsequent REAL ceremony starts clean. A dry-run's import populated
 /// `{DEPLOY_DIR_NEW}/accounts` and loaded that state into NEW's memory; stop
@@ -713,6 +852,123 @@ async fn curl_version_with_retry(port: u16, budget: Duration) -> Result<String> 
 
 #[cfg(test)]
 mod tests {
+    fn good_proof() -> BootProof {
+        BootProof {
+            sealed_files_before: 182,
+            sealed_files_after: 182,
+            came_back: true,
+            mrenclave_after: Some("367cabb2".repeat(8)),
+            post_migration_marker: true,
+            load_refusal: None,
+        }
+    }
+
+    #[test]
+    fn a_boot_on_the_migrated_set_that_verified_the_manifest_passes() {
+        assert!(judge_boot_proof(&good_proof()).is_ok());
+    }
+
+    #[test]
+    fn an_empty_new_booting_fine_is_not_a_pass() {
+        // THE case this function exists for, and the reason the emptiness check is FIRST.
+        // Before step 5a existed, the only restart in the rehearsal happened after the reset
+        // had deleted the migrated set — so NEW came up clean, answered /version, and anything
+        // keyed on "did it come back" would have called that a pass. It proves nothing.
+        for n in [0usize, 1] {
+            let p = BootProof {
+                sealed_files_before: n,
+                came_back: true,
+                ..good_proof()
+            };
+            let e = judge_boot_proof(&p).unwrap_err();
+            assert!(e.contains("nothing to boot ON"), "n={n}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_to_boot_is_reported_as_the_gate_working() {
+        // For β18 this is the EXPECTED shape of a bad stamp, so the message has to say so
+        // rather than read like a transport failure.
+        let p = BootProof {
+            came_back: false,
+            load_refusal: Some("FATAL: sealed perp state present but failed to load".into()),
+            ..good_proof()
+        };
+        let e = judge_boot_proof(&p).unwrap_err();
+        assert!(e.contains("FATAL"), "{e}");
+        assert!(e.contains("refusal to boot by design"), "{e}");
+    }
+
+    #[test]
+    fn a_silent_failure_to_come_back_points_at_the_log() {
+        let p = BootProof {
+            came_back: false,
+            load_refusal: None,
+            ..good_proof()
+        };
+        let e = judge_boot_proof(&p).unwrap_err();
+        assert!(e.contains("enclave.log"), "{e}");
+    }
+
+    #[test]
+    fn a_boot_that_changed_the_sealed_set_fails() {
+        // A load READS the set. If the count moved, something rewrote or consumed it, and
+        // whatever the next step would migrate is no longer what was just proven.
+        let p = BootProof {
+            sealed_files_after: 181,
+            ..good_proof()
+        };
+        let e = judge_boot_proof(&p).unwrap_err();
+        assert!(e.contains("CHANGED across the boot"), "{e}");
+    }
+
+    #[test]
+    fn a_live_port_with_a_refusal_in_the_log_is_not_a_pass() {
+        let p = BootProof {
+            came_back: true,
+            load_refusal: Some("Error: perpLoadState failed (ret=-33)".into()),
+            ..good_proof()
+        };
+        let e = judge_boot_proof(&p).unwrap_err();
+        assert!(e.contains("A live port is not a loaded state"), "{e}");
+    }
+
+    #[test]
+    fn coming_back_without_the_manifest_marker_is_not_a_pass() {
+        // The discriminating assertion: an enclave that ignored the set boots happily and says
+        // `sealed SignerList absent`. From outside, identical to success.
+        let p = BootProof {
+            post_migration_marker: false,
+            ..good_proof()
+        };
+        let e = judge_boot_proof(&p).unwrap_err();
+        assert!(
+            e.contains("never said it verified the migration manifest"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn the_emptiness_check_is_ordered_before_the_came_back_check() {
+        // Order is load-bearing, not stylistic. With the checks swapped, an empty NEW that
+        // came back would be judged on `came_back` and pass. Asserted as an ORDER property:
+        // a proof that is bad in BOTH ways must report the emptiness, because that is the one
+        // that makes the rest of the verdict meaningless.
+        let p = BootProof {
+            sealed_files_before: 0,
+            sealed_files_after: 0,
+            came_back: false,
+            post_migration_marker: false,
+            load_refusal: Some("FATAL: something".into()),
+            ..good_proof()
+        };
+        let e = judge_boot_proof(&p).unwrap_err();
+        assert!(
+            e.contains("nothing to boot ON"),
+            "emptiness must win the race: {e}"
+        );
+    }
+
     use super::*;
     use std::io::Write;
 
