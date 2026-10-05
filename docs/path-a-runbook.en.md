@@ -139,6 +139,15 @@ explains §11.4's observation that a cluster with 14 completed migrations had no
 able to lock itself out, not even with an empty or rolled-back allowlist" — so the promoted NEW
 serves normally, and a node joining with the SAME measurement is admitted without any allowlist.
 
+**TWO consumers, not one** (audit 2026-10-05; my first reading found only the first and said so).
+`admission.cpp` gates BOTH `ADMIT_PURPOSE_PATHA_TARGET` and `ADMIT_PURPOSE_NODE_BOOTSTRAP` on the
+allowlist. So a bootstrap-joining node behaves differently with the allowlist absent — but in the
+SAFE direction: it falls back to self-only and therefore REJECTS a different-but-governed
+measurement rather than admitting an un-governed one. That is a liveness restriction, latent in a
+homogeneous cluster where every join is the self measurement. Both consumers lose the ability to
+admit a DIFFERENT governed measurement; neither gains the ability to admit an UNGOVERNED one, and
+that asymmetry is what keeps this at low severity rather than the reverse.
+
 **What is lost is the governance round**, and its only consumer is the NEXT MRENCLAVE bump, whose
 export refuses with `-25` until the allowlist is governed again. So re-run it after promotion:
 

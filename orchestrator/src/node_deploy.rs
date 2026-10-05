@@ -552,7 +552,11 @@ const ABSENT_BUT_MUST_BE_REESTABLISHED: &[(&str, &str)] = &[(
      omission rather than a choice. Nothing breaks today: SELF is always implicitly admitted, \
      so the cluster cannot lock itself out and a node joining with the SAME measurement is \
      admitted without any allowlist. What IS lost is the 2-of-3 governance round that admitted \
-     this target, and the only consumer of that is the NEXT MRENCLAVE bump — whose export will \
+     this target. TWO purposes consult the allowlist, not one — PATHA_TARGET and \
+     NODE_BOOTSTRAP (audit 2026-10-05, correcting my first reading) — and both lose only \
+     the ability to admit a DIFFERENT governed measurement, never gaining the ability to \
+     admit an UNGOVERNED one, which is the asymmetry that keeps this low. The consumer \
+     that bites operationally is the NEXT MRENCLAVE bump — whose export will \
      refuse with -25 until the allowlist is governed again. MANDATORY after promotion: re-run \
      the governance so the next bump does not start by looking broken.",
 )];
