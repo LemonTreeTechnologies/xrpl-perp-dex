@@ -555,10 +555,17 @@ const ABSENT_BUT_MUST_BE_REESTABLISHED: &[(&str, &str)] = &[(
      this target. TWO purposes consult the allowlist, not one — PATHA_TARGET and \
      NODE_BOOTSTRAP (audit 2026-10-05, correcting my first reading) — and both lose only \
      the ability to admit a DIFFERENT governed measurement, never gaining the ability to \
-     admit an UNGOVERNED one, which is the asymmetry that keeps this low. The consumer \
-     that bites operationally is the NEXT MRENCLAVE bump — whose export will \
-     refuse with -25 until the allowlist is governed again. MANDATORY after promotion: re-run \
-     the governance so the next bump does not start by looking broken.",
+     admit an UNGOVERNED one, which is the asymmetry that keeps this low. The NEXT bump needs ITS OWN \
+     target admitted, which was always the procedure, so having the previous measurement \
+     listed does not help it. The sharper loss is the epoch CHAIN: governance is \
+     replay-protected by binding each op to {op, mrenclave, epoch, prev_allowlist_hash}, and \
+     with no sealed allowlist the enclave falls back to the implicit empty genesis state — \
+     observed after the 2026-10-05 migration as epoch=0 digest=63e0a485f9ce159c, byte for \
+     byte what it was before the first governance round. So every bundle ever signed for \
+     epoch 1 is valid AGAIN. Nil exposure here (the only such bundle admitted the \
+     measurement now running), but that is the real reason to fix the section table. \
+     Re-governing after promotion is OPTIONAL and tidy — it moves the chain off genesis — \
+     and see runbook §5.3, which first said MANDATORY and was corrected.",
 )];
 
 /// What a sound migration nonetheless leaves for the operator to redo, with why.
@@ -1124,10 +1131,31 @@ mod tests {
         let f = boot_followups(&p);
         assert_eq!(f.len(), 1, "and it must NOT pass silently: {f:?}");
         assert!(f[0].contains("GOVERNED MRENCLAVE ALLOWLIST"), "{:?}", f[0]);
-        assert!(f[0].contains("MANDATORY after promotion"), "{:?}", f[0]);
+        // The message first said re-governing was MANDATORY and named -25 as the consequence.
+        // Both were wrong — the next bump needs ITS OWN target admitted either way — so these
+        // assertions moved WITH the correction rather than being loosened to keep passing.
         assert!(
-            f[0].contains("-25"),
-            "it must name what the next bump will see: {:?}",
+            f[0].contains("epoch CHAIN"),
+            "the real loss must be named: {:?}",
+            f[0]
+        );
+        assert!(
+            f[0].contains("valid AGAIN"),
+            "and its consequence: {:?}",
+            f[0]
+        );
+        assert!(
+            f[0].contains("OPTIONAL"),
+            "re-governing is not mandatory: {:?}",
+            f[0]
+        );
+        // The retracted CLAIM, not the bare word: the text legitimately says "first said
+        // MANDATORY and was corrected", and an assertion on the word alone caught the
+        // retraction's own reference to it. A check that fires on its own correction is too
+        // broad, which is its own small lesson about asserting on substrings.
+        assert!(
+            !f[0].contains("MANDATORY after promotion"),
+            "the retracted claim must not survive in the text: {:?}",
             f[0]
         );
     }
