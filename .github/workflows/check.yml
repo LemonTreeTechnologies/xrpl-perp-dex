@@ -65,5 +65,10 @@ jobs:
       # The same lesson one format over: the prefix-framing defect had three producers against
       # one parser and two never framed. This counts the producers of the QUORUM-BUNDLE format,
       # which had four until they were consolidated.
+      # The path is relative to this job's working-directory (orchestrator), NOT the repo
+      # root. It was written as `orchestrator/scripts/...` and so resolved to
+      # orchestrator/orchestrator/... and exited 127 on every run — i.e. this gate has
+      # never once executed. It merged during the Actions-quota outage, when nothing ran
+      # to say so, which is the second time a quota-dead gate has let a defect through.
       - name: one quorum-bundle producer
-        run: orchestrator/scripts/ci_one_quorum_bundle_producer.py
+        run: scripts/ci_one_quorum_bundle_producer.py
