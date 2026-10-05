@@ -39,7 +39,8 @@ scp -q -o BatchMode=yes "$HERE/govern-b18-remote.sh" "$BASTION:/tmp/govern-b18-r
   || { echo "FAILED: cannot reach the bastion $BASTION"; exit 2; }
 
 echo "[1/5] allowlist BEFORE"
-run allowlist
+before="$(run allowlist)"
+printf '%s\n' "$before"
 hr
 
 echo "[2/5] what each node's NEW enclave on 9089 actually reports"
@@ -64,7 +65,25 @@ echo "  all three report exactly the measurement being admitted"
 hr
 
 echo "[3/5] governing — 2-of-3 operator quorum over the p2p relay, up to ~2 min"
-run govern
+# SKIP IT IF IT IS ALREADY DONE. The enclave refuses a duplicate add with code -11 on
+# purpose — "reject no-ops early so a wasted governance round is visible to operators rather
+# than silently consuming an epoch" — so re-running this step on an already-admitted
+# measurement reported a 0-of-3 FAILURE on an allowlist that was already correct, and the
+# orchestrator then advised a retry that can never succeed.
+#
+# An earlier version of this comment claimed the step was idempotent. It is not, and the
+# enclave is deliberately not: that is the design, and the script was the thing that was
+# wrong. So the check moves here — ask the allowlist first, and govern only if there is
+# something to govern.
+before_entries="$(printf '%s\n' "$before" | grep -c "entries=1" || true)"
+if [ "$OP" = "add" ] && [ "$before_entries" -eq 3 ]; then
+  echo "  SKIPPED — all three nodes already hold 1 entry at the same digest, so there is"
+  echo "  nothing to govern. A duplicate add returns -11 by design and consumes no epoch."
+  echo "  (If that one entry is a DIFFERENT measurement, step [2/5] above would have"
+  echo "  mismatched and this script would already have stopped.)"
+else
+  run govern
+fi
 hr
 
 echo "[4/5] allowlist AFTER"
@@ -94,11 +113,23 @@ hr
 cat <<'READ'
 How to read the line above:
 
-  "status":"ok"                      the export PROCEEDED. The gate's ADMIT path has fired for
-                                     the first time in this cluster's life.
-  code=-25 MRENCLAVE_NOT_ADMITTED    still refused — the admission did not reach the enclave
-                                     that performs the export.
+  "status":"dry-run-ok"              FULL PASS: export, import, durability AND step 5a — the
+                                     new enclave BOOTED on the migrated state through the
+                                     startup load path. Check boot_proof says
+                                     post_migration_marker:true and the sealed file count is
+                                     the same before and after. Only this clears the ceremony.
+  "status":"dry-run-boot-failed"     the 5a boot ran and was judged a FAILURE; boot_failure
+                                     says why. For β18 a refusal to boot is the gate working:
+                                     the section stamp is checked at startup load. The
+                                     migrated set is LEFT on disk for diagnosis. Do not run
+                                     the ceremony.
+  "status":"dry-run-boot-not-run"    the boot could not be performed. Also NOT a pass.
+  code=-25 MRENCLAVE_NOT_ADMITTED    the export refused — the admission did not reach the
+                                     enclave that performs the export.
   anything else                      a different failure; send the whole line.
+
+  NOTE: an earlier version of this text promised "status":"ok" for the success case. The
+  route returns "dry-run-ok" on a dry run, so the real success read as "anything else".
 
 OLD is still serving on 9088 either way. Nothing has been retired, and the governance can be
 undone with OP=remove.
