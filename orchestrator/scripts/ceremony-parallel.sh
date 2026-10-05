@@ -206,11 +206,34 @@ fi
 # ── FIRE. All three at once, not one after another. ───────────────────────────
 DRY=true; [ "$MODE" = "real" ] && DRY=false
 echo "[3/3] firing on all three CONCURRENTLY (dry_run=$DRY)"
+# THE BODY TRAVELS ON STDIN, and that is not a style choice.
+#
+# The first version passed it as part of the command string: on() wraps its argument in single
+# quotes, and the argument itself contained `printf '%s' '{...}'` — whose own single quotes
+# terminated the outer quoting. curl then received the word `printf` as a hostname and all three
+# nodes failed with "Could not resolve host: printf". Exactly the quoting-inside-quoting that
+# forced govern-b18 into two files, walked into again.
+#
+# It failed SAFE — 0 of 3, nothing fired, OLD untouched — and in `real` mode it would equally
+# have fired nothing rather than half a cluster. But the fix has to remove the nesting, not
+# escape it better: piping the JSON through both ssh hops leaves ONE level of quoting on the
+# remote side and no quoting of the payload at all.
+#
+# The pipe is inside the subshell, so the backgrounded job's stdin being /dev/null does not
+# matter here — printf feeds ssh directly. (That trap is real: a backgrounded `cat > file` with
+# no pipe reads /dev/null and silently writes an empty file, which is how an earlier build
+# script in this repo shipped 0 bytes.)
+BODY="{\"expected_mrenclave_new\":\"$MRENCLAVE_NEW\",\"old_api_base\":\"https://localhost:9088\",\"new_api_base\":\"https://localhost:9089\",\"delegation_timeout_secs\":120,\"dry_run\":$DRY}"
+# Validate the delivered body BEFORE posting it. A truncated or mangled payload would
+# otherwise reach the enclave and come back as a confusing refusal, at the one moment nobody
+# wants to debug a quoting problem. json.tool needs no quotes of its own, so adding it does not
+# reintroduce the nesting this block exists to avoid.
+FIRE='cat > /tmp/ceremony.json && python3 -m json.tool /tmp/ceremony.json > /dev/null && curl -sS --max-time 600 -X POST http://127.0.0.1:7095/admin/migrate-state -H "Content-Type: application/json" -d @/tmp/ceremony.json'
 for ip in "${NODES[@]}"; do
   (
-    body="{\"expected_mrenclave_new\":\"$MRENCLAVE_NEW\",\"old_api_base\":\"https://localhost:9088\",\"new_api_base\":\"https://localhost:9089\",\"delegation_timeout_secs\":120,\"dry_run\":$DRY}"
-    on "$ip" "printf '%s' '$body' > /tmp/ceremony.json && curl -sS --max-time 600 -X POST http://127.0.0.1:7095/admin/migrate-state -H 'Content-Type: application/json' -d @/tmp/ceremony.json" \
-      > "$OUT/$ip.out" 2> "$OUT/$ip.err"
+    printf '%s' "$BODY" \
+      | ssh -o BatchMode=yes "$BASTION" "ssh -o BatchMode=yes -o ConnectTimeout=15 azureuser@$ip '$FIRE'" \
+        > "$OUT/$ip.out" 2> "$OUT/$ip.err"
     echo "$?" > "$OUT/$ip.rc"
   ) &
 done
