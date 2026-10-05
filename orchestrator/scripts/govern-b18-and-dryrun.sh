@@ -48,7 +48,7 @@ meas="$(run new_measurements)"
 printf '%s\n' "$meas" | sed 's/^/  /'
 mismatch=0
 count=0
-while read -r ip got; do
+while read -r ip got _port; do   # "<mre> on:<port>" — the port is informational
   [ -z "${ip:-}" ] && continue
   count=$((count + 1))
   [ "${got:-}" = "$MRENCLAVE" ] || { echo "  MISMATCH $ip reports ${got:-nothing}"; mismatch=1; }

@@ -148,16 +148,36 @@ homogeneous cluster where every join is the self measurement. Both consumers los
 admit a DIFFERENT governed measurement; neither gains the ability to admit an UNGOVERNED one, and
 that asymmetry is what keeps this at low severity rather than the reverse.
 
-**What is lost is the governance round**, and its only consumer is the NEXT MRENCLAVE bump, whose
-export refuses with `-25` until the allowlist is governed again. So re-run it after promotion:
+**CORRECTION, 2026-10-05, after the migration ran.** This section first said re-governing was
+MANDATORY immediately after promotion. That was wrong on both counts, and checking the code
+rather than repeating the claim is what showed it:
+
+* Re-governing the measurement that is now RUNNING buys no admission capability. SELF is
+  implicitly admitted, so the entry adds nothing. (It is not refused, either — the header
+  defines `TRUSTED_MRENCLAVES_ERR_SELF` and nothing in the ecall implements it, so the
+  operation would simply succeed and change nothing that matters.)
+* The next bump needs ITS OWN target admitted, which was always the procedure. Having the
+  PREVIOUS measurement on the list does not help it.
+
+**What is actually lost is the epoch CHAIN, and that is the sharper consequence.** Governance is
+replay-protected by binding each operation to `{op, mrenclave, epoch, prev_allowlist_hash}`, and
+with no sealed allowlist the enclave falls back to "the implicit empty genesis one (epoch 0, zero
+chain head)". Observed after this migration: `entries=0 epoch=0 digest=63e0a485f9ce159c` — byte
+for byte the state the cluster was in before the first governance round. So every governance
+bundle ever signed for epoch 1 is valid AGAIN.
+
+On this cluster the only epoch-1 bundle ever signed admitted the measurement now running, so the
+concrete exposure is nil. On a cluster where some OTHER measurement had been admitted at epoch 1,
+the reset would reopen the replay of a bundle admitting THAT one. That is a much stronger reason
+for the section-table fix than losing a governance round, and it is the reason to prioritise it.
+
+**So: re-governing after promotion is OPTIONAL and tidy, not mandatory.** It advances the chain
+off the genesis state, which closes the replay window for that one old bundle — worth doing when
+convenient, not a step to run under pressure. The command, if you want it:
 
 ```
-bash orchestrator/scripts/govern-b18-and-dryrun.sh      # with MRENCLAVE set to the NEW measurement
+bash orchestrator/scripts/govern-b18-and-dryrun.sh      # with MRENCLAVE = the RUNNING measurement
 ```
-
-Do it now rather than at the next bump, or the next bump starts by looking broken for a reason
-that has nothing to do with it. The dry run reports this as a `followups` entry on every run, so
-it is handed to the operator rather than remembered.
 
 **The forward fix** is a section-table entry for it, mirroring `pinned_unl.sealed` (optional=true,
 added for exactly this reason — "the governance-pinned XRPL UNL must survive MRENCLAVE bumps").

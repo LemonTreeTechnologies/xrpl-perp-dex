@@ -27,11 +27,20 @@ case "$CMD" in
     done
     ;;
   new_measurements)
+    # 9089 FIRST, then 9088. The target lives on 9089 during a side-by-side deploy and on 9088
+    # after promotion — §5 stops perp-dex-enclave-next, so asking only 9089 made this step
+    # report NO-ANSWER-9089 on a correctly promoted cluster and refuse to govern. The check's
+    # purpose is "does an enclave on this node actually RUN the measurement being admitted",
+    # and that is port-agnostic; the port it found is printed so the answer stays legible.
     for ip in $NODES; do
       printf '%s ' "$ip"
-      on "$ip" "curl -sk --max-time 8 https://127.0.0.1:9089/version" \
-        | python3 -c 'import sys,json;print(json.load(sys.stdin).get("mrenclave",""))' 2>/dev/null \
-        || echo "NO-ANSWER-9089"
+      got=""
+      for port in 9089 9088; do
+        m="$(on "$ip" "curl -sk --max-time 8 https://127.0.0.1:$port/version" \
+             | python3 -c 'import sys,json;print(json.load(sys.stdin).get("mrenclave",""))' 2>/dev/null)"
+        if [ -n "$m" ]; then got="$m"; echo "$m on:$port"; break; fi
+      done
+      [ -n "$got" ] || echo "NO-ANSWER-9089-OR-9088"
     done
     ;;
   govern)
