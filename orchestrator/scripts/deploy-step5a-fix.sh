@@ -65,7 +65,7 @@ echo "[2/4] PROVING the built artefact carries EVERY fix it is supposed to"
 ssh -o BatchMode=yes "$BASTION" '
   B=~/llm-perp-xrpl/orchestrator/target/release/perp-dex-orchestrator
   fail=0
-  for m in "step 5a" "did not carry" "NO-OP, not a failure to retry"; do
+  for m in "step 5a" "did not carry" "NO-OP, not a failure to retry" "REQUIRED after promotion"; do
     N=$(strings -a "$B" | grep -cF "$m")
     printf "  %-34s %s\n" "\"$m\"" "$N"
     [ "$N" -gt 0 ] || { echo "    MISSING — this build predates that fix"; fail=1; }
@@ -90,7 +90,8 @@ for ip in 20.71.184.176 20.224.243.60 52.236.130.102; do
     N1=\$(strings -a \$B 2>/dev/null | grep -cF \"step 5a\")
     N2=\$(strings -a \$B 2>/dev/null | grep -cF \"did not carry\")
     N3=\$(strings -a \$B 2>/dev/null | grep -cF \"NO-OP, not a failure to retry\")
-    echo \"service=\$A  step5a=\$N1  inventory-diff=\$N2  govern-no-op=\$N3\"'"
+    N4=\$(strings -a \$B 2>/dev/null | grep -cF \"REQUIRED after promotion\")
+    echo \"service=\$A  step5a=\$N1  inventory-diff=\$N2  govern-no-op=\$N3  followups=\$N4\"'"
 done
 hr
 echo "If every node reports service=active and all three markers >0, rehearse on ALL THREE:"
