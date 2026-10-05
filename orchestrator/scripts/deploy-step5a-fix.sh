@@ -53,12 +53,21 @@ ssh -o BatchMode=yes "$BASTION" '
 ' || { echo "FAILED: build — nothing deployed"; exit 2; }
 hr
 
-echo "[2/4] PROVING the built artefact carries the fix — never trust the build's success line"
+echo "[2/4] PROVING the built artefact carries EVERY fix it is supposed to"
+# ONE MARKER PER CHANGE, and that matters. "step 5a" alone stopped proving anything the moment
+# a second fix landed on top of it: the string is in both builds, so the check would pass on a
+# binary missing the newer change entirely. A marker that cannot distinguish the version you
+# want from the one you have is not a check. Add a line here with every change that must be on
+# the cluster before the next ceremony step.
 ssh -o BatchMode=yes "$BASTION" '
   B=~/llm-perp-xrpl/orchestrator/target/release/perp-dex-orchestrator
-  N=$(strings -a "$B" | grep -c "step 5a")
-  echo "  \"step 5a\" strings in the binary: $N"
-  [ "$N" -gt 0 ] || { echo "  FAILED: the binary does NOT contain the fix"; exit 3; }
+  fail=0
+  for m in "step 5a" "did not carry" "NO-OP, not a failure to retry"; do
+    N=$(strings -a "$B" | grep -cF "$m")
+    printf "  %-34s %s\n" "\"$m\"" "$N"
+    [ "$N" -gt 0 ] || { echo "    MISSING — this build predates that fix"; fail=1; }
+  done
+  [ "$fail" -eq 0 ] || exit 3
 ' || { echo "FAILED: artefact check — do not deploy"; exit 3; }
 hr
 
@@ -73,13 +82,16 @@ echo "[4/4] PROVING the RUNNING binary on each node carries it"
 for ip in 20.71.184.176 20.224.243.60 52.236.130.102; do
   echo -n "  $ip  "
   ssh -o BatchMode=yes "$BASTION" "ssh -o BatchMode=yes -o ConnectTimeout=10 azureuser@$ip '
-    N=\$(strings -a /home/azureuser/perp/perp-dex-orchestrator 2>/dev/null | grep -c \"step 5a\")
+    B=/home/azureuser/perp/perp-dex-orchestrator
     A=\$(systemctl is-active perp-dex-orchestrator 2>/dev/null)
-    echo \"service=\$A  step-5a-strings=\$N\"'"
+    N1=\$(strings -a \$B 2>/dev/null | grep -cF \"step 5a\")
+    N2=\$(strings -a \$B 2>/dev/null | grep -cF \"did not carry\")
+    N3=\$(strings -a \$B 2>/dev/null | grep -cF \"NO-OP, not a failure to retry\")
+    echo \"service=\$A  step5a=\$N1  inventory-diff=\$N2  govern-no-op=\$N3\"'"
 done
 hr
-echo "If every node reports service=active and step-5a-strings>0, re-run the dry run:"
-echo "    bash orchestrator/scripts/govern-b18-and-dryrun.sh"
+echo "If every node reports service=active and all three markers >0, rehearse on ALL THREE:"
+echo "    bash orchestrator/scripts/ceremony-parallel.sh dryrun"
 echo "The allowlist step will report entries=1 already and is idempotent. Read BOTH \`status\`"
 echo "and \`boot_proof\` in the [5/5] line: \"dry-run-ok\" is now the only PASS and it requires"
 echo "the 5a boot; \"dry-run-boot-failed\" means the boot was attempted and judged a failure."
