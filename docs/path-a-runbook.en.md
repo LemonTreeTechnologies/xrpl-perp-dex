@@ -51,7 +51,39 @@ perp-dex-orchestrator node-deploy --side-by-side --enclave-dist ./dist-new
 Installs NEW artefacts to `perp-next/` and starts the NEW enclave on port 9089 alongside OLD (9088). NEW boots with empty sealed state + an ephemeral migration keypair generated inside SGX. Verify on each node: `curl -k https://localhost:9089/version` → NEW MRENCLAVE.
 
 **3.2 — Fire the ceremony on ALL nodes concurrently.**
-Each operator, on their own node, at the same time:
+
+**Use the launcher. Do not type three curls.**
+
+```
+bash orchestrator/scripts/ceremony-parallel.sh preflight   # readiness only, fires nothing
+bash orchestrator/scripts/ceremony-parallel.sh dryrun      # rehearsal on all three, reversible
+bash orchestrator/scripts/ceremony-parallel.sh real         # THE REAL ONE
+```
+
+Why a launcher rather than the three curls below. §11.10 is the one invariant with no tested
+recovery, and the prevention it asks for was specified as "each operator, on their own node, at
+the same time". That assumes three operators. With a single operator holding all three nodes
+through one bastion, doing it by hand IS the sequential violation — you cannot type three curls
+at once, and the §7.1 consequence of losing the window ends in re-bootstrapping an operator
+through a path never exercised on hardware.
+
+The arithmetic, at 2-of-3: if node-1 retires while node-3 is still collecting delegations,
+node-3 has exactly two signers left and is on the edge; if two retire first it has one, and is
+stuck. Concurrency does not remove the window — it makes the early phases overlap so every node
+has its delegations long before any node reaches the last step.
+
+The PRE-FLIGHT is the other half, and refuses to fire anything unless all three nodes are ready:
+OLD serving at the expected measurement, NEW answering with exactly the target, `perp-next/accounts`
+EMPTY, all three services active, the orchestrator carrying the step-5a fix, and the allowlist
+holding exactly one entry **at the same digest on all three** — because a per-node count of 1 says
+nothing about whether it is the same 1. A node that is not ready fails LATE, after the others have
+retired, which is exactly the shape §7.1 exists for. Every one of those refusals was probed by
+mutation rather than assumed.
+
+The `real` mode states the consequences in plain terms and requires the operator to type a
+sentence; it is not a `-y` flag.
+
+The equivalent by hand, for reference — each operator, on their own node, at the same time:
 ```
 curl -sS -X POST http://127.0.0.1:7095/admin/migrate-state \
   -H 'Content-Type: application/json' \
