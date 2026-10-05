@@ -333,7 +333,70 @@ impl HttpGovernSink {
             .await
             .with_context(|| format!("POST mrenclaves/govern to {node_admin_url}"))?;
         let body: serde_json::Value = resp.json().await.context("govern response body")?;
-        parse_seal_response(&body)
+        parse_govern_response(op.op, &body)
+    }
+}
+
+/* ── the allowlist route's OWN codes ─────────────────────────────────────────
+ *
+ * From `TrustedMrenclaves.h`. They are listed here, narrowly, because the generic
+ * `parse_seal_response` turns whatever number arrives into "seal-epoch rejected: code=N" —
+ * and N only means something if you know WHICH ecall produced it. -11 from the allowlist
+ * route is "already admitted"; -11 from a different route is a different thing entirely.
+ * Interpreting it in the shared parser would be the code-collision defect that already cost
+ * this project a migration, so the interpretation lives at the one call site that knows. */
+const GOVERN_ERR_ALREADY: i64 = -11;
+const GOVERN_ERR_NOT_FOUND: i64 = -12;
+
+/// Parse an allowlist-govern response, separating the two NO-OP refusals from real failures.
+///
+/// WHY. Re-running the β18 governance returned, on all three nodes:
+///
+///   apply: seal-epoch rejected: code=-11 message=govern_trusted_mrenclaves failed
+///   "only 0 of 3 nodes acked within 45s; retry the change (the enclave monotonic/idempotent
+///    guards make a retry safe)"
+///
+/// Every part of that is misleading. The enclave did exactly the right thing: the measurement
+/// was ALREADY on the allowlist, and `ecall_govern_trusted_mrenclaves` refuses a no-op on
+/// purpose — its own comment says "reject no-ops early so a wasted governance round is visible
+/// to operators rather than silently consuming an epoch". The allowlist was untouched: epoch 1,
+/// same digest, all three nodes. Nothing was broken and nothing needed doing.
+///
+/// But the advice was to RETRY, and a duplicate add can never succeed — it returns -11 forever.
+/// So an operator is told to loop on an operation that is already complete, by a message that
+/// calls the enclave "idempotent" when the refusal is precisely the enclave NOT being
+/// idempotent, deliberately.
+///
+/// This still returns Err, and that is the honest outcome: nothing was applied, no epoch
+/// advanced, so a caller counting `applied_nodes` must not see a success. What changes is that
+/// the text says what happened and that retrying cannot help.
+fn parse_govern_response(op: u8, body: &serde_json::Value) -> Result<()> {
+    if body["status"].as_str() == Some("ok") {
+        return Ok(());
+    }
+    let code = body.get("code").and_then(|c| c.as_i64());
+    match (op, code) {
+        (crate::mrenclave_governance::OP_ADD, Some(GOVERN_ERR_ALREADY)) => bail!(
+            concat!(
+                "NO-OP, not a failure to retry: this measurement is ALREADY on the governed ",
+                "allowlist, and the enclave refuses a duplicate add by design so a wasted ",
+                "governance round stays visible instead of silently consuming an epoch. The ",
+                "allowlist is unchanged and already in the state you asked for. A RETRY CANNOT ",
+                "SUCCEED - it returns code={} every time. Check mrenclaves/status and go on to ",
+                "the next step.",
+            ),
+            GOVERN_ERR_ALREADY
+        ),
+        (crate::mrenclave_governance::OP_REMOVE, Some(GOVERN_ERR_NOT_FOUND)) => bail!(
+            concat!(
+                "NO-OP, not a failure to retry: this measurement is NOT on the governed ",
+                "allowlist, so there is nothing to remove. The allowlist is unchanged and ",
+                "already in the state you asked for. A RETRY CANNOT SUCCEED - it returns ",
+                "code={} every time.",
+            ),
+            GOVERN_ERR_NOT_FOUND
+        ),
+        _ => parse_seal_response(body),
     }
 }
 
@@ -520,6 +583,87 @@ impl ProjectionConfirmer for HttpProjectionConfirmer {
 
 #[cfg(test)]
 mod tests {
+    use crate::mrenclave_governance::{OP_ADD, OP_REMOVE};
+
+    fn rejected(code: i64) -> serde_json::Value {
+        serde_json::json!({"status": "error", "code": code,
+                           "message": "govern_trusted_mrenclaves failed"})
+    }
+
+    #[test]
+    fn a_governed_ok_is_ok() {
+        assert!(parse_govern_response(OP_ADD, &serde_json::json!({"status": "ok"})).is_ok());
+    }
+
+    #[test]
+    fn adding_an_already_admitted_measurement_says_a_retry_cannot_succeed() {
+        // The β18 re-run returned exactly this on all three nodes while being advised to
+        // retry. A duplicate add returns -11 forever, so the advice was a loop.
+        let e = parse_govern_response(OP_ADD, &rejected(-11))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("NO-OP"), "{e}");
+        assert!(e.contains("RETRY CANNOT SUCCEED"), "{e}");
+        assert!(e.contains("ALREADY on the governed allowlist"), "{e}");
+        // No run of stray spaces: a `\`-continued literal inside this file gets JOINED by
+        // cargo fmt, which keeps the indentation the backslash was there to strip. The first
+        // version of this message reached the operator with runs of 14 spaces in it.
+        assert!(
+            !e.contains("  "),
+            "the message has collapsed whitespace: {e}"
+        );
+    }
+
+    #[test]
+    fn removing_a_measurement_that_is_not_there_says_the_same() {
+        let e = parse_govern_response(OP_REMOVE, &rejected(-12))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("NO-OP"), "{e}");
+        assert!(e.contains("RETRY CANNOT SUCCEED"), "{e}");
+    }
+
+    #[test]
+    fn the_no_op_codes_are_read_per_op_and_not_as_a_set() {
+        // -11 is "already admitted", which is meaningless for a REMOVE; -12 is "not found",
+        // meaningless for an ADD. Matching on the code alone would make either op swallow the
+        // other's refusal and tell the operator nothing needs doing when something does.
+        for (op, code) in [(OP_ADD, -12i64), (OP_REMOVE, -11)] {
+            let e = parse_govern_response(op, &rejected(code))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !e.contains("NO-OP"),
+                "op={op} code={code} must NOT read as a no-op: {e}"
+            );
+            assert!(
+                e.contains("seal-epoch rejected"),
+                "op={op} code={code}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_failure_is_left_alone() {
+        // -6 is quorum-not-met: a genuine failure that a retry CAN fix. It must keep the
+        // generic surface, or widening the no-op set would start hiding real refusals —
+        // the direction that matters, since a hidden refusal reads as "nothing to do".
+        let e = parse_govern_response(OP_ADD, &rejected(-6))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("seal-epoch rejected"), "{e}");
+        assert!(!e.contains("NO-OP"), "{e}");
+    }
+
+    #[test]
+    fn a_response_with_no_code_field_still_errors_generically() {
+        let body = serde_json::json!({"status": "error", "message": "something"});
+        let e = parse_govern_response(OP_ADD, &body)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("seal-epoch rejected"), "{e}");
+    }
+
     use super::*;
     use crate::membership_canonical::SignerEntry;
     use crate::membership_coordinator::prepare_statement;
