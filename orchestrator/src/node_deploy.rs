@@ -537,6 +537,43 @@ const MAY_BE_ABSENT_FROM_NEW: &[&str] = &[
     "path_a_retired.sealed",
 ];
 
+/// Absences that do NOT fail the boot but leave a REQUIRED follow-up, each with what is lost.
+///
+/// A second list rather than more entries in the first one, because these are not the same kind
+/// of thing. The names above are absent for a reason that needs no action. These are absent
+/// because the migration does not carry them, which means something has to be re-established
+/// afterwards — and an exemption that merely suppressed them would turn a required step into
+/// an invisible one. So they pass the gate and are REPORTED, loudly, every time.
+const ABSENT_BUT_MUST_BE_REESTABLISHED: &[(&str, &str)] = &[(
+    "trusted_mrenclaves.sealed",
+    "the GOVERNED MRENCLAVE ALLOWLIST. Path-A's section table (kPathASectionTable) has no \
+     entry for it — note that `recent_nonces.sealed` carries an explicit INTENTIONALLY NOT \
+     MIGRATED decision with a written rationale, and this file has nothing, so it is an \
+     omission rather than a choice. Nothing breaks today: SELF is always implicitly admitted, \
+     so the cluster cannot lock itself out and a node joining with the SAME measurement is \
+     admitted without any allowlist. What IS lost is the 2-of-3 governance round that admitted \
+     this target, and the only consumer of that is the NEXT MRENCLAVE bump — whose export will \
+     refuse with -25 until the allowlist is governed again. MANDATORY after promotion: re-run \
+     the governance so the next bump does not start by looking broken.",
+)];
+
+/// What a sound migration nonetheless leaves for the operator to redo, with why.
+///
+/// Separate from the verdict on purpose: these do not make a migration unsound, and folding
+/// them into the Err would train an operator to override a gate that is correctly refusing
+/// other things. They are returned so the CALLER has to print them.
+pub fn boot_followups(p: &BootProof) -> Vec<String> {
+    p.missing_from_new
+        .iter()
+        .filter_map(|n| {
+            ABSENT_BUT_MUST_BE_REESTABLISHED
+                .iter()
+                .find(|(name, _)| *name == n.as_str())
+                .map(|(name, why)| format!("{name} was NOT carried by the migration: {why}"))
+        })
+        .collect()
+}
+
 /// The verdict, PURE and separate from the I/O above so every branch can be probed without a
 /// cluster. Ok(()) means step 5a passed; Err carries what an operator must read.
 pub fn judge_boot_proof(p: &BootProof) -> Result<(), String> {
@@ -579,6 +616,11 @@ pub fn judge_boot_proof(p: &BootProof) -> Result<(), String> {
         .missing_from_new
         .iter()
         .filter(|n| !MAY_BE_ABSENT_FROM_NEW.contains(&n.as_str()))
+        .filter(|n| {
+            !ABSENT_BUT_MUST_BE_REESTABLISHED
+                .iter()
+                .any(|(name, _)| *name == n.as_str())
+        })
         .collect();
     if !unexplained.is_empty() {
         return Err(format!(
@@ -1057,6 +1099,69 @@ mod tests {
             ..good_proof()
         };
         assert!(judge_boot_proof(&p).is_ok());
+    }
+
+    #[test]
+    fn the_governed_allowlist_not_being_carried_passes_but_is_reported() {
+        // Path-A's section table has no entry for it at all — recent_nonces.sealed carries an
+        // explicit INTENTIONALLY-NOT-MIGRATED decision with a rationale, and this file carries
+        // nothing, so it is an omission. It does not make the migration unsound: SELF is always
+        // implicitly admitted, so the cluster cannot lock itself out and a node joining with
+        // the SAME measurement needs no allowlist. What is lost is the governance round, whose
+        // only consumer is the NEXT bump.
+        let p = BootProof {
+            missing_from_new: vec!["trusted_mrenclaves.sealed".into()],
+            ..good_proof()
+        };
+        assert!(
+            judge_boot_proof(&p).is_ok(),
+            "it must not fail an otherwise sound migration"
+        );
+        let f = boot_followups(&p);
+        assert_eq!(f.len(), 1, "and it must NOT pass silently: {f:?}");
+        assert!(f[0].contains("GOVERNED MRENCLAVE ALLOWLIST"), "{:?}", f[0]);
+        assert!(f[0].contains("MANDATORY after promotion"), "{:?}", f[0]);
+        assert!(
+            f[0].contains("-25"),
+            "it must name what the next bump will see: {:?}",
+            f[0]
+        );
+    }
+
+    #[test]
+    fn a_clean_migration_leaves_no_followups() {
+        assert!(boot_followups(&good_proof()).is_empty());
+    }
+
+    #[test]
+    fn the_two_absence_lists_stay_disjoint() {
+        // THE INVARIANT THAT KEEPS THE REMINDER ALIVE. Moving a name from the reported list into
+        // the silent one would make a required follow-up vanish without a single line changing
+        // behaviour visibly — the suppression failure mode, arriving as a tidy-up.
+        for (name, _) in ABSENT_BUT_MUST_BE_REESTABLISHED {
+            assert!(
+                !MAY_BE_ABSENT_FROM_NEW.contains(name),
+                "{name} is in BOTH lists: the silent one wins and the follow-up disappears"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reported_absence_does_not_hide_an_unexplained_one() {
+        let p = BootProof {
+            missing_from_new: vec![
+                "trusted_mrenclaves.sealed".into(),
+                "s0_perp_meta.sealed".into(),
+            ],
+            ..good_proof()
+        };
+        let e = judge_boot_proof(&p).unwrap_err();
+        assert!(e.contains("s0_perp_meta.sealed"), "{e}");
+        assert!(
+            !e.contains("trusted_mrenclaves"),
+            "the reported one must not be blamed: {e}"
+        );
+        assert!(e.contains("did not carry 1 sealed file"), "{e}");
     }
 
     #[test]
