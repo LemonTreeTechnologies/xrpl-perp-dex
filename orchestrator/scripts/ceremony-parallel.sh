@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ceremony-parallel.sh — fire the Path-A ceremony on ALL THREE nodes CONCURRENTLY.
 #
+#   bash orchestrator/scripts/ceremony-parallel.sh clear-next  clear a failed rehearsal's scratch
 #   bash orchestrator/scripts/ceremony-parallel.sh preflight  readiness only, fires NOTHING
 #   bash orchestrator/scripts/ceremony-parallel.sh dryrun     rehearsal, reversible, default
 #   bash orchestrator/scripts/ceremony-parallel.sh real       THE REAL ONE — retires OLD
@@ -42,9 +43,55 @@ hr() { printf '%s\n' "----------------------------------------------------------
 on() { ssh -o BatchMode=yes "$BASTION" "ssh -o BatchMode=yes -o ConnectTimeout=10 azureuser@$1 '$2'"; }
 
 case "$MODE" in
-  preflight|dryrun|real) ;;
-  *) echo "usage: $0 [preflight|dryrun|real]"; exit 2 ;;
+  clear-next|preflight|dryrun|real) ;;
+  *) echo "usage: $0 [clear-next|preflight|dryrun|real]"; exit 2 ;;
 esac
+
+# ── clear-next: break the deadlock a FAILED rehearsal leaves behind. ──────────
+#
+# A failed step-5a deliberately LEAVES the migrated set on NEW for diagnosis, and the reset
+# that would clear it only runs on a PASS. So a failure leaves perp-next/accounts populated,
+# the pre-flight then refuses (correctly — a non-empty NEW means a half-finished attempt), and
+# nothing clears it. That is a deadlock in this script's own design; §7's table says to clear
+# the directory by hand, which at this point in a ceremony is exactly the wrong moment to
+# improvise an rm over ssh.
+#
+# THE CLEAR IS GATED ON OLD BEING INTACT, so it can never be the thing that destroys the only
+# copy. Per node it refuses unless OLD's accounts dir holds its full set, OLD answers on 9088,
+# and perp/accounts is NOT a symlink into perp-next. Verified on the live cluster before this
+# was written: OLD 183 files / 10,536,156 bytes, NEW 182 / 10,515,313, no symlink — every byte
+# in perp-next is a re-sealed copy of state OLD still holds.
+if [ "$MODE" = "clear-next" ]; then
+  echo "[1/2] checking OLD is intact on every node BEFORE clearing anything on NEW"
+  blocked=0
+  for ip in "${NODES[@]}"; do
+    q="$(on "$ip" '
+      printf "old_files=%s\n" "$(ls -1 /home/azureuser/perp/accounts/ 2>/dev/null | wc -l)"
+      printf "new_files=%s\n" "$(ls -1 /home/azureuser/perp-next/accounts/ 2>/dev/null | wc -l)"
+      printf "symlink=%s\n"   "$(test -L /home/azureuser/perp/accounts && echo YES || echo no)"
+      printf "old_up=%s\n"    "$(curl -k -s --max-time 6 https://localhost:9088/version >/dev/null 2>&1 && echo yes || echo NO)"
+    ')"
+    f() { printf '%s\n' "$q" | sed -n "s/^$1=//p" | head -1; }
+    of="$(f old_files)"; nf="$(f new_files)"; sl="$(f symlink)"; up="$(f old_up)"
+    printf '  %-16s OLD %s files, up=%s, symlink=%s   NEW %s files\n' "$ip" "$of" "$up" "$sl" "$nf"
+    [ "${of:-0}" -ge 100 ] 2>/dev/null || { echo "    REFUSING: OLD holds only ${of:-?} files"; blocked=1; }
+    [ "$sl" = "no" ]  || { echo "    REFUSING: perp/accounts is a SYMLINK — clearing could reach OLD's state"; blocked=1; }
+    [ "$up" = "yes" ] || { echo "    REFUSING: OLD is not answering on 9088"; blocked=1; }
+  done
+  hr
+  if [ "$blocked" -ne 0 ]; then
+    echo "STOP — not clearing anything. OLD must be intact and serving on every node first."
+    exit 1
+  fi
+  echo "[2/2] clearing perp-next/accounts on all three (stop NEW, remove, start NEW)"
+  for ip in "${NODES[@]}"; do
+    printf '  %-16s ' "$ip"
+    on "$ip" 'sudo systemctl stop perp-dex-enclave-next && rm -f /home/azureuser/perp-next/accounts/* && sudo systemctl start perp-dex-enclave-next && sleep 4 && printf "cleared, now %s files, NEW up=%s\n" "$(ls -1 /home/azureuser/perp-next/accounts/ 2>/dev/null | wc -l)" "$(curl -k -s --max-time 8 https://localhost:9089/version >/dev/null 2>&1 && echo yes || echo NO)"'
+  done
+  hr
+  echo "Next: bash orchestrator/scripts/ceremony-parallel.sh dryrun"
+  exit 0
+fi
 
 echo "Path-A ceremony — PARALLEL across all three nodes      MODE=$MODE"
 echo "target measurement: $MRENCLAVE_NEW"
