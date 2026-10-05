@@ -17,11 +17,14 @@
 set -uo pipefail
 
 BASTION="andrey@94.130.18.162"
-WANT_COMMIT="7246ea7"
+# NO PINNED COMMIT. It said 7246ea7 while deploying master's head, which by the third run was
+# 32b2ef2 — a deploy script printing a commit it is not deploying is the same class of lie as a
+# build whose "Finished" line means nothing. The script reports what it ACTUALLY moved to, which
+# the build step prints, and the artefact markers are what prove the content.
 
 hr() { printf '%s\n' "------------------------------------------------------------"; }
 
-echo "deploying the step-5a dry-run fix (master @ ${WANT_COMMIT})"
+echo "deploying the orchestrator from master (the build step prints the exact commit)"
 hr
 
 echo "[1/4] building on Hetzner (the build clone is on an older branch — moving it to master)"
@@ -92,6 +95,9 @@ done
 hr
 echo "If every node reports service=active and all three markers >0, rehearse on ALL THREE:"
 echo "    bash orchestrator/scripts/ceremony-parallel.sh dryrun"
-echo "The allowlist step will report entries=1 already and is idempotent. Read BOTH \`status\`"
-echo "and \`boot_proof\` in the [5/5] line: \"dry-run-ok\" is now the only PASS and it requires"
-echo "the 5a boot; \"dry-run-boot-failed\" means the boot was attempted and judged a failure."
+echo
+echo "In each node's response read \`status\` AND \`boot_proof\`:"
+echo "  \"dry-run-ok\"            the only PASS. It now requires the step-5a boot."
+echo "  \"dry-run-boot-failed\"   the boot ran and was judged a failure; boot_failure says why."
+echo "  missing_from_new        must hold nothing unexplained — that is the answer to"
+echo "                          'OLD has 183 sealed files, the rehearsal wrote 182, which one'."
