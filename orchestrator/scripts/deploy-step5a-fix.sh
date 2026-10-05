@@ -94,7 +94,9 @@ for ip in 20.71.184.176 20.224.243.60 52.236.130.102; do
     echo \"service=\$A  step5a=\$N1  inventory-diff=\$N2  govern-no-op=\$N3  followups=\$N4\"'"
 done
 hr
-echo "If every node reports service=active and all three markers >0, rehearse on ALL THREE:"
+# Count-agnostic on purpose: it said "all three markers" the moment there were four, which
+# is the same stale-claim shape as the pinned commit this script used to print.
+echo "If every node reports service=active and EVERY marker above is >0, rehearse on ALL THREE:"
 echo "    bash orchestrator/scripts/ceremony-parallel.sh dryrun"
 echo
 echo "In each node's response read \`status\` AND \`boot_proof\`:"
