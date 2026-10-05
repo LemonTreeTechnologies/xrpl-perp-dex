@@ -186,6 +186,15 @@ enum Command {
     },
 
     /// Query account balance with authentication.
+    /// Read the price feed's depeg alarm and say plainly whether the non-USD venue has
+    /// drifted away from the dollar venues. Read-only; exits non-zero when an alarm is
+    /// current or cannot be aged, so a monitor can use it directly.
+    PriceHealth {
+        /// Enclave REST API base URL (must be loopback)
+        #[arg(long, default_value = "https://localhost:9088/v1")]
+        enclave_url: String,
+    },
+
     Balance {
         /// API server URL
         #[arg(long, default_value = "http://localhost:3000")]
@@ -745,6 +754,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Balance { api, seed }) => {
             return cli_tools::cli_balance(&api, &seed).await;
+        }
+        Some(Command::PriceHealth { enclave_url }) => {
+            return price_feed::cli_price_health(&enclave_url).await;
         }
         Some(Command::UpgradeCorpusCeremony {
             old_url,
