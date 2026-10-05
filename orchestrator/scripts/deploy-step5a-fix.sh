@@ -25,8 +25,20 @@ echo "deploying the step-5a dry-run fix (master @ ${WANT_COMMIT})"
 hr
 
 echo "[1/4] building on Hetzner (the build clone is on an older branch — moving it to master)"
+# TWO defects lived in this block on its first run, both in this file's own stated subject:
+#
+#   1. no `cargo` on PATH. A non-interactive ssh runs neither the login profile nor .bashrc,
+#      so cargo — installed by rustup under ~/.cargo/bin — simply is not there. Hence the
+#      explicit `. ~/.cargo/env`, not a login shell, so it fails loudly if that file moves.
+#   2. `cargo build ... | tail -3` returns TAIL's exit code, which is always 0. So `set -e`
+#      could not fire and step [1/4] reported nothing while the build had not happened. That
+#      is precisely the false-green shape this script's step [2/4] exists to catch — and it
+#      is what caught it. Fixed with `set -o pipefail` AND an explicit status check, because
+#      a pipeline's exit code is not the thing you think it is.
 ssh -o BatchMode=yes "$BASTION" '
-  set -e
+  set -eo pipefail
+  . "$HOME/.cargo/env" 2>/dev/null || { echo "  FAILED: no ~/.cargo/env — where is cargo?"; exit 9; }
+  command -v cargo >/dev/null || { echo "  FAILED: cargo still not on PATH"; exit 9; }
   cd ~/llm-perp-xrpl
   echo "  was: $(git branch --show-current) $(git rev-parse --short HEAD)"
   git fetch origin master -q
@@ -34,8 +46,11 @@ ssh -o BatchMode=yes "$BASTION" '
   git reset --hard -q origin/master
   echo "  now: $(git branch --show-current) $(git rev-parse --short HEAD)"
   cd orchestrator
-  cargo build --release --locked 2>&1 | tail -3
-' || { echo "FAILED: build"; exit 2; }
+  cargo build --release --locked > /tmp/step5a-build.log 2>&1
+  rc=$?
+  tail -3 /tmp/step5a-build.log
+  [ "$rc" -eq 0 ] || { echo "  FAILED: cargo build exited $rc (full log: /tmp/step5a-build.log)"; exit "$rc"; }
+' || { echo "FAILED: build — nothing deployed"; exit 2; }
 hr
 
 echo "[2/4] PROVING the built artefact carries the fix — never trust the build's success line"
