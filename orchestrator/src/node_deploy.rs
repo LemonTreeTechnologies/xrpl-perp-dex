@@ -513,7 +513,29 @@ pub struct BootProof {
     pub post_migration_marker: bool,
     /// The enclave's own refusal sentence, if it printed one on this boot.
     pub load_refusal: Option<String>,
+    /// Sealed file NAMES present in OLD's accounts dir but absent from NEW's, i.e. what the
+    /// migration did not carry. The count alone cannot answer this: OLD holds 183 files and the
+    /// rehearsal wrote 182, and "182" says nothing about WHICH one is missing. If it is a
+    /// node's own `.account` file, the ceremony would be losing the operator's pool material —
+    /// and that question must be answered BEFORE the irreversible step, not by §4 afterwards.
+    pub missing_from_new: Vec<String>,
+    /// And the reverse: names NEW has that OLD does not. Expected to contain the fresh
+    /// migration manifest; anything else is worth a look.
+    pub extra_in_new: Vec<String>,
 }
+
+/// Names that may legitimately be absent from NEW, with the reason each one is here.
+///
+/// Deliberately tiny and explicit. The catastrophic direction for a fail-closed check is the
+/// FALSE REJECT — refusing a sound migration teaches an operator to bypass the check — so the
+/// exemptions are named rather than pattern-matched, and anything NOT on this list that goes
+/// missing fails the boot.
+const MAY_BE_ABSENT_FROM_NEW: &[&str] = &[
+    // NEW maintains its OWN replay-protection set; it consumed this ceremony's nonce itself.
+    "recent_nonces.sealed",
+    // OLD's retired-marker, which only exists after OLD retires — never carried forward.
+    "path_a_retired.sealed",
+];
 
 /// The verdict, PURE and separate from the I/O above so every branch can be probed without a
 /// cluster. Ok(()) means step 5a passed; Err carries what an operator must read.
@@ -553,6 +575,21 @@ pub fn judge_boot_proof(p: &BootProof) -> Result<(), String> {
              loaded state."
         ));
     }
+    let unexplained: Vec<&String> = p
+        .missing_from_new
+        .iter()
+        .filter(|n| !MAY_BE_ABSENT_FROM_NEW.contains(&n.as_str()))
+        .collect();
+    if !unexplained.is_empty() {
+        return Err(format!(
+            "the migration did not carry {} sealed file(s) that OLD holds and nothing explains: \
+             {:?}. The file COUNT cannot catch this — OLD holds 183 and a rehearsal wrote 182, \
+             and the difference is the whole question. If an `.account` file is in that list the \
+             ceremony would lose an operator's pool material.",
+            unexplained.len(),
+            unexplained
+        ));
+    }
     if !p.post_migration_marker {
         return Err(
             "NEW came back and printed no refusal, but never said it verified the migration \
@@ -565,10 +602,22 @@ pub fn judge_boot_proof(p: &BootProof) -> Result<(), String> {
 }
 
 fn count_files(dir: &str) -> usize {
-    match std::fs::read_dir(dir) {
-        Ok(entries) => entries.flatten().filter(|e| e.path().is_file()).count(),
-        Err(_) => 0,
-    }
+    file_names(dir).len()
+}
+
+/// Sorted file names in a directory; empty when it cannot be read. Directories are skipped,
+/// so `.dcap-helper` does not count as sealed state.
+fn file_names(dir: &str) -> Vec<String> {
+    let mut v: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    v.sort();
+    v
 }
 
 /// Runbook §3 step 5a — BOOT the new enclave on migrated state, during the dry run.
@@ -621,6 +670,21 @@ pub async fn boot_new_on_migrated_state() -> Result<BootProof> {
         .find(|l| l.contains("FATAL") || l.contains("perpLoadState failed"))
         .map(|l| l.trim().to_string());
 
+    // WHAT the migration carried, not just how much. Compared against OLD's live dir rather
+    // than a recorded baseline, so it cannot drift out of date.
+    let old_names = file_names(&format!("{DEPLOY_DIR}/accounts"));
+    let new_names = file_names(&accounts_dir);
+    let missing_from_new: Vec<String> = old_names
+        .iter()
+        .filter(|n| !new_names.contains(n))
+        .cloned()
+        .collect();
+    let extra_in_new: Vec<String> = new_names
+        .iter()
+        .filter(|n| !old_names.contains(n))
+        .cloned()
+        .collect();
+
     let proof = BootProof {
         sealed_files_before,
         sealed_files_after,
@@ -628,6 +692,8 @@ pub async fn boot_new_on_migrated_state() -> Result<BootProof> {
         mrenclave_after,
         post_migration_marker,
         load_refusal,
+        missing_from_new,
+        extra_in_new,
     };
     info!(?proof, "step 5a: boot proof");
     Ok(proof)
@@ -860,6 +926,8 @@ mod tests {
             mrenclave_after: Some("367cabb2".repeat(8)),
             post_migration_marker: true,
             load_refusal: None,
+            missing_from_new: vec![],
+            extra_in_new: vec!["migration_manifest.sealed".into()],
         }
     }
 
@@ -946,6 +1014,80 @@ mod tests {
             e.contains("never said it verified the migration manifest"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn a_sealed_file_the_migration_did_not_carry_fails_the_boot() {
+        // The question the file COUNT cannot answer. OLD holds 183 and the rehearsal wrote
+        // 182; if the one left behind is a node's own pool account, the ceremony loses the
+        // operator's key material — and that has to surface BEFORE the irreversible step.
+        let p = BootProof {
+            missing_from_new: vec!["0x85f9f80f55e208f372448558e02a548ea76fa80c.account".into()],
+            ..good_proof()
+        };
+        let e = judge_boot_proof(&p).unwrap_err();
+        assert!(e.contains("did not carry"), "{e}");
+        assert!(
+            e.contains(".account"),
+            "the name must be in the message: {e}"
+        );
+    }
+
+    #[test]
+    fn the_legitimately_absent_names_do_not_fail_it() {
+        // THE DIRECTION THAT MATTERS for a fail-closed check: a false reject refuses a sound
+        // migration, and an operator who meets one learns to bypass the check. NEW keeps its
+        // own replay set, and OLD's retired-marker is never carried forward.
+        for name in ["recent_nonces.sealed", "path_a_retired.sealed"] {
+            let p = BootProof {
+                missing_from_new: vec![name.into()],
+                ..good_proof()
+            };
+            assert!(
+                judge_boot_proof(&p).is_ok(),
+                "{name} is explained and must not fail the boot"
+            );
+        }
+        // Both at once, still fine.
+        let p = BootProof {
+            missing_from_new: vec![
+                "recent_nonces.sealed".into(),
+                "path_a_retired.sealed".into(),
+            ],
+            ..good_proof()
+        };
+        assert!(judge_boot_proof(&p).is_ok());
+    }
+
+    #[test]
+    fn an_explained_absence_does_not_hide_an_unexplained_one() {
+        // The exemption filters, it does not short-circuit: a list containing both must still
+        // fail, and must name ONLY the unexplained member.
+        let p = BootProof {
+            missing_from_new: vec!["recent_nonces.sealed".into(), "s0_perp_meta.sealed".into()],
+            ..good_proof()
+        };
+        let e = judge_boot_proof(&p).unwrap_err();
+        assert!(e.contains("s0_perp_meta.sealed"), "{e}");
+        assert!(
+            !e.contains("recent_nonces"),
+            "an explained name must not be reported: {e}"
+        );
+        assert!(
+            e.contains("did not carry 1 sealed file"),
+            "count must be of UNEXPLAINED: {e}"
+        );
+    }
+
+    #[test]
+    fn extra_files_in_new_are_reported_but_do_not_fail() {
+        // NEW writes a fresh migration manifest that OLD's set did not have. Failing on extras
+        // would reject every sound migration.
+        let p = BootProof {
+            extra_in_new: vec!["migration_manifest.sealed".into(), "whatever.sealed".into()],
+            ..good_proof()
+        };
+        assert!(judge_boot_proof(&p).is_ok());
     }
 
     #[test]

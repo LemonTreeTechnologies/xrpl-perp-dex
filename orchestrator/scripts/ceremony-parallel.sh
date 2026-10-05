@@ -125,6 +125,36 @@ if [ "$ready" -ne 3 ]; then
 fi
 echo "  all three ready, and they agree on what is admitted"
 hr
+
+# ── BASELINE. Captured BEFORE anything fires, because §4 cannot run without it. ──
+#
+# §4 check 3 is "state survival — compare against pre-migration values", and NOTHING in §3
+# says to capture those values. The ceremony is irreversible, so a baseline not taken before
+# it is a baseline that can never be taken: the check would be unperformable at precisely the
+# moment it matters. A verification step you cannot execute is not a safety net.
+#
+# WHAT DISCRIMINATES, said plainly. The vault API currently reports all zeros and
+# active:false, so it would read IDENTICALLY on a migration that carried nothing — as a
+# witness it cannot tell success from total loss. The discriminating witness is the sealed
+# FILE INVENTORY: 183 files and ~10.5 MB per node today, against ~0 for an empty NEW. So the
+# name list and its digest are the load-bearing part here, and the API bodies are recorded
+# because they are cheap and because the vault may hold real values by the next cycle.
+BASE="$HOME/path-a-baseline-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$BASE"
+echo "[1b/3] capturing the PRE-MIGRATION baseline §4 will compare against"
+for ip in "${NODES[@]}"; do
+  on "$ip" '
+    printf "files=%s\n"  "$(ls -1 /home/azureuser/perp/accounts/ 2>/dev/null | wc -l)"
+    printf "bytes=%s\n"  "$(du -sb /home/azureuser/perp/accounts/ 2>/dev/null | cut -f1)"
+    printf "names_sha256=%s\n" "$(ls -1 /home/azureuser/perp/accounts/ 2>/dev/null | sort | sha256sum | cut -d" " -f1)"
+    echo "--- names ---"; ls -1 /home/azureuser/perp/accounts/ 2>/dev/null | sort
+    echo "--- vault type=1 ---"; curl -k -s --max-time 8 "https://localhost:9088/v1/perp/vault/status?type=1" 2>/dev/null; echo
+  ' > "$BASE/$ip.baseline" 2>&1
+  echo "  $ip  $(sed -n 's/^files=/files /p;s/^bytes=/bytes /p;s/^names_sha256=/sha /p' "$BASE/$ip.baseline" | tr '\n' ' ')"
+done
+echo "  saved: $BASE"
+echo "  §4 check 3 compares NEW's inventory against these. Keep this directory until §4 passes."
+hr
 if [ "$MODE" = "preflight" ]; then
   echo "preflight only — NOTHING was fired. Next:"
   echo "    bash orchestrator/scripts/ceremony-parallel.sh dryrun"
