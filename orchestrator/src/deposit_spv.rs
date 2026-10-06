@@ -290,9 +290,9 @@ pub fn outcome_from_error(msg: &str) -> SubmitOutcome {
 /// Config for the deposit driver.
 pub struct DepositDriverConfig {
     /// rippled HTTP RPC, e.g. `http://127.0.0.1:5005`.
-    pub http_url: String,
+    pub http_urls: Vec<String>,
     /// rippled websocket, for the validations stream.
-    pub ws_url: String,
+    pub ws_urls: Vec<String>,
     /// The escrow, as a classic address — the same form rippled renders `Destination` in.
     pub escrow_classic: String,
     /// Seconds between scans. A ledger closes roughly every 4s, so anything under that
@@ -311,10 +311,29 @@ impl DepositDriverConfig {
             return None;
         }
         Some(Self {
-            http_url: std::env::var("XRPL_RPC_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:5005".to_string()),
-            ws_url: std::env::var("XRPL_WS_URL")
-                .unwrap_or_else(|_| "ws://127.0.0.1:6006".to_string()),
+            // Same ruling as the clock, and for the same reason: the audit confirmed the
+            // deposit path self-verifies as completely — same xrpl_spv_verify_quorum plus a
+            // SHAMap inclusion proof and pinned issuer/escrow checks — so a source can only
+            // WITHHOLD or censor a deposit, never forge or mis-credit one. Censorship is the
+            // liveness risk multiple sources address. The previous default here was also
+            // 127.0.0.1:5005, which no node runs, and it is why deposit-spv has never been
+            // operationally live despite being recorded as such.
+            http_urls: crate::attested_clock::split_urls(
+                "XRPL_RPC_URL",
+                &[
+                    "https://s.altnet.rippletest.net:51234",
+                    "https://clio.altnet.rippletest.net:51234",
+                    "https://testnet.xrpl-labs.com",
+                ],
+            ),
+            ws_urls: crate::attested_clock::split_urls(
+                "XRPL_WS_URL",
+                &[
+                    "wss://s.altnet.rippletest.net:51233",
+                    "wss://clio.altnet.rippletest.net:51233",
+                    "wss://testnet.xrpl-labs.com",
+                ],
+            ),
             escrow_classic: escrow_classic.to_string(),
             scan_interval_secs: std::env::var("PERP_DEPOSIT_SPV_INTERVAL_SECS")
                 .ok()
@@ -345,6 +364,27 @@ pub fn resume_from(last_credited: u64, boundary: u64, safety_margin: u64) -> u64
 /// Errors are logged and retried rather than propagated. A collector that exits on a
 /// dropped websocket is a collector that silently stops proving deposits, and the
 /// symptom would appear hours later as "deposits stopped crediting".
+/// One collector per endpoint, all writing into ONE buffer.
+///
+/// Merging streams is safe because a validation is self-verifying: the enclave checks each
+/// signature against the pinned UNL and counts DISTINCT signers, so a duplicate from a second
+/// source cannot inflate a quorum and a forged one cannot join it. What merging buys is the
+/// thing the audit ruled this on — liveness. A validation is only available LIVE (rippled
+/// serves no validation history), so missing the moment a ledger closed means missing it for
+/// good; being subscribed in three places makes that need three simultaneous failures.
+pub async fn run_validation_collectors(
+    ws_urls: Vec<String>,
+    buffer: std::sync::Arc<std::sync::Mutex<ValidationBuffer>>,
+) {
+    let mut set = Vec::new();
+    for url in ws_urls {
+        set.push(tokio::spawn(run_validation_collector(url, buffer.clone())));
+    }
+    for h in set {
+        let _ = h.await;
+    }
+}
+
 pub async fn run_validation_collector(
     ws_url: String,
     buffer: std::sync::Arc<std::sync::Mutex<ValidationBuffer>>,
@@ -365,7 +405,7 @@ pub async fn run_validation_collector(
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
-                tracing::info!("deposit-spv: collecting validations");
+                tracing::info!(source = %ws_url, "collecting validations");
                 while let Some(msg) = ws.next().await {
                     let Ok(Message::Text(txt)) = msg else { break };
                     let Ok(j) = serde_json::from_str::<serde_json::Value>(&txt) else {
@@ -423,7 +463,18 @@ pub async fn run_deposit_scanner(
             continue;
         }
 
-        let validated = match fetch_validated_index(&http, &cfg.http_url).await {
+        // First endpoint that answers. Unlike the clock there is no "newest" to prefer here:
+        // the scanner walks forward from where it left off, so a lagging endpoint costs a
+        // round rather than stalling us, and the next tick asks again.
+        let Some(primary) = first_reachable(&http, &cfg.http_urls).await else {
+            tracing::warn!(
+                tried = cfg.http_urls.len(),
+                "deposit-spv: no XRPL endpoint answered; retrying"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(cfg.scan_interval_secs)).await;
+            continue;
+        };
+        let validated = match fetch_validated_index(&http, &primary).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "deposit-spv: cannot read the validated index");
@@ -439,7 +490,7 @@ pub async fn run_deposit_scanner(
         // deposits are already on XRPL and the watermark keeps them creditable), and
         // sprinting through hundreds of ledgers would hold the enclave busy against the
         // hourly reserves commit, which IS time-sensitive.
-        match scan_one_ledger(&http, &cfg, &perp, &buffer, start).await {
+        match scan_one_ledger(&http, &primary, &cfg, &perp, &buffer, start).await {
             Ok(()) => next_ledger = Some(start + 1),
             Err(e) => {
                 // Do NOT advance. A ledger that failed for a transient reason must be
@@ -453,6 +504,18 @@ pub async fn run_deposit_scanner(
     }
 }
 
+/// The first endpoint that answers a trivial query. Tried in order; the list is short and a
+/// tick has time to spare, so a sequential walk keeps a dead endpoint to a skipped entry.
+async fn first_reachable(http: &reqwest::Client, urls: &[String]) -> Option<String> {
+    for u in urls {
+        if fetch_validated_index(http, u).await.is_ok() {
+            return Some(u.clone());
+        }
+        tracing::debug!(url = %u, "deposit-spv: endpoint did not answer");
+    }
+    None
+}
+
 async fn fetch_validated_index(http: &reqwest::Client, url: &str) -> Result<u64> {
     let body = serde_json::json!({"method": "ledger",
         "params": [{"ledger_index": "validated", "transactions": false}]});
@@ -464,6 +527,7 @@ async fn fetch_validated_index(http: &reqwest::Client, url: &str) -> Result<u64>
 
 async fn scan_one_ledger(
     http: &reqwest::Client,
+    rpc_url: &str,
     cfg: &DepositDriverConfig,
     perp: &crate::perp_client::PerpClient,
     buffer: &std::sync::Arc<std::sync::Mutex<ValidationBuffer>>,
@@ -471,7 +535,7 @@ async fn scan_one_ledger(
 ) -> Result<()> {
     // Expanded JSON first, to find the payments cheaply without parsing binary.
     let j: serde_json::Value = http
-        .post(&cfg.http_url)
+        .post(rpc_url)
         .json(&serde_json::json!({"method": "ledger", "params": [
             {"ledger_index": index, "transactions": true, "expand": true}]}))
         .send()
@@ -507,7 +571,7 @@ async fn scan_one_ledger(
     // Binary for the transaction bytes: the tree is rebuilt from what the validators
     // signed, not from a JSON rendering of it.
     let jb: serde_json::Value = http
-        .post(&cfg.http_url)
+        .post(rpc_url)
         .json(&serde_json::json!({"method": "ledger", "params": [
             {"ledger_index": index, "transactions": true, "expand": true, "binary": true}]}))
         .send()
