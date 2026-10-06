@@ -89,6 +89,26 @@ for ip in "${NODES[@]}"; do
   [ "${ft:-1}" = "0" ]         || { echo "    BLOCKED: ${ft} refusal(s) in the log since the last start"; blocked=1; }
   [ "${bp:-1}" = "0" ]         || { echo "    BLOCKED: ${bp} live sealed file(s) are NOT MRENCLAVE-policy"; blocked=1; }
 done
+
+# AUDIT FINDING 3 (2026-10-06): cross-check $NEWEST the way MRENCLAVE_LIVE is cross-checked.
+#
+# It is a hardcoded constant naming the directory `historical` mode must KEEP. Nothing verified
+# it was in fact the newest, so a future bump that updated MRENCLAVE_LIVE and forgot $NEWEST
+# would delete the true pre-migration state and keep a stale generation — forensic-evidence
+# loss, not customer-state loss, since the live set is never a delete target. That turns the
+# "the NEXT bump must update the constants" note at the top of this file from something
+# trusted into something enforced.
+if [ "$MODE" != "all" ]; then
+  for ip in "${NODES[@]}"; do
+    newest_actual="$(on "$ip" "ls -dt /home/azureuser/perp/accounts.* 2>/dev/null | head -1 | xargs -r basename")"
+    if [ -n "$newest_actual" ] && [ "$newest_actual" != "$NEWEST" ]; then
+      echo "  BLOCKED on $ip: the newest stale copy is $newest_actual, but this script is set"
+      echo "    to keep $NEWEST. One of the two is from a previous cycle. Update NEWEST at the"
+      echo "    top of this script, or use \`all\` if every copy is genuinely meant to go."
+      blocked=1
+    fi
+  done
+fi
 hr
 [ "$blocked" -eq 0 ] || { echo "STOP — nothing deleted. The live state must be beyond doubt first."; exit 1; }
 echo "  live state healthy everywhere"
