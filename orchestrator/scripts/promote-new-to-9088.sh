@@ -89,8 +89,14 @@ for ip in "${NODES[@]}"; do
     mv /home/azureuser/perp/accounts /home/azureuser/perp/accounts.OLD-$MRENCLAVE_OLD_SHORT
     cp -r /home/azureuser/perp-next/accounts /home/azureuser/perp/accounts
     n_src=\$(ls -1 /home/azureuser/perp-next/accounts/ | wc -l)
+    # AUDIT FINDING 2 (2026-10-06): a FILE COUNT is a weak witness for a copy — N files with
+    # one truncated still counts N. A sorted per-file sha256 manifest is the real witness, and
+    # ~182 files of 10 MB costs about a second against the price of re-running a ceremony.
+    m_src=\$(cd /home/azureuser/perp-next/accounts && find . -maxdepth 1 -type f -printf \"%P\\n\" | sort | xargs -r sha256sum | sha256sum | cut -c1-16)
+    m_dst=\$(cd /home/azureuser/perp/accounts && find . -maxdepth 1 -type f -printf \"%P\\n\" | sort | xargs -r sha256sum | sha256sum | cut -c1-16)
+    [ \"\$m_src\" = \"\$m_dst\" ] || { echo \"    COPY MISMATCH digest src=\$m_src dst=\$m_dst — NOT starting\"; exit 9; }
     n_dst=\$(ls -1 /home/azureuser/perp/accounts/ | wc -l)
-    [ \"\$n_src\" = \"\$n_dst\" ] || { echo \"    COPY MISMATCH src=\$n_src dst=\$n_dst — NOT clearing perp-next, NOT starting\"; exit 9; }
+    [ \"\$n_src\" = \"\$n_dst\" ] || { echo \"    COPY MISMATCH src=\$n_src dst=\$n_dst — NOT starting\"; exit 9; }
     # BACK UP BEFORE OVERWRITING. This script did not, on the β18 promotion, and that broke a
     # pattern every one of the thirteen prior cycles had kept — perp/ holds
     # enclave.signed.so.b4b-*, .b5, .b6-*, .b7-*, .bak-b8-*, .b9-*, .b10-*, .b12-*, .b13-*,
@@ -111,9 +117,16 @@ for ip in "${NODES[@]}"; do
     # side-by-side deploy, while perp/ carries the orchestrator deployed TODAY with the
     # step-5a, inventory-diff, govern-no-op and followups fixes. Copying \"the binaries\" as a
     # set would silently downgrade it — §5 names the enclave and the server, and only those.
-    rm -f /home/azureuser/perp-next/accounts/*
+    # AUDIT FINDING 1 (2026-10-06): perp-next is NOT cleared here. It used to be, one line
+    # before the service even started, while the health check that decides whether the start
+    # SUCCEEDED runs in the OUTER script after this block returns. A copy that verified but
+    # failed to LOAD therefore left the migrated set already deleted, and the only way back
+    # was re-running the ceremony — under outage pressure, precisely when nobody wants that.
+    # Customer state was never at risk (OLD is preserved by the mv above), so it was
+    # availability rather than loss. The fix is free: keep the NEW set double-protected
+    # across the whole start-and-verify window and clear it afterwards.
     sudo systemctl start perp-dex-enclave
-    echo \"    copied \$n_dst sealed files, binaries installed, perp-next cleared\"
+    echo \"    copied \$n_dst sealed files (count and digest matched), binaries installed\"
   " || { echo "  STOP: promotion failed on this node. OLD's state is at accounts.OLD-$MRENCLAVE_OLD_SHORT"; echo "        and perp-next still holds the migrated set. Do NOT touch the other nodes."; exit 1; }
 
   sleep 10
@@ -129,6 +142,11 @@ for ip in "${NODES[@]}"; do
   [ "$pm" = "$MRENCLAVE_NEW" ] || { echo "  STOP: :9088 is not reporting the NEW measurement"; exit 1; }
   [ "$sv" = "active" ]         || { echo "  STOP: perp-dex-enclave is $sv"; exit 1; }
   [ "${ft:-1}" = "0" ]         || { echo "  STOP: the enclave log shows a refusal on this boot"; exit 1; }
+  # Only NOW, with :9088 answering as the NEW measurement, the service active and no refusal
+  # in the log, is the copy still sitting in perp-next redundant.
+  on "$ip" "rm -f /home/azureuser/perp-next/accounts/*" \
+    && echo "  perp-next cleared (after verification, not before)" \
+    || echo "  WARNING: could not clear perp-next; the next deploy will refuse until it is"
   echo "  OK — NEW is serving :9088 on this node"
   hr
 done
