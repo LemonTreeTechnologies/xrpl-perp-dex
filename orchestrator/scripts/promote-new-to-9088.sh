@@ -66,6 +66,20 @@ for ip in "${NODES[@]}"; do
     n_src=\$(ls -1 /home/azureuser/perp-next/accounts/ | wc -l)
     n_dst=\$(ls -1 /home/azureuser/perp/accounts/ | wc -l)
     [ \"\$n_src\" = \"\$n_dst\" ] || { echo \"    COPY MISMATCH src=\$n_src dst=\$n_dst — NOT clearing perp-next, NOT starting\"; exit 9; }
+    # BACK UP BEFORE OVERWRITING. This script did not, on the β18 promotion, and that broke a
+    # pattern every one of the thirteen prior cycles had kept — perp/ holds
+    # enclave.signed.so.b4b-*, .b5, .b6-*, .b7-*, .bak-b8-*, .b9-*, .b10-*, .b12-*, .b13-*,
+    # .pre-bump-20260925.bak and more. The rule is recorded as critical for a reason: the
+    # retired generation's sealed state in accounts.OLD-<mre> can only be unsealed by a binary
+    # with that MRENCLAVE, so overwriting it without a copy leaves that state readable only
+    # after rebuilding the measurement from source. Reproducible, but not at hand -- and
+    # not-at-hand is exactly when you need it.
+    cp -n /home/azureuser/perp/enclave.signed.so \
+          /home/azureuser/perp/enclave.signed.so.$MRENCLAVE_OLD_SHORT.bak
+    cp -n /home/azureuser/perp/perp-dex-server \
+          /home/azureuser/perp/perp-dex-server.$MRENCLAVE_OLD_SHORT.bak
+    test -s /home/azureuser/perp/enclave.signed.so.$MRENCLAVE_OLD_SHORT.bak || {
+      echo \"    REFUSING: could not back up the OLD enclave binary\"; exit 8; }
     cp /home/azureuser/perp-next/enclave.signed.so /home/azureuser/perp/enclave.signed.so
     cp /home/azureuser/perp-next/perp-dex-server  /home/azureuser/perp/perp-dex-server
     # DELIBERATELY NOT perp-dex-orchestrator. perp-next holds a stale copy from the
