@@ -16,6 +16,16 @@
 # SEQUENTIAL, one node at a time, verifying before moving on. Promotion has no delegation
 # quorum in it, so the §11.10 parallel constraint does not apply here — and doing them one at a
 # time means a failure stops with two nodes still in a known state.
+#
+# CYCLE-SPECIFIC MEASUREMENTS. The two constants below belong to the β18 cycle
+# (aead7ecf -> 367cabb2…, completed 2026-10-05). The NEXT bump must update them.
+#
+# Leaving them stale cannot cause a wrong action, and that is by construction rather than by
+# luck: the pre-flight compares them against what the nodes actually report, so a stale value
+# produces a REFUSAL naming the mismatch. Demonstrated after this cycle — with β18 promoted into
+# the :9088 slot the pre-flight says NOT READY: old-mrenclave(367cabb2), because aead7ecf is
+# gone. That is the gate working, not a bug to route around.
+#
 set -uo pipefail
 
 BASTION="andrey@94.130.18.162"
@@ -24,7 +34,22 @@ MRENCLAVE_OLD_SHORT="aead7ecf"
 declare -a NODES=(20.71.184.176 20.224.243.60 52.236.130.102)
 
 hr() { printf '%s\n' "------------------------------------------------------------"; }
-on() { ssh -o BatchMode=yes "$BASTION" "ssh -o BatchMode=yes -o ConnectTimeout=20 azureuser@$1 '$2'"; }
+on() {
+  # STRUCTURAL GUARD, not a convention. This function embeds its argument inside single quotes
+  # for the inner ssh, so a single quote in that argument closes the quoting and the remote
+  # command arrives mangled. It bit three times in two days: the ceremony firing (curl received
+  # the word printf as a hostname), the stale-copy survey (a printf FORMAT in single quotes
+  # arrived word-split and printed %4s as a column), and the scrub step (same, so a DELETION
+  # reported no count). A comment telling the next person not to do it was already there and did
+  # not help, so it refuses instead.
+  case "$2" in
+    *\'*) echo "on(): refusing — the command contains a single quote, which would break the" >&2
+          echo "      nested quoting. Use escaped double quotes instead. Command was:" >&2
+          echo "      $2" >&2
+          return 64 ;;
+  esac
+  ssh -o BatchMode=yes "$BASTION" "ssh -o BatchMode=yes -o ConnectTimeout=20 azureuser@$1 '$2'"
+}
 
 echo "runbook §5 — promote NEW into the canonical :9088 slot"
 echo "target: $MRENCLAVE_NEW   OLD being set aside: $MRENCLAVE_OLD_SHORT"

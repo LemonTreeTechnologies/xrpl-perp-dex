@@ -25,6 +25,16 @@
 # expected measurement, the service is active, no refusal since its last start, the live
 # accounts dir holds a plausible set, EVERY live sealed file is MRENCLAVE-policy, and the live
 # directory is a different inode from each candidate. Any failure and nothing is deleted.
+#
+# CYCLE-SPECIFIC MEASUREMENTS. The two constants below belong to the β18 cycle
+# (aead7ecf -> 367cabb2…, completed 2026-10-05). The NEXT bump must update them.
+#
+# Leaving them stale cannot cause a wrong action, and that is by construction rather than by
+# luck: the pre-flight compares them against what the nodes actually report, so a stale value
+# produces a REFUSAL naming the mismatch. Demonstrated after this cycle — with β18 promoted into
+# the :9088 slot the pre-flight says NOT READY: old-mrenclave(367cabb2), because aead7ecf is
+# gone. That is the gate working, not a bug to route around.
+#
 set -uo pipefail
 
 BASTION="andrey@94.130.18.162"
@@ -34,7 +44,22 @@ declare -a NODES=(20.71.184.176 20.224.243.60 52.236.130.102)
 MODE="${1:-survey}"
 
 hr() { printf '%s\n' "------------------------------------------------------------"; }
-on() { ssh -o BatchMode=yes "$BASTION" "ssh -o BatchMode=yes -o ConnectTimeout=20 azureuser@$1 '$2'"; }
+on() {
+  # STRUCTURAL GUARD, not a convention. This function embeds its argument inside single quotes
+  # for the inner ssh, so a single quote in that argument closes the quoting and the remote
+  # command arrives mangled. It bit three times in two days: the ceremony firing (curl received
+  # the word printf as a hostname), the stale-copy survey (a printf FORMAT in single quotes
+  # arrived word-split and printed %4s as a column), and the scrub step (same, so a DELETION
+  # reported no count). A comment telling the next person not to do it was already there and did
+  # not help, so it refuses instead.
+  case "$2" in
+    *\'*) echo "on(): refusing — the command contains a single quote, which would break the" >&2
+          echo "      nested quoting. Use escaped double quotes instead. Command was:" >&2
+          echo "      $2" >&2
+          return 64 ;;
+  esac
+  ssh -o BatchMode=yes "$BASTION" "ssh -o BatchMode=yes -o ConnectTimeout=20 azureuser@$1 '$2'"
+}
 
 case "$MODE" in survey|historical|all) ;; *) echo "usage: $0 [survey|historical|all]"; exit 2 ;; esac
 echo "runbook §6 — decommission OLD sealed state      MODE=$MODE"
@@ -113,9 +138,11 @@ echo "[3/3] scrubbing"
 for ip in "${NODES[@]}"; do
   printf '  %-16s ' "$ip"
   if [ "$MODE" = "historical" ]; then
-    on "$ip" "n=0; for d in /home/azureuser/perp/accounts.*; do [ -d \"\$d\" ] || continue; [ \"\$(basename \$d)\" = \"$NEWEST\" ] && continue; rm -rf \"\$d\" && n=\$((n+1)); done; printf 'removed %s, kept %s\n' \"\$n\" \"$NEWEST\""
+    # BEFORE and AFTER counted with ls, not an incremented variable: the count then verifies the
+    # deletion rather than merely narrating it, and there is nothing to lose to quoting.
+    on "$ip" "b=\$(ls -d /home/azureuser/perp/accounts.* 2>/dev/null | wc -l); for d in /home/azureuser/perp/accounts.*; do [ -d \"\$d\" ] || continue; [ \"\$(basename \$d)\" = \"$NEWEST\" ] && continue; rm -rf \"\$d\"; done; a=\$(ls -d /home/azureuser/perp/accounts.* 2>/dev/null | wc -l); printf \"before=%s after=%s removed=%s kept=%s\\n\" \"\$b\" \"\$a\" \"\$((b-a))\" \"$NEWEST\""
   else
-    on "$ip" "n=0; for d in /home/azureuser/perp/accounts.*; do [ -d \"\$d\" ] || continue; rm -rf \"\$d\" && n=\$((n+1)); done; printf 'removed %s\n' \"\$n\""
+    on "$ip" "b=\$(ls -d /home/azureuser/perp/accounts.* 2>/dev/null | wc -l); for d in /home/azureuser/perp/accounts.*; do [ -d \"\$d\" ] || continue; rm -rf \"\$d\"; done; a=\$(ls -d /home/azureuser/perp/accounts.* 2>/dev/null | wc -l); printf \"before=%s after=%s removed=%s\\n\" \"\$b\" \"\$a\" \"\$((b-a))\""
   fi
   # §6.1 — leave perp-next down to the one-time machine setup
   on "$ip" 'c=$(ls -1 /home/azureuser/perp-next/accounts/ 2>/dev/null | wc -l); if [ "$c" = "0" ]; then rmdir /home/azureuser/perp-next/accounts 2>/dev/null; rm -f /home/azureuser/perp-next/enclave.signed.so /home/azureuser/perp-next/perp-dex-server /home/azureuser/perp-next/perp-dex-orchestrator /home/azureuser/perp-next/civetweb_access.log /home/azureuser/perp-next/enclave.log; printf "    §6.1: perp-next cleared, left: %s\n" "$(ls -1 /home/azureuser/perp-next/ | tr "\n" " ")"; else printf "    §6.1 SKIPPED: perp-next/accounts holds %s files — a promoted set was left behind, investigate\n" "$c"; fi'
