@@ -14,6 +14,16 @@
 # WHAT IT DOES NOT DO: promote anything, decommission anything, or decide anything. It reports,
 # and it is explicit about which checks are decisive and which are merely informative — a
 # verification script that presents a weak check as a strong one is worse than no script.
+#
+# CYCLE-SPECIFIC MEASUREMENTS. The two constants below belong to the β18 cycle
+# (aead7ecf -> 367cabb2…, completed 2026-10-05). The NEXT bump must update them.
+#
+# Leaving them stale cannot cause a wrong action, and that is by construction rather than by
+# luck: the pre-flight compares them against what the nodes actually report, so a stale value
+# produces a REFUSAL naming the mismatch. Demonstrated after this cycle — with β18 promoted into
+# the :9088 slot the pre-flight says NOT READY: old-mrenclave(367cabb2), because aead7ecf is
+# gone. That is the gate working, not a bug to route around.
+#
 set -uo pipefail
 
 BASTION="andrey@94.130.18.162"
@@ -22,7 +32,22 @@ declare -a NODES=(20.71.184.176 20.224.243.60 52.236.130.102)
 BASE="${1:-$(ls -dt "$HOME"/path-a-baseline-* 2>/dev/null | head -1)}"
 
 hr() { printf '%s\n' "------------------------------------------------------------"; }
-on() { ssh -o BatchMode=yes "$BASTION" "ssh -o BatchMode=yes -o ConnectTimeout=15 azureuser@$1 '$2'"; }
+on() {
+  # STRUCTURAL GUARD, not a convention. This function embeds its argument inside single quotes
+  # for the inner ssh, so a single quote in that argument closes the quoting and the remote
+  # command arrives mangled. It bit three times in two days: the ceremony firing (curl received
+  # the word printf as a hostname), the stale-copy survey (a printf FORMAT in single quotes
+  # arrived word-split and printed %4s as a column), and the scrub step (same, so a DELETION
+  # reported no count). A comment telling the next person not to do it was already there and did
+  # not help, so it refuses instead.
+  case "$2" in
+    *\'*) echo "on(): refusing — the command contains a single quote, which would break the" >&2
+          echo "      nested quoting. Use escaped double quotes instead. Command was:" >&2
+          echo "      $2" >&2
+          return 64 ;;
+  esac
+  ssh -o BatchMode=yes "$BASTION" "ssh -o BatchMode=yes -o ConnectTimeout=15 azureuser@$1 '$2'"
+}
 
 [ -n "$BASE" ] && [ -d "$BASE" ] || {
   echo "FAILED: no baseline directory. §4 check 3 compares against pre-migration values, and"

@@ -29,6 +29,16 @@
 # THE PRE-FLIGHT IS THE OTHER HALF, and arguably the more valuable one: it refuses to fire
 # ANYTHING unless all three nodes are ready. A node that is not ready fails late — after the
 # others have retired — which is the exact shape §7.1 exists for.
+#
+# CYCLE-SPECIFIC MEASUREMENTS. The two constants below belong to the β18 cycle
+# (aead7ecf -> 367cabb2…, completed 2026-10-05). The NEXT bump must update them.
+#
+# Leaving them stale cannot cause a wrong action, and that is by construction rather than by
+# luck: the pre-flight compares them against what the nodes actually report, so a stale value
+# produces a REFUSAL naming the mismatch. Demonstrated after this cycle — with β18 promoted into
+# the :9088 slot the pre-flight says NOT READY: old-mrenclave(367cabb2), because aead7ecf is
+# gone. That is the gate working, not a bug to route around.
+#
 set -uo pipefail
 
 BASTION="andrey@94.130.18.162"
@@ -40,7 +50,22 @@ OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
 hr() { printf '%s\n' "------------------------------------------------------------"; }
-on() { ssh -o BatchMode=yes "$BASTION" "ssh -o BatchMode=yes -o ConnectTimeout=10 azureuser@$1 '$2'"; }
+on() {
+  # STRUCTURAL GUARD, not a convention. This function embeds its argument inside single quotes
+  # for the inner ssh, so a single quote in that argument closes the quoting and the remote
+  # command arrives mangled. It bit three times in two days: the ceremony firing (curl received
+  # the word printf as a hostname), the stale-copy survey (a printf FORMAT in single quotes
+  # arrived word-split and printed %4s as a column), and the scrub step (same, so a DELETION
+  # reported no count). A comment telling the next person not to do it was already there and did
+  # not help, so it refuses instead.
+  case "$2" in
+    *\'*) echo "on(): refusing — the command contains a single quote, which would break the" >&2
+          echo "      nested quoting. Use escaped double quotes instead. Command was:" >&2
+          echo "      $2" >&2
+          return 64 ;;
+  esac
+  ssh -o BatchMode=yes "$BASTION" "ssh -o BatchMode=yes -o ConnectTimeout=10 azureuser@$1 '$2'"
+}
 
 case "$MODE" in
   clear-next|preflight|dryrun|real) ;;
