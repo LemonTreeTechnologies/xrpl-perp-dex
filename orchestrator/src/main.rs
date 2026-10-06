@@ -2352,15 +2352,29 @@ async fn main() -> Result<()> {
     let deposit_cfg = deposit_spv::DepositDriverConfig::from_env(&escrow_address);
     let clock_cfg = attested_clock::ClockDriverConfig::from_env();
     if deposit_cfg.is_some() || clock_cfg.is_some() {
-        let ws_url = deposit_cfg
+        // The UNION of whatever both configs name, deduplicated. Either driver alone is
+        // enough to want the collector, and if both are on they should not open the same
+        // subscription twice.
+        let mut ws_urls: Vec<String> = deposit_cfg
             .as_ref()
-            .map(|d| d.ws_url.clone())
-            .or_else(|| clock_cfg.as_ref().map(|c| c.ws_url.clone()))
-            .expect("one of the two configs is present");
+            .map(|d| d.ws_urls.clone())
+            .unwrap_or_default();
+        if let Some(c) = clock_cfg.as_ref() {
+            for u in &c.ws_urls {
+                if !ws_urls.contains(u) {
+                    ws_urls.push(u.clone());
+                }
+            }
+        }
+        assert!(!ws_urls.is_empty(), "one of the two configs is present");
         let buffer =
             std::sync::Arc::new(std::sync::Mutex::new(deposit_spv::ValidationBuffer::new()));
-        tokio::spawn(deposit_spv::run_validation_collector(
-            ws_url,
+        info!(
+            sources = ws_urls.len(),
+            "validations collector: one per endpoint"
+        );
+        tokio::spawn(deposit_spv::run_validation_collectors(
+            ws_urls,
             buffer.clone(),
         ));
         if let Some(dcfg) = deposit_cfg {
@@ -2372,7 +2386,25 @@ async fn main() -> Result<()> {
             ));
             info!("deposit-spv ENABLED (collector always; scanner sequencer-only)");
         }
-        if let Some(ccfg) = clock_cfg {
+        // THE ONE WAY THE STALE-PIN BRICK RETURNS (audit 2026-10-06). The clock is
+        // OFF-by-default and unl-refresh is ON-by-default, so the dangerous configuration is
+        // narrow and specific: someone sets PERP_UNL_REFRESH=0 and arms the clock. Then the
+        // enclave's derived validator set ages with nothing refreshing it, one stale signing
+        // key is the whole 5-of-6 margin, and the clock refuses every ledger — which is
+        // exactly what happened the last time it was switched on. Refusing that pair costs
+        // nothing legitimate: there is no reason to want attested time while deliberately
+        // freezing the trust root it is checked against.
+        let unl_off = std::env::var("PERP_UNL_REFRESH").ok().as_deref() == Some("0");
+        if attested_clock::clock_must_refuse(clock_cfg.is_some(), unl_off) {
+            error!(
+                metric = "attested_clock_refused_unl_off",
+                "attested-clock NOT started: PERP_ATTESTED_CLOCK is on while PERP_UNL_REFRESH=0. \
+                 The clock is checked against the enclave's derived validator set, and with \
+                 nothing refreshing that set one rotated signing key is the whole 5-of-6 \
+                 margin — the clock would then refuse every ledger. Remove PERP_UNL_REFRESH=0 \
+                 or leave the clock off."
+            );
+        } else if let Some(ccfg) = clock_cfg {
             // Deliberately NOT sequencer-gated: each node advances its own clock from a
             // header it verified itself. A cluster cosign would buy nothing here and
             // would cost liveness on the path whose stalling halts trading.

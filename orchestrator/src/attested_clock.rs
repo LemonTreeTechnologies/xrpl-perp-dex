@@ -138,8 +138,27 @@ pub struct ClockHealth {
 pub const RIPPLE_EPOCH_OFFSET_SECS: u64 = 946_684_800;
 
 pub struct ClockDriverConfig {
-    pub http_url: String,
-    pub ws_url: String,
+    /// SEVERAL endpoints, not one, and no rippled of our own in the path.
+    ///
+    /// Ruled 2026-10-06 after the audit confirmed the fetch source is untrusted BY
+    /// CONSTRUCTION: `xrpl_spv_verify_quorum` computes `ledger_hash` from the raw header and
+    /// requires a quorum of DISTINCT pinned-UNL signers over THAT hash, and `close_time` is
+    /// read only after that passes — a changed time is a changed hash is a failed quorum. So a
+    /// source cannot make the enclave accept a false time; it can only WITHHOLD or serve a
+    /// stale-but-validly-signed header, which the monotonic check refuses. That makes this a
+    /// LIVENESS decision, and for liveness independent sources beat one shared source.
+    ///
+    /// A single shared source was rejected for the reason the price-venue ruling gives: it is
+    /// the common-mode shape, and worse here, because a stalled clock halts trading on EVERY
+    /// node at once rather than moving a median. Our own rippled was additionally ruled out by
+    /// arithmetic — 89 GB of database and 13 GB RSS against 18 GB free and 15 GB of RAM
+    /// already shared with the enclave.
+    ///
+    /// This is not a new concession: the pinned-UNL refresh, which is the trust ROOT rather
+    /// than a header, has been fed from a public URL and enclave-verified in production since
+    /// 2026-09-27.
+    pub http_urls: Vec<String>,
+    pub ws_urls: Vec<String>,
     /// A ledger closes roughly every 4s; polling much faster only earns `-89`.
     pub interval_secs: u64,
 }
@@ -155,16 +174,94 @@ impl ClockDriverConfig {
             return None;
         }
         Some(Self {
-            http_url: std::env::var("XRPL_RPC_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:5005".to_string()),
-            ws_url: std::env::var("XRPL_WS_URL")
-                .unwrap_or_else(|_| "ws://127.0.0.1:6006".to_string()),
+            // Defaults are the endpoints VERIFIED reachable from all three cluster nodes on
+            // 2026-10-06, each returning a validated 118-byte header at the same index, with
+            // the validations stream open. Not a list copied from documentation: the previous
+            // default was `127.0.0.1:5005`, which no node has ever run.
+            //
+            // Two implementations and two operators: s.altnet is rippled and clio.altnet is
+            // Clio, both Ripple; testnet.xrpl-labs.com is a different operator. Said plainly
+            // because it bounds what the set buys — against WITHHOLDING there are two
+            // independent parties here, not three.
+            http_urls: split_urls(
+                "XRPL_RPC_URL",
+                &[
+                    "https://s.altnet.rippletest.net:51234",
+                    "https://clio.altnet.rippletest.net:51234",
+                    "https://testnet.xrpl-labs.com",
+                ],
+            ),
+            ws_urls: split_urls(
+                "XRPL_WS_URL",
+                &[
+                    "wss://s.altnet.rippletest.net:51233",
+                    "wss://clio.altnet.rippletest.net:51233",
+                    "wss://testnet.xrpl-labs.com",
+                ],
+            ),
             interval_secs: std::env::var("PERP_ATTESTED_CLOCK_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5),
         })
     }
+}
+
+/// Must the clock refuse to arm? True exactly when it is on while the trust-root refresh is
+/// deliberately off.
+///
+/// A function rather than two lines inline in `main`, so it can be probed. The clock is
+/// checked against the enclave's derived validator set; with nothing refreshing that set one
+/// rotated signing key is the whole 5-of-6 margin, and the clock then refuses every ledger —
+/// which is what happened the last time it was switched on. Both drivers on, or the clock
+/// off, are fine; the pair "clock armed + refresh disabled" is the only configuration with no
+/// legitimate reading.
+pub fn clock_must_refuse(clock_enabled: bool, unl_refresh_disabled: bool) -> bool {
+    clock_enabled && unl_refresh_disabled
+}
+
+/// Read a comma-separated endpoint list from `var`, falling back to `defaults`.
+///
+/// Empty entries are dropped and each is trimmed, so `"a, ,b,"` is two endpoints rather than
+/// four — a trailing comma in a systemd drop-in should not produce an endpoint called "".
+/// An env var that is set but yields NOTHING usable falls back to the defaults rather than
+/// leaving the driver with an empty list, because a clock with no source is a halt and a
+/// typo in a config file should not cause one silently.
+pub fn split_urls(var: &str, defaults: &[&str]) -> Vec<String> {
+    let from_env: Vec<String> = std::env::var(var)
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if from_env.is_empty() {
+        defaults.iter().map(|s| s.to_string()).collect()
+    } else {
+        from_env
+    }
+}
+
+/// Pick the response describing the NEWEST validated ledger among those that parse.
+///
+/// Not first-that-parses, and the reason is correctness of liveness rather than taste: the
+/// validations are buffered only for ledgers we were subscribed for when they closed —
+/// rippled serves no validation history — so asking about a ledger an endpoint is lagging on
+/// yields a header whose validations we do not have, every tick, for as long as that endpoint
+/// lags. Taking the highest index asks about the ledger we are actually buffering.
+///
+/// Endpoints that fail or return garbage are skipped. One that answers is enough; none is the
+/// only failure, and it is the one multiple sources exist to make unlikely.
+pub fn newest_parsed(
+    responses: &[(String, serde_json::Value)],
+) -> Option<(String, [u8; HEADER_LEN], String, u64)> {
+    responses
+        .iter()
+        .filter_map(|(url, j)| {
+            header_from_ledger_response(j)
+                .ok()
+                .map(|(h, hash, idx)| (url.clone(), h, hash, idx))
+        })
+        .max_by_key(|(_, _, _, idx)| *idx)
 }
 
 /// Pull the header and hash out of a `ledger` response taken with `binary: true`.
@@ -223,15 +320,28 @@ async fn advance_once(
     perp: &crate::perp_client::PerpClient,
     buffer: &std::sync::Arc<std::sync::Mutex<ValidationBuffer>>,
 ) -> Result<(u64, i64)> {
-    let j: serde_json::Value = http
-        .post(&cfg.http_url)
-        .json(&serde_json::json!({"method": "ledger", "params": [
-            {"ledger_index": "validated", "binary": true, "transactions": false}]}))
-        .send()
-        .await?
-        .json()
-        .await?;
-    let (header, ledger_hash, index) = header_from_ledger_response(&j)?;
+    // Ask EVERY endpoint, then take the newest that parses. Sequential rather than joined:
+    // the list is short, a tick has seconds to spare, and a sequential loop keeps the failure
+    // of one endpoint from needing any care beyond being skipped.
+    let body = serde_json::json!({"method": "ledger", "params": [
+        {"ledger_index": "validated", "binary": true, "transactions": false}]});
+    let mut responses: Vec<(String, serde_json::Value)> = Vec::new();
+    for url in &cfg.http_urls {
+        match http.post(url).json(&body).send().await {
+            Ok(r) => match r.json::<serde_json::Value>().await {
+                Ok(j) => responses.push((url.clone(), j)),
+                Err(e) => tracing::debug!(url = %url, error = %e, "clock: body not JSON"),
+            },
+            Err(e) => tracing::debug!(url = %url, error = %e, "clock: endpoint unreachable"),
+        }
+    }
+    let Some((src, header, ledger_hash, index)) = newest_parsed(&responses) else {
+        bail!(
+            "no endpoint returned a usable validated ledger ({} tried)",
+            cfg.http_urls.len()
+        );
+    };
+    tracing::debug!(source = %src, ledger = index, "clock: newest validated header");
 
     let validations = {
         let b = buffer
@@ -337,6 +447,104 @@ pub async fn run_attested_clock(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_clock_refuses_to_arm_only_when_the_trust_root_is_off() {
+        // The whole truth table, because the point is that three of the four are FINE and
+        // refusing any of them would be an over-restriction an operator has to work around.
+        assert!(
+            clock_must_refuse(true, true),
+            "armed + refresh off is the one bad pair"
+        );
+        assert!(
+            !clock_must_refuse(true, false),
+            "armed + refresh on is the intended state"
+        );
+        assert!(
+            !clock_must_refuse(false, true),
+            "clock off: refresh being off is not ours"
+        );
+        assert!(
+            !clock_must_refuse(false, false),
+            "neither on: nothing to refuse"
+        );
+    }
+
+    fn resp(idx: u64, validated: bool, bytes: usize) -> serde_json::Value {
+        // ledger_data must carry the sequence at offset 0, because the parser cross-checks it
+        // against ledger_index — two halves of one response disagreeing is the defect it
+        // exists to catch.
+        let mut raw = vec![0u8; bytes];
+        if bytes >= 4 {
+            raw[..4].copy_from_slice(&(idx as u32).to_be_bytes());
+        }
+        serde_json::json!({"result": {
+            "validated": validated,
+            "ledger_index": idx,
+            "ledger_hash": format!("{idx:064X}"),
+            "ledger": {"ledger_data": hex::encode(&raw)},
+        }})
+    }
+
+    #[test]
+    fn urls_split_on_commas_and_drop_the_empties() {
+        std::env::set_var("TEST_URLS_A", " a , ,b, ");
+        let v = split_urls("TEST_URLS_A", &["z"]);
+        assert_eq!(v, vec!["a".to_string(), "b".to_string()]);
+        std::env::remove_var("TEST_URLS_A");
+    }
+
+    #[test]
+    fn an_unset_or_useless_var_falls_back_to_the_defaults() {
+        // A clock with no source is a halt, so a trailing comma in a drop-in must not produce
+        // an endpoint called "" and an empty list must not survive.
+        std::env::remove_var("TEST_URLS_B");
+        assert_eq!(split_urls("TEST_URLS_B", &["d1", "d2"]), vec!["d1", "d2"]);
+        std::env::set_var("TEST_URLS_B", " , , ");
+        assert_eq!(split_urls("TEST_URLS_B", &["d1"]), vec!["d1"]);
+        std::env::remove_var("TEST_URLS_B");
+    }
+
+    #[test]
+    fn the_newest_parsed_response_wins_not_the_first() {
+        // THE POINT, and it is liveness not taste: validations are buffered only for the
+        // ledger we were subscribed for when it closed, so taking a lagging endpoint's header
+        // asks about a ledger whose validations we do not have — every tick, for as long as
+        // that endpoint lags.
+        let rs = vec![
+            ("lagging".to_string(), resp(100, true, HEADER_LEN)),
+            ("fresh".to_string(), resp(103, true, HEADER_LEN)),
+            ("middle".to_string(), resp(101, true, HEADER_LEN)),
+        ];
+        let (src, _, _, idx) = newest_parsed(&rs).expect("one parses");
+        assert_eq!(idx, 103);
+        assert_eq!(src, "fresh");
+    }
+
+    #[test]
+    fn unparseable_and_unvalidated_responses_are_skipped_not_fatal() {
+        let rs = vec![
+            ("garbage".to_string(), serde_json::json!({"result": {}})),
+            ("unvalidated".to_string(), resp(999, false, HEADER_LEN)),
+            ("short".to_string(), resp(998, true, 10)),
+            ("good".to_string(), resp(7, true, HEADER_LEN)),
+        ];
+        let (src, _, _, idx) = newest_parsed(&rs).expect("the good one survives");
+        assert_eq!(
+            (src.as_str(), idx),
+            ("good", 7),
+            "a higher index must NOT win if it did not parse"
+        );
+    }
+
+    #[test]
+    fn no_usable_response_is_none_rather_than_a_guess() {
+        let rs = vec![
+            ("a".to_string(), serde_json::json!({"result": {}})),
+            ("b".to_string(), resp(5, false, HEADER_LEN)),
+        ];
+        assert!(newest_parsed(&rs).is_none());
+    }
+
     use super::*;
 
     /// Captured from our own rippled 3.1.3 on testnet, 2026-09-25 — a real response, not
