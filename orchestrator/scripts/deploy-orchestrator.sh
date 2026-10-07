@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# deploy-step5a-fix.sh — put the step-5a dry-run fix (PR #69) on the cluster.
+# deploy-orchestrator.sh — build the orchestrator from master and put it on all three nodes.
+#
+# RENAMED from deploy-step5a-fix.sh on 2026-10-07: it has deployed four unrelated changes
+# since, so the name had become a stale claim about its own scope — the same defect this file
+# has already had fixed in it three times (a pinned commit it was not deploying, a retracted
+# idempotency note, a marker count that went stale). A filename is output too.
 #
 # RUN THIS FROM YOUR LAPTOP:  bash orchestrator/scripts/deploy-step5a-fix.sh
 #
@@ -65,7 +70,10 @@ echo "[2/4] PROVING the built artefact carries EVERY fix it is supposed to"
 ssh -o BatchMode=yes "$BASTION" '
   B=~/llm-perp-xrpl/orchestrator/target/release/perp-dex-orchestrator
   fail=0
-  for m in "step 5a" "did not carry" "NO-OP, not a failure to retry" "REQUIRED after promotion"; do
+  # ONE MARKER PER CHANGE that must be on the cluster before the next step. A marker that
+  # cannot distinguish the build you want from the one you have is not a check.
+  for m in "step 5a" "did not carry" "NO-OP, not a failure to retry" "REQUIRED after promotion" \
+           "clio.altnet.rippletest.net" "attested_clock_refused_unl_off"; do
     N=$(strings -a "$B" | grep -cF "$m")
     printf "  %-34s %s\n" "\"$m\"" "$N"
     [ "$N" -gt 0 ] || { echo "    MISSING — this build predates that fix"; fail=1; }
@@ -91,13 +99,15 @@ for ip in 20.71.184.176 20.224.243.60 52.236.130.102; do
     N2=\$(strings -a \$B 2>/dev/null | grep -cF \"did not carry\")
     N3=\$(strings -a \$B 2>/dev/null | grep -cF \"NO-OP, not a failure to retry\")
     N4=\$(strings -a \$B 2>/dev/null | grep -cF \"REQUIRED after promotion\")
-    echo \"service=\$A  step5a=\$N1  inventory-diff=\$N2  govern-no-op=\$N3  followups=\$N4\"'"
+    N5=\$(strings -a \$B 2>/dev/null | grep -cF \"clio.altnet.rippletest.net\")
+    N6=\$(strings -a \$B 2>/dev/null | grep -cF \"attested_clock_refused_unl_off\")
+    echo \"service=\$A  step5a=\$N1  inv-diff=\$N2  govern=\$N3  followups=\$N4  multi-src=\$N5  clock-guard=\$N6\"'"
 done
 hr
 # Count-agnostic on purpose: it said "all three markers" the moment there were four, which
 # is the same stale-claim shape as the pinned commit this script used to print.
-echo "If every node reports service=active and EVERY marker above is >0, rehearse on ALL THREE:"
-echo "    bash orchestrator/scripts/ceremony-parallel.sh dryrun"
+echo "If every node reports service=active and EVERY marker above is >0, the cluster is current."
+echo "To arm the attested clock:  bash orchestrator/scripts/arm-attested-clock.sh"
 echo
 echo "In each node's response read \`status\` AND \`boot_proof\`:"
 echo "  \"dry-run-ok\"            the only PASS. It now requires the step-5a boot."
