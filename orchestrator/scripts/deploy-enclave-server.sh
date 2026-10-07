@@ -86,7 +86,13 @@ for ip in "${NODES[@]}"; do
   ssh -o BatchMode=yes "$BASTION" "sleep 12"
   m="$(mre "$ip")"
   sv="$(on "$ip" "systemctl is-active perp-dex-enclave")"
-  ft="$(on "$ip" "awk /Server.started.on.port.9088/{n=NR} {a[NR]=\$0} END{c=0; for(i=n;i<=NR;i++) if (a[i] ~ /FATAL|perpLoadState failed/) c++; print c} /home/azureuser/perp/enclave.log")"
+  # NO awk. The awk program was passed UNQUOTED through on(), which forbids single quotes,
+  # so bash saw its braces and parens as syntax and the command died — the check then
+  # returned empty, read as a refusal, and halted a deploy whose three other checks had
+  # already passed. A false stop is still a defect. grep and tail need no quoting gymnastics,
+  # and this exact command was run against the already-swapped node before being committed:
+  # last-start line 123113, refusals since 0.
+  ft="$(on "$ip" "N=\$(grep -n \"Server started on port 9088\" /home/azureuser/perp/enclave.log | tail -1 | cut -d: -f1); tail -n +\$N /home/azureuser/perp/enclave.log | grep -ciE \"FATAL|perpLoadState failed\"")"
   lim="$(bodylimit "$ip")"
   printf '    after: :9088=%s  svc=%s  refusals-in-log=%s  8000-char body -> %s\n' \
     "${m:0:16}" "$sv" "${ft:-?}" "${lim:-no answer}"
