@@ -207,6 +207,22 @@ impl ClockDriverConfig {
     }
 }
 
+/// Install the process-level rustls CryptoProvider, once, idempotently.
+///
+/// WHY THIS EXISTS AT ALL. rustls 0.23 refuses to choose when more than one provider is
+/// compiled in, and both `aws-lc-rs` and `ring` are enabled on it by other crates in this graph
+/// (alloy and reqwest between them). Nothing noticed while every websocket URL was
+/// `ws://127.0.0.1:6006`, because plaintext needs no provider. The first `wss://` handshake
+/// panicked with "Could not automatically determine the process-level CryptoProvider".
+///
+/// Installing it HERE rather than relying on feature resolution means a future dependency bump
+/// cannot quietly change which crypto our TLS runs on. `install_default` returns Err when one
+/// is already installed, which is not a failure — it is the idempotent case — so the result is
+/// deliberately discarded.
+pub fn install_tls_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 /// Must the clock refuse to arm? True exactly when it is on while the trust-root refresh is
 /// deliberately off.
 ///
