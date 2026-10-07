@@ -110,7 +110,21 @@ done
 hr
 [ "$blocked" -eq 0 ] || { echo "STOP — nothing armed."; exit 1; }
 if [ "$MODE" = "check" ]; then
-  echo "readiness only — nothing changed. Next: $0 one"
+  # The hint has to reflect what is actually armed. It said "Next: one" even when all three
+  # were already running, which is the stale-output shape this session has corrected in four
+  # other scripts: the state moved and the prose beside it did not.
+  armed=0
+  for ip in "$NODE1" "${REST[@]}"; do
+    s="$(status_of "$ip")"; set -- $s
+    [ "${1:-}" = "True" ] && armed=$((armed + 1))
+  done
+  echo "readiness only — nothing changed. $armed of 3 node(s) have the clock armed."
+  case "$armed" in
+    0) echo "Next: $0 one   (node-1 first; the nodes are independent here, so a failure is"
+       echo "               learned on one node rather than three)" ;;
+    3) echo "All three are armed. Nothing to do — to switch them off: $0 disarm" ;;
+    *) echo "Next: $0 rest  (arms the remaining node(s))" ;;
+  esac
   exit 0
 fi
 
@@ -118,7 +132,19 @@ echo "[2/3] arming ${#targets[@]} node(s)"
 for ip in "${targets[@]}"; do arm_one "$ip" || exit 1; done
 hr
 
-echo "[3/3] watching for ~3 minutes — advances must climb, refusals must stay 0"
+echo "[3/3] watching for ~3 minutes — advances must climb, refusals must stop climbing"
+# JUDGED ON THE DELTA, not the lifetime total. A freshly armed node takes one -208
+# (under quorum) on its first tick, because the collector has only just subscribed and has not
+# yet buffered a full set of validations for the ledger it is asked about. That is expected and
+# never repeats — but a verdict keyed on "refusals == 0" called it INCONCLUSIVE on a node that
+# had advanced 29 times and refused once, three minutes earlier. Second false verdict of the
+# day from the same habit: I diagnosed node-1 by hand using exactly this delta ("529 -> 529,
+# unchanged") and then left the script judging the total.
+declare -A ref0 adv0
+for ip in "${targets[@]}"; do
+  s="$(status_of "$ip")"; set -- $s
+  adv0[$ip]="${2:-0}"; ref0[$ip]="${3:-0}"
+done
 for round in 1 2 3 4 5 6; do
   ssh -o BatchMode=yes "$BASTION" "sleep 30"
   for ip in "${targets[@]}"; do
@@ -131,17 +157,27 @@ hr
 fail=0
 for ip in "${targets[@]}"; do
   s="$(status_of "$ip")"; set -- $s
-  if [ "${2:-0}" -gt 0 ] 2>/dev/null && [ "${3:-1}" = "0" ]; then
-    echo "  $ip: ADVANCING, no refusals — this is the shape we want"
-  elif [ "${3:-0}" -gt 0 ] 2>/dev/null && [ "${2:-0}" = "0" ]; then
-    echo "  $ip: REFUSING every ledger (advances=0, refusals=${3}, last_rc=${4:-?}) — this is"
-    echo "       what happened the last time it was switched on. Disarm and read the rc:"
+  d_adv=$(( ${2:-0} - ${adv0[$ip]:-0} ))
+  d_ref=$(( ${3:-0} - ${ref0[$ip]:-0} ))
+  printf '  %-16s over the window: advances +%s, refusals +%s\n' "$ip" "$d_adv" "$d_ref"
+  if [ "$d_adv" -gt 0 ] && [ "$d_ref" -eq 0 ]; then
+    echo "       ADVANCING and refusals have stopped — this is the shape we want."
+    [ "${3:-0}" -gt 0 ] 2>/dev/null && echo "       (${3} lifetime refusal(s), none during the window: a startup -208 before the"
+    [ "${3:-0}" -gt 0 ] 2>/dev/null && echo "        validation buffer filled is expected and does not repeat.)"
+  elif [ "$d_adv" -eq 0 ] && [ "$d_ref" -gt 0 ]; then
+    echo "       REFUSING every ledger (advances +0, refusals +$d_ref, last_rc=${4:-?}) — this"
+    echo "       is what happened the last time it was switched on. Disarm and read the rc:"
     echo "       -70/-71 pinned UNL missing or below its floor; -7x the quorum did not verify;"
     echo "       -89/-90 not newer / time went backwards (benign if advances are also climbing)."
     fail=1
+  elif [ "$d_adv" -gt 0 ] && [ "$d_ref" -gt 0 ]; then
+    echo "       ADVANCING but still refusing (+$d_adv / +$d_ref). Not a failure and not clean:"
+    echo "       some ledgers are being asked about before their validations are buffered."
+    echo "       Watch whether the refusal rate falls; read the journal for the rc."
+    fail=1
   else
-    echo "  $ip: INCONCLUSIVE (advances=${2:-?}, refusals=${3:-?}) — give it longer or read the"
-    echo "       orchestrator journal; a tick needs the validations we buffered for that ledger."
+    echo "       STALLED (+0 advances) — no tick completed in three minutes. Read the"
+    echo "       orchestrator journal; a tick needs the validations buffered for that ledger."
     fail=1
   fi
 done
