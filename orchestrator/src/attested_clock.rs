@@ -335,7 +335,7 @@ async fn advance_once(
     cfg: &ClockDriverConfig,
     perp: &crate::perp_client::PerpClient,
     buffer: &std::sync::Arc<std::sync::Mutex<ValidationBuffer>>,
-) -> Result<(u64, i64)> {
+) -> Result<(u64, i64, String)> {
     // Ask EVERY endpoint, then take the newest that parses. Sequential rather than joined:
     // the list is short, a tick has seconds to spare, and a sequential loop keeps the failure
     // of one endpoint from needing any care beyond being skipped.
@@ -378,11 +378,25 @@ async fn advance_once(
     // and derives the count from what it framed, so the two cannot disagree.
     let blob = build_xclk_blob(&header, &validations)?;
 
-    let rc = match perp.attested_clock_advance(&blob).await {
-        Ok(_) => 0i64,
-        Err(e) => crate::perp_client::rc_from_error(&e.to_string()).unwrap_or(i64::MIN),
+    // CARRY THE ERROR TEXT, not just a sentinel. When the rc could not be parsed this used to
+    // return i64::MIN alone, and the driver then logged
+    //   rc=-9223372036854775808 cause="(this enclave does not report a cause)"
+    // which blames the enclave for withholding a cause it had in fact sent. The enclave's route
+    // answers {"message":"Attested clock refused (rc=-203)"} — so when the rc is missing the
+    // failure is NOT a refusal at all but something before it (transport, timeout, a body we
+    // did not expect), and that is exactly the case where the text is the only evidence there
+    // is. Diagnostics that accuse the wrong component cost more than no diagnostics.
+    let (rc, detail) = match perp.attested_clock_advance(&blob).await {
+        Ok(_) => (0i64, String::new()),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            match crate::perp_client::rc_from_error(&msg) {
+                Some(rc) => (rc, msg),
+                None => (i64::MIN, msg),
+            }
+        }
     };
-    Ok((index, rc))
+    Ok((index, rc, detail))
 }
 
 /// The loop. Never exits: a clock that gives up is a halt nobody asked for.
@@ -404,7 +418,7 @@ pub async fn run_attested_clock(
 
     loop {
         match advance_once(&http, &cfg, &perp, &buffer).await {
-            Ok((index, rc)) => match classify_clock_rc(rc) {
+            Ok((index, rc, detail)) => match classify_clock_rc(rc) {
                 ClockOutcome::Advanced => {
                     health.advances.fetch_add(1, Ordering::Relaxed);
                     announced_no_unl = false;
@@ -448,7 +462,15 @@ pub async fn run_attested_clock(
                         outcome = ?other,
                         // Empty for an enclave old enough to still flatten to -72/-74.
                         // Saying so beats printing "unknown", which reads like a defect.
-                        cause = spv_cause(rc).unwrap_or("(this enclave does not report a cause)"),
+                        cause = spv_cause(rc).unwrap_or(if rc == i64::MIN {
+                            // NOT the enclave's silence. i64::MIN means we could not find an
+                            // rc in the failure at all, which means the call did not reach a
+                            // refusal — the detail field below is the only evidence.
+                            "(no rc in the failure — this is not an enclave refusal; read detail)"
+                        } else {
+                            "(this enclave does not report a cause)"
+                        }),
+                        detail = %detail,
                         "attested clock refused"
                     );
                 }
