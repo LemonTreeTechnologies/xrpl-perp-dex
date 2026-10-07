@@ -692,6 +692,11 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Before anything can make a TLS connection. rustls 0.23 refuses to choose when several
+    // crypto providers are compiled in, and this graph has two; the first wss:// handshake
+    // panicked rather than erroring. Explicit here so a dependency bump cannot change it.
+    attested_clock::install_tls_provider();
+
     let cli = Cli::parse();
 
     match cli.command {

@@ -627,6 +627,66 @@ fn unhex(s: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    /// Proves OUR CLIENT can reach the public validations stream — not that the endpoint
+    /// serves it.
+    ///
+    /// THE DISTINCTION IS THE WHOLE POINT, and it cost a deploy on 2026-10-07. The endpoints
+    /// were verified by hand with a python TLS client, and the ports were verified reachable
+    /// from every node, so "the source works" was established. What was never checked was
+    /// whether `tokio_tungstenite::connect_async` could speak TLS at all — the crate was built
+    /// with `default-features = false` and no TLS backend, because the previous default URL was
+    /// `ws://127.0.0.1:6006` and plaintext never needed one. Moving the defaults to `wss://`
+    /// turned every connection into "URL error: TLS support not compiled in", and the clock sat
+    /// at advances=0 refusals=0 for three minutes looking inconclusive.
+    ///
+    /// `#[ignore]` because it needs the network and CI must stay hermetic. Run it by hand after
+    /// touching the TLS features or the endpoint defaults:
+    ///
+    ///     cargo test --locked ws_tls -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs outbound network; run by hand after touching TLS features or endpoints"]
+    async fn ws_tls_really_connects_and_validations_arrive() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        // The same call main makes. Without it this test panics inside rustls rather than
+        // failing on the network, which is a different bug wearing the same red.
+        crate::attested_clock::install_tls_provider();
+        let url = "wss://s.altnet.rippletest.net:51233";
+        let (mut ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "connect_async({url}) failed: {e} \
+                 — if this says 'TLS support not compiled in', the tokio-tungstenite \
+                 features in Cargo.toml lost their rustls backend"
+                )
+            });
+        ws.send(Message::text(
+            r#"{"command":"subscribe","streams":["validations"]}"#,
+        ))
+        .await
+        .expect("subscribe");
+
+        // One real validation frame is enough: it proves TLS, the handshake, the subscription
+        // and the stream, which is every link the collector depends on.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut saw = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), ws.next()).await {
+                Ok(Some(Ok(Message::Text(txt)))) => {
+                    if txt.contains("validationReceived") && txt.contains("ledger_hash") {
+                        saw = true;
+                        break;
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                _ => break,
+            }
+        }
+        assert!(saw, "no validationReceived frame in 30s from {url}");
+    }
+
     use super::*;
 
     /// The real thing: a REAL `ledger` response (binary:true) for validated testnet

@@ -15,7 +15,18 @@ tokio = { version = "1", features = ["full"] }
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+# rustls, matching reqwest's `rustls-tls` so the binary carries ONE TLS stack rather than two.
+# Without a TLS feature `connect_async` on a wss:// URL fails with "TLS support not compiled
+# in" — which is exactly what happened on 2026-10-07 when the endpoint defaults moved from
+# ws://127.0.0.1:6006 (plaintext, so TLS was never needed) to public wss:// endpoints.
+# Direct dependency for ONE line: installing the process-level CryptoProvider explicitly.
+# Both aws-lc-rs and ring are already enabled on rustls 0.23 by other crates in the graph
+# (alloy/reqwest), so rustls refuses to pick one and panics at the first TLS handshake it is
+# asked to make. The ambiguity pre-existed; moving the websocket defaults to wss:// is what
+# made it reachable. Choosing here means a future alloy bump cannot silently change which
+# crypto our TLS uses.
+rustls = { version = "0.23", default-features = false }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 
 # Serialization
