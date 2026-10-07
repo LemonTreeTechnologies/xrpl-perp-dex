@@ -108,9 +108,3 @@ hr
 # is the same stale-claim shape as the pinned commit this script used to print.
 echo "If every node reports service=active and EVERY marker above is >0, the cluster is current."
 echo "To arm the attested clock:  bash orchestrator/scripts/arm-attested-clock.sh"
-echo
-echo "In each node's response read \`status\` AND \`boot_proof\`:"
-echo "  \"dry-run-ok\"            the only PASS. It now requires the step-5a boot."
-echo "  \"dry-run-boot-failed\"   the boot ran and was judged a failure; boot_failure says why."
-echo "  missing_from_new        must hold nothing unexplained — that is the answer to"
-echo "                          'OLD has 183 sealed files, the rehearsal wrote 182, which one'."
