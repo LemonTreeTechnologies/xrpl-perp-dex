@@ -334,7 +334,7 @@ pub async fn process_withdrawal(
         let account_id = match xrpl_signer::decode_xrpl_address(&signer.xrpl_address) {
             Ok(id) => id,
             Err(e) => {
-                warn!(signer = %signer.name, "failed to decode address: {}", e);
+                warn!(signer = %signer.name, "failed to decode address: {:#}", e);
                 continue;
             }
         };
@@ -376,7 +376,7 @@ pub async fn process_withdrawal(
                 }));
             }
             Err(e) => {
-                warn!(signer = %signer.name, "signing failed: {}", e);
+                warn!(signer = %signer.name, "signing failed: {:#}", e);
             }
         }
     }
@@ -429,7 +429,7 @@ pub async fn process_withdrawal(
             })
         }
         Err(e) => {
-            error!(user = %req.user_id, "XRPL submission failed: {}", e);
+            error!(user = %req.user_id, "XRPL submission failed: {:#}", e);
             Ok(WithdrawResult {
                 status: "signed_but_not_submitted".into(),
                 amount: req.amount.clone(),

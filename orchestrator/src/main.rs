@@ -646,7 +646,7 @@ async fn run_liquidation_scan(
     let result = match perp.check_liquidations().await {
         Ok(r) => r,
         Err(e) => {
-            warn!("liquidation scan failed: {}", e);
+            warn!("liquidation scan failed: {:#}", e);
             return;
         }
     };
@@ -691,7 +691,7 @@ async fn run_liquidation_scan(
                         price: current_price,
                     });
                 }
-                Err(e) => error!(position_id = pos_id, "liquidation failed: {}", e),
+                Err(e) => error!(position_id = pos_id, "liquidation failed: {:#}", e),
             }
         }
     }
@@ -1041,7 +1041,7 @@ async fn main() -> Result<()> {
         .filter_map(|r| match crate::xrpl_signer::decode_xrpl_address(r) {
             Ok(id) => Some(hex::encode(id)),
             Err(e) => {
-                warn!(addr = %r, error = %e,
+                warn!(addr = %r, error = %format!("{e:#}"),
                     "operator-capital r-address failed to decode — dropped from the attested set");
                 None
             }
@@ -1310,7 +1310,7 @@ async fn main() -> Result<()> {
         }
         Err(e) => {
             warn!(
-                "Path A: failed to fetch local ECDH pubkey ({}) — \
+                "Path A: failed to fetch local ECDH pubkey ({:#}) — \
                  recipient filter disabled, share-v2 import will still \
                  be enforced by the enclave attest cache",
                 e
@@ -1358,7 +1358,7 @@ async fn main() -> Result<()> {
                     warn!(peer_pubkey = %peer_pubkey, "peer quote verification refused (403)")
                 }
                 Err(e) => {
-                    warn!(peer_pubkey = %peer_pubkey, "peer quote verify error: {}", e)
+                    warn!(peer_pubkey = %peer_pubkey, "peer quote verify error: {:#}", e)
                 }
             }
         }
@@ -1425,21 +1425,21 @@ async fn main() -> Result<()> {
                 let my_pk = match announcer_client.ecdh_pubkey().await {
                     Ok(v) => v,
                     Err(e) => {
-                        warn!(shard_id, "announcer ecdh_pubkey failed: {}", e);
+                        warn!(shard_id, "announcer ecdh_pubkey failed: {:#}", e);
                         continue;
                     }
                 };
                 let rd = match announcer_client.ecdh_report_data(shard_id, &group_id).await {
                     Ok(v) => v,
                     Err(e) => {
-                        warn!(shard_id, "announcer ecdh_report_data failed: {}", e);
+                        warn!(shard_id, "announcer ecdh_report_data failed: {:#}", e);
                         continue;
                     }
                 };
                 let quote = match announcer_client.attestation_quote(&rd).await {
                     Ok(v) => v,
                     Err(e) => {
-                        warn!(shard_id, "announcer attestation_quote failed: {}", e);
+                        warn!(shard_id, "announcer attestation_quote failed: {:#}", e);
                         continue;
                     }
                 };
@@ -1481,7 +1481,7 @@ async fn main() -> Result<()> {
         });
         let _admin_handle = tokio::spawn(async move {
             if let Err(e) = path_a_redkg::spawn_admin_listener(admin_listen, admin_state).await {
-                error!("Path A admin listener exited: {}", e);
+                error!("Path A admin listener exited: {:#}", e);
             }
         });
     }
@@ -1944,7 +1944,7 @@ async fn main() -> Result<()> {
         while let Some(batch) = trade_batch_rx.recv().await {
             if is_seq_fwd.load(Ordering::Relaxed) {
                 if let Err(e) = pub_tx.send(batch).await {
-                    warn!("failed to forward batch to P2P: {}", e);
+                    warn!("failed to forward batch to P2P: {:#}", e);
                 }
             }
         }
@@ -1957,7 +1957,7 @@ async fn main() -> Result<()> {
             if !peer.is_empty() {
                 match p2p_node.dial(peer) {
                     Ok(_) => info!(peer = %peer, "dialing P2P peer"),
-                    Err(e) => warn!(peer = %peer, "failed to dial: {}", e),
+                    Err(e) => warn!(peer = %peer, "failed to dial: {:#}", e),
                 }
             }
         }
@@ -2242,7 +2242,7 @@ async fn main() -> Result<()> {
                             leg = "taker",
                             trade_id = fill.trade_id,
                             user = %order.user_id,
-                            "REPLAY FAILED — this validator's enclave state has diverged from the sequencer's: {}",
+                            "REPLAY FAILED — this validator's enclave state has diverged from the sequencer's: {:#}",
                             e
                         );
                     } else {
@@ -2278,7 +2278,7 @@ async fn main() -> Result<()> {
                             leg = "maker",
                             trade_id = fill.trade_id,
                             user = %fill.maker_user_id,
-                            "REPLAY FAILED — this validator's enclave state has diverged from the sequencer's: {}",
+                            "REPLAY FAILED — this validator's enclave state has diverged from the sequencer's: {:#}",
                             e
                         );
                     } else {
@@ -2526,7 +2526,7 @@ async fn main() -> Result<()> {
             // Validators still save their own sealed state periodically
             if last_state_save.elapsed() >= STATE_SAVE_INTERVAL {
                 if let Err(e) = perp.save_state().await {
-                    warn!("state save failed: {}", e);
+                    warn!("state save failed: {:#}", e);
                 }
                 last_state_save = Instant::now();
             }
@@ -2585,7 +2585,7 @@ async fn main() -> Result<()> {
                     match live_price_path {
                         Some(price_feed::LivePricePath::OperatorFeed) => {
                             if let Err(e) = perp.update_price(&mark_fp8, &index_fp8, now_ts).await {
-                                error!("price update failed: {}", e);
+                                error!("price update failed: {:#}", e);
                             }
                         }
                         Some(price_feed::LivePricePath::SignedMedian) => {
@@ -2608,7 +2608,7 @@ async fn main() -> Result<()> {
                         timestamp: now_ts,
                     });
                 }
-                Err(e) => warn!("price fetch failed: {}", e),
+                Err(e) => warn!("price fetch failed: {:#}", e),
             }
             last_price_update = Instant::now();
         }
@@ -2644,7 +2644,7 @@ async fn main() -> Result<()> {
                         .await
                     };
                     if let Err(e) = credit_result {
-                        error!(sender = %deposit.sender, is_xrp = deposit.is_xrp, "deposit credit failed: {}", e);
+                        error!(sender = %deposit.sender, is_xrp = deposit.is_xrp, "deposit credit failed: {:#}", e);
                     } else {
                         if let Some(db) = &app_state.db {
                             db.insert_deposit(
@@ -2668,7 +2668,7 @@ async fn main() -> Result<()> {
                     let _ = std::fs::write(ledger_file, last_ledger.to_string());
                 }
             }
-            Err(e) => warn!("deposit scan failed: {}", e),
+            Err(e) => warn!("deposit scan failed: {:#}", e),
         }
 
         // Liquidation scanning
@@ -2737,7 +2737,7 @@ async fn main() -> Result<()> {
                         payments: funding_payments,
                     });
                 }
-                Err(e) => error!("funding application failed: {}", e),
+                Err(e) => error!("funding application failed: {:#}", e),
             }
             last_funding_instant = Instant::now();
         }
@@ -2782,7 +2782,7 @@ async fn main() -> Result<()> {
         // State save (every 5 minutes)
         if last_state_save.elapsed() >= STATE_SAVE_INTERVAL {
             if let Err(e) = perp.save_state().await {
-                warn!("state save failed: {}", e);
+                warn!("state save failed: {:#}", e);
             }
             last_state_save = Instant::now();
         }

@@ -631,7 +631,7 @@ pub async fn run_validation_collector(
                     // failures in 24h could not be attributed to one of three endpoints —
                     // and a per-source fault is exactly what a multi-source set must be able
                     // to see.
-                    tracing::warn!(source = %ws_url, error = %e,
+                    tracing::warn!(source = %ws_url, error = %format!("{e:#}"),
                         "deposit-spv: validations subscribe failed");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
@@ -641,14 +641,16 @@ pub async fn run_validation_collector(
                 match pump_validations(&mut ws, &buffer, VALIDATION_IDLE_TIMEOUT).await {
                     PumpEnd::Closed => tracing::warn!(source = %ws_url,
                         "deposit-spv: validations stream closed, reconnecting"),
-                    PumpEnd::Failed(e) => tracing::warn!(source = %ws_url, error = %e,
-                        "deposit-spv: validations stream failed, reconnecting"),
+                    PumpEnd::Failed(e) => {
+                        tracing::warn!(source = %ws_url, error = %format!("{e:#}"),
+                        "deposit-spv: validations stream failed, reconnecting")
+                    }
                     PumpEnd::IdleTimeout => tracing::warn!(source = %ws_url,
                         idle_secs = VALIDATION_IDLE_TIMEOUT.as_secs(),
                         "deposit-spv: validations stream went SILENT, reconnecting"),
                 }
             }
-            Err(e) => tracing::warn!(source = %ws_url, error = %e,
+            Err(e) => tracing::warn!(source = %ws_url, error = %format!("{e:#}"),
                 "deposit-spv: ws connect failed"),
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;

@@ -222,7 +222,7 @@ async fn handle_migrate_state(
                                         "dry-run-ok"
                                     }
                                     Err(e) => {
-                                        error!(error = %e, "admin: DRY-RUN PASSED but NEW-reset \
+                                        error!(error = %format!("{e:#}"), "admin: DRY-RUN PASSED but NEW-reset \
                                             FAILED — operator MUST clear perp-next/accounts + \
                                             restart perp-dex-enclave-next before the real ceremony");
                                         "dry-run-ok-reset-failed"
@@ -234,7 +234,7 @@ async fn handle_migrate_state(
                     Err(e) => {
                         // Could not even perform the boot. NOT a pass: an unrun check and a
                         // passed check must never share a status string.
-                        error!(error = %e, "admin: step 5a could not be RUN — the dry run is not \
+                        error!(error = %format!("{e:#}"), "admin: step 5a could not be RUN — the dry run is not \
                             a pass and NEW's set is left in place");
                         boot_failure = Some(format!("step 5a could not be run: {e:#}"));
                         "dry-run-boot-not-run"
@@ -265,7 +265,7 @@ async fn handle_migrate_state(
         }
         Err(e) => {
             let final_state = state_label(driver.state());
-            error!(state = %final_state, error = %e, "admin: ceremony failed");
+            error!(state = %final_state, error = %format!("{e:#}"), "admin: ceremony failed");
             (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {

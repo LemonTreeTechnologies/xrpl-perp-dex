@@ -47,7 +47,7 @@ pub fn load_or_create_identity(path: &Path) -> Result<Keypair> {
             Err(e) => {
                 warn!(
                     path = %path.display(),
-                    error = %e,
+                    error = %format!("{e:#}"),
                     "existing identity file is corrupt — generating a new one"
                 );
             }
@@ -3057,7 +3057,7 @@ impl P2PNode {
             unsigned_tx,
             signer_account_id_hex,
         ) {
-            warn!(req_id = %request_id, error = %e, "X-C1: signing request rejected by policy");
+            warn!(req_id = %request_id, error = %format!("{e:#}"), "X-C1: signing request rejected by policy");
             return reject(format!("policy: {e}"));
         }
 
@@ -3248,7 +3248,7 @@ impl P2PNode {
                             orders = batch.orders.len(),
                             "published batch via gossipsub"
                         ),
-                        Err(e) => warn!("gossipsub publish failed: {}", e),
+                        Err(e) => warn!("gossipsub publish failed: {:#}", e),
                     }
                 }
 
@@ -3260,7 +3260,7 @@ impl P2PNode {
                     }
                 } => {
                     if let Err(e) = self.publish_election(&msg) {
-                        tracing::debug!("election publish: {}", e);
+                        tracing::debug!("election publish: {:#}", e);
                     }
                 }
 
@@ -3311,7 +3311,7 @@ impl P2PNode {
                             self.pending_signing.insert(relay.request_id, relay.response_tx);
                         }
                         Err(e) => {
-                            warn!("signing publish failed: {}", e);
+                            warn!("signing publish failed: {:#}", e);
                             let _ = relay.response_tx.send(SigningMessage::Response {
                                 request_id: "".into(),
                                 signer_xrpl_address: "".into(),
@@ -3360,7 +3360,7 @@ impl P2PNode {
                                 relay.request_id, relay.responses_tx);
                         }
                         Err(e) => {
-                            warn!("path-a delegation publish failed: {}", e);
+                            warn!("path-a delegation publish failed: {:#}", e);
                             let _ = relay.responses_tx.send(SigningMessage::Response {
                                 request_id: relay.request_id,
                                 signer_xrpl_address: String::new(),
@@ -3417,7 +3417,7 @@ impl P2PNode {
                                 relay.request_id, relay.responses_tx);
                         }
                         Err(e) => {
-                            warn!("β1 membership-epoch publish failed: {}", e);
+                            warn!("β1 membership-epoch publish failed: {:#}", e);
                             let _ = relay.responses_tx.send(SigningMessage::Response {
                                 request_id: relay.request_id,
                                 signer_xrpl_address: String::new(),
@@ -3467,7 +3467,7 @@ impl P2PNode {
                                 relay.request_id, relay.responses_tx);
                         }
                         Err(e) => {
-                            warn!("β4 mrenclave-governance publish failed: {}", e);
+                            warn!("β4 mrenclave-governance publish failed: {:#}", e);
                             let _ = relay.responses_tx.send(SigningMessage::Response {
                                 request_id: relay.request_id,
                                 signer_xrpl_address: String::new(),
@@ -3510,7 +3510,7 @@ impl P2PNode {
                     match self.publish_signing(&msg) {
                         Ok(_) => { self.pending_unl_policy.insert(relay.request_id, relay.responses_tx); }
                         Err(e) => {
-                            warn!("#131 §6 unl-policy publish failed: {}", e);
+                            warn!("#131 §6 unl-policy publish failed: {:#}", e);
                             let _ = relay.responses_tx.send(SigningMessage::Response {
                                 request_id: relay.request_id,
                                 signer_xrpl_address: String::new(),
@@ -3541,7 +3541,7 @@ impl P2PNode {
                     match self.publish_signing(&msg) {
                         Ok(_) => { self.pending_unl_status.insert(relay.request_id, relay.responses_tx); }
                         Err(e) => {
-                            warn!("#131 unl-status publish failed: {}", e);
+                            warn!("#131 unl-status publish failed: {:#}", e);
                             let _ = relay.responses_tx.send(SigningMessage::UnlStatusResponse {
                                 request_id: relay.request_id,
                                 signer_xrpl_address: String::new(),
@@ -3584,7 +3584,7 @@ impl P2PNode {
                             self.pending_spv_baseline.insert(relay.request_id, relay.responses_tx);
                         }
                         Err(e) => {
-                            warn!("#131 reserves-spv publish failed: {}", e);
+                            warn!("#131 reserves-spv publish failed: {:#}", e);
                             let _ = relay.responses_tx.send(SigningMessage::Response {
                                 request_id: relay.request_id,
                                 signer_xrpl_address: String::new(),
@@ -3634,7 +3634,7 @@ impl P2PNode {
                                 relay.request_id, relay.responses_tx);
                         }
                         Err(e) => {
-                            warn!("β3.2b membership-apply publish failed: {}", e);
+                            warn!("β3.2b membership-apply publish failed: {:#}", e);
                             let _ = relay.responses_tx.send(SigningMessage::Response {
                                 request_id: relay.request_id,
                                 signer_xrpl_address: String::new(),
@@ -3656,7 +3656,7 @@ impl P2PNode {
                     if let Ok(data) = serde_json::to_vec(&event) {
                         if let Err(e) = self.swarm.behaviour_mut().gossipsub
                             .publish(self.events_topic.clone(), data) {
-                            warn!("events publish failed: {}", e);
+                            warn!("events publish failed: {:#}", e);
                         }
                     }
                 }
@@ -3671,7 +3671,7 @@ impl P2PNode {
                     if let Ok(data) = serde_json::to_vec(&msg) {
                         if let Err(e) = self.swarm.behaviour_mut().gossipsub
                             .publish(self.bootstrap_topic.clone(), data) {
-                            warn!("bootstrap publish failed: {}", e);
+                            warn!("bootstrap publish failed: {:#}", e);
                         }
                     }
                 }
@@ -3694,7 +3694,7 @@ impl P2PNode {
                                     "published peer-quote announcement"
                                 );
                             }
-                            Err(e) => warn!("peer-quote publish failed: {}", e),
+                            Err(e) => warn!("peer-quote publish failed: {:#}", e),
                         }
                     }
                 }
@@ -3720,7 +3720,7 @@ impl P2PNode {
                                     "published v2 share envelope"
                                 );
                             }
-                            Err(e) => warn!("share-v2 publish failed: {}", e),
+                            Err(e) => warn!("share-v2 publish failed: {:#}", e),
                         }
                     }
                 }
@@ -3736,7 +3736,7 @@ impl P2PNode {
                         match self.swarm.behaviour_mut().gossipsub
                             .publish(self.dkg_step_topic.clone(), data) {
                             Ok(_) => info!(?msg, "published dkg-step message"),
-                            Err(e) => warn!("dkg-step publish failed: {}", e),
+                            Err(e) => warn!("dkg-step publish failed: {:#}", e),
                         }
                     }
                 }
@@ -3776,22 +3776,22 @@ impl P2PNode {
                                     "received order batch"
                                 );
                                 if let Err(e) = self.batch_tx.send(batch).await {
-                                    error!("failed to forward batch: {}", e);
+                                    error!("failed to forward batch: {:#}", e);
                                 }
                             }
                             Err(e) => {
-                                warn!("invalid batch from {}: {}", propagation_source, e);
+                                warn!("invalid batch from {}: {:#}", propagation_source, e);
                             }
                         }
                     } else if message.topic == election_topic_hash {
                         match serde_json::from_slice::<ElectionMessage>(&message.data) {
                             Ok(msg) => {
                                 if let Err(e) = self.election_inbound_tx.send(msg).await {
-                                    error!("failed to forward election msg: {}", e);
+                                    error!("failed to forward election msg: {:#}", e);
                                 }
                             }
                             Err(e) => {
-                                warn!("invalid election msg from {}: {}", propagation_source, e);
+                                warn!("invalid election msg from {}: {:#}", propagation_source, e);
                             }
                         }
                     } else if message.topic == signing_topic_hash {
@@ -3871,7 +3871,7 @@ impl P2PNode {
                                     },
                                 ).await;
                                 if let Err(e) = self.publish_signing(&response) {
-                                    error!("failed to publish signing response: {}", e);
+                                    error!("failed to publish signing response: {:#}", e);
                                 }
                             }
                             Ok(SigningMessage::Response {
@@ -4008,7 +4008,7 @@ impl P2PNode {
                                     &nonce_bytes,
                                 ).await;
                                 if let Err(e) = self.publish_signing(&response) {
-                                    error!("failed to publish path-a delegation response: {}", e);
+                                    error!("failed to publish path-a delegation response: {:#}", e);
                                 }
                             }
                             Ok(SigningMessage::MembershipEpochRequest {
@@ -4107,7 +4107,7 @@ impl P2PNode {
                                     new_quorum,
                                 ).await;
                                 if let Err(e) = self.publish_signing(&response) {
-                                    error!("failed to publish β1 membership response: {}", e);
+                                    error!("failed to publish β1 membership response: {:#}", e);
                                 }
                             }
                             Ok(SigningMessage::MrenclaveGovernanceRequest {
@@ -4177,7 +4177,7 @@ impl P2PNode {
                                     &prev_allowlist_hash,
                                 ).await;
                                 if let Err(e) = self.publish_signing(&response) {
-                                    error!("failed to publish β4 mrenclave-gov response: {}", e);
+                                    error!("failed to publish β4 mrenclave-gov response: {:#}", e);
                                 }
                             }
                             Ok(SigningMessage::UnlPolicyRequest {
@@ -4219,7 +4219,7 @@ impl P2PNode {
                                     pinned_ledger_seq, quorum_num, quorum_den,
                                 ).await {
                                     if let Err(e) = self.publish_signing(&response) {
-                                        error!("failed to publish #131 unl-policy response: {}", e);
+                                        error!("failed to publish #131 unl-policy response: {:#}", e);
                                     }
                                 }
                             }
@@ -4251,7 +4251,7 @@ impl P2PNode {
                                 let response =
                                     Self::handle_unl_status_request(&local, &request_id).await;
                                 if let Err(e) = self.publish_signing(&response) {
-                                    error!("failed to publish unl-status response: {}", e);
+                                    error!("failed to publish unl-status response: {:#}", e);
                                 }
                             }
                             // Routed HERE, not by the generic prefix chain: that chain
@@ -4311,7 +4311,7 @@ impl P2PNode {
                                     &local, &request_id, &proof_blob_hex, &excluded_hex,
                                 ).await {
                                     if let Err(e) = self.publish_signing(&response) {
-                                        error!("failed to publish #131 reserves-spv response: {}", e);
+                                        error!("failed to publish #131 reserves-spv response: {:#}", e);
                                     }
                                 }
                             }
@@ -4370,11 +4370,11 @@ impl P2PNode {
                                     }
                                 }
                                 if let Err(e) = self.publish_signing(&response) {
-                                    error!("failed to publish β membership-apply ack: {}", e);
+                                    error!("failed to publish β membership-apply ack: {:#}", e);
                                 }
                             }
                             Err(e) => {
-                                warn!("invalid signing msg from {}: {}", propagation_source, e);
+                                warn!("invalid signing msg from {}: {:#}", propagation_source, e);
                             }
                         }
                     } else if message.topic == events_topic_hash {
@@ -4382,12 +4382,12 @@ impl P2PNode {
                             Ok(event) => {
                                 if let Some(ref tx) = self.events_inbound_tx {
                                     if let Err(e) = tx.send(event).await {
-                                        error!("failed to forward state event: {}", e);
+                                        error!("failed to forward state event: {:#}", e);
                                     }
                                 }
                             }
                             Err(e) => {
-                                warn!("invalid state event from {}: {}", propagation_source, e);
+                                warn!("invalid state event from {}: {:#}", propagation_source, e);
                             }
                         }
                     } else if message.topic == peer_quote_topic_hash {
@@ -4395,12 +4395,12 @@ impl P2PNode {
                             Ok(msg) => {
                                 if let Some(ref tx) = self.peer_quote_inbound_tx {
                                     if let Err(e) = tx.send(msg).await {
-                                        error!("failed to forward peer-quote: {}", e);
+                                        error!("failed to forward peer-quote: {:#}", e);
                                     }
                                 }
                             }
                             Err(e) => {
-                                warn!("invalid peer-quote from {}: {}", propagation_source, e);
+                                warn!("invalid peer-quote from {}: {:#}", propagation_source, e);
                             }
                         }
                     } else if message.topic == share_v2_topic_hash {
@@ -4447,12 +4447,12 @@ impl P2PNode {
                                 }
                                 if let Some(ref tx) = self.share_v2_inbound_tx {
                                     if let Err(e) = tx.send(msg).await {
-                                        error!("failed to forward share-v2: {}", e);
+                                        error!("failed to forward share-v2: {:#}", e);
                                     }
                                 }
                             }
                             Err(e) => {
-                                warn!("invalid share-v2 from {}: {}", propagation_source, e);
+                                warn!("invalid share-v2 from {}: {:#}", propagation_source, e);
                             }
                         }
                     } else if message.topic == bootstrap_topic_hash {
@@ -4464,12 +4464,12 @@ impl P2PNode {
                             Ok(msg) => {
                                 if let Some(ref tx) = self.bootstrap_inbound_tx {
                                     if let Err(e) = tx.send(msg).await {
-                                        error!("failed to forward bootstrap msg: {}", e);
+                                        error!("failed to forward bootstrap msg: {:#}", e);
                                     }
                                 }
                             }
                             Err(e) => {
-                                warn!("invalid bootstrap msg from {}: {}", propagation_source, e);
+                                warn!("invalid bootstrap msg from {}: {:#}", propagation_source, e);
                             }
                         }
                     } else if message.topic == dkg_step_topic_hash {
@@ -4528,12 +4528,12 @@ impl P2PNode {
                                 }
                                 if let Some(ref tx) = self.dkg_step_inbound_tx {
                                     if let Err(e) = tx.send(msg).await {
-                                        error!("failed to forward dkg-step: {}", e);
+                                        error!("failed to forward dkg-step: {:#}", e);
                                     }
                                 }
                             }
                             Err(e) => {
-                                warn!("invalid dkg-step from {}: {}", propagation_source, e);
+                                warn!("invalid dkg-step from {}: {:#}", propagation_source, e);
                             }
                         }
                     }

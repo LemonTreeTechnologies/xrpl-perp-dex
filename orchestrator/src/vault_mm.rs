@@ -215,7 +215,7 @@ pub async fn seed_vault_deposit(perp: &crate::perp_client::PerpClient, config: &
         ),
         Err(e) => warn!(
             user = %config.user_id,
-            "vault MM: seed deposit failed (may already exist): {}",
+            "vault MM: seed deposit failed (may already exist): {:#}",
             e
         ),
     }
@@ -390,7 +390,7 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
                     )
                     .await
                 {
-                    warn!(level, price = %bid_price, "vault bid failed: {}", e);
+                    warn!(level, price = %bid_price, "vault bid failed: {:#}", e);
                 }
             }
 
@@ -416,7 +416,7 @@ pub async fn run_vault_mm(state: Arc<AppState>, config: VaultMmConfig) {
                     )
                     .await
                 {
-                    warn!(level, price = %ask_price, "vault ask failed: {}", e);
+                    warn!(level, price = %ask_price, "vault ask failed: {:#}", e);
                 }
             }
         }

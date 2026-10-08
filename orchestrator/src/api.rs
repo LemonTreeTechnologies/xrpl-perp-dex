@@ -1113,7 +1113,7 @@ async fn submit_order(
             if msg.contains("insufficient margin") {
                 err(StatusCode::BAD_REQUEST, &msg).into_response()
             } else {
-                error!("submit_order error: {}", e);
+                error!("submit_order error: {:#}", e);
                 err(StatusCode::INTERNAL_SERVER_ERROR, &msg).into_response()
             }
         }
@@ -1331,7 +1331,7 @@ async fn close_position(
             (StatusCode::OK, Json(resp)).into_response()
         }
         Err(e) => {
-            error!("close_position via CLOB error: {}", e);
+            error!("close_position via CLOB error: {:#}", e);
             err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response()
         }
     }
