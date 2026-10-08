@@ -2307,7 +2307,6 @@ pub async fn signerlist_bootstrap_rotate(
 mod tests {
     use super::*;
 
-    #[test]
     /// The messages must name the flags of the CALLER, not a hardcoded spelling.
     ///
     /// They were hardcoded to "--escrow-seed", and the moment `sign-request` reused this
@@ -2328,6 +2327,7 @@ mod tests {
         assert!(e2.contains("--escrow-seed-file"), "{e2}");
     }
 
+    #[test]
     fn resolve_seed_prefers_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seed");
