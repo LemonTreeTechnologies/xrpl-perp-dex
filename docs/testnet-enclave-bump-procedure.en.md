@@ -16,7 +16,36 @@
 
 ## 1. Pre-flight
 
-**Self-contained prerequisites.** This procedure does not require any operator-held secrets. The testnet escrow seed lives at the canonical path `~/.secrets/perp-dex-xrpl/escrow-testnet.json` on Hetzner (mode 0600). If that file is missing or stale, step 7 creates a fresh testnet escrow via faucet and writes the new seed there — no human-memory dependency. See `feedback_secrets_canonical_files.md` for the rule.
+**Self-contained prerequisites.** This procedure does not require any operator-held secrets.
+
+> ⚠ **CORRECTED 2026-10-08 — the paragraph that used to stand here was FALSE, and false in the
+> direction that aims this ceremony at a dead account.** It said "the testnet escrow seed lives at
+> the canonical path `~/.secrets/perp-dex-xrpl/escrow-testnet.json` on Hetzner". Measured on all
+> four machines: that path on Hetzner holds the seed of the **RETIRED** escrow
+> `rUY1bpf7X2ySfY1AL2PFKCSXyQKNpMWQGD`, and the **live** escrow
+> `rfYnJDSAeFuDCUTq2oYbckbJcz3gAJTNCd` has its seed on **sgx-node-1 only** — nowhere on Hetzner.
+> The old paragraph also promised a fallback "if that file is missing or stale": there is no
+> staleness **check** anywhere in this procedure, so the file being present is enough for the
+> fallback never to fire and the stale address to be used silently.
+>
+> **Therefore, before any step that reads `escrow_address` (§236, §245, §265, §465), verify the
+> file against the escrow the cluster is actually running** — that address is public and is
+> reported by every node without authentication:
+>
+> ```bash
+> LIVE=$(ssh andrey@94.130.18.162 "ssh azureuser@20.71.184.176 \
+>   'curl -s http://localhost:3000/v1/system/status'" | jq -r .deposit_address)
+> FILE=$(ssh andrey@94.130.18.162 "jq -r .escrow_address ~/.secrets/perp-dex-xrpl/escrow-testnet.json")
+> [ "$LIVE" = "$FILE" ] || { echo "STOP: seed file names $FILE, the cluster runs $LIVE"; exit 1; }
+> ```
+>
+> The right fix is structural and is not this check: the escrow **address** is public and does not
+> belong in `~/.secrets` at all. Put it in version-controlled config, and make `escrow-init`,
+> `signerlist-seal-initial` and `signerlist-bootstrap-rotate` refuse a seed whose `escrow_address`
+> does not match the running cluster. See `docs/key-inventory.{en,ru}.md` in the private repo.
+
+See `feedback_secrets_canonical_files.md` for the canonical-path rule — it still holds; what
+failed here was that nothing ever checked the canonical file still named the live account.
 
 Run from your local laptop. All of these are read-only.
 

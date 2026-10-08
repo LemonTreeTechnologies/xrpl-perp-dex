@@ -286,12 +286,24 @@ pub async fn spawn_admin_listener(
 mod admin_surface_tests {
     use super::*;
 
-    /// Sign a body the way `verify_request` canonicalises it: SHA-256(body ‖ timestamp).
+    /// Sign a request the way the ADMIN canonical does:
+    /// SHA-256("xperp/v1/admin|" ‖ method ‖ "|" ‖ uri_path ‖ "|" ‖ body ‖ "|" ‖ timestamp).
     ///
     /// Written out here rather than shared from auth's test module, and that is SAFE in this
     /// direction: the real verifier is what accepts or rejects it, so a wrong replication
     /// makes the test FAIL, never pass. A fixture can only co-delude when both sides are mine.
-    fn operator_headers(body: &[u8]) -> (reqwest::header::HeaderMap, String) {
+    ///
+    /// IT USED TO SIGN THE PUBLIC CANONICAL — SHA-256(body ‖ timestamp) — and that is why this
+    /// test was red. The signature was real and the key was an allowlisted operator's; what the
+    /// surface rejected was the DOMAIN. Which is the layer doing exactly its job: an admin route
+    /// does not accept a public-canonical signature, because that canonical binds neither the
+    /// method nor the route. So the red test was the feature, and the fixture was the bug —
+    /// worth keeping in mind before "fixing" a refusal by loosening the thing refusing.
+    fn operator_headers(
+        method: &str,
+        uri_path: &str,
+        body: &[u8],
+    ) -> (reqwest::header::HeaderMap, String) {
         use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
         use sha2::{Digest, Sha256};
 
@@ -305,7 +317,13 @@ mod admin_surface_tests {
             .as_secs()
             .to_string();
         let mut h = Sha256::new();
+        h.update(b"xperp/v1/admin|");
+        h.update(method.as_bytes());
+        h.update(b"|");
+        h.update(uri_path.as_bytes());
+        h.update(b"|");
         h.update(body);
+        h.update(b"|");
         h.update(ts.as_bytes());
         let (sig, _): (Signature, _) = sk.sign_prehash(&h.finalize()).unwrap();
 
@@ -350,7 +368,7 @@ mod admin_surface_tests {
     #[tokio::test]
     async fn the_admin_surface_refuses_unsigned_and_stranger_but_admits_an_operator() {
         let body = br#"{"probe":true}"#;
-        let (headers, operator_addr) = operator_headers(body);
+        let (headers, operator_addr) = operator_headers("POST", "/admin/safe/projection", body);
 
         // (1) operator configured, request UNSIGNED -> 401
         let base = serve(vec![operator_addr.clone()]).await;
@@ -422,7 +440,7 @@ mod admin_surface_tests {
     #[tokio::test]
     async fn an_empty_allowlist_serves_nothing_over_http() {
         let body = br#"{"probe":true}"#;
-        let (headers, _) = operator_headers(body);
+        let (headers, _) = operator_headers("POST", "/admin/safe/projection", body);
         let base = serve(vec![]).await;
         let r = reqwest::Client::new()
             .post(format!("{base}/admin/safe/projection"))

@@ -37,3 +37,21 @@ uv.lock
 
 # Vault backtest data cache (parquet, ~50 MB/year — fetched, not committed)
 research/backtest-data/
+
+# Node/operator config files that carry LIVE CREDENTIALS in the clear.
+# These live outside the tree today, which is NOT protection — nothing stopped
+# the next copy from being committed, and the key inventory of 2026-10-08 found
+# that exactly that had already happened: SEVEN distinct real `session_key`
+# values are in this repo's published history (three of them from a real PRG-3
+# ceremony, in docs/path-a-prg3-deploy-log.md). A session key has no expiry and
+# no rotation route, so a committed one cannot be revoked — only the next copy
+# can be prevented. `setup_multisig_escrow.py` is CODE and stays tracked; the
+# patterns below are anchored on the .json data files only.
+signers_config.json
+signers_config.json.*
+beta_entry.json
+betaB_entry.json
+escrow-testnet.json
+escrow-testnet.json.*
+multisig_escrow*.json
+reserves.env
