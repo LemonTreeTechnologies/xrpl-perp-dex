@@ -2763,7 +2763,14 @@ async fn main() -> Result<()> {
                         .await
                         {
                             Ok(tx) => info!(tx = %tx, "reserves-commit published to Base-Sepolia"),
-                            Err(e) => warn!("reserves-commit skipped/failed: {}", e),
+                            // `{:#}` NOT `{}`. On an anyhow::Error, `{}` prints only the
+                            // OUTERMOST context — which here was a hand-written guess at the
+                            // cause — and discards the source chain where the enclave's own
+                            // rc lives (PerpClient::post deliberately keeps the body for
+                            // exactly this reason). The cluster logged that guess hourly for
+                            // over a week, 166 times, so nobody could tell which refusal it
+                            // was. Same defect as the clock refusal fixed in #91.
+                            Err(e) => warn!("reserves-commit skipped/failed: {:#}", e),
                         }
                     }
                     None => warn!("reserves-commit enabled but no local_signer in signers_config"),

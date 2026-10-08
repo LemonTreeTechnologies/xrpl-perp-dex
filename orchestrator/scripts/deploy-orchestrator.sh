@@ -74,7 +74,8 @@ ssh -o BatchMode=yes "$BASTION" '
   # cannot distinguish the build you want from the one you have is not a check.
   for m in "step 5a" "did not carry" "NO-OP, not a failure to retry" "REQUIRED after promotion" \
            "clio.altnet.rippletest.net" "attested_clock_refused_unl_off" \
-           "validations stream went SILENT" "SPV-deposit boundary ARMED"; do
+           "validations stream went SILENT" "SPV-deposit boundary ARMED" \
+           "enclave reserves_commit refused"; do
     N=$(strings -a "$B" | grep -cF "$m")
     printf "  %-34s %s\n" "\"$m\"" "$N"
     [ "$N" -gt 0 ] || { echo "    MISSING — this build predates that fix"; fail=1; }
@@ -104,7 +105,8 @@ for ip in 20.71.184.176 20.224.243.60 52.236.130.102; do
     N6=\$(strings -a \$B 2>/dev/null | grep -cF \"attested_clock_refused_unl_off\")
     N7=\$(strings -a \$B 2>/dev/null | grep -cF \"validations stream went SILENT\")
     N8=\$(strings -a \$B 2>/dev/null | grep -cF \"SPV-deposit boundary ARMED\")
-    echo \"service=\$A  step5a=\$N1  inv-diff=\$N2  govern=\$N3  followups=\$N4  multi-src=\$N5  clock-guard=\$N6  ws-idle=\$N7  spv-arm=\$N8\"'"
+    N9=\$(strings -a \$B 2>/dev/null | grep -cF \"enclave reserves_commit refused\")
+    echo \"service=\$A  step5a=\$N1  inv-diff=\$N2  govern=\$N3  followups=\$N4  multi-src=\$N5  clock-guard=\$N6  ws-idle=\$N7  spv-arm=\$N8  rc-chain=\$N9\"'"
 done
 hr
 # Count-agnostic on purpose: it said "all three markers" the moment there were four, which
