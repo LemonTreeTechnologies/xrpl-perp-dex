@@ -16,12 +16,18 @@ use crate::xrpl_signer;
 /// Exactly one of `seed` / `seed_file` must be set; clap already
 /// enforces the conflicts-with rule at parse time, but we re-check
 /// here for defence in depth.
-pub fn resolve_escrow_seed(seed: Option<&str>, seed_file: Option<&Path>) -> Result<String> {
+/// Resolve a seed from either an argv value or a file.
+///
+/// `flag` is the option's own basename ("escrow-seed", "seed"), so the messages name the
+/// flags THIS caller actually has. They used to be hardcoded to the escrow spelling, and the
+/// moment a second command reused this function its "one of --escrow-seed or
+/// --escrow-seed-file is required" sent the operator to options that do not exist on it.
+pub fn resolve_seed(seed: Option<&str>, seed_file: Option<&Path>, flag: &str) -> Result<String> {
     match (seed, seed_file) {
         (Some(s), None) => {
             warn!(
-                "escrow seed passed via --escrow-seed (argv); it is visible to every local \
-                user via `ps`. Use --escrow-seed-file for future ceremonies."
+                "seed passed via --{flag} (argv); it is visible to every local user via \
+                 `ps`. Use --{flag}-file for future ceremonies."
             );
             Ok(s.trim().to_string())
         }
@@ -36,7 +42,7 @@ pub fn resolve_escrow_seed(seed: Option<&str>, seed_file: Option<&Path>) -> Resu
                     warn!(
                         path = %path.display(),
                         mode = format!("{mode:o}"),
-                        "escrow seed file is not 0600. `chmod 0600` before the next ceremony."
+                        "seed file is not 0600. `chmod 0600` before the next ceremony."
                     );
                 }
             }
@@ -45,18 +51,18 @@ pub fn resolve_escrow_seed(seed: Option<&str>, seed_file: Option<&Path>) -> Resu
             let first = content
                 .lines()
                 .next()
-                .ok_or_else(|| anyhow::anyhow!("escrow seed file is empty: {}", path.display()))?
+                .ok_or_else(|| anyhow::anyhow!("seed file is empty: {}", path.display()))?
                 .trim();
             if first.is_empty() {
-                anyhow::bail!("escrow seed file first line is empty: {}", path.display());
+                anyhow::bail!("seed file first line is empty: {}", path.display());
             }
             Ok(first.to_string())
         }
         (Some(_), Some(_)) => {
-            anyhow::bail!("--escrow-seed and --escrow-seed-file are mutually exclusive");
+            anyhow::bail!("--{flag} and --{flag}-file are mutually exclusive");
         }
         (None, None) => {
-            anyhow::bail!("one of --escrow-seed or --escrow-seed-file is required");
+            anyhow::bail!("one of --{flag} or --{flag}-file is required");
         }
     }
 }
@@ -2301,8 +2307,28 @@ pub async fn signerlist_bootstrap_rotate(
 mod tests {
     use super::*;
 
+    /// The messages must name the flags of the CALLER, not a hardcoded spelling.
+    ///
+    /// They were hardcoded to "--escrow-seed", and the moment `sign-request` reused this
+    /// function its refusal told the operator to use options that command does not have —
+    /// which is how a shared helper lies on behalf of a caller it has never heard of.
     #[test]
-    fn resolve_escrow_seed_prefers_file() {
+    fn the_refusal_names_the_callers_own_flags() {
+        let e = resolve_seed(None, None, "seed").unwrap_err().to_string();
+        assert!(e.contains("--seed") && e.contains("--seed-file"), "{e}");
+        assert!(
+            !e.contains("escrow"),
+            "named a flag the caller does not have: {e}"
+        );
+
+        let e2 = resolve_seed(None, None, "escrow-seed")
+            .unwrap_err()
+            .to_string();
+        assert!(e2.contains("--escrow-seed-file"), "{e2}");
+    }
+
+    #[test]
+    fn resolve_seed_prefers_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seed");
         std::fs::write(&path, "shSeedValueOnFirstLine\n").unwrap();
@@ -2311,13 +2337,13 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-        let got = resolve_escrow_seed(None, Some(&path)).unwrap();
+        let got = resolve_seed(None, Some(&path), "escrow-seed").unwrap();
         assert_eq!(got, "shSeedValueOnFirstLine");
     }
 
     #[test]
     fn resolve_escrow_seed_accepts_argv_with_warning() {
-        let got = resolve_escrow_seed(Some("shArgvSeed"), None).unwrap();
+        let got = resolve_seed(Some("shArgvSeed"), None, "escrow-seed").unwrap();
         assert_eq!(got, "shArgvSeed");
     }
 
@@ -2326,12 +2352,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seed");
         std::fs::write(&path, "sh\n").unwrap();
-        assert!(resolve_escrow_seed(Some("s"), Some(&path)).is_err());
+        assert!(resolve_seed(Some("s"), Some(&path), "escrow-seed").is_err());
     }
 
     #[test]
     fn resolve_escrow_seed_rejects_neither() {
-        assert!(resolve_escrow_seed(None, None).is_err());
+        assert!(resolve_seed(None, None, "escrow-seed").is_err());
     }
 
     #[test]
@@ -2339,7 +2365,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seed");
         std::fs::write(&path, "\n").unwrap();
-        assert!(resolve_escrow_seed(None, Some(&path)).is_err());
+        assert!(resolve_seed(None, Some(&path), "escrow-seed").is_err());
     }
 
     // ── Phase 2.1c-A Domain-field encoding (multi-operator §3.3) ─

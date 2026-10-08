@@ -94,8 +94,15 @@ for ip in "${NODES[@]}"; do
   # last-start line 123113, refusals since 0.
   ft="$(on "$ip" "N=\$(grep -n \"Server started on port 9088\" /home/azureuser/perp/enclave.log | tail -1 | cut -d: -f1); tail -n +\$N /home/azureuser/perp/enclave.log | grep -ciE \"FATAL|perpLoadState failed\"")"
   lim="$(bodylimit "$ip")"
-  printf '    after: :9088=%s  svc=%s  refusals-in-log=%s  8000-char body -> %s\n' \
-    "${m:0:16}" "$sv" "${ft:-?}" "${lim:-no answer}"
+  # AND A MARKER FOR THE CHANGE BEING DEPLOYED NOW. The 8000-char body check above proves the
+  # 2026-10-07 body fix, which is ALREADY on the cluster — so on any later swap it passes
+  # whether or not the new binary landed. A check that cannot distinguish the build you want
+  # from the one you have is not a check; this is the same lesson the orchestrator deploy
+  # script learned when "step 5a" stopped discriminating. Add a line per change.
+  mk="$(on "$ip" "strings -a /home/azureuser/perp/perp-dex-server | grep -cF \"Reserves commit refused (rc=\"")"
+  printf '    after: :9088=%s  svc=%s  refusals-in-log=%s  8000-char body -> %s  rc-marker=%s\n' \
+    "${m:0:16}" "$sv" "${ft:-?}" "${lim:-no answer}" "${mk:-?}"
+  [ "${mk:-0}" -gt 0 ] 2>/dev/null || { echo "    STOP: the running server does not carry the reserves-rc change — the swap did not take"; exit 1; }
   [ "$m" = "$MRENCLAVE_EXPECTED" ] || { echo "    STOP: the measurement CHANGED — this should be impossible when only the server is swapped"; exit 1; }
   [ "$sv" = "active" ] || { echo "    STOP: perp-dex-enclave is $sv"; exit 1; }
   [ "${ft:-1}" = "0" ] || { echo "    STOP: the enclave log shows a refusal on this boot"; exit 1; }
