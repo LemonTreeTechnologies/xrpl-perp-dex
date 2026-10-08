@@ -2770,7 +2770,27 @@ async fn main() -> Result<()> {
                             // exactly this reason). The cluster logged that guess hourly for
                             // over a week, 166 times, so nobody could tell which refusal it
                             // was. Same defect as the clock refusal fixed in #91.
-                            Err(e) => warn!("reserves-commit skipped/failed: {:#}", e),
+                            Err(e) => {
+                                // And now CLASSIFY it, because a code is not an instruction.
+                                // The measured history: 197 refusals with -40 (custody below
+                                // liabilities), then 381 with -96 (the Base owner-set
+                                // projection out of sync) — two different operator actions
+                                // behind one unchanging sentence for seventeen days.
+                                let msg = format!("{e:#}");
+                                match reserves_publisher::classify_commit_from_error(&msg) {
+                                    Some(r) => warn!(
+                                        refusal = ?r,
+                                        transient = reserves_publisher::commit_is_transient(&r),
+                                        action = reserves_publisher::commit_action(&r),
+                                        "reserves-commit refused: {msg}"
+                                    ),
+                                    // No rc in the chain. SAY SO rather than classify a guess
+                                    // — a guess is exactly what this line used to be.
+                                    None => {
+                                        warn!("reserves-commit refused, NO rc in the chain: {msg}")
+                                    }
+                                }
+                            }
                         }
                     }
                     None => warn!("reserves-commit enabled but no local_signer in signers_config"),

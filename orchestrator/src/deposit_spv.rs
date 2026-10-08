@@ -277,7 +277,7 @@ pub fn classify_submit(rc: i32) -> SubmitOutcome {
 /// Pull the `rc=` out of an enclave error string.
 ///
 /// Shared by both classifiers so a second copy of the parse cannot drift from the first.
-fn rc_from_error(msg: &str) -> Option<i32> {
+pub fn rc_from_error(msg: &str) -> Option<i32> {
     let i = msg.find("rc=")?;
     let rest = &msg[i + 3..];
     let end = rest

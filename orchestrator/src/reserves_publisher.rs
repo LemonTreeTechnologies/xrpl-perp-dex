@@ -219,3 +219,164 @@ pub async fn run_reserves_commit_once(
     .await
     .context("submit Safe execTransaction")
 }
+
+/// Why the enclave refused to publish the liabilities root.
+///
+/// THIS EXISTS BECAUSE A SENTENCE CANNOT TRACK A CAUSE. The route used to answer "Reserves
+/// commit failed (under-custody or signing error)" — hand-written, naming two causes nobody
+/// had checked. It was right for the first 197 refusals (`-40`, custody below liabilities)
+/// and then silently wrong for the next 381 (`-96`, a different condition entirely) across
+/// seventeen days, because the sentence does not change when the cause does.
+///
+/// The codes are read from the enclave, not invented here: `ecall_perp_reserves_commit`
+/// returns `-97` when no sealed SignerList authority is loaded, `-96` when
+/// `base_projection_confirmed_epoch != signerlist_version`, `-41` when the excluded set is
+/// over cap, `-42` when `perp_reserves_compute` could not take the shared leaf buffer, and
+/// `-40` when `custody_ok` is false.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CommitRefusal {
+    /// -40: custody is below liabilities. The refusal is the protection working.
+    UnderCustody,
+    /// -41: the operator-declared excluded-sender set exceeds the enclave's cap.
+    ExcludedSetOverCap,
+    /// -42: another caller holds the shared leaf buffer. The ONLY transient one.
+    LeafBufferBusy,
+    /// -96: the Base owner-set projection lags the sealed SignerList authority.
+    BaseProjectionOutOfSync,
+    /// -97: no sealed SignerList authority is loaded.
+    NoSealedAuthority,
+    /// -1: a host-side argument check in the manager, before the ecall.
+    HostArgs,
+    /// -1000: the ecall itself failed.
+    EcallFailed,
+    /// Anything else — NOT assumed benign and NOT assumed transient.
+    Unknown(i32),
+}
+
+pub fn classify_commit(rc: i32) -> CommitRefusal {
+    match rc {
+        -40 => CommitRefusal::UnderCustody,
+        -41 => CommitRefusal::ExcludedSetOverCap,
+        -42 => CommitRefusal::LeafBufferBusy,
+        -96 => CommitRefusal::BaseProjectionOutOfSync,
+        -97 => CommitRefusal::NoSealedAuthority,
+        -1 => CommitRefusal::HostArgs,
+        -1000 => CommitRefusal::EcallFailed,
+        other => CommitRefusal::Unknown(other),
+    }
+}
+
+/// Only -42 is worth retrying. Everything else repeats until someone acts, which is why the
+/// hourly driver must not describe them as transient.
+pub fn commit_is_transient(r: &CommitRefusal) -> bool {
+    matches!(r, CommitRefusal::LeafBufferBusy)
+}
+
+/// What the operator has to DO. A code is not an instruction; this is the difference between
+/// a number in a log nobody acts on and a next step.
+pub fn commit_action(r: &CommitRefusal) -> &'static str {
+    match r {
+        CommitRefusal::UnderCustody =>
+            "custody is BELOW liabilities — the refusal is the protection working; close the gap, do not bypass",
+        CommitRefusal::ExcludedSetOverCap =>
+            "the declared operator-capital excluded-sender set is over the enclave's cap — shrink it",
+        CommitRefusal::LeafBufferBusy =>
+            "another caller holds the shared leaf buffer — transient, the next pass retries",
+        CommitRefusal::BaseProjectionOutOfSync =>
+            "the Base owner-set projection lags the sealed SignerList — converge the Safe owner set, then record the projection; publishing stays halted until they match",
+        CommitRefusal::NoSealedAuthority =>
+            "no sealed SignerList authority is loaded — this node cannot publish at all",
+        CommitRefusal::HostArgs =>
+            "a host-side argument check failed before the ecall — a caller bug, not cluster state",
+        CommitRefusal::EcallFailed =>
+            "the ecall itself failed — check the enclave process, not the reserves state",
+        CommitRefusal::Unknown(_) =>
+            "UNRECOGNISED code — do not assume it is benign or transient; read the enclave source for it",
+    }
+}
+
+/// Classify from the error chain the publisher actually produces.
+///
+/// Reuses `deposit_spv::rc_from_error` rather than carrying a second copy of the parse — a
+/// second copy is the thing that drifts from the first.
+pub fn classify_commit_from_error(msg: &str) -> Option<CommitRefusal> {
+    crate::deposit_spv::rc_from_error(msg).map(classify_commit)
+}
+
+#[cfg(test)]
+mod commit_refusal_tests {
+    use super::*;
+
+    /// The REAL chain, copied from node-1's journal at 2026-10-08T10:00:00Z, with only the
+    /// server message changed — that message is what the enclave-side fix alters, and
+    /// everything around it (the `.context`, the URL, civetweb's own `Error 500:` page, the
+    /// JSON body on its own line) is exactly what the publisher produced.
+    ///
+    /// Written out rather than invented because the shape is not guessable: the body arrives
+    /// AFTER civetweb's generated status page, on a second line, and a fixture that omitted
+    /// that would pass while the real chain parsed to nothing.
+    const REAL_CHAIN: &str = concat!(
+        "enclave reserves_commit refused: https://localhost:9088/v1/perp/reserves-commit",
+        " -> HTTP 500 Internal Server Error: Error 500: Internal Server Error\n",
+        r#"{"message":"Reserves commit refused (rc=-96)","status":"error"}"#
+    );
+
+    #[test]
+    fn the_real_error_chain_yields_the_base_projection_refusal() {
+        assert_eq!(
+            classify_commit_from_error(REAL_CHAIN),
+            Some(CommitRefusal::BaseProjectionOutOfSync)
+        );
+    }
+
+    /// The measured history: 197 refusals at -40, then 381 at -96. The two demand DIFFERENT
+    /// operator actions, which is the whole reason a single sentence was not enough.
+    #[test]
+    fn the_two_phases_of_the_live_halt_classify_differently() {
+        assert_eq!(classify_commit(-40), CommitRefusal::UnderCustody);
+        assert_eq!(classify_commit(-96), CommitRefusal::BaseProjectionOutOfSync);
+        assert_ne!(
+            commit_action(&classify_commit(-40)),
+            commit_action(&classify_commit(-96))
+        );
+        assert!(commit_action(&CommitRefusal::UnderCustody).contains("custody"));
+        assert!(commit_action(&CommitRefusal::BaseProjectionOutOfSync).contains("Safe owner set"));
+    }
+
+    /// Only the leaf-buffer contention is worth retrying. Calling anything else transient is
+    /// what makes an hourly driver look like it is making progress while nothing is.
+    #[test]
+    fn only_the_leaf_buffer_refusal_is_transient() {
+        assert!(commit_is_transient(&CommitRefusal::LeafBufferBusy));
+        for r in [
+            CommitRefusal::UnderCustody,
+            CommitRefusal::ExcludedSetOverCap,
+            CommitRefusal::BaseProjectionOutOfSync,
+            CommitRefusal::NoSealedAuthority,
+            CommitRefusal::HostArgs,
+            CommitRefusal::EcallFailed,
+            CommitRefusal::Unknown(-7),
+        ] {
+            assert!(
+                !commit_is_transient(&r),
+                "{r:?} must not be called transient"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_code_is_not_assumed_benign() {
+        assert_eq!(classify_commit(-5), CommitRefusal::Unknown(-5));
+        assert!(commit_action(&CommitRefusal::Unknown(-5)).contains("UNRECOGNISED"));
+    }
+
+    /// A chain with no rc must come back None, so the caller SAYS it has no code rather than
+    /// classifying one. The old line's whole defect was answering without knowing.
+    #[test]
+    fn a_chain_without_a_code_classifies_to_nothing() {
+        assert_eq!(
+            classify_commit_from_error("enclave reserves_commit refused: connection refused"),
+            None
+        );
+    }
+}
