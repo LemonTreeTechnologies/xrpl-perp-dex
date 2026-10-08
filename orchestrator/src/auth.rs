@@ -377,6 +377,57 @@ pub fn pubkey_to_xrpl_address(pubkey_bytes: &[u8]) -> String {
 
 /// Axum middleware: verify auth headers on mutating endpoints.
 /// GET requests to public market data are exempt.
+/// Authorise a request on the OPERATOR admin surface: a valid signature AND a signer that is
+/// on the cluster's operator allowlist.
+///
+/// WHY THIS EXISTS, measured 2026-10-08. `spawn_admin_listener` builds its app as
+/// `let app = router(state)` — NO auth layer at all. So the six routes it serves
+/// (`/admin/path-a/share-export`, `/admin/frost/round`, `/admin/safe/{exec,projection,
+/// derive-step,attest-projection}`) are protected by loopback and nothing else. Audit ruling
+/// 2026-10-08 Q1: an operator allowlist is a PRECONDITION to serving that surface AT ALL, and
+/// **loopback is a mitigation, not the control** — a co-located process or an SSRF reaches
+/// loopback.
+///
+/// I first reported this as "authentication without authorization" because an unauthenticated
+/// probe to `/v1/admin/safe/projection` answered "missing X-XRPL-Address header". That answer
+/// came from the MAIN app on :3000, where the path does not exist — the auth middleware there
+/// runs BEFORE routing, so a nonexistent path and a real one reply identically. The admin
+/// listener is a different app and asks for nothing.
+///
+/// NO BEARER PATH, deliberately, unlike `auth_middleware`. A bearer token is something the
+/// server can mint for itself; on a surface that can export a share envelope or relay a Safe
+/// transaction, the credential must be one only an operator holds.
+pub fn verify_operator_request(
+    headers: &HeaderMap,
+    method: &str,
+    body_bytes: &[u8],
+    uri_path: &str,
+    operators: &[String],
+) -> Result<AuthenticatedUser, (u16, String)> {
+    // AN EMPTY ALLOWLIST IS NOT "ALLOW ALL" — it is "serve nothing". The other reading is how a
+    // misconfiguration becomes an open door, and it is the same shape as a coverage ratchet
+    // that passes when the file it watches has vanished.
+    if operators.is_empty() {
+        return Err((
+            403,
+            "operator allowlist is empty — this surface serves nothing".to_string(),
+        ));
+    }
+    let user = verify_request(headers, method, body_bytes, uri_path).map_err(|e| (401, e))?;
+    if !operators.iter().any(|o| o == &user.xrpl_address) {
+        // The address is NAMED in the refusal: an operator debugging a mismatched config needs
+        // to see which identity was presented, and it is already in the request they sent.
+        return Err((
+            403,
+            format!(
+                "{} is not on the cluster operator allowlist",
+                user.xrpl_address
+            ),
+        ));
+    }
+    Ok(user)
+}
+
 pub async fn auth_middleware(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let uri = request.uri().path().to_string();
@@ -595,6 +646,61 @@ mod tests {
     use k256::elliptic_curve::rand_core::OsRng;
 
     /// Helper: generate a test keypair and derive XRPL address.
+    /// The operator surface refuses an UNSIGNED request. 401, not 403: nothing was presented.
+    #[test]
+    fn the_operator_surface_refuses_an_unsigned_request() {
+        let ops = vec!["rOperatorOne".to_string()];
+        let (code, msg) =
+            verify_operator_request(&HeaderMap::new(), "POST", b"{}", "/admin/safe/exec", &ops)
+                .unwrap_err();
+        assert_eq!(code, 401, "{msg}");
+    }
+
+    /// A VALID signature from someone who is not an operator is refused 403 — authenticated and
+    /// unauthorised are different answers, and conflating them is what let this surface look
+    /// protected while it asked for nothing.
+    #[test]
+    fn a_valid_signature_from_a_stranger_is_refused() {
+        let (sk, _vk, pk, addr) = test_keypair();
+        let body = br#"{"x":1}"#;
+        let headers = sign_body(&sk, &pk, &addr, body);
+        let ops = vec!["rSomeoneElseEntirely".to_string()];
+        let (code, msg) =
+            verify_operator_request(&headers, "POST", body, "/admin/safe/exec", &ops).unwrap_err();
+        assert_eq!(code, 403, "{msg}");
+        assert!(
+            msg.contains(&addr),
+            "the refusal must name the identity presented: {msg}"
+        );
+    }
+
+    /// And the signature really is checked against the allowlist by IDENTITY, not merely
+    /// present: the same request passes once that address is an operator.
+    #[test]
+    fn a_valid_signature_from_an_operator_passes() {
+        let (sk, _vk, pk, addr) = test_keypair();
+        let body = br#"{"x":1}"#;
+        let headers = sign_body(&sk, &pk, &addr, body);
+        let ops = vec!["rSomeoneElseEntirely".to_string(), addr.clone()];
+        let user = verify_operator_request(&headers, "POST", body, "/admin/safe/exec", &ops)
+            .expect("an operator's signed request must pass");
+        assert_eq!(user.xrpl_address, addr);
+    }
+
+    /// AN EMPTY ALLOWLIST SERVES NOTHING. The other reading — empty means unrestricted — is how
+    /// a misconfiguration becomes an open door, so it is pinned: even a correctly signed
+    /// request from a real keypair is refused when no operator is configured.
+    #[test]
+    fn an_empty_allowlist_refuses_even_a_valid_signature() {
+        let (sk, _vk, pk, addr) = test_keypair();
+        let body = br#"{"x":1}"#;
+        let headers = sign_body(&sk, &pk, &addr, body);
+        let (code, msg) =
+            verify_operator_request(&headers, "POST", body, "/admin/safe/exec", &[]).unwrap_err();
+        assert_eq!(code, 403, "{msg}");
+        assert!(msg.contains("serves nothing"), "{msg}");
+    }
+
     fn test_keypair() -> (SigningKey, VerifyingKey, String, String) {
         let sk = SigningKey::random(&mut OsRng);
         let vk = *sk.verifying_key();
