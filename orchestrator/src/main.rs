@@ -1487,10 +1487,35 @@ async fn main() -> Result<()> {
     // export function it fronts is also callable as a library from any
     // future in-process driver (e.g., automated re-DKG orchestration).
     if let Some(admin_listen) = cli.admin_listen.clone() {
+        // THE OPERATOR ALLOWLIST FOR THIS LISTENER. Until 2026-10-08 the admin app was built
+        // with no auth layer at all, so share-export, the FROST round driver and the four Safe
+        // routes were behind loopback and nothing else. Audit ruling Q1: the allowlist is a
+        // precondition to serving the surface, and loopback is a mitigation rather than the
+        // control (a co-located process or an SSRF reaches loopback).
+        //
+        // Without --signers-config this is EMPTY, and empty means the surface serves nothing.
+        // Said out loud, because an operator who brings the listener up and gets 403 on
+        // everything deserves to know why rather than reading the refusal as a bug.
+        let operators: Vec<String> = signers_config
+            .as_ref()
+            .map(|c| c.signers.iter().map(|s| s.xrpl_address.clone()).collect())
+            .unwrap_or_default();
+        if operators.is_empty() {
+            warn!(
+                "--admin-listen is set but the operator allowlist is EMPTY (no --signers-config): \
+                 every route on that listener will refuse with 403. This is fail-closed, not a bug."
+            );
+        } else {
+            info!(
+                operators = operators.len(),
+                "admin listener: every route requires a signed request from a cluster operator"
+            );
+        }
         let admin_state = Arc::new(path_a_redkg::AdminState {
             client: pool_path_a_client::PoolPathAClient::new(&cli.enclave_url)?,
             share_v2_pub_tx: share_v2_pub_tx.clone(),
             groups: shard_router.path_a_groups().to_vec(),
+            operators,
         });
         let _admin_handle = tokio::spawn(async move {
             if let Err(e) = path_a_redkg::spawn_admin_listener(admin_listen, admin_state).await {

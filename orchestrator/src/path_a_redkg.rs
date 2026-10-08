@@ -34,6 +34,10 @@ pub struct AdminState {
     pub client: PoolPathAClient,
     pub share_v2_pub_tx: mpsc::Sender<ShareEnvelopeV2Message>,
     pub groups: Vec<PathAGroup>,
+    /// The cluster's operator XRPL addresses. EVERY route on this listener requires a signed
+    /// request from one of them. Empty is not "allow all" — `verify_operator_request` refuses
+    /// everything, which is the correct reading of a missing allowlist.
+    pub operators: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +169,7 @@ async fn handle_share_export(
 }
 
 pub fn router(state: Arc<AdminState>) -> Router {
+    let operators = Arc::new(state.operators.clone());
     Router::new()
         .route("/admin/path-a/share-export", post(handle_share_export))
         .with_state(state)
@@ -199,6 +204,62 @@ pub fn router(state: Arc<AdminState>) -> Router {
             "/admin/safe/attest-projection",
             post(crate::safe_projection::handle_attest),
         ))
+        // APPLIED TO THE WHOLE ROUTER, not to the Safe routes, so a route ADDED here later
+        // inherits the check instead of needing to remember it. Until 2026-10-08 this app was
+        // `let app = router(state)` with no auth layer at all: six routes — share-export,
+        // frost/round and the four Safe ones — behind loopback and nothing else. Audit ruling
+        // Q1: the allowlist is a PRECONDITION to serving this surface, and loopback is a
+        // mitigation rather than the control, because a co-located process or an SSRF reaches
+        // loopback.
+        .layer(axum::middleware::from_fn_with_state(
+            operators.clone(),
+            operator_only,
+        ))
+}
+
+/// Refuse anything that is not a signed request from a cluster operator.
+///
+/// Takes the allowlist as its own state rather than reading it off `AdminState`, because two
+/// of the six routes are `merge`d as stateless sub-routers and would otherwise be outside it.
+async fn operator_only(
+    axum::extract::State(operators): axum::extract::State<Arc<Vec<String>>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let method = request.method().as_str().to_string();
+    let uri = request.uri().path().to_string();
+    let headers = request.headers().clone();
+    let (parts, body) = request.into_parts();
+    // The body must be buffered because the signature covers it. 1 MiB is the same bound the
+    // main app's auth layer uses.
+    let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"status":"error","message":"failed to read body"})),
+            )
+                .into_response()
+        }
+    };
+    if let Err((code, msg)) =
+        crate::auth::verify_operator_request(&headers, &method, &body_bytes, &uri, &operators)
+    {
+        // Logged with the route and the reason: a refusal nobody can read is how this surface
+        // came to look protected while it asked for nothing.
+        warn!(route = %uri, code, reason = %msg, "admin surface REFUSED a request");
+        return (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::FORBIDDEN),
+            Json(serde_json::json!({"status":"error","message":msg})),
+        )
+            .into_response();
+    }
+    next.run(axum::extract::Request::from_parts(
+        parts,
+        axum::body::Body::from(body_bytes),
+    ))
+    .await
 }
 
 /// Bind a 127.0.0.1-only admin HTTP listener. Errors if `listen_addr`
@@ -227,4 +288,157 @@ pub async fn spawn_admin_listener(
         .await
         .map_err(|e| anyhow::anyhow!("admin listener serve error: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod admin_surface_tests {
+    use super::*;
+
+    /// Sign a body the way `verify_request` canonicalises it: SHA-256(body ‖ timestamp).
+    ///
+    /// Written out here rather than shared from auth's test module, and that is SAFE in this
+    /// direction: the real verifier is what accepts or rejects it, so a wrong replication
+    /// makes the test FAIL, never pass. A fixture can only co-delude when both sides are mine.
+    fn operator_headers(body: &[u8]) -> (reqwest::header::HeaderMap, String) {
+        use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
+        use sha2::{Digest, Sha256};
+
+        let sk = SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let pubkey = sk.verifying_key().to_sec1_bytes();
+        let pubkey_hex = hex::encode(&pubkey);
+        let address = crate::auth::pubkey_to_xrpl_address(&pubkey);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        let mut h = Sha256::new();
+        h.update(body);
+        h.update(ts.as_bytes());
+        let (sig, _): (Signature, _) = sk.sign_prehash(&h.finalize()).unwrap();
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-xrpl-address", address.parse().unwrap());
+        headers.insert("x-xrpl-publickey", pubkey_hex.parse().unwrap());
+        headers.insert(
+            "x-xrpl-signature",
+            hex::encode(sig.to_der().as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-xrpl-timestamp", ts.parse().unwrap());
+        (headers, address)
+    }
+
+    /// Serve the real admin router on an ephemeral loopback port and return its base URL.
+    async fn serve(operators: Vec<String>) -> String {
+        let (tx, _rx) = mpsc::channel(1);
+        let state = Arc::new(AdminState {
+            client: PoolPathAClient::new("https://localhost:9088/v1").unwrap(),
+            share_v2_pub_tx: tx,
+            groups: vec![],
+            operators,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(state)).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// THE LAYER IS WIRED, not merely written.
+    ///
+    /// The primitive has its own unit tests in auth.rs; this drives the REAL router over REAL
+    /// HTTP, because probing a predicate is not probing its wiring — the same distinction the
+    /// audit drew on the clock guard, where I had checked a truth table and never that the
+    /// refusal actually skipped the spawn.
+    ///
+    /// `/admin/safe/projection` is used as the probe route; the assertion is about the LAYER,
+    /// so a legitimate operator need only get past it (the handler then fails on its own, with
+    /// some other status, because no enclave is listening in a unit test).
+    #[tokio::test]
+    async fn the_admin_surface_refuses_unsigned_and_stranger_but_admits_an_operator() {
+        let body = br#"{"probe":true}"#;
+        let (headers, operator_addr) = operator_headers(body);
+
+        // (1) operator configured, request UNSIGNED -> 401
+        let base = serve(vec![operator_addr.clone()]).await;
+        let c = reqwest::Client::new();
+        let unsigned = c
+            .post(format!("{base}/admin/safe/projection"))
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unsigned.status().as_u16(), 401, "unsigned must be 401");
+
+        // (2) SIGNED, but the signer is not on the allowlist -> 403
+        let base2 = serve(vec!["rSomeoneElseEntirely".to_string()]).await;
+        let stranger = c
+            .post(format!("{base2}/admin/safe/projection"))
+            .headers(headers.clone())
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stranger.status().as_u16(), 403, "a stranger must be 403");
+
+        // (3) SIGNED by an operator -> the layer must NOT be what stops it
+        let ok = c
+            .post(format!("{base}/admin/safe/projection"))
+            .headers(headers)
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        let s = ok.status().as_u16();
+        assert!(
+            s != 401 && s != 403,
+            "an operator's signed request must get past the layer; got {s}"
+        );
+    }
+
+    /// EVERY route on the listener is covered, not just the Safe ones — share-export and the
+    /// FROST round driver are on the same app, and they were the two that worried me most when
+    /// I found the listener had no auth layer at all.
+    #[tokio::test]
+    async fn the_layer_covers_share_export_and_the_frost_round_too() {
+        let base = serve(vec!["rOperatorOne".to_string()]).await;
+        let c = reqwest::Client::new();
+        for route in [
+            "/admin/path-a/share-export",
+            "/admin/frost/round",
+            "/admin/safe/exec",
+            "/admin/safe/derive-step",
+            "/admin/safe/attest-projection",
+        ] {
+            let r = c
+                .post(format!("{base}{route}"))
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status().as_u16(),
+                401,
+                "{route} answered {} to an unsigned request",
+                r.status()
+            );
+        }
+    }
+
+    /// An EMPTY allowlist serves nothing — end to end, not only in the primitive.
+    #[tokio::test]
+    async fn an_empty_allowlist_serves_nothing_over_http() {
+        let body = br#"{"probe":true}"#;
+        let (headers, _) = operator_headers(body);
+        let base = serve(vec![]).await;
+        let r = reqwest::Client::new()
+            .post(format!("{base}/admin/safe/projection"))
+            .headers(headers)
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 403);
+    }
 }
