@@ -613,24 +613,11 @@ pub fn router(state: Arc<CoordinatorState>) -> Router {
 }
 
 pub async fn spawn_admin_listener(listen_addr: String, state: Arc<CoordinatorState>) -> Result<()> {
-    let parsed: std::net::SocketAddr = listen_addr
-        .parse()
-        .with_context(|| format!("invalid --dkg-admin-listen address {listen_addr:?}"))?;
-    if !parsed.ip().is_loopback() {
-        anyhow::bail!(
-            "--dkg-admin-listen must resolve to a loopback address; got {}",
-            parsed.ip()
-        );
-    }
-    let listener = tokio::net::TcpListener::bind(parsed)
-        .await
-        .with_context(|| format!("dkg-admin bind on {parsed} failed"))?;
-    info!(listen = %parsed, "DKG admin listener started");
-    let app = router(state);
-    axum::serve(listener, app)
-        .await
-        .context("dkg-admin serve error")?;
-    Ok(())
+    // Bound through the one place that answers "how is this surface reached"
+    // (admin_listen.rs). An absolute path gives a unix socket at mode 0600, where the OS
+    // decides who may connect; anything else is a loopback TCP port, which every local
+    // process and any SSRF can reach — and which now says so at every start.
+    crate::admin_listen::serve_admin("dkg-admin-listen", &listen_addr, router(state), "dkg").await
 }
 
 // ── Share-v2 inbound discriminator ─────────────────────────────

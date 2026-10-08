@@ -903,24 +903,17 @@ pub fn router(state: Arc<AdminState>) -> Router {
 }
 
 pub async fn spawn_admin_listener(listen_addr: String, state: Arc<AdminState>) -> Result<()> {
-    let parsed: std::net::SocketAddr = listen_addr
-        .parse()
-        .with_context(|| format!("invalid --signerlist-admin-listen address {listen_addr:?}"))?;
-    if !parsed.ip().is_loopback() {
-        bail!(
-            "--signerlist-admin-listen must resolve to a loopback address; got {}",
-            parsed.ip()
-        );
-    }
-    let listener = tokio::net::TcpListener::bind(parsed)
-        .await
-        .with_context(|| format!("signerlist-admin bind on {parsed} failed"))?;
-    info!(listen = %parsed, "signerlist-update admin listener started");
-    let app = router(state);
-    axum::serve(listener, app)
-        .await
-        .context("signerlist-admin serve error")?;
-    Ok(())
+    // Bound through the one place that answers "how is this surface reached"
+    // (admin_listen.rs). An absolute path gives a unix socket at mode 0600, where the OS
+    // decides who may connect; anything else is a loopback TCP port, which every local
+    // process and any SSRF can reach — and which now says so at every start.
+    crate::admin_listen::serve_admin(
+        "signerlist-admin-listen",
+        &listen_addr,
+        router(state),
+        "signerlist-update",
+    )
+    .await
 }
 
 #[cfg(test)]
