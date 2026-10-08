@@ -192,6 +192,27 @@ pub fn verify_request(
     body_bytes: &[u8],
     uri_path: &str,
 ) -> Result<AuthenticatedUser, String> {
+    verify_request_with(
+        headers,
+        method,
+        body_bytes,
+        uri_path,
+        CanonicalDomain::Public,
+    )
+}
+
+/// The one implementation of every check; only the canonical differs by domain.
+///
+/// Kept as one function on purpose: the timestamp window, the pubkey→address derivation and the
+/// dual signature modes (direct hash, and the XRPL-wallet SHA-512Half form) must not exist in
+/// two copies that can drift.
+fn verify_request_with(
+    headers: &HeaderMap,
+    method: &str,
+    body_bytes: &[u8],
+    uri_path: &str,
+    domain: CanonicalDomain,
+) -> Result<AuthenticatedUser, String> {
     // Extract headers
     let address = headers
         .get("x-xrpl-address")
@@ -286,7 +307,18 @@ pub fn verify_request(
     let is_get = method.eq_ignore_ascii_case("GET");
     let hash = {
         let mut hasher = Sha256::new();
-        if is_get {
+        if domain == CanonicalDomain::Admin {
+            // Binds METHOD, ROUTE, BODY and TIME. Nothing here is optional: without the route a
+            // signature crosses routes, and without the method a POST signature would serve a
+            // DELETE on the same path.
+            hasher.update(b"xperp/v1/admin|");
+            hasher.update(method.as_bytes());
+            hasher.update(b"|");
+            hasher.update(uri_path.as_bytes());
+            hasher.update(b"|");
+            hasher.update(body_bytes);
+            hasher.update(b"|");
+        } else if is_get {
             hasher.update(uri_path.as_bytes());
         } else if body_bytes.is_empty() {
             hasher.update(b"xperp/v1/login|");
@@ -377,6 +409,35 @@ pub fn pubkey_to_xrpl_address(pubkey_bytes: &[u8]) -> String {
 
 /// Axum middleware: verify auth headers on mutating endpoints.
 /// GET requests to public market data are exempt.
+/// Which canonical the signature must cover.
+///
+/// The public canonical for a POST WITH A BODY is `SHA-256(body ‖ timestamp)` — the route is
+/// NOT in it. On the public API that is survivable; on the admin surface it is not, because one
+/// signed request is then valid on ANY admin route whose deserializer accepts the same body,
+/// for the whole replay window. One of those routes resets staged migration state and another
+/// rewrites the membership authority, so "authenticated" would not mean "authenticated FOR
+/// THIS".
+///
+/// The admin canonical binds method, route, body and time. It is a NEW domain rather than a
+/// change to the public one: external clients (Tom's frontend, bots) sign the public canonical
+/// and that contract is not ours to break unilaterally.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CanonicalDomain {
+    /// Today's rules, unchanged, for the public API.
+    Public,
+    /// `SHA-256("xperp/v1/admin|" ‖ method ‖ "|" ‖ uri_path ‖ "|" ‖ body ‖ "|" ‖ timestamp)`.
+    Admin,
+}
+
+/// Is this an admin-surface path?
+///
+/// EXPORTED SO THE SIGNER AND THE VERIFIER DERIVE IT FROM ONE PLACE. If the signing tool had
+/// its own rule — or a flag an operator must remember — the two could disagree, and the failure
+/// would be a confusing 401 rather than a wrong signature. Same input, same predicate, no flag.
+pub fn is_admin_path(uri_path: &str) -> bool {
+    uri_path.starts_with("/admin/") || uri_path.contains("/v1/admin/")
+}
+
 /// Authorise a request on the OPERATOR admin surface: a valid signature AND a signer that is
 /// on the cluster's operator allowlist.
 ///
@@ -413,7 +474,14 @@ pub fn verify_operator_request(
             "operator allowlist is empty — this surface serves nothing".to_string(),
         ));
     }
-    let user = verify_request(headers, method, body_bytes, uri_path).map_err(|e| (401, e))?;
+    let user = verify_request_with(
+        headers,
+        method,
+        body_bytes,
+        uri_path,
+        CanonicalDomain::Admin,
+    )
+    .map_err(|e| (401, e))?;
     if !operators.iter().any(|o| o == &user.xrpl_address) {
         // The address is NAMED in the refusal: an operator debugging a mismatched config needs
         // to see which identity was presented, and it is already in the request they sent.
@@ -646,6 +714,66 @@ mod tests {
     use k256::elliptic_curve::rand_core::OsRng;
 
     /// Helper: generate a test keypair and derive XRPL address.
+    /// A PUBLIC-canonical signature must NOT authenticate an admin request.
+    ///
+    /// This is the whole point of the separate domain. The public canonical for a POST with a
+    /// body is `SHA-256(body ‖ ts)`, so any signature an external client produced for the
+    /// product API would otherwise be a valid admin credential for the replay window — the
+    /// same "foreign oracle" shape the empty-body POST path was domain-separated to defeat.
+    #[test]
+    fn a_public_canonical_signature_does_not_authenticate_an_admin_request() {
+        let (sk, _vk, pk, addr) = test_keypair();
+        let body = br#"{"x":1}"#;
+        let headers = sign_body(&sk, &pk, &addr, body); // the PUBLIC canonical
+        let ops = vec![addr.clone()];
+        let (code, msg) =
+            verify_operator_request(&headers, "POST", body, "/admin/safe/exec", &ops).unwrap_err();
+        assert_eq!(
+            code, 401,
+            "a public-canonical signature must not pass: {msg}"
+        );
+    }
+
+    /// A signature for ONE admin route must not work on ANOTHER.
+    ///
+    /// One of these routes resets staged migration state and another rewrites the membership
+    /// authority, so "authenticated" has to mean "authenticated FOR THIS". With the route
+    /// absent from the hash, the same bytes crossed every route whose deserializer accepted
+    /// them, for the whole replay window.
+    #[test]
+    fn an_admin_signature_does_not_cross_routes() {
+        let (sk, _vk, pk, addr) = test_keypair();
+        let body = br#"{"x":1}"#;
+        let ops = vec![addr.clone()];
+
+        let for_safe = sign_admin(&sk, &pk, &addr, "POST", "/admin/safe/exec", body);
+        verify_operator_request(&for_safe, "POST", body, "/admin/safe/exec", &ops)
+            .expect("valid on its own route");
+
+        let (code, msg) =
+            verify_operator_request(&for_safe, "POST", body, "/admin/migrate-state", &ops)
+                .unwrap_err();
+        assert_eq!(code, 401, "it must not cross to another route: {msg}");
+
+        // ...nor to another METHOD on the same route.
+        let (code2, _) =
+            verify_operator_request(&for_safe, "DELETE", body, "/admin/safe/exec", &ops)
+                .unwrap_err();
+        assert_eq!(code2, 401, "it must not cross methods");
+    }
+
+    /// And the PUBLIC surface must still accept the public canonical — the contract external
+    /// clients sign is not ours to break while fixing ours.
+    #[test]
+    fn the_public_canonical_still_works_on_the_public_surface() {
+        let (sk, _vk, pk, addr) = test_keypair();
+        let body = br#"{"x":1}"#;
+        let headers = sign_body(&sk, &pk, &addr, body);
+        let user = verify_request(&headers, "POST", body, "/v1/perp/orders")
+            .expect("the public canonical must still authenticate a product route");
+        assert_eq!(user.xrpl_address, addr);
+    }
+
     /// The operator surface refuses an UNSIGNED request. 401, not 403: nothing was presented.
     #[test]
     fn the_operator_surface_refuses_an_unsigned_request() {
@@ -663,7 +791,7 @@ mod tests {
     fn a_valid_signature_from_a_stranger_is_refused() {
         let (sk, _vk, pk, addr) = test_keypair();
         let body = br#"{"x":1}"#;
-        let headers = sign_body(&sk, &pk, &addr, body);
+        let headers = sign_admin(&sk, &pk, &addr, "POST", "/admin/safe/exec", body);
         let ops = vec!["rSomeoneElseEntirely".to_string()];
         let (code, msg) =
             verify_operator_request(&headers, "POST", body, "/admin/safe/exec", &ops).unwrap_err();
@@ -680,7 +808,7 @@ mod tests {
     fn a_valid_signature_from_an_operator_passes() {
         let (sk, _vk, pk, addr) = test_keypair();
         let body = br#"{"x":1}"#;
-        let headers = sign_body(&sk, &pk, &addr, body);
+        let headers = sign_admin(&sk, &pk, &addr, "POST", "/admin/safe/exec", body);
         let ops = vec!["rSomeoneElseEntirely".to_string(), addr.clone()];
         let user = verify_operator_request(&headers, "POST", body, "/admin/safe/exec", &ops)
             .expect("an operator's signed request must pass");
@@ -716,6 +844,43 @@ mod tests {
             .unwrap()
             .as_secs()
             .to_string()
+    }
+
+    /// Helper: sign the ADMIN canonical — method, route, body, time — and build the headers.
+    ///
+    /// A separate helper on purpose. `sign_body` below produces the PUBLIC canonical, and when
+    /// the admin surface gained its own domain those two operator tests started failing, which
+    /// is the change working: a public-canonical signature must NOT authenticate an admin
+    /// request. Reusing one helper for both would have hidden exactly that.
+    fn sign_admin(
+        sk: &SigningKey,
+        pubkey_hex: &str,
+        address: &str,
+        method: &str,
+        uri_path: &str,
+        body: &[u8],
+    ) -> HeaderMap {
+        let ts = current_ts();
+        let mut hasher = Sha256::new();
+        hasher.update(b"xperp/v1/admin|");
+        hasher.update(method.as_bytes());
+        hasher.update(b"|");
+        hasher.update(uri_path.as_bytes());
+        hasher.update(b"|");
+        hasher.update(body);
+        hasher.update(b"|");
+        hasher.update(ts.as_bytes());
+        let hash = hasher.finalize();
+        let (sig, _): (Signature, _) = sk.sign_prehash(&hash).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-xrpl-address", address.parse().unwrap());
+        headers.insert("x-xrpl-publickey", pubkey_hex.parse().unwrap());
+        headers.insert(
+            "x-xrpl-signature",
+            hex::encode(sig.to_der().as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-xrpl-timestamp", ts.parse().unwrap());
+        headers
     }
 
     /// Helper: sign body + timestamp and build auth headers.
