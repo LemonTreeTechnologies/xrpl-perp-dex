@@ -152,9 +152,16 @@ enum Command {
 
     /// Generate a signed curl command for any API endpoint.
     SignRequest {
-        /// XRPL secp256k1 seed (secret)
+        /// XRPL secp256k1 seed (secret). PS-VISIBLE — every local user can read it out of
+        /// `ps`. Prefer --seed-file, which is why that option now exists: the admin surface
+        /// needs a signed request, and the only way to produce one was to put an operator
+        /// seed on a command line, so the Safe-convergence procedure had no path that did
+        /// not violate the rule about secrets in argv.
         #[arg(long)]
-        seed: String,
+        seed: Option<String>,
+        /// Path to a file containing the seed. Mode 0600 is checked and warned about.
+        #[arg(long)]
+        seed_file: Option<PathBuf>,
         /// HTTP method (GET, POST, DELETE)
         #[arg(long, default_value = "POST")]
         method: String,
@@ -741,9 +748,10 @@ async fn main() -> Result<()> {
             escrow_address,
             disable_master,
         }) => {
-            let seed = cli_tools::resolve_escrow_seed(
+            let seed = cli_tools::resolve_seed(
                 escrow_seed.as_deref(),
                 escrow_seed_file.as_deref(),
+                "escrow-seed",
             )?;
             return cli_tools::escrow_setup(
                 &xrpl_url,
@@ -756,11 +764,15 @@ async fn main() -> Result<()> {
         }
         Some(Command::SignRequest {
             seed,
+            seed_file,
             method,
             url,
             body,
         }) => {
-            return cli_tools::sign_request(&seed, &method, &url, body.as_deref()).await;
+            // Reuses resolve_escrow_seed, which warns on an argv seed and on a seed file
+            // that is not 0600 — rather than a second copy of that policy here.
+            let s = cli_tools::resolve_seed(seed.as_deref(), seed_file.as_deref(), "seed")?;
+            return cli_tools::sign_request(&s, &method, &url, body.as_deref()).await;
         }
         Some(Command::Withdraw {
             api,
@@ -956,9 +968,10 @@ async fn main() -> Result<()> {
             // unset, in which case no seed is needed); only validate
             // when at least one was given.
             let seed = if escrow_seed.is_some() || escrow_seed_file.is_some() {
-                Some(cli_tools::resolve_escrow_seed(
+                Some(cli_tools::resolve_seed(
                     escrow_seed.as_deref(),
                     escrow_seed_file.as_deref(),
+                    "escrow-seed",
                 )?)
             } else {
                 None
