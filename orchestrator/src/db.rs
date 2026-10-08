@@ -53,7 +53,7 @@ impl Db {
                 Some(Db { pool })
             }
             Err(e) => {
-                error!("PostgreSQL connection failed (history disabled): {}", e);
+                error!("PostgreSQL connection failed (history disabled): {:#}", e);
                 None
             }
         }
@@ -100,7 +100,7 @@ impl Db {
         .await;
 
         if let Err(e) = r {
-            error!("pg insert_trade failed: {}", e);
+            error!("pg insert_trade failed: {:#}", e);
         }
     }
 
@@ -125,7 +125,7 @@ impl Db {
         .await;
 
         if let Err(e) = r {
-            error!("pg insert_deposit failed: {}", e);
+            error!("pg insert_deposit failed: {:#}", e);
         }
     }
 
@@ -158,7 +158,7 @@ impl Db {
         .await;
 
         if let Err(e) = r {
-            error!("pg insert_deposit_binding failed: {}", e);
+            error!("pg insert_deposit_binding failed: {:#}", e);
         }
     }
 
@@ -188,7 +188,7 @@ impl Db {
         .await;
 
         if let Err(e) = r {
-            error!("pg insert_withdrawal failed: {}", e);
+            error!("pg insert_withdrawal failed: {:#}", e);
         }
     }
 
@@ -211,7 +211,7 @@ impl Db {
         .await;
 
         if let Err(e) = r {
-            error!("pg insert_liquidation failed: {}", e);
+            error!("pg insert_liquidation failed: {:#}", e);
         }
     }
 
@@ -244,7 +244,7 @@ impl Db {
         .execute(&self.pool)
         .await;
         if let Err(e) = r {
-            error!("pg insert_funding_payment failed: {}", e);
+            error!("pg insert_funding_payment failed: {:#}", e);
         }
     }
 
@@ -267,7 +267,7 @@ impl Db {
         .execute(&self.pool)
         .await;
         if let Err(e) = r {
-            error!("pg insert_funding_event failed: {}", e);
+            error!("pg insert_funding_event failed: {:#}", e);
         }
     }
 
@@ -309,7 +309,7 @@ impl Db {
         .execute(&self.pool)
         .await;
         if let Err(e) = r {
-            error!("pg insert_resting_order failed: {}", e);
+            error!("pg insert_resting_order failed: {:#}", e);
         }
     }
 
@@ -323,7 +323,7 @@ impl Db {
             .execute(&self.pool)
             .await;
         if let Err(e) = r {
-            error!("pg update_resting_order_filled failed: {}", e);
+            error!("pg update_resting_order_filled failed: {:#}", e);
         }
     }
 
@@ -334,7 +334,7 @@ impl Db {
             .execute(&self.pool)
             .await;
         if let Err(e) = r {
-            error!("pg delete_resting_order failed: {}", e);
+            error!("pg delete_resting_order failed: {:#}", e);
         }
     }
 
@@ -403,7 +403,7 @@ impl Db {
                 signer_pubkey_hex,
             };
             if let Err(e) = crate::auth::verify_signature_only(&binding) {
-                warn!(order_id = id, %user_id, "resting order rejected on reload: {}", e);
+                warn!(order_id = id, %user_id, "resting order rejected on reload: {:#}", e);
                 rejected += 1;
                 continue;
             }
@@ -524,7 +524,7 @@ impl Db {
                 epoch = b.authority_epoch,
                 "retained current membership bundle (epoch {})", b.authority_epoch
             ),
-            Err(e) => error!("pg upsert_current_membership_bundle failed: {}", e),
+            Err(e) => error!("pg upsert_current_membership_bundle failed: {:#}", e),
         }
     }
 
@@ -586,7 +586,7 @@ impl Db {
             }),
             Ok(None) => None,
             Err(e) => {
-                warn!("pg load_current_membership_bundle failed: {}", e);
+                warn!("pg load_current_membership_bundle failed: {:#}", e);
                 None
             }
         }

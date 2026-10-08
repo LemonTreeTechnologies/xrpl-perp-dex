@@ -72,3 +72,14 @@ jobs:
       # to say so, which is the second time a quota-dead gate has let a defect through.
       - name: one quorum-bundle producer
         run: scripts/ci_one_quorum_bundle_producer.py
+
+      # A logged error must print its CHAIN. `warn!("...: {}", e)` on an anyhow::Error shows
+      # only the outermost context — which in the reserves publisher was a hand-written guess
+      # at the cause — and discards the source, where the enclave's rc lives. The cluster
+      # logged that guess hourly for over a week, 166 times, so the one fact needed to act was
+      # never in the log at all. 101 sites had the defect against 2 that did not, which is why
+      # this is a gate and not a convention.
+      # Path is relative to this job's working-directory (orchestrator), NOT the repo root —
+      # the mistake that left the gate above at exit 127 and never once executed.
+      - name: logged errors print their chain
+        run: scripts/ci_log_error_chain.py

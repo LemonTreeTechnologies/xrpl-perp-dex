@@ -451,7 +451,7 @@ impl TradingEngine {
                 };
 
                 if let Err(e) = tx.send(batch).await {
-                    warn!("failed to send batch to P2P: {}", e);
+                    warn!("failed to send batch to P2P: {:#}", e);
                 }
             }
         }

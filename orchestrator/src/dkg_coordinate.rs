@@ -707,7 +707,7 @@ pub async fn route_inbound_share_v2(
         {
             Ok(true) => info!(signer_id, shard_id, "imported v2 FROST share"),
             Ok(false) => warn!(signer_id, "v2 share import refused (403)"),
-            Err(e) => warn!(signer_id, "v2 share import error: {}", e),
+            Err(e) => warn!(signer_id, "v2 share import error: {:#}", e),
         }
     }
     Ok(())

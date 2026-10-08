@@ -70,7 +70,7 @@ impl ShardRouter {
                     shard_id_unsupported = true,
                     shard_id = entry.shard_id,
                     url = %entry.enclave_url,
-                    "set_shard_id not supported by enclave (running as shard 0): {}",
+                    "set_shard_id not supported by enclave (running as shard 0): {:#}",
                     e
                 );
             }
@@ -112,7 +112,7 @@ impl ShardRouter {
                     shard_id_unsupported = true,
                     shard_id,
                     url = %enclave_url,
-                    "set_shard_id not supported by enclave (running as shard 0): {}",
+                    "set_shard_id not supported by enclave (running as shard 0): {:#}",
                     e
                 );
             }

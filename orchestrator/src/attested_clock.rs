@@ -346,9 +346,13 @@ async fn advance_once(
         match http.post(url).json(&body).send().await {
             Ok(r) => match r.json::<serde_json::Value>().await {
                 Ok(j) => responses.push((url.clone(), j)),
-                Err(e) => tracing::debug!(url = %url, error = %e, "clock: body not JSON"),
+                Err(e) => {
+                    tracing::debug!(url = %url, error = %format!("{e:#}"), "clock: body not JSON")
+                }
             },
-            Err(e) => tracing::debug!(url = %url, error = %e, "clock: endpoint unreachable"),
+            Err(e) => {
+                tracing::debug!(url = %url, error = %format!("{e:#}"), "clock: endpoint unreachable")
+            }
         }
     }
     let Some((src, header, ledger_hash, index)) = newest_parsed(&responses) else {

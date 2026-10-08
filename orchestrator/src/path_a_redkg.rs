@@ -89,7 +89,7 @@ pub async fn export_shares(
                 continue;
             }
             Err(e) => {
-                warn!(%peer_pubkey, "share-export error: {}", e);
+                warn!(%peer_pubkey, "share-export error: {:#}", e);
                 errored += 1;
                 errors.push(format!("{peer_pubkey}: {e}"));
                 continue;
@@ -104,7 +104,7 @@ pub async fn export_shares(
             envelope,
         };
         if let Err(e) = pub_tx.send(msg).await {
-            warn!(%peer_pubkey, "share-v2 publish channel closed: {}", e);
+            warn!(%peer_pubkey, "share-v2 publish channel closed: {:#}", e);
             errored += 1;
             errors.push(format!("{peer_pubkey}: publish channel closed"));
             continue;

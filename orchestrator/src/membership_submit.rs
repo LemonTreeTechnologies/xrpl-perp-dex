@@ -127,7 +127,7 @@ impl LibP2PProjectionSubmitter {
                     }));
                 }
                 Ok(Ok(SigningMessage::Response { error: Some(e), .. })) => {
-                    warn!(signer = %xrpl_address, error = %e, "projection signer rejected");
+                    warn!(signer = %xrpl_address, error = %format!("{e:#}"), "projection signer rejected");
                 }
                 Ok(Ok(_)) => warn!(signer = %xrpl_address, "malformed projection signing response"),
                 Ok(Err(_)) => warn!(signer = %xrpl_address, "projection signing channel dropped"),

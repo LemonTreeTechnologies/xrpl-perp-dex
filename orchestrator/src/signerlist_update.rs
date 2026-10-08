@@ -341,7 +341,7 @@ async fn drive(
         let account_id = match xrpl_signer::decode_xrpl_address(&signer.xrpl_address) {
             Ok(id) => id,
             Err(e) => {
-                warn!(addr = %signer.xrpl_address, error = %e, "decode failed; skipping");
+                warn!(addr = %signer.xrpl_address, error = %format!("{e:#}"), "decode failed; skipping");
                 continue;
             }
         };
@@ -395,7 +395,7 @@ async fn drive(
                 }));
             }
             Ok(Ok(SigningMessage::Response { error: Some(e), .. })) => {
-                warn!(signer = %signer.xrpl_address, error = %e, "remote signer rejected");
+                warn!(signer = %signer.xrpl_address, error = %format!("{e:#}"), "remote signer rejected");
             }
             Ok(Ok(_)) => warn!(signer = %signer.xrpl_address, "malformed signing response"),
             Ok(Err(_)) => warn!(signer = %signer.xrpl_address, "signing response channel dropped"),
@@ -709,7 +709,7 @@ async fn drive_bootstrap_rotate(
         let account_id = match xrpl_signer::decode_xrpl_address(&signer.xrpl_address) {
             Ok(id) => id,
             Err(e) => {
-                warn!(addr = %signer.xrpl_address, error = %e, "decode failed; skipping");
+                warn!(addr = %signer.xrpl_address, error = %format!("{e:#}"), "decode failed; skipping");
                 continue;
             }
         };
@@ -763,7 +763,7 @@ async fn drive_bootstrap_rotate(
                 }));
             }
             Ok(Ok(SigningMessage::Response { error: Some(e), .. })) => {
-                warn!(signer = %signer.xrpl_address, error = %e, "remote signer rejected");
+                warn!(signer = %signer.xrpl_address, error = %format!("{e:#}"), "remote signer rejected");
             }
             Ok(Ok(_)) => warn!(signer = %signer.xrpl_address, "malformed signing response"),
             Ok(Err(_)) => warn!(signer = %signer.xrpl_address, "signing response channel dropped"),

@@ -291,7 +291,7 @@ async fn handle_membership_change(
     match drive_change(&state, req).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => {
-            warn!(error = %e, "β membership-change failed");
+            warn!(error = %format!("{e:#}"), "β membership-change failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"status": "error", "message": format!("{e:#}")})),
@@ -389,7 +389,7 @@ async fn handle_membership_genesis(
     match drive_genesis(&state, req).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => {
-            warn!(error = %e, "β4 genesis bootstrap failed");
+            warn!(error = %format!("{e:#}"), "β4 genesis bootstrap failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"status": "error", "message": format!("{e:#}")})),
@@ -505,7 +505,7 @@ async fn handle_govern(
     match drive_govern(&state, req).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => {
-            warn!(error = %e, "β4 mrenclave-governance failed");
+            warn!(error = %format!("{e:#}"), "β4 mrenclave-governance failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"status": "error", "message": format!("{e:#}")})),
@@ -629,7 +629,7 @@ async fn handle_reserves_spv_baseline(
     match drive_reserves_spv_baseline(&state, req).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => {
-            warn!(error = %e, "#131 SPV baseline ceremony failed");
+            warn!(error = %format!("{e:#}"), "#131 SPV baseline ceremony failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"status": "error", "message": format!("{e:#}")})),
@@ -683,7 +683,7 @@ async fn handle_unl_refresh(
         )
             .into_response(),
         Err(e) => {
-            warn!(error = %e, "#131 §6 validator-manifest refresh failed");
+            warn!(error = %format!("{e:#}"), "#131 §6 validator-manifest refresh failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"status": "error", "message": format!("{e:#}")})),
@@ -812,7 +812,7 @@ async fn handle_unl_policy(
         )
             .into_response(),
         Err(e) => {
-            warn!(error = %e, "#131 §6 UNL policy ceremony failed");
+            warn!(error = %format!("{e:#}"), "#131 §6 UNL policy ceremony failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"status": "error", "message": format!("{e:#}")})),
