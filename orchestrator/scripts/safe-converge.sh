@@ -28,6 +28,34 @@ TARGET_THRESHOLD="${TARGET_THRESHOLD:-1}"
 MODE="${1:-plan}"
 case "$MODE" in plan) ;; *) echo "usage: $0 plan   (apply is deliberately not implemented yet)"; exit 2 ;; esac
 
+# A MULTI-OWNER SET AT THRESHOLD 1 IS REFUSED BEFORE ANYTHING IS ASKED (audit ruling, Q2,
+# 2026-10-08). Today one enclave can act alone; {3 owners}@1 makes EACH of three act alone —
+# three unilateral controllers where there was one, for no security gained. It is a t-of-n
+# costume: count the independent parties required to move funds and at @1 it is one, which is
+# exactly what the cluster's 2-of-3 exists to forbid. Forbidden transiently AND as an end
+# state, so add-owners and raise-threshold must land in ONE Safe transaction.
+#
+# This script DEFAULTED to that posture, which is why the check is here and not in a comment:
+# it would have printed a plan for the forbidden thing and called it a plan.
+if [ "$TARGET_THRESHOLD" -le 1 ] 2>/dev/null; then
+  cat <<'WHY'
+REFUSING: target_threshold=1 with a multi-member projection is the forbidden posture.
+
+  project_owner_set maps EVERY sealed member to an owner — there is no selection, so the
+  target is always the whole cluster. With threshold 1 that means each of three nodes could
+  execute a Safe transaction ALONE, where today only node-1 can.
+
+  The two honest postures (audit ruling):
+    (i)  Tier-1 single publisher  = {node-1}@1   — NOT EXPRESSIBLE in this code today;
+                                                   project_owner_set has no single-member mode
+    (ii) faithful 2-of-3 cluster  = {3}@2        — atomic (one MultiSend), and only meaningful
+                                                   once replication lets owners 2/3 approve a
+                                                   Safe tx against their own state
+  Re-run with TARGET_THRESHOLD=2 to see the (ii) plan. Nothing is submitted either way.
+WHY
+  exit 3
+fi
+
 hr() { printf '%s\n' "------------------------------------------------------------"; }
 echo "Safe owner-set projection — MODE=$MODE  node=$NODE  target_threshold=$TARGET_THRESHOLD"
 hr
@@ -116,6 +144,12 @@ except Exception:
     print("  could not parse the response — printed verbatim above"); raise SystemExit(0)
 if d.get("status") == "error":
     print("  the node REFUSED:", d.get("message")); raise SystemExit(0)
+# Post-check too, because the node derives the target and this script only asked for it.
+owners, th = d.get("target_owners", []), d.get("target_threshold")
+if len(owners) > 1 and th == 1:
+    print("  REFUSING TO PRINT A PLAN: the node derived a multi-owner set at threshold 1,")
+    print("  which is the forbidden posture (three unilateral controllers). Not a plan.")
+    raise SystemExit(3)
 print("  in_sync         :", d.get("in_sync"))
 print("  target_threshold:", d.get("target_threshold"))
 for o in d.get("target_owners", []): print("  target owner    :", o)
