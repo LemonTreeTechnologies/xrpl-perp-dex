@@ -45,6 +45,7 @@ mod reserves_baseline; // AC-BASE — one-time custody-baseline ceremony (hash +
 mod reserves_publisher; // #131 3d — Tier-1 reserves publisher
 mod safe_governance; // #131 Safe owner-management calldata + signature ordering
 mod safe_projection; // #131 the Safe owner set as a projection of sealed membership
+mod session_key_revoke; // rotate a leaked session key out of existence, with a live-key guard
 pub mod shard_router;
 mod signerlist_update;
 mod singleton;
@@ -390,6 +391,49 @@ enum Command {
         /// `curl -s http://localhost:3000/v1/system/status | jq -r .deposit_address`
         #[arg(long)]
         expect_escrow: String,
+    },
+
+    /// Revoke ONE leaked session key, by rotating it to a value
+    /// nobody holds.
+    ///
+    /// A session key never expires: `ecall_validate_session_key` is a
+    /// pool lookup plus a `ct_memcmp`, and the pool survives Path-A.
+    /// So a key that leaks stays valid until it is rotated, and the
+    /// 2026-10-08 inventory found thirteen historically-real ones in
+    /// git — seven of them in a PUBLIC repository.
+    ///
+    /// Run it ON the node whose pool holds the account. It validates
+    /// the old key first (so "already dead" is distinguished from a
+    /// real revocation), rotates, then validates again and FAILS if
+    /// the old key still authenticates — a 200 from the enclave is a
+    /// claim, not a result.
+    ///
+    /// By default the new value is discarded, which is the point: the
+    /// signing key survives but nothing can present a credential for
+    /// it again. Pass `--save-new` only if the account must stay
+    /// drivable.
+    RevokeSessionKey {
+        /// Enclave REST API base URL (loopback only).
+        #[arg(long, default_value = "https://localhost:9088/v1")]
+        enclave_url: String,
+        /// The pool account, `0x` + 40 hex. Public, so a flag is fine.
+        #[arg(long)]
+        address: String,
+        /// File holding the key to revoke. A FILE, not a flag value:
+        /// an argument is visible in `ps` to every local user, which
+        /// is the same exposure this command exists to clean up.
+        #[arg(long)]
+        key_file: PathBuf,
+        /// Directory of configs defining which keys are IN USE; the
+        /// command refuses to rotate any of them, and refuses outright
+        /// if it finds none — an empty set means a wrong directory, not
+        /// an all-clear.
+        #[arg(long, default_value = "/home/azureuser/perp")]
+        in_use_dir: PathBuf,
+        /// Keep the new value at this path (mode 0600) instead of
+        /// discarding it. Only when the account must remain drivable.
+        #[arg(long)]
+        save_new: Option<PathBuf>,
     },
 
     /// Phase 2.1c-E — node-local deploy. Each operator runs this on
@@ -908,6 +952,22 @@ async fn main() -> Result<()> {
                 &seed_path,
                 &enclave_url,
                 &expect_escrow,
+            )
+            .await;
+        }
+        Some(Command::RevokeSessionKey {
+            enclave_url,
+            address,
+            key_file,
+            in_use_dir,
+            save_new,
+        }) => {
+            return session_key_revoke::revoke_session_key(
+                &enclave_url,
+                &address,
+                &key_file,
+                &in_use_dir,
+                save_new.as_ref(),
             )
             .await;
         }
