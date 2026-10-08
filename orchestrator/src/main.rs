@@ -375,6 +375,21 @@ enum Command {
         /// Enclave REST API base URL (loopback only).
         #[arg(long, default_value = "https://localhost:9088/v1")]
         enclave_url: String,
+        /// The escrow this ceremony is MEANT to seal, named
+        /// explicitly. Required, and checked against the seed file.
+        ///
+        /// Why a flag and not just the file: on 2026-10-08 the
+        /// canonical seed path held a RETIRED escrow on three of the
+        /// four machines, including the host ceremonies are driven
+        /// from — the live seed was on sgx-node-1 only. Sealing is
+        /// the sharpest consumer of that file: it would have sealed
+        /// a dead account and a previous generation's signer set as
+        /// the enclave's version=1 authority, silently, because
+        /// nothing compared the file against the running cluster.
+        /// Read the live value off any node, no auth needed:
+        /// `curl -s http://localhost:3000/v1/system/status | jq -r .deposit_address`
+        #[arg(long)]
+        expect_escrow: String,
     },
 
     /// Phase 2.1c-E — node-local deploy. Each operator runs this on
@@ -881,13 +896,20 @@ async fn main() -> Result<()> {
             xrpl_url,
             seed_file,
             enclave_url,
+            expect_escrow,
         }) => {
             let default_seed_path = PathBuf::from(format!(
                 "{}/.secrets/perp-dex-xrpl/escrow-testnet.json",
                 std::env::var("HOME").context("HOME not set")?
             ));
             let seed_path = seed_file.unwrap_or(default_seed_path);
-            return cli_tools::signerlist_seal_initial(&xrpl_url, &seed_path, &enclave_url).await;
+            return cli_tools::signerlist_seal_initial(
+                &xrpl_url,
+                &seed_path,
+                &enclave_url,
+                &expect_escrow,
+            )
+            .await;
         }
         Some(Command::SignerlistBootstrapRotate {
             admin_url,

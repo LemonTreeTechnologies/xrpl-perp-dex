@@ -1915,11 +1915,50 @@ pub async fn operator_add(
 
 // ── sign-request (Bug 4) ───────────────────────────────────────
 
-fn sign_body(keypair: &XrplKeypair, body: &[u8], timestamp: u64) -> Result<String> {
+/// The path portion of a URL, as the server's `request.uri().path()` would report it.
+///
+/// Deliberately tolerant: a bare path is returned unchanged, so `--url /admin/x` works as well
+/// as a full URL, and a `unix:` form is handled by the caller before this is reached.
+fn uri_path_of(url: &str) -> String {
+    let after_scheme = match url.find("://") {
+        Some(i) => &url[i + 3..],
+        None => return url.split('?').next().unwrap_or(url).to_string(),
+    };
+    match after_scheme.find('/') {
+        Some(i) => after_scheme[i..]
+            .split('?')
+            .next()
+            .unwrap_or(&after_scheme[i..])
+            .to_string(),
+        None => "/".to_string(),
+    }
+}
+
+fn sign_body(
+    keypair: &XrplKeypair,
+    method: &str,
+    uri_path: &str,
+    body: &[u8],
+    timestamp: u64,
+) -> Result<String> {
     use sha2::Digest;
 
     let mut hasher = sha2::Sha256::new();
-    hasher.update(body);
+    // THE DOMAIN IS DERIVED FROM THE PATH, not from a flag. `crate::auth::is_admin_path` is the
+    // same predicate the verifier applies to the same input, so the two cannot disagree — and
+    // an operator has nothing to remember. A flag you can forget produces a signature the
+    // server rejects, which is fail-closed but reads as a confusing 401.
+    if crate::auth::is_admin_path(uri_path) {
+        hasher.update(b"xperp/v1/admin|");
+        hasher.update(method.as_bytes());
+        hasher.update(b"|");
+        hasher.update(uri_path.as_bytes());
+        hasher.update(b"|");
+        hasher.update(body);
+        hasher.update(b"|");
+    } else {
+        hasher.update(body);
+    }
     hasher.update(timestamp.to_string().as_bytes());
     let hash: [u8; 32] = hasher.finalize().into();
 
@@ -1935,7 +1974,11 @@ pub async fn sign_request(seed: &str, method: &str, url: &str, body: Option<&str
         .as_secs();
 
     let body_bytes = body.unwrap_or("").as_bytes();
-    let sig_hex = sign_body(&keypair, body_bytes, timestamp)?;
+    // The PATH, not the whole URL: the verifier sees `request.uri().path()`, so the signer must
+    // hash the same substring. Taking it from the URL rather than asking the operator for it
+    // keeps one source of truth.
+    let uri_path = uri_path_of(url);
+    let sig_hex = sign_body(&keypair, method, &uri_path, body_bytes, timestamp)?;
 
     println!("# XRPL address: {}", keypair.address);
     println!("# Public key:   {}", keypair.compressed_pubkey_hex);
@@ -1977,7 +2020,15 @@ pub async fn cli_withdraw(
         body["destination_tag"] = serde_json::json!(tag);
     }
     let body_str = serde_json::to_string(&body)?;
-    let sig_hex = sign_body(&keypair, body_str.as_bytes(), timestamp)?;
+    // A product route, never an admin one, so this takes the public canonical — which
+    // `sign_body` selects from the path rather than from a parameter here.
+    let sig_hex = sign_body(
+        &keypair,
+        "POST",
+        "/v1/perp/withdraw",
+        body_str.as_bytes(),
+        timestamp,
+    )?;
 
     println!("Withdraw");
     println!("========");
@@ -2112,6 +2163,52 @@ fn parse_signerlist_set_tx_response(resp: &serde_json::Value) -> Result<(String,
     Ok((blob, ledger_index))
 }
 
+/// Refuse to seal unless the operator NAMED the escrow and the seed
+/// file agrees.
+///
+/// The failure this exists for is not hypothetical. On 2026-10-08 the
+/// canonical seed path `~/.secrets/perp-dex-xrpl/escrow-testnet.json`
+/// held the seed of a RETIRED escrow on Hetzner, sgx-node-2 and
+/// sgx-node-3 — three machines of four, including the one ceremonies
+/// are driven from. Only sgx-node-1 had the live escrow. A rotation on
+/// 07-30 wrote the new seed on node-1 and made a `.bak` of the old one
+/// on the other two, then never replaced their actual file.
+///
+/// Nothing noticed, because nothing compared. `seal-initial` is the
+/// sharpest consumer of this file: it seals an escrow and its signer
+/// roster as the enclave's version=1 authority. Fed the stale file it
+/// would have sealed a dead account, succeeded, and left the cluster
+/// with a sealed authority over an escrow nobody uses.
+///
+/// So the gate is not "is the file self-consistent" — the retired file
+/// is perfectly self-consistent, which is exactly why it was silent.
+/// The gate is that a human states which account this is for, and the
+/// file has to match. The address is public; the live one comes off any
+/// node's unauthenticated `/v1/system/status` as `deposit_address`.
+fn check_expected_escrow(seed_escrow: &str, expect: &str, seed_file: &Path) -> Result<()> {
+    let expect = expect.trim();
+    if expect.is_empty() {
+        anyhow::bail!(
+            "--expect-escrow is empty. Name the escrow this ceremony is for; \
+             read the live one off any node with \
+             `curl -s http://localhost:3000/v1/system/status | jq -r .deposit_address`"
+        );
+    }
+    if seed_escrow != expect {
+        anyhow::bail!(
+            "REFUSING to seal: {} names escrow {}, but --expect-escrow says {}.\n\
+             A seed file that disagrees with the escrow you meant is the shape that \
+             put a RETIRED escrow at this canonical path on three of four machines \
+             (2026-10-08). Check which account the cluster actually runs:\n\
+             \x20 curl -s http://localhost:3000/v1/system/status | jq -r .deposit_address",
+            seed_file.display(),
+            seed_escrow,
+            expect
+        );
+    }
+    Ok(())
+}
+
 /// Phase 2.2-B — `signerlist-seal-initial` subcommand. Each operator
 /// runs this once on their own node after the founder publishes the
 /// escrow + SignerListSet tx hash. Reads the escrow seed file for
@@ -2128,6 +2225,7 @@ pub async fn signerlist_seal_initial(
     xrpl_url: &str,
     seed_file: &Path,
     enclave_url: &str,
+    expect_escrow: &str,
 ) -> Result<()> {
     let content = std::fs::read_to_string(seed_file)
         .with_context(|| format!("cannot read {}", seed_file.display()))?;
@@ -2137,6 +2235,7 @@ pub async fn signerlist_seal_initial(
     let escrow_address = seed["escrow_address"]
         .as_str()
         .context("seed file missing escrow_address")?;
+    check_expected_escrow(escrow_address, expect_escrow, seed_file)?;
     let tx_hash = seed["signer_list_set_tx_hash"]
         .as_str()
         .context("seed file missing signer_list_set_tx_hash")?;
@@ -2325,6 +2424,65 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e2.contains("--escrow-seed-file"), "{e2}");
+    }
+
+    // The real 2026-10-08 case, as a test: both files are internally
+    // perfect, and that is the point. The retired escrow's seed names
+    // its own account, its own signers, its own tx hash — a validator
+    // that only checked self-consistency would pass it. What makes it
+    // wrong is external: it is not the escrow the cluster runs.
+    #[test]
+    fn seal_refuses_a_self_consistent_seed_for_the_wrong_escrow() {
+        let retired = "rUY1bpf7X2ySfY1AL2PFKCSXyQKNpMWQGD";
+        let live = "rfYnJDSAeFuDCUTq2oYbckbJcz3gAJTNCd";
+        let err = check_expected_escrow(retired, live, Path::new("/s/escrow-testnet.json"))
+            .expect_err(
+                "a seed naming the retired escrow must not seal when the live one was named",
+            );
+        let msg = format!("{err}");
+        // The refusal has to name BOTH accounts. "escrow mismatch" would
+        // leave the operator to go and look up which file was stale.
+        assert!(
+            msg.contains(retired),
+            "refusal must name what the file says: {msg}"
+        );
+        assert!(
+            msg.contains(live),
+            "refusal must name what was expected: {msg}"
+        );
+        assert!(
+            msg.contains("/s/escrow-testnet.json"),
+            "refusal must name the file it read: {msg}"
+        );
+    }
+
+    #[test]
+    fn seal_admits_the_escrow_the_operator_named() {
+        let live = "rfYnJDSAeFuDCUTq2oYbckbJcz3gAJTNCd";
+        check_expected_escrow(live, live, Path::new("/s/escrow-testnet.json"))
+            .expect("the matching case must pass, or the gate is just a wall");
+        // Trimmed, because the value usually arrives through a shell
+        // substitution and `jq -r` output carries a newline.
+        check_expected_escrow(
+            live,
+            "  rfYnJDSAeFuDCUTq2oYbckbJcz3gAJTNCd\n",
+            Path::new("/s/x"),
+        )
+        .expect("surrounding whitespace is a shell artefact, not a mismatch");
+    }
+
+    #[test]
+    fn seal_refuses_an_empty_expectation_rather_than_treating_it_as_a_wildcard() {
+        let err = check_expected_escrow(
+            "rfYnJDSAeFuDCUTq2oYbckbJcz3gAJTNCd",
+            "   ",
+            Path::new("/s/x"),
+        )
+        .expect_err("an empty --expect-escrow must not pass for anything");
+        assert!(
+            format!("{err}").contains("--expect-escrow"),
+            "the refusal must name the flag the operator has to pass"
+        );
     }
 
     #[test]
