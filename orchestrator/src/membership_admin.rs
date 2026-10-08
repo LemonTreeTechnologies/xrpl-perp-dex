@@ -841,23 +841,17 @@ pub async fn spawn_admin_listener(
     listen_addr: String,
     state: Arc<MembershipAdminState>,
 ) -> Result<()> {
-    let parsed: std::net::SocketAddr = listen_addr
-        .parse()
-        .with_context(|| format!("invalid --membership-admin-listen address {listen_addr:?}"))?;
-    if !parsed.ip().is_loopback() {
-        bail!(
-            "--membership-admin-listen must resolve to a loopback address; got {}",
-            parsed.ip()
-        );
-    }
-    let listener = tokio::net::TcpListener::bind(parsed)
-        .await
-        .with_context(|| format!("membership-admin bind on {parsed} failed"))?;
-    info!(listen = %parsed, "β membership-change admin listener started");
-    axum::serve(listener, router(state))
-        .await
-        .context("membership-admin serve error")?;
-    Ok(())
+    // Bound through the one place that answers "how is this surface reached"
+    // (admin_listen.rs). An absolute path gives a unix socket at mode 0600, where the OS
+    // decides who may connect; anything else is a loopback TCP port, which every local
+    // process and any SSRF can reach — and which now says so at every start.
+    crate::admin_listen::serve_admin(
+        "membership-admin-listen",
+        &listen_addr,
+        router(state),
+        "membership-change",
+    )
+    .await
 }
 
 #[cfg(test)]

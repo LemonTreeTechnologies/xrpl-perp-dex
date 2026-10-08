@@ -4,6 +4,7 @@
 //!   1. API server (axum) — accepts orders from users
 //!   2. Background loop — price feeds, deposit monitoring, liquidations, funding
 
+mod admin_listen;
 mod api;
 mod attested_clock;
 mod auth;
