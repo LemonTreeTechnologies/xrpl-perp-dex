@@ -133,6 +133,32 @@ state.
 is why the flag could not be switched on at all; the command above closes that gap. Steps
 1 and 3 have not been performed, and `deposit-spv` is OFF on all three nodes.
 
+## Custody is 2-of-3. The attestation authority is 1-of-1. Do not conflate them.
+
+Two different objects, and the difference decides what may truthfully be said:
+
+| | who holds it | today |
+|---|---|---|
+| **Custody of customer funds** | XRPL escrow `rfYnJDSAeFuDCUTq2oYbckbJcz3gAJTNCd`, SignerList with the master key disabled | **2-of-3** |
+| **Authority over the published reserves root** | the Base Safe `0xa6b6bfbd…`, which holds **no funds** and which the code names "authority of the registry" | **1-of-1** (node-1's enclave key) |
+
+So: **custody is 2-of-3 and saying so is true.** What is single-party is *who vouches for the
+published root* — and a 1-of-1 publisher means one compromised or buggy enclave can publish a
+**false** root. That is the real Tier-1/Tier-2 line here and it has nothing to do with custody.
+
+**The proof does not yet say which.** `perp_reserves_snapshot_hash` commits the epoch, the
+liabilities, the custody figures, the leaf count and the excluded-senders hash — **not the
+owner set and not the threshold** — and the registry read returns `{epoch, root}`. A consumer
+cannot tell a 1-of-1 publisher from a 2-of-3 one by reading the proof.
+
+**⚠ CONSTRAINT ON EXTERNAL MATERIAL (audit ruling 2026-10-08, RESP `b349ec3`).** Nothing we
+publish may claim or imply that the reserves root is **vouched-for** by 2-of-3 while the
+publishing Safe is 1-of-1. Claiming 2-of-3 *custody* is fine and true. Claiming 2-of-3
+*attestation* of the root is not, and no honest-labeling retrofit saves it: a reader who was
+told the root carries three independent signatures has been told something false. And the
+opposite error is equally forbidden — labelling the Safe's 1-of-1 as "custody" would understate
+a 2-of-3 custody that is real.
+
 ## Security notes
 - The gas EOA is a **hot key**: least-privilege (only gas), rotatable, isolated
   from enclave/escrow keys. Compromise ⇒ DoS/gas-drain at most, never a forged
