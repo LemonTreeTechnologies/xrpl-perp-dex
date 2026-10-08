@@ -274,17 +274,138 @@ pub fn classify_submit(rc: i32) -> SubmitOutcome {
 /// found the failure is TRANSIENT, not permanent: an unparseable error is more likely a
 /// transport problem than a verdict, and mistaking one for a permanent refusal would
 /// silently drop a creditable deposit.
+/// Pull the `rc=` out of an enclave error string.
+///
+/// Shared by both classifiers so a second copy of the parse cannot drift from the first.
+fn rc_from_error(msg: &str) -> Option<i32> {
+    let i = msg.find("rc=")?;
+    let rest = &msg[i + 3..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '-')
+        .unwrap_or(rest.len());
+    rest[..end].parse::<i32>().ok()
+}
+
 pub fn outcome_from_error(msg: &str) -> SubmitOutcome {
-    if let Some(i) = msg.find("rc=") {
-        let rest = &msg[i + 3..];
-        let end = rest
-            .find(|c: char| !c.is_ascii_digit() && c != '-')
-            .unwrap_or(rest.len());
-        if let Ok(rc) = rest[..end].parse::<i32>() {
-            return classify_submit(rc);
+    match rc_from_error(msg) {
+        Some(rc) => classify_submit(rc),
+        None => SubmitOutcome::Transient(msg.to_string()),
+    }
+}
+
+/// What arming the SPV-deposit boundary did.
+///
+/// The enclave surfaces its two expected refusals through a 500 carrying the rc, and the
+/// difference matters to whoever ran the command: one means the job is already done, the
+/// other means a PREREQUISITE is missing and no amount of retrying will arm anything.
+/// Collapsing both into "failed" is the shape that had this orchestrator advise a retry of a
+/// governance round which could never succeed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ArmOutcome {
+    /// The boundary is now armed.
+    Armed,
+    /// It was already armed (-62). A NO-OP, not a failure to retry.
+    AlreadyArmed,
+    /// No SPV custody baseline has been proven yet (-84). A prerequisite, not a retry: the
+    /// boundary IS the sealed reserves floor, so there is nothing to copy until a baseline
+    /// has been proven and sealed.
+    NoBaselineProven,
+    /// Anything else, verbatim — an unknown code is not assumed benign.
+    Other(String),
+}
+
+pub fn classify_arm(rc: i32) -> ArmOutcome {
+    match rc {
+        0 => ArmOutcome::Armed,
+        -62 => ArmOutcome::AlreadyArmed,
+        -84 => ArmOutcome::NoBaselineProven,
+        other => ArmOutcome::Other(format!("rc={other}")),
+    }
+}
+
+/// Does this outcome mean the operator still has to do something?
+///
+/// Separated from the printing so the NO-OP/prerequisite distinction is a TESTABLE FACT
+/// rather than a property of which `println` branch ran. `cli_arm_spv_deposit_boundary`
+/// derives its exit status from this one predicate, so the two cannot drift apart.
+pub fn arm_requires_action(o: &ArmOutcome) -> bool {
+    match o {
+        // Armed is done; AlreadyArmed is ALSO done — the enclave refuses the duplicate by
+        // design, and reporting that as a failure is what makes an operator retry an
+        // operation that is already complete.
+        ArmOutcome::Armed | ArmOutcome::AlreadyArmed => false,
+        ArmOutcome::NoBaselineProven | ArmOutcome::Other(_) => true,
+    }
+}
+
+pub fn arm_outcome_from_error(msg: &str) -> ArmOutcome {
+    match rc_from_error(msg) {
+        Some(rc) => classify_arm(rc),
+        None => ArmOutcome::Other(msg.to_string()),
+    }
+}
+
+/// Arm the SPV-deposit boundary — runbook #131 P3, the step with no caller until now.
+///
+/// THE CLIENT METHOD HAS EXISTED SINCE P3 AND NOTHING EVER CALLED IT, which is why
+/// `PERP_DEPOSIT_SPV=1` could not be switched on: every submission refuses with -85 until the
+/// boundary is armed, so the flag alone would have produced a log full of refusals and no
+/// credited deposit. Same shape as the three price ecalls that passed audit with no host
+/// route — switching a thing on is itself a test, and this is the part that was missing.
+///
+/// Takes no value. The enclave copies its own sealed reserves floor, so there is no number
+/// for this side to supply and therefore none for it to get wrong.
+pub async fn cli_arm_spv_deposit_boundary(enclave_url: &str) -> Result<()> {
+    let perp = crate::perp_client::PerpClient::new(enclave_url)?;
+
+    let outcome = match perp.arm_spv_deposit_boundary().await {
+        Ok(v) => {
+            // The route answers `{"status":"success"}` and does NOT report the floor it
+            // copied, so this cannot print the ledger index — saying one would be inventing
+            // it. Reported as what it is.
+            println!("response: {v}");
+            ArmOutcome::Armed
+        }
+        Err(e) => arm_outcome_from_error(&format!("{e:#}")),
+    };
+
+    match &outcome {
+        ArmOutcome::Armed => {
+            println!("SPV-deposit boundary ARMED.");
+            println!();
+            println!("WHAT THIS CHANGED. Deposits at or below the sealed reserves floor can");
+            println!("never credit; deposits above it now can, once the scanner is running.");
+            println!("The enclave still refuses any proof at or below max(last_credited,");
+            println!("boundary), so arming cannot replay anything already settled.");
+            println!();
+            println!("The scanner is a SEPARATE switch and is still off: set");
+            println!("PERP_DEPOSIT_SPV=1 on the sequencer. The validations collector already");
+            println!("runs on every node — the attested clock shares it.");
+        }
+        ArmOutcome::AlreadyArmed => {
+            println!("SPV-deposit boundary was ALREADY armed (-62) — nothing to do.");
+            println!("This is a NO-OP, not a failure: re-running it is safe and changes");
+            println!("nothing. The enclave refuses the duplicate deliberately.");
+        }
+        ArmOutcome::NoBaselineProven => {
+            println!("CANNOT ARM — no SPV custody baseline has been proven yet (-84).");
+            println!();
+            println!("The boundary is a copy of the sealed reserves floor, so there is");
+            println!("nothing to copy until a baseline has been proven and sealed by the P2");
+            println!("ceremony. This is a PREREQUISITE, not a transient failure: retrying");
+            println!("returns -84 forever. Prove the custody baseline first.");
+        }
+        ArmOutcome::Other(what) => {
+            println!("arming refused with an unrecognised answer: {what}");
+            println!("An unknown code is not assumed benign — this is a stop.");
         }
     }
-    SubmitOutcome::Transient(msg.to_string())
+
+    // ONE place decides the exit status, and it is the predicate the tests pin.
+    if arm_requires_action(&outcome) {
+        bail!("the boundary is NOT armed ({outcome:?}) — see the explanation above");
+    }
+    Ok(())
 }
 
 /// Config for the deposit driver.
@@ -1098,6 +1219,55 @@ mod tests {
         // would make routine operation look broken.
         assert_eq!(classify_submit(-2), SubmitOutcome::AlreadySettled);
         assert_eq!(classify_submit(-86), SubmitOutcome::AlreadySettled);
+    }
+
+    /// -62 MEANS THE JOB IS ALREADY DONE, and saying otherwise is what makes an operator
+    /// retry a completed operation. This exact shape — a deliberate enclave refusal of a
+    /// duplicate, reported by the orchestrator as a failure with a retry suggestion — cost a
+    /// wasted governance round, so the predicate is pinned rather than left to a println.
+    #[test]
+    fn an_already_armed_boundary_is_a_no_op_not_a_failure() {
+        assert_eq!(classify_arm(-62), ArmOutcome::AlreadyArmed);
+        assert!(!arm_requires_action(&ArmOutcome::AlreadyArmed));
+        assert!(!arm_requires_action(&ArmOutcome::Armed));
+    }
+
+    /// -84 is a PREREQUISITE, not a transient failure: the boundary copies the sealed reserves
+    /// floor, so until a custody baseline is proven there is nothing to copy and retrying
+    /// returns -84 forever.
+    #[test]
+    fn a_missing_custody_baseline_is_a_prerequisite_not_a_retry() {
+        assert_eq!(classify_arm(-84), ArmOutcome::NoBaselineProven);
+        assert!(arm_requires_action(&ArmOutcome::NoBaselineProven));
+    }
+
+    #[test]
+    fn an_unknown_arm_code_is_not_assumed_benign() {
+        assert_eq!(classify_arm(-7), ArmOutcome::Other("rc=-7".into()));
+        assert!(arm_requires_action(&ArmOutcome::Other("rc=-7".into())));
+    }
+
+    /// The fixture is the string the ENCLAVE builds, not one I invented: perp_handler.cpp
+    /// composes `"arm SPV deposit boundary failed (rc=" + to_string(rc) + ")"`. A fixture
+    /// written from my idea of the wording would pass while the real message parsed to
+    /// nothing.
+    #[test]
+    fn the_arm_code_is_recovered_from_the_enclaves_own_error_text() {
+        assert_eq!(
+            arm_outcome_from_error("arm SPV deposit boundary failed (rc=-84)"),
+            ArmOutcome::NoBaselineProven
+        );
+        assert_eq!(
+            arm_outcome_from_error("arm SPV deposit boundary failed (rc=-62)"),
+            ArmOutcome::AlreadyArmed
+        );
+    }
+
+    #[test]
+    fn an_arm_error_with_no_code_is_not_silently_benign() {
+        let o = arm_outcome_from_error("error sending request: connection refused");
+        assert!(matches!(o, ArmOutcome::Other(_)));
+        assert!(arm_requires_action(&o));
     }
 
     #[test]

@@ -98,6 +98,41 @@ Add the other nodes' enclave EVM keys as Safe owners and raise the threshold to
 2-of-3 — a Safe **owner-add + threshold-change** governance action, **no contract
 change and no re-audit** of the registry. The registry stays `onlyAuthority(Safe)`.
 
+## Enabling SPV-proven deposits (#131 P3) — NOT YET ON
+
+Three steps, in order. The first is a prerequisite, not a flag.
+
+1. **A custody baseline must be proven and sealed** (the ceremony above). The deposit
+   boundary is a copy of the sealed reserves floor, so until a baseline exists there is
+   nothing to copy and arming returns `-84` forever — a prerequisite, not a transient
+   failure.
+2. **Arm the boundary**, one command:
+
+   ```
+   perp-dex-orchestrator arm-spv-deposit-boundary
+   ```
+
+   It takes no value: the enclave copies its own sealed floor, so there is no number for
+   the operator to supply and therefore none to get wrong. `-62` means it was already
+   armed — a NO-OP, not a failure. **Until this runs, every proven deposit refuses with
+   `-85`**, so the flag in step 3 alone produces a log full of refusals and not one
+   credited deposit.
+3. **Start the scanner** — `PERP_DEPOSIT_SPV=1` on the sequencer, set in the systemd unit
+   rather than a shell. The validations collector already runs on every node: the attested
+   clock shares it, and two collectors on one stream would double the subscription for no
+   gain.
+
+**What switching it on changes, in money terms.** Deposits proven against the pinned UNL
+start crediting balances automatically, with sender, amount, ledger and transaction
+identity derived in-enclave and never asserted by this side. The enclave refuses any proof
+at or below `max(last_credited, boundary)`, so arming cannot replay anything already
+settled. The scanner is sequencer-only, because only that node holds the authoritative
+state.
+
+**State as of 2026-10-08.** Step 2's route has existed since P3 with **no caller**, which
+is why the flag could not be switched on at all; the command above closes that gap. Steps
+1 and 3 have not been performed, and `deposit-spv` is OFF on all three nodes.
+
 ## Security notes
 - The gas EOA is a **hot key**: least-privilege (only gas), rotatable, isolated
   from enclave/escrow keys. Compromise ⇒ DoS/gas-drain at most, never a forged

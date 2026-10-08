@@ -395,6 +395,21 @@ enum Command {
         side_by_side: bool,
     },
 
+    /// #131 P3 — arm the SPV-deposit boundary, the step that had no caller.
+    ///
+    /// Until this runs, every proven deposit refuses with -85, so `PERP_DEPOSIT_SPV=1` alone
+    /// produces a log full of refusals and not one credited deposit. Takes no value: the
+    /// enclave copies its own sealed reserves floor, so there is no number for this side to
+    /// supply and therefore none for it to get wrong.
+    ///
+    /// Reports -62 (already armed) as the NO-OP it is, and -84 (no custody baseline proven)
+    /// as the PREREQUISITE it is rather than something to retry.
+    ArmSpvDepositBoundary {
+        /// Enclave REST API base URL (must be loopback per O-L4)
+        #[arg(long, default_value = "https://localhost:9088/v1")]
+        enclave_url: String,
+    },
+
     /// REQ-β4.2 — Path A pre-flight capacity check (the STATIC half of the
     /// operator-safety gate). Reads the node's sealed state and STOPs, BEFORE
     /// any «go», if it exceeds a migration capacity limit (export buffer,
@@ -915,6 +930,9 @@ async fn main() -> Result<()> {
                 println!("  backup_suffix: {}", result.backup_suffix);
             }
             return Ok(());
+        }
+        Some(Command::ArmSpvDepositBoundary { enclave_url }) => {
+            return deposit_spv::cli_arm_spv_deposit_boundary(&enclave_url).await;
         }
         Some(Command::MigratePreflight { accounts_dir }) => {
             // Read-only static-sufficiency gate. Renders the table (both
@@ -2745,7 +2763,14 @@ async fn main() -> Result<()> {
                         .await
                         {
                             Ok(tx) => info!(tx = %tx, "reserves-commit published to Base-Sepolia"),
-                            Err(e) => warn!("reserves-commit skipped/failed: {}", e),
+                            // `{:#}` NOT `{}`. On an anyhow::Error, `{}` prints only the
+                            // OUTERMOST context — which here was a hand-written guess at the
+                            // cause — and discards the source chain where the enclave's own
+                            // rc lives (PerpClient::post deliberately keeps the body for
+                            // exactly this reason). The cluster logged that guess hourly for
+                            // over a week, 166 times, so nobody could tell which refusal it
+                            // was. Same defect as the clock refusal fixed in #91.
+                            Err(e) => warn!("reserves-commit skipped/failed: {:#}", e),
                         }
                     }
                     None => warn!("reserves-commit enabled but no local_signer in signers_config"),

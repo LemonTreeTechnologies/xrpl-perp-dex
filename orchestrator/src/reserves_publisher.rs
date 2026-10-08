@@ -120,7 +120,11 @@ pub async fn run_reserves_commit_once(
             excluded_account_ids,
         )
         .await
-        .context("enclave reserves_commit (under-custody or signing error)")?;
+        // NO GUESS AT THE CAUSE. This said "(under-custody or signing error)", which named
+        // two causes it had not checked and excluded every other one; printed alone it read
+        // as a diagnosis. The enclave's rc is the diagnosis and it is already in the source
+        // chain — this layer only says which call refused.
+        .context("enclave reserves_commit refused")?;
 
     // The figures the enclave actually committed. Logged because the SPV backing gate
     // (AC-BASE-2″) replaces custody with an SPV-PROVEN balance ONE-SHOT and irreversibly:
