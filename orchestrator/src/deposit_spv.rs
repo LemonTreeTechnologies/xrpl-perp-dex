@@ -385,12 +385,117 @@ pub async fn run_validation_collectors(
     }
 }
 
+/// Where one websocket connection ended.
+///
+/// Returned rather than logged in place so a test can assert WHICH of the three happened. A
+/// peer that closed, a peer that errored and a peer that went SILENT are different faults, and
+/// telling the third one apart is the entire reason the idle timeout below exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PumpEnd {
+    /// The peer sent a Close frame, or the stream simply ran out.
+    Closed,
+    /// The transport failed.
+    Failed(String),
+    /// Nothing at all arrived for the idle window.
+    IdleTimeout,
+}
+
+/// How long a validations stream may stay SILENT before we treat it as dead.
+///
+/// It has to be a read timeout, not a connect timeout: the fault it exists for is a half-open
+/// socket, where the connection succeeded and the peer has since vanished without a FIN. An
+/// unbounded `ws.next()` then waits forever, the collector never reconnects, and NOTHING is
+/// logged — one of the three sources is silently gone. Liveness is the only thing the
+/// multi-source set buys us (a validation is self-verifying, so merging streams cannot inflate
+/// a quorum), so a source that dies quietly is precisely the failure this design exists to
+/// prevent.
+///
+/// Testnet closes a ledger roughly every 4s and each close yields several validations, so a
+/// minute of silence is two orders of magnitude past normal.
+const VALIDATION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Read one connection's frames into the buffer until that connection ends.
+///
+/// Split out of the reconnect loop so a test can reach it, and takes the idle window as an
+/// argument so a test can use a short one. `run_validation_collector` passes
+/// `VALIDATION_IDLE_TIMEOUT`.
+pub async fn pump_validations<S, E>(
+    ws: &mut S,
+    buffer: &std::sync::Arc<std::sync::Mutex<ValidationBuffer>>,
+    idle: std::time::Duration,
+) -> PumpEnd
+where
+    S: futures_util::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    loop {
+        let msg = match tokio::time::timeout(idle, ws.next()).await {
+            Err(_elapsed) => return PumpEnd::IdleTimeout,
+            Ok(None) => return PumpEnd::Closed,
+            Ok(Some(Err(e))) => return PumpEnd::Failed(e.to_string()),
+            Ok(Some(Ok(m))) => m,
+        };
+
+        let txt = match msg {
+            Message::Text(t) => t,
+            Message::Close(_) => return PumpEnd::Closed,
+            // A KEEPALIVE IS NOT A REASON TO TEAR DOWN THE CONNECTION. tungstenite answers a
+            // Ping with a Pong itself and ALSO hands the Ping to us (tungstenite-0.24
+            // protocol/mod.rs:611, asserted by its own tests at :829), so the previous
+            // `let Ok(Message::Text(txt)) = msg else { break }` dropped the whole stream on
+            // any server keepalive.
+            //
+            // WHAT IS MEASURED, and it is not what I first claimed: our client took 163 text
+            // frames and ZERO pings from clio in 90s with the stream still open
+            // (`frame_kinds_a_real_endpoint_sends_us`), while a python client on the bastion
+            // saw a server ping every ~5s on the SAME endpoint. So ping delivery is
+            // connection- or path-dependent — Cloudflare fronts that host and is what 418s
+            // us — and pings are NOT the cause of the ~60s reconnect cycle the cluster shows
+            // (1322 stream-closes in 24h on node-1). That cause is still unidentified; the
+            // per-source field and the three distinct endings below are what will name it.
+            // This arm is correct either way: a reader that ends its stream on a frame kind
+            // it merely does not consume is wrong whether or not the frame has arrived yet.
+            Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {
+                continue
+            }
+        };
+
+        let Ok(j) = serde_json::from_str::<serde_json::Value>(&txt) else {
+            continue;
+        };
+        // `full: true` only. A partial validation is not a signature over the ledger the
+        // enclave will check, so buffering one would inflate the apparent count and produce a
+        // blob that fails quorum for a reason nothing reports.
+        if j["type"] != "validationReceived" || j["full"] != true {
+            continue;
+        }
+        let (Some(lh), Some(data_hex)) = (j["ledger_hash"].as_str(), j["data"].as_str()) else {
+            continue;
+        };
+        if let Ok(data) = unhex(data_hex) {
+            if let Ok(mut b) = buffer.lock() {
+                b.insert(lh, data);
+            }
+        }
+    }
+}
+
 pub async fn run_validation_collector(
     ws_url: String,
     buffer: std::sync::Arc<std::sync::Mutex<ValidationBuffer>>,
 ) {
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message;
+
+    // A RECONNECT counter, not a health counter. It increments once per successful connect, so
+    // a high value means the stream keeps dying. Logged because reading the bare
+    // "collecting validations" count across three sources as 193/91/1 looks like "the first
+    // two are busiest" when it means "the first two are flapping and the third is stable" —
+    // which is how I read it and got it backwards.
+    let mut opens: u64 = 0;
 
     loop {
         match tokio_tungstenite::connect_async(&ws_url).await {
@@ -401,37 +506,29 @@ pub async fn run_validation_collector(
                     ))
                     .await
                 {
-                    tracing::warn!(error = %e, "deposit-spv: validations subscribe failed");
+                    // EVERY branch names the source. Only the success line did, so 1086
+                    // failures in 24h could not be attributed to one of three endpoints —
+                    // and a per-source fault is exactly what a multi-source set must be able
+                    // to see.
+                    tracing::warn!(source = %ws_url, error = %e,
+                        "deposit-spv: validations subscribe failed");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
-                tracing::info!(source = %ws_url, "collecting validations");
-                while let Some(msg) = ws.next().await {
-                    let Ok(Message::Text(txt)) = msg else { break };
-                    let Ok(j) = serde_json::from_str::<serde_json::Value>(&txt) else {
-                        continue;
-                    };
-                    // `full: true` only. A partial validation is not a signature over the
-                    // ledger the enclave will check, so buffering one would inflate the
-                    // apparent count and produce a blob that fails quorum for a reason
-                    // nothing reports.
-                    if j["type"] != "validationReceived" || j["full"] != true {
-                        continue;
-                    }
-                    let (Some(lh), Some(data_hex)) =
-                        (j["ledger_hash"].as_str(), j["data"].as_str())
-                    else {
-                        continue;
-                    };
-                    if let Ok(data) = unhex(data_hex) {
-                        if let Ok(mut b) = buffer.lock() {
-                            b.insert(lh, data);
-                        }
-                    }
+                opens += 1;
+                tracing::info!(source = %ws_url, opens, "collecting validations");
+                match pump_validations(&mut ws, &buffer, VALIDATION_IDLE_TIMEOUT).await {
+                    PumpEnd::Closed => tracing::warn!(source = %ws_url,
+                        "deposit-spv: validations stream closed, reconnecting"),
+                    PumpEnd::Failed(e) => tracing::warn!(source = %ws_url, error = %e,
+                        "deposit-spv: validations stream failed, reconnecting"),
+                    PumpEnd::IdleTimeout => tracing::warn!(source = %ws_url,
+                        idle_secs = VALIDATION_IDLE_TIMEOUT.as_secs(),
+                        "deposit-spv: validations stream went SILENT, reconnecting"),
                 }
-                tracing::warn!("deposit-spv: validations stream closed, reconnecting");
             }
-            Err(e) => tracing::warn!(error = %e, "deposit-spv: ws connect failed"),
+            Err(e) => tracing::warn!(source = %ws_url, error = %e,
+                "deposit-spv: ws connect failed"),
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
@@ -688,6 +785,218 @@ mod tests {
     }
 
     use super::*;
+
+    /// One REAL frame off `wss://clio.altnet.rippletest.net:51233`, captured 2026-10-08.
+    ///
+    /// Every key and value is as the endpoint sent it. Only `data` is shortened — the capture
+    /// script truncated it — and that is safe here because the pump only unhexes it; nothing in
+    /// this file inspects the validation blob. Written out rather than invented because a
+    /// fixture built from my idea of the shape passes tautologically: the live frame carries
+    /// thirteen keys, including `cookie` and `network_id`, which I would not have guessed.
+    const REAL_VALIDATION_FRAME: &str = r#"{"cookie":"6079102537327064379","data":"2280000001260146177129325A06CA3A1234567890ABCDEF","flags":2147483649,"full":true,"ledger_hash":"451C6E1D2A1B5BFA776CB54B3CBC35F1B77F06F6D27C1229384EF279369BFC05","ledger_index":"21370737","master_key":"nHUCAdca6VoWWYVdBH1bwCUQggEX2e5acQSqxM3DwyuhsFknxmh3","network_id":1,"signature":"304402204B2CA83844D82E8EC6199E904D7AA6DFAD3FE131BB1376AF8354D49ABDB1FFF302205507A77ACC2A76FA68D8345135AEA80FA729A0AAD1D62C156A25D4D4CF2548A3","signing_time":844760778,"type":"validationReceived","validated_hash":"E890251C88D063C4DB4D507EB19F5E04D035506C9BFE4CAA0E8DB7A72DFB5D5F","validation_public_key":"n9KWVA64rMeqkAvcQ4DNCa2eDXTzprCtK1HLC8H5PEyUVwSSyL5X"}"#;
+
+    const REAL_LEDGER_HASH: &str =
+        "451C6E1D2A1B5BFA776CB54B3CBC35F1B77F06F6D27C1229384EF279369BFC05";
+
+    /// Serve ONE websocket connection on loopback and run `script` against it.
+    ///
+    /// Loopback is the right harness here and not a shortcut past a cluster run: the seam under
+    /// test is OUR READER against frames a peer sends, so the far side only has to produce those
+    /// frames. What a real endpoint adds — TLS, the subscription, the public internet — is
+    /// covered by the `#[ignore]`d network tests below, which is where it belongs.
+    async fn serve_once<F, Fut>(script: F) -> String
+    where
+        F: FnOnce(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.expect("accept");
+            let ws = tokio_tungstenite::accept_async(sock)
+                .await
+                .expect("server handshake");
+            script(ws).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn connect(
+        url: &str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        tokio_tungstenite::connect_async(url)
+            .await
+            .expect("client handshake")
+            .0
+    }
+
+    fn empty_buffer() -> std::sync::Arc<std::sync::Mutex<ValidationBuffer>> {
+        std::sync::Arc::new(std::sync::Mutex::new(ValidationBuffer::new()))
+    }
+
+    /// A SILENT stream must end the pump instead of wedging it forever.
+    ///
+    /// This is the half-open socket: the handshake completed and the peer then vanished without
+    /// a FIN, so the kernel has nothing to report and `ws.next()` never returns. Before the
+    /// timeout, that collector was gone for the life of the process with NOT ONE log line —
+    /// one of the three liveness sources silently consumed, which is the single failure mode a
+    /// multi-source set exists to prevent.
+    #[tokio::test]
+    async fn a_silent_stream_times_out_instead_of_wedging_forever() {
+        let url = serve_once(|ws| async move {
+            // Hold the connection open and send NOTHING, ever.
+            let _held = ws;
+            futures_util::future::pending::<()>().await;
+        })
+        .await;
+
+        let mut ws = connect(&url).await;
+        let buffer = empty_buffer();
+        let end = pump_validations(&mut ws, &buffer, std::time::Duration::from_millis(300)).await;
+
+        assert_eq!(end, PumpEnd::IdleTimeout, "a silent peer must time out");
+    }
+
+    /// A KEEPALIVE PING MUST NOT END THE STREAM, and the validation after it must still land.
+    ///
+    /// This is the probe for the defect, and the buffer assertion is the part that discriminates:
+    /// `PumpEnd` alone cannot tell the two implementations apart, because the old code ended at
+    /// the ping and returned the same "closed" it returns here. Only the validation that arrives
+    /// AFTER the ping separates them — on the old reader the buffer comes back empty.
+    #[tokio::test]
+    async fn a_keepalive_ping_does_not_end_the_stream_and_the_next_validation_still_lands() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let url = serve_once(|mut ws| async move {
+            ws.send(Message::Ping(vec![])).await.expect("ping");
+            ws.send(Message::text(REAL_VALIDATION_FRAME))
+                .await
+                .expect("validation");
+            ws.send(Message::Close(None)).await.expect("close");
+        })
+        .await;
+
+        let mut ws = connect(&url).await;
+        let buffer = empty_buffer();
+        let end = pump_validations(&mut ws, &buffer, std::time::Duration::from_secs(10)).await;
+
+        assert_eq!(
+            end,
+            PumpEnd::Closed,
+            "the stream must end on the CLOSE, not on the ping"
+        );
+        let b = buffer.lock().expect("buffer");
+        assert_eq!(
+            b.len(),
+            1,
+            "the validation sent AFTER the ping was dropped — the reader ended at the keepalive"
+        );
+        assert!(
+            b.get(REAL_LEDGER_HASH).is_some_and(|v| v.len() == 1),
+            "the validation landed under the wrong ledger hash"
+        );
+    }
+
+    /// A partial validation must be ignored even though it is well-formed JSON.
+    ///
+    /// Buffering one would inflate the apparent count and produce a blob that fails quorum for
+    /// a reason nothing reports. Probed by flipping `full` on an otherwise REAL frame, so the
+    /// only difference between this test and the one above is the field under test.
+    #[tokio::test]
+    async fn a_partial_validation_is_not_buffered() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let partial = REAL_VALIDATION_FRAME.replace(r#""full":true"#, r#""full":false"#);
+        assert_ne!(
+            partial, REAL_VALIDATION_FRAME,
+            "the fixture edit did not land"
+        );
+
+        let url = serve_once(move |mut ws| async move {
+            ws.send(Message::text(partial)).await.expect("partial");
+            ws.send(Message::Close(None)).await.expect("close");
+        })
+        .await;
+
+        let mut ws = connect(&url).await;
+        let buffer = empty_buffer();
+        let end = pump_validations(&mut ws, &buffer, std::time::Duration::from_secs(10)).await;
+
+        assert_eq!(end, PumpEnd::Closed);
+        assert_eq!(buffer.lock().expect("buffer").len(), 0);
+    }
+
+    /// WHAT FRAME KINDS DOES A REAL ENDPOINT ACTUALLY SEND US?
+    ///
+    /// Not a pass/fail test — a measurement, kept because the question it answers was settled
+    /// twice by inference and both times wrongly. A python client saw a server PING every ~5s
+    /// on clio, while the live collector's connections lasted ~60s; those two cannot both
+    /// describe a reader that tears down on a ping, so the frame kinds OUR client receives had
+    /// to be measured rather than derived from the dependency's source.
+    ///
+    /// RESULT 2026-10-08 from the laptop: `text=163 ping=0 pong=0 binary=0 other=0`, ended
+    /// `still open at the deadline`. Re-run it from a NODE before concluding anything about
+    /// the cluster: the nodes are the hosts getting 418'd, and this ran from somewhere else.
+    ///
+    ///     cargo test --locked frame_kinds -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs outbound network; a measurement, not an assertion"]
+    async fn frame_kinds_a_real_endpoint_sends_us() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        crate::attested_clock::install_tls_provider();
+        let url = "wss://clio.altnet.rippletest.net:51233";
+        let (mut ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
+        ws.send(Message::text(
+            r#"{"command":"subscribe","streams":["validations"]}"#,
+        ))
+        .await
+        .expect("subscribe");
+
+        let (mut text, mut ping, mut pong, mut binary, mut other) = (0u32, 0u32, 0u32, 0u32, 0u32);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let mut ended = "still open at the deadline";
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(20), ws.next()).await {
+                Err(_) => {
+                    ended = "20s of silence";
+                    break;
+                }
+                Ok(None) => {
+                    ended = "stream ended (None)";
+                    break;
+                }
+                Ok(Some(Err(e))) => {
+                    println!("  transport error: {e}");
+                    ended = "transport error";
+                    break;
+                }
+                Ok(Some(Ok(Message::Text(_)))) => text += 1,
+                Ok(Some(Ok(Message::Ping(_)))) => ping += 1,
+                Ok(Some(Ok(Message::Pong(_)))) => pong += 1,
+                Ok(Some(Ok(Message::Binary(_)))) => binary += 1,
+                Ok(Some(Ok(Message::Close(c)))) => {
+                    println!("  close frame: {c:?}");
+                    ended = "close frame";
+                    break;
+                }
+                Ok(Some(Ok(_))) => other += 1,
+            }
+        }
+        println!(
+            "  {url}\n  ended={ended}\n  text={text} ping={ping} pong={pong} binary={binary} other={other}"
+        );
+    }
 
     /// The real thing: a REAL `ledger` response (binary:true) for validated testnet
     /// ledger 20808565, verbatim. Proves what the unit tests above cannot — that the
