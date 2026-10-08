@@ -74,13 +74,27 @@ PY
 # The seed goes file-to-file on THIS host. Never echoed, never in argv, shredded on exit.
 umask 077
 trap 'shred -u /tmp/.sc-seed 2>/dev/null || rm -f /tmp/.sc-seed' EXIT
-python3 -c 'import json; print(json.load(open("/home/azureuser/perp/signers_config.json"))["escrow_seed"])' > /tmp/.sc-seed
+# The canonical path (feedback_secrets_canonical_files): signers_config.json carries
+# escrow_seed as an EMPTY string on purpose — the value was moved to the secrets file, which
+# is the right shape. Reading the config instead produced a 1-byte file and a refusal that
+# said "seed file first line is empty", which is the correct refusal and a useless place to
+# look. The keypair's on-chain authority is revoked (disable_master_tx_hash is recorded
+# beside it), so signing an admin request with it proves identity without conferring any
+# power to move value — which is what an auth credential should be.
+SECRET_FILE=/home/azureuser/.secrets/perp-dex-xrpl/escrow-testnet.json
+[ -s "$SECRET_FILE" ] || { echo "NO-CREDENTIAL: $SECRET_FILE is missing on this node"; exit 4; }
+python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["escrow_seed"])' "$SECRET_FILE" > /tmp/.sc-seed
 chmod 600 /tmp/.sc-seed
 URL="http://localhost:3000/v1/admin/safe/projection"
 BODY="$(cat /tmp/safe-proj-req.json)"
-CURL="$(./perp-dex-orchestrator sign-request --seed-file /tmp/.sc-seed --method POST --url "$URL" --body "$BODY" 2>/dev/null | tail -n +2)"
-[ -n "$CURL" ] || { echo "SIGN-FAILED: sign-request produced nothing"; exit 3; }
-eval "$CURL" 2>/dev/null
+OUT="$(./perp-dex-orchestrator sign-request --seed-file /tmp/.sc-seed --method POST --url "$URL" --body "$BODY" 2>&1)"
+# sign-request prints THREE header lines (address, pubkey, blank) before the command, so the
+# command starts at line 4. `tail -n +2` kept the comment lines too — harmless in bash, but
+# it also meant a failure message was eval'd as a command instead of being reported.
+case "$OUT" in Error:*) echo "SIGN-FAILED: $OUT"; exit 3 ;; esac
+CMD="$(printf '%s' "$OUT" | tail -n +4)"
+[ -n "$CMD" ] || { echo "SIGN-FAILED: no curl command emitted"; exit 3; }
+eval "$CMD" -s --max-time 25
 RSCRIPT
 )
 REMOTE="${REMOTE//__OWNERS__/$OWNERS_JSON}"
