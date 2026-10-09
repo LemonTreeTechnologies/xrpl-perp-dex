@@ -121,9 +121,10 @@ impl Roster {
             .collect()
     }
 
-    /// Enforce the invariants that do not need the signature: non-empty, cluster binding,
-    /// anti-rollback, and cannot-lock-itself-out. The signature is checked separately by `load`
-    /// BEFORE this is trusted.
+    /// Enforce the invariants that do not need the signature: non-empty, cluster binding, and
+    /// anti-rollback. (There is deliberately NO cannot-lock-itself-out check — see the note in
+    /// the body; under option 3 that failure mode is unreachable.) The signature is checked
+    /// separately by `load` BEFORE this is trusted.
     fn check_invariants(
         &self,
         running_escrow: &str,
@@ -201,6 +202,40 @@ pub fn probe_ssh_keygen() -> Result<(), RosterError> {
     }
 }
 
+/// A user-private directory to materialize the allowed_signers in, created 0700 if absent.
+///
+/// Prefers `$XDG_RUNTIME_DIR` (per-user 0700 on systemd hosts), else `$HOME/.cache`. Both have a
+/// user-private PARENT, so no other user can rename our file away mid-verify — which bare /tmp,
+/// when non-sticky, cannot promise. If neither is set we FAIL CLOSED rather than use /tmp: a
+/// verify we cannot place safely must refuse, not relocate to an unsafe spot.
+fn private_runtime_dir() -> Result<std::path::PathBuf, RosterError> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .ok_or_else(|| {
+            RosterError::SignatureUnverified(
+                "no XDG_RUNTIME_DIR or HOME for a private runtime dir — refusing to use /tmp"
+                    .into(),
+            )
+        })?;
+    let dir = base.join("perp-roster");
+    if !dir.exists() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|e| {
+                RosterError::SignatureUnverified(format!("cannot create {}: {e}", dir.display()))
+            })?;
+    }
+    // Enforce 0700 whether we just made it or it pre-existed.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        RosterError::SignatureUnverified(format!("cannot secure {}: {e}", dir.display()))
+    })?;
+    Ok(dir)
+}
+
 /// Verify the detached SSHSIG over the roster file against the baked operator public key, by
 /// mirroring `ssh-keygen -Y verify` exactly (auditor RESP 2026-10-09, Q1/Q3).
 ///
@@ -208,19 +243,24 @@ pub fn probe_ssh_keygen() -> Result<(), RosterError> {
 ///   1. argv array, never `sh -c` — no shell parsing of any path.
 ///   2. the ssh-keygen EXIT STATUS is the only gate; stdout is never scanned for "Good signature".
 ///   3. any spawn / IO / missing-binary error ⇒ SignatureUnverified (fail closed).
-///   4. the allowed_signers file is materialized 0600 in a private temp dir, NOT /tmp directly —
-///      a world-writable allowed_signers is a TOCTOU: an attacker races to replace it with their
-///      own pubkey and the roster then "verifies". `tempfile` creates it owner-only in a dir we
-///      own; the payload (the roster TOML) goes on STDIN, never a second temp file.
+///   4. the allowed_signers file is materialized 0600 in a PRIVATE, USER-OWNED runtime dir —
+///      never /tmp. A world-writable allowed_signers is a TOCTOU: an attacker races to replace
+///      it with their own pubkey and the roster then "verifies". The random name + O_EXCL + 0600
+///      close the file race, but only while the PARENT is sticky or owner-only — and in a
+///      non-sticky world-writable /tmp any user can rename our file away regardless of its mode.
+///      So we place it under `$XDG_RUNTIME_DIR` / `$HOME/.cache` (user-private), and FAIL CLOSED
+///      rather than fall back to /tmp. The payload (the roster TOML) goes on STDIN, never a
+///      second temp file. (auditor RESP residual 1, 2026-10-09.)
 fn verify_roster_signature(
     roster_bytes: &[u8],
     sig_path: &Path,
     allowed_signers_pubkey: &str,
 ) -> Result<(), RosterError> {
-    // 0600 allowed_signers in an owner-only temp dir (tempfile defaults to 0600 and a dir we own).
+    let runtime_dir = private_runtime_dir()?;
+    // 0600 allowed_signers inside the user-private runtime dir (never /tmp).
     let mut allowed = tempfile::Builder::new()
         .prefix("perp-roster-allowed-signers")
-        .tempfile()
+        .tempfile_in(&runtime_dir)
         .map_err(|e| {
             RosterError::SignatureUnverified(format!("cannot materialize allowed_signers: {e}"))
         })?;
@@ -480,16 +520,31 @@ ops = ["membership-change"]
         Some((pubkey, sig, d))
     }
 
+    /// Skip the SSHSIG tests when `ssh-keygen -Y` is unavailable — BUT NEVER in CI. A silent skip
+    /// on the authority verify is a false green, so when `CI` is set, an unavailable ssh-keygen
+    /// FAILS the run instead of skipping. (auditor RESP residual 3, 2026-10-09.)
+    fn skip_sshsig_unavailable(which: &str) -> bool {
+        if probe_ssh_keygen().is_ok() {
+            return false;
+        }
+        if std::env::var_os("CI").is_some() {
+            panic!("CI: ssh-keygen -Y unavailable — the {which} SSHSIG test would skip, which is a false green on the authority verify");
+        }
+        eprintln!("ssh-keygen -Y unavailable (not CI); skipping {which} SSHSIG test");
+        true
+    }
+
     /// THE MANDATORY POSITIVE CASE. Without a green here, an always-Err verify would pass every
     /// tamper test below (the hollow-verifier trap). A good roster, signed with a key baked as
     /// operator.pub, in the perp-roster namespace, MUST verify.
     #[test]
     fn a_correctly_signed_roster_verifies_and_loads() {
-        let bytes = roster_toml(7, "mrenclave-govern").into_bytes();
-        let Some((pubkey, sig, _d)) = ssh_sign(&bytes, ROSTER_NAMESPACE, ROSTER_IDENTITY) else {
-            eprintln!("ssh-keygen -Y unavailable; skipping positive SSHSIG test");
+        if skip_sshsig_unavailable("positive") {
             return;
-        };
+        }
+        let bytes = roster_toml(7, "mrenclave-govern").into_bytes();
+        let (pubkey, sig, _d) =
+            ssh_sign(&bytes, ROSTER_NAMESPACE, ROSTER_IDENTITY).expect("ssh-keygen available");
         let dir = tempfile::tempdir().unwrap();
         let rp = dir.path().join("cluster_roster.v7.toml");
         std::fs::write(&rp, &bytes).unwrap();
@@ -504,11 +559,12 @@ ops = ["membership-change"]
     /// so a skip never masquerades as a pass.
     #[test]
     fn every_tampered_or_mis_namespaced_roster_is_refused() {
-        let bytes = roster_toml(7, "mrenclave-govern").into_bytes();
-        let Some((pubkey, sig, _d)) = ssh_sign(&bytes, ROSTER_NAMESPACE, ROSTER_IDENTITY) else {
-            eprintln!("ssh-keygen -Y unavailable; skipping negative SSHSIG tests");
+        if skip_sshsig_unavailable("negative") {
             return;
-        };
+        }
+        let bytes = roster_toml(7, "mrenclave-govern").into_bytes();
+        let (pubkey, sig, _d) =
+            ssh_sign(&bytes, ROSTER_NAMESPACE, ROSTER_IDENTITY).expect("ssh-keygen available");
         let dir = tempfile::tempdir().unwrap();
         let ap = dir.path().join("operator.pub");
         std::fs::write(&ap, &pubkey).unwrap();
