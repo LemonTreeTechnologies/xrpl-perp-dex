@@ -31,6 +31,13 @@ use crate::p2p::{MembershipEpochRelay, SigningMessage};
 
 const MAX_SIGNERS: usize = 32; // XRPL SignerList limit (mirrors the enclave)
 
+/// decision (b) — membership transition descriptor op codes. MUST match the enclave's
+/// MEMBERSHIP_DESC_OP_* in membership_descriptor.h (the enclave recomputes the descriptor digest
+/// over this byte, so a mismatch makes every operator signature fail).
+pub const MEMBERSHIP_DESC_OP_ADD: u8 = 1;
+pub const MEMBERSHIP_DESC_OP_REMOVE: u8 = 2;
+pub const MEMBERSHIP_DESC_OP_SET: u8 = 3;
+
 /// The fully-resolved membership transition presented to the quorum. Every
 /// field except `message_hash` is an input to `ecall_seal_membership_epoch`;
 /// `message_hash` is what the quorum signs and what the bundle is collected
@@ -44,6 +51,14 @@ pub struct MembershipEpochStatement {
     pub new_quorum: u32,
     pub new_set_hash: [u8; 32],
     pub message_hash: [u8; 32],
+    /// decision (b): the operator-authorized transition descriptor this statement carries to each
+    /// node's enclave. `op` (1=ADD/2=REMOVE/3=SET), the member added (32 bytes, zero for
+    /// REMOVE/SET), and the concatenated 64-byte ed25519 descriptor signature(s). Operator-
+    /// provided — the orchestrator never produces or trusts them; the enclave verifies against the
+    /// baked governance key. Carried, not derived.
+    pub op: u8,
+    pub new_member_mrenclave: [u8; 32],
+    pub descriptor_sigs: Vec<u8>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -60,12 +75,16 @@ pub enum PrepareError {
 /// Pure + deterministic — the basis of the (P) single statement. Validation
 /// mirrors the enclave's pre-seal quorum sanity so a doomed ceremony never
 /// collects signatures.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_statement(
     escrow: [u8; 20],
     current_epoch: u64,
     current_epoch_digest: [u8; 32],
     new_signers: Vec<SignerEntry>,
     new_quorum: u32,
+    op: u8,
+    new_member_mrenclave: [u8; 32],
+    descriptor_sigs: Vec<u8>,
 ) -> Result<MembershipEpochStatement, PrepareError> {
     if new_signers.is_empty() {
         return Err(PrepareError::EmptySet);
@@ -98,6 +117,9 @@ pub fn prepare_statement(
         new_quorum,
         new_set_hash,
         message_hash,
+        op,
+        new_member_mrenclave,
+        descriptor_sigs,
     })
 }
 
@@ -204,6 +226,9 @@ impl MembershipBundleCollector for LibP2PMembershipCollector {
             prev_epoch_hash: statement.prev_epoch_hash,
             new_signers: statement.new_signers.clone(),
             new_quorum: statement.new_quorum,
+            op: statement.op,
+            new_member_mrenclave: statement.new_member_mrenclave,
+            descriptor_sigs: statement.descriptor_sigs.clone(),
             responses_tx,
         };
         self.relay_tx
@@ -351,10 +376,14 @@ impl MembershipChangeOutcome {
 /// broadcast under the loopback topology). Each node independently verifies the
 /// bundle and enforces monotonic-epoch — so a partial apply is safe (no node
 /// adopts a different set), just incomplete; the caller inspects `all_sealed()`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_membership_change(
     escrow: [u8; 20],
     new_signers: Vec<SignerEntry>,
     new_quorum: u32,
+    op: u8,
+    new_member_mrenclave: [u8; 32],
+    descriptor_sigs: Vec<u8>,
     digest_src: &dyn EpochDigestSource,
     collector: &dyn MembershipBundleCollector,
     applier: &dyn ClusterSealApplier,
@@ -370,6 +399,9 @@ pub async fn run_membership_change(
         current_digest,
         new_signers,
         new_quorum,
+        op,
+        new_member_mrenclave,
+        descriptor_sigs,
     )
     .map_err(|e| anyhow!("prepare membership statement: {e:?}"))?;
 
@@ -422,6 +454,11 @@ pub async fn run_genesis_bootstrap(
         /* current_epoch_digest */ [0u8; 32],
         genesis_signers,
         genesis_quorum,
+        /* op: genesis seals the initial set via the seal-initial path, not the consent
+        descriptor gate, so a SET op with no member/sigs is the correct no-descriptor shape */
+        MEMBERSHIP_DESC_OP_SET,
+        [0u8; 32],
+        Vec::new(),
     )
     .map_err(|e| anyhow!("prepare genesis statement: {e:?}"))?;
 
@@ -469,6 +506,9 @@ mod tests {
             [0xBB; 32],
             vec![entry(0x01, 1), entry(0x02, 2)],
             2,
+            MEMBERSHIP_DESC_OP_SET,
+            [0u8; 32],
+            vec![],
         )
         .expect("valid");
         assert_eq!(st.proposed_epoch, 5);
@@ -488,25 +528,70 @@ mod tests {
         let esc = [0u8; 20];
         let dig = [0u8; 32];
         assert_eq!(
-            prepare_statement(esc, 1, dig, vec![], 1),
+            prepare_statement(
+                esc,
+                1,
+                dig,
+                vec![],
+                1,
+                MEMBERSHIP_DESC_OP_SET,
+                [0u8; 32],
+                vec![]
+            ),
             Err(PrepareError::EmptySet)
         );
         assert_eq!(
-            prepare_statement(esc, 1, dig, vec![entry(1, 0)], 1),
+            prepare_statement(
+                esc,
+                1,
+                dig,
+                vec![entry(1, 0)],
+                1,
+                MEMBERSHIP_DESC_OP_SET,
+                [0u8; 32],
+                vec![]
+            ),
             Err(PrepareError::ZeroWeight)
         );
         // quorum 0 and quorum > weight sum (1+2=3)
         assert_eq!(
-            prepare_statement(esc, 1, dig, vec![entry(1, 1), entry(2, 2)], 0),
+            prepare_statement(
+                esc,
+                1,
+                dig,
+                vec![entry(1, 1), entry(2, 2)],
+                0,
+                MEMBERSHIP_DESC_OP_SET,
+                [0u8; 32],
+                vec![]
+            ),
             Err(PrepareError::QuorumOutOfBounds)
         );
         assert_eq!(
-            prepare_statement(esc, 1, dig, vec![entry(1, 1), entry(2, 2)], 4),
+            prepare_statement(
+                esc,
+                1,
+                dig,
+                vec![entry(1, 1), entry(2, 2)],
+                4,
+                MEMBERSHIP_DESC_OP_SET,
+                [0u8; 32],
+                vec![]
+            ),
             Err(PrepareError::QuorumOutOfBounds)
         );
         let too_many: Vec<SignerEntry> = (0..33).map(|i| entry(i as u8, 1)).collect();
         assert_eq!(
-            prepare_statement(esc, 1, dig, too_many, 1),
+            prepare_statement(
+                esc,
+                1,
+                dig,
+                too_many,
+                1,
+                MEMBERSHIP_DESC_OP_SET,
+                [0u8; 32],
+                vec![]
+            ),
             Err(PrepareError::TooManySigners)
         );
     }
@@ -571,6 +656,9 @@ mod tests {
             [0xBB; 32],
             vec![entry(0x01, 1), entry(0x02, 2)],
             2,
+            MEMBERSHIP_DESC_OP_SET,
+            [0u8; 32],
+            vec![],
         )
         .expect("valid")
     }
@@ -733,6 +821,9 @@ mod tests {
             [0xAA; 20],
             vec![entry(0x01, 1), entry(0x02, 2)],
             2,
+            MEMBERSHIP_DESC_OP_SET,
+            [0u8; 32],
+            vec![],
             &digest,
             &collector,
             &applier,
@@ -828,6 +919,9 @@ mod tests {
             [0xAA; 20],
             vec![entry(0x01, 1), entry(0x02, 2)],
             2,
+            MEMBERSHIP_DESC_OP_SET,
+            [0u8; 32],
+            vec![],
             &digest,
             &collector,
             &applier,
@@ -851,6 +945,9 @@ mod tests {
             [0xAA; 20],
             vec![entry(0x01, 1)],
             1,
+            MEMBERSHIP_DESC_OP_SET,
+            [0u8; 32],
+            vec![],
             &digest,
             &collector,
             &applier,

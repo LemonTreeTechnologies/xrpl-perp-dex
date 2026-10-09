@@ -341,6 +341,17 @@ pub enum SigningMessage {
         /// Full proposed signer set — receiver re-derives `set_hash` (X-C1).
         new_signers: Vec<MembershipSignerWire>,
         new_quorum: u32,
+        /// decision (b): the operator-authorized transition descriptor, carried to every node so
+        /// each validates it in its OWN enclave before consenting. `op`, the 32-byte member being
+        /// added (lowercase hex, all-zero for REMOVE/SET), and the concatenated 64-byte ed25519
+        /// descriptor signature(s) (lowercase hex). The receiver never trusts these — the enclave
+        /// verifies them against the baked governance key.
+        #[serde(default)]
+        op: u8,
+        #[serde(default)]
+        new_member_mrenclave_hex: String,
+        #[serde(default)]
+        descriptor_sigs_hex: String,
     },
     /// β4 Thread B — an operator-quorum request to authorise a MRENCLAVE
     /// allowlist operation (governance) OR to attest a reproducible build
@@ -714,6 +725,14 @@ pub struct MembershipEpochRelay {
     pub prev_epoch_hash: [u8; 32],
     pub new_signers: Vec<crate::membership_canonical::SignerEntry>,
     pub new_quorum: u32,
+    /// decision (b) — the operator-authorized transition descriptor each node's enclave validates
+    /// before it will consent. `op` (1=ADD/2=REMOVE/3=SET), the member being added (32 bytes,
+    /// all-zero for REMOVE/SET), and the concatenated 64-byte ed25519 descriptor signature(s).
+    /// The orchestrator only CARRIES these — they are produced by the operator (sign-descriptor
+    /// subcommand) and verified in-enclave against the baked governance key.
+    pub op: u8,
+    pub new_member_mrenclave: [u8; 32],
+    pub descriptor_sigs: Vec<u8>,
     /// Channel to receive `SigningMessage::Response` instances as peers reply.
     pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
 }
@@ -2204,6 +2223,7 @@ impl P2PNode {
     /// chain-link carried on the wire — never trusted as a hash. The local pool
     /// key signs the same 32-byte digest `ecall_seal_membership_epoch` will
     /// reconstruct and verify the collected bundle against.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_membership_epoch_request(
         local_signer: &LocalSigner,
         request_id: &str,
@@ -2212,6 +2232,9 @@ impl P2PNode {
         prev_epoch_hash: &[u8; 32],
         new_signers: &[crate::membership_canonical::SignerEntry],
         new_quorum: u32,
+        op: u8,
+        new_member_mrenclave: &[u8; 32],
+        descriptor_sigs: &[u8],
     ) -> SigningMessage {
         // β4 Thread A site C (RESP-β4 AC-β4-A2): the ENCLAVE re-derives the
         // domain-separated consent hash itself (compute_membership_message_hash
@@ -2256,6 +2279,9 @@ impl P2PNode {
                 "quorum_threshold": new_quorum,
                 "proposed_epoch": proposed_epoch,
                 "prev_epoch_hash": hex::encode(prev_epoch_hash),
+                "op": op,
+                "new_member_mrenclave": hex::encode(new_member_mrenclave),
+                "descriptor_sigs": hex::encode(descriptor_sigs),
             }))
             .send()
             .await;
@@ -2774,6 +2800,11 @@ impl P2PNode {
                     prev,
                     signers,
                     *new_quorum,
+                    // APPLY/seal arm: verifies the collected bundle, not a descriptor — the
+                    // descriptor gates CONSENT, upstream. No-descriptor shape here.
+                    crate::membership_coordinator::MEMBERSHIP_DESC_OP_SET,
+                    [0u8; 32],
+                    Vec::new(),
                 ) {
                     Ok(s) => s,
                     Err(e) => {
@@ -2851,6 +2882,10 @@ impl P2PNode {
                     prev,
                     entries,
                     *quorum,
+                    // APPLY/bootstrap arm: no consent descriptor here.
+                    crate::membership_coordinator::MEMBERSHIP_DESC_OP_SET,
+                    [0u8; 32],
+                    Vec::new(),
                 ) {
                     Ok(s) => s,
                     Err(e) => {
@@ -3390,6 +3425,9 @@ impl P2PNode {
                             &relay.prev_epoch_hash,
                             &relay.new_signers,
                             relay.new_quorum,
+                            relay.op,
+                            &relay.new_member_mrenclave,
+                            &relay.descriptor_sigs,
                         ).await;
                         let _ = relay.responses_tx.send(local_response).await;
                     }
@@ -3410,6 +3448,9 @@ impl P2PNode {
                         prev_epoch_hash_hex: hex::encode(relay.prev_epoch_hash),
                         new_signers: new_signers_wire,
                         new_quorum: relay.new_quorum,
+                        op: relay.op,
+                        new_member_mrenclave_hex: hex::encode(relay.new_member_mrenclave),
+                        descriptor_sigs_hex: hex::encode(&relay.descriptor_sigs),
                     };
                     match self.publish_signing(&msg) {
                         Ok(_) => {
@@ -4019,6 +4060,9 @@ impl P2PNode {
                                 prev_epoch_hash_hex,
                                 new_signers,
                                 new_quorum,
+                                op,
+                                new_member_mrenclave_hex,
+                                descriptor_sigs_hex,
                             }) => {
                                 // β1: off-chain membership-epoch authorisation
                                 // from a peer's ceremony driver. Sign IF we
@@ -4097,6 +4141,14 @@ impl P2PNode {
                                     signers = signers.len(),
                                     "β1 membership-epoch request received — signing locally"
                                 );
+                                // decision (b): decode the carried descriptor. A bad member hash
+                                // or odd-length sigs is not trusted — the enclave would refuse
+                                // anyway — so decode leniently (zero member / empty sigs) and let
+                                // the in-enclave validation be the gate.
+                                let new_member_mrenclave =
+                                    decode_32(&new_member_mrenclave_hex).unwrap_or([0u8; 32]);
+                                let descriptor_sigs =
+                                    hex::decode(&descriptor_sigs_hex).unwrap_or_default();
                                 let response = Self::handle_membership_epoch_request(
                                     &local,
                                     &request_id,
@@ -4105,6 +4157,9 @@ impl P2PNode {
                                     &prev_epoch_hash,
                                     &signers,
                                     new_quorum,
+                                    op,
+                                    &new_member_mrenclave,
+                                    &descriptor_sigs,
                                 ).await;
                                 if let Err(e) = self.publish_signing(&response) {
                                     error!("failed to publish β1 membership response: {:#}", e);
@@ -5860,6 +5915,9 @@ mod tests {
                 },
             ],
             new_quorum: 2,
+            op: 1,
+            new_member_mrenclave_hex: "cc".repeat(32),
+            descriptor_sigs_hex: "dd".repeat(64),
         };
         let wire = serde_json::to_string(&req).expect("serialize");
         // snake_case tag, per the enum's serde attr.
@@ -5871,6 +5929,9 @@ mod tests {
                 proposed_epoch,
                 new_signers,
                 new_quorum,
+                op,
+                new_member_mrenclave_hex,
+                descriptor_sigs_hex,
                 ..
             } => {
                 assert_eq!(request_id, "beta1-membership-xyz");
@@ -5878,6 +5939,10 @@ mod tests {
                 assert_eq!(new_signers.len(), 2);
                 assert_eq!(new_signers[1].weight, 2);
                 assert_eq!(new_quorum, 2);
+                // decision (b): the descriptor fields survive the wire round-trip.
+                assert_eq!(op, 1);
+                assert_eq!(new_member_mrenclave_hex, "cc".repeat(32));
+                assert_eq!(descriptor_sigs_hex, "dd".repeat(64));
             }
             _ => panic!("expected MembershipEpochRequest"),
         }
