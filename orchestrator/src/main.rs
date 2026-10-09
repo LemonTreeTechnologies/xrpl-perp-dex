@@ -28,6 +28,7 @@ mod membership_submit;
 mod membership_sync;
 mod mrenclave_governance;
 mod node_deploy;
+mod operator_roster; // authority model B: per-operator roster gating the admin surface
 mod orderbook;
 mod p2p;
 mod path_a_capacity;
