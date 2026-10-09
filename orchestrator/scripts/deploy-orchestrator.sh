@@ -29,6 +29,32 @@ BASTION="andrey@94.130.18.162"
 
 hr() { printf '%s\n' "------------------------------------------------------------"; }
 
+# ONE MARKER PER CHANGE that must be on the cluster, and ONE LIST — it used to be written out
+# twice, by hand, in step [2/4] and again in step [4/4]. Two lists diverge: #107 and #108 were
+# merged and the lists would have proved a binary carrying neither, because neither list knew
+# the new strings existed. Checked before adding them that each is present in the new build and
+# ABSENT in the deployed one — a marker that does not discriminate is not a check.
+MARKERS=(
+  "step 5a"
+  "did not carry"
+  "NO-OP, not a failure to retry"
+  "REQUIRED after promotion"
+  "clio.altnet.rippletest.net"
+  "attested_clock_refused_unl_off"
+  "validations stream went SILENT"
+  "SPV-deposit boundary ARMED"
+  "enclave reserves_commit refused"
+  "xperp/v1/admin|"          # #107 the admin canonical binds method+route
+  "REFUSING to seal"         # #107 seal-initial requires --expect-escrow
+  "is IN USE by this node"   # #108 revoke-session-key's in-use guard
+)
+# Passed to the remote shells base64-encoded: the markers contain spaces and a pipe, and
+# threading those through two levels of ssh quoting is how a check silently tests the wrong
+# string. This session already lost a flag that way.
+MARKERS_B64=$(printf '%s\n' "${MARKERS[@]}" | base64 -w0)
+
+
+
 echo "deploying the orchestrator from master (the build step prints the exact commit)"
 hr
 
@@ -67,21 +93,18 @@ echo "[2/4] PROVING the built artefact carries EVERY fix it is supposed to"
 # binary missing the newer change entirely. A marker that cannot distinguish the version you
 # want from the one you have is not a check. Add a line here with every change that must be on
 # the cluster before the next ceremony step.
-ssh -o BatchMode=yes "$BASTION" '
+ssh -o BatchMode=yes "$BASTION" "MARKERS_B64=$MARKERS_B64 bash -s" <<'REMOTE' \
+  || { echo "FAILED: artefact check — do not deploy"; exit 3; }
   B=~/llm-perp-xrpl/orchestrator/target/release/perp-dex-orchestrator
   fail=0
-  # ONE MARKER PER CHANGE that must be on the cluster before the next step. A marker that
-  # cannot distinguish the build you want from the one you have is not a check.
-  for m in "step 5a" "did not carry" "NO-OP, not a failure to retry" "REQUIRED after promotion" \
-           "clio.altnet.rippletest.net" "attested_clock_refused_unl_off" \
-           "validations stream went SILENT" "SPV-deposit boundary ARMED" \
-           "enclave reserves_commit refused"; do
-    N=$(strings -a "$B" | grep -cF "$m")
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    N=$(strings -a "$B" | grep -cF -- "$m")
     printf "  %-34s %s\n" "\"$m\"" "$N"
     [ "$N" -gt 0 ] || { echo "    MISSING — this build predates that fix"; fail=1; }
-  done
+  done <<< "$(printf '%s' "$MARKERS_B64" | base64 -d)"
   [ "$fail" -eq 0 ] || exit 3
-' || { echo "FAILED: artefact check — do not deploy"; exit 3; }
+REMOTE
 hr
 
 echo "[3/4] deploying to all three nodes"
@@ -92,21 +115,27 @@ ssh -o BatchMode=yes "$BASTION" 'cd ~/llm-perp-xrpl/orchestrator && ./scripts/de
 hr
 
 echo "[4/4] PROVING the RUNNING binary on each node carries it"
+# THE SAME LIST as step [2/4]. This block used to spell out N1..N9 by hand through two levels
+# of ssh quoting, which is both unreadable and a second list to forget: when #107 and #108
+# landed, neither list knew their strings existed, so both would have "proved" a binary
+# carrying neither change.
 for ip in 20.71.184.176 20.224.243.60 52.236.130.102; do
-  echo -n "  $ip  "
-  ssh -o BatchMode=yes "$BASTION" "ssh -o BatchMode=yes -o ConnectTimeout=10 azureuser@$ip '
-    B=/home/azureuser/perp/perp-dex-orchestrator
-    A=\$(systemctl is-active perp-dex-orchestrator 2>/dev/null)
-    N1=\$(strings -a \$B 2>/dev/null | grep -cF \"step 5a\")
-    N2=\$(strings -a \$B 2>/dev/null | grep -cF \"did not carry\")
-    N3=\$(strings -a \$B 2>/dev/null | grep -cF \"NO-OP, not a failure to retry\")
-    N4=\$(strings -a \$B 2>/dev/null | grep -cF \"REQUIRED after promotion\")
-    N5=\$(strings -a \$B 2>/dev/null | grep -cF \"clio.altnet.rippletest.net\")
-    N6=\$(strings -a \$B 2>/dev/null | grep -cF \"attested_clock_refused_unl_off\")
-    N7=\$(strings -a \$B 2>/dev/null | grep -cF \"validations stream went SILENT\")
-    N8=\$(strings -a \$B 2>/dev/null | grep -cF \"SPV-deposit boundary ARMED\")
-    N9=\$(strings -a \$B 2>/dev/null | grep -cF \"enclave reserves_commit refused\")
-    echo \"service=\$A  step5a=\$N1  inv-diff=\$N2  govern=\$N3  followups=\$N4  multi-src=\$N5  clock-guard=\$N6  ws-idle=\$N7  spv-arm=\$N8  rc-chain=\$N9\"'"
+  echo "  $ip"
+  ssh -o BatchMode=yes "$BASTION" "IP=$ip MARKERS_B64=$MARKERS_B64 bash -s" <<'REMOTE'
+    ssh -o BatchMode=yes -o ConnectTimeout=15 "azureuser@$IP" \
+        "MARKERS_B64=$MARKERS_B64 bash -s" <<'INNER'
+      B=/home/azureuser/perp/perp-dex-orchestrator
+      echo "    service=$(systemctl is-active perp-dex-orchestrator 2>/dev/null)"
+      fail=0
+      while IFS= read -r m; do
+        [ -n "$m" ] || continue
+        N=$(strings -a "$B" 2>/dev/null | grep -cF -- "$m")
+        printf "    %-34s %s\n" "\"$m\"" "$N"
+        [ "$N" -gt 0 ] || { echo "      MISSING on the RUNNING binary"; fail=1; }
+      done <<< "$(printf '%s' "$MARKERS_B64" | base64 -d)"
+      [ "$fail" -eq 0 ] || echo "    ^^ THIS NODE IS NOT CURRENT"
+INNER
+REMOTE
 done
 hr
 # Count-agnostic on purpose: it said "all three markers" the moment there were four, which
