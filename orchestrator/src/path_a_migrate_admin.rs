@@ -349,9 +349,7 @@ mod tests {
             path_a_delegation_tx: tx,
             default_old_api_base: "https://localhost:9088".into(),
             default_new_api_base: "https://localhost:9089".into(),
-            authority: std::sync::Arc::new(
-                crate::operator_roster::RosterAuthority::fail_closed(),
-            ),
+            authority: std::sync::Arc::new(crate::operator_roster::RosterAuthority::fail_closed()),
         });
         let err = spawn_admin_listener("0.0.0.0:7095".into(), state)
             .await
