@@ -112,11 +112,12 @@ impl Roster {
     }
 
     /// The allowlist for a given op: the r-addresses permitted to request it. This is what an
-    /// admin surface hands `verify_operator_request` in place of `signers[]`.
+    /// admin surface hands `verify_operator_request` in place of `signers[]`. Defined in terms of
+    /// `can_op` so the per-request check and the allowlist can never disagree.
     pub fn allowlist_for(&self, op: &str) -> Vec<String> {
         self.operators
             .iter()
-            .filter(|o| o.ops.iter().any(|x| x == op))
+            .filter(|o| self.can_op(&o.xrpl_address, op))
             .map(|o| o.xrpl_address.clone())
             .collect()
     }
@@ -153,6 +154,53 @@ impl Roster {
         // lock-out failure mode is unreachable. A check for it would imply a self-governance
         // property the system deliberately does not have (auditor RESP 2026-10-09, Q4).
         Ok(())
+    }
+}
+
+/// The op name an admin ROUTE maps to, for the per-op `can_op` check: everything after
+/// `/admin/`. `/admin/membership-change` → `membership-change`; `/admin/safe/projection` →
+/// `safe/projection`. A roster lists exactly these strings in each operator's `ops`. A path with
+/// no `/admin/` segment returns the path unchanged — an op no operator holds, so it fails closed.
+pub fn op_for_admin_path(path: &str) -> &str {
+    let p = path.trim_start_matches('/');
+    p.strip_prefix("admin/").unwrap_or(p)
+}
+
+/// The admin surfaces' shared authority: the loaded roster, or `None` when none is configured or
+/// it failed to load. `None` is fail-closed — every allowlist it produces is empty, and
+/// `verify_operator_request` refuses an empty allowlist. This is the one object every admin
+/// router layers `operator_only` against, replacing the per-surface `signers[]` lists.
+pub struct RosterAuthority {
+    roster: Option<Roster>,
+}
+
+impl RosterAuthority {
+    pub fn new(roster: Roster) -> Self {
+        Self {
+            roster: Some(roster),
+        }
+    }
+
+    /// A fail-closed authority: no roster, so every surface serves nothing. This is what an admin
+    /// listener is given when no roster is configured or the roster did not load/verify — the
+    /// surface comes up refusing everything, never open.
+    pub fn fail_closed() -> Self {
+        Self { roster: None }
+    }
+
+    /// The r-addresses permitted to request the op this admin path maps to. Empty when there is
+    /// no roster or no operator holds the op — both fail closed at `verify_operator_request`.
+    pub fn allowlist_for_path(&self, admin_path: &str) -> Vec<String> {
+        let op = op_for_admin_path(admin_path);
+        self.roster
+            .as_ref()
+            .map(|r| r.allowlist_for(op))
+            .unwrap_or_default()
+    }
+
+    /// The loaded roster's version, for logging/status. None when fail-closed.
+    pub fn version(&self) -> Option<u64> {
+        self.roster.as_ref().map(|r| r.version)
     }
 }
 
@@ -446,6 +494,45 @@ ops = ["membership-change"]
         parse_ok(1)
             .check_invariants(ESCROW, None)
             .expect("first load must pass");
+    }
+
+    #[test]
+    fn op_for_admin_path_strips_the_admin_prefix() {
+        assert_eq!(
+            op_for_admin_path("/admin/membership-change"),
+            "membership-change"
+        );
+        assert_eq!(
+            op_for_admin_path("/admin/safe/projection"),
+            "safe/projection"
+        );
+        assert_eq!(
+            op_for_admin_path("/admin/mrenclave-govern"),
+            "mrenclave-govern"
+        );
+        // a non-admin path maps to itself — an op no operator holds, so fail-closed
+        assert_eq!(op_for_admin_path("/v1/system/status"), "v1/system/status");
+    }
+
+    #[test]
+    fn a_fail_closed_authority_permits_no_one() {
+        let a = RosterAuthority::fail_closed();
+        assert!(a.allowlist_for_path("/admin/membership-change").is_empty());
+        assert_eq!(a.version(), None);
+    }
+
+    #[test]
+    fn an_authority_hands_out_exactly_the_per_op_allowlist() {
+        let r = parse_ok(3);
+        let a = RosterAuthority::new(r);
+        // bob holds membership-change; the path maps to that op
+        assert_eq!(
+            a.allowlist_for_path("/admin/membership-change"),
+            vec!["rBob000000000000000000000000000000".to_string()]
+        );
+        // an op nobody holds → empty → fail closed
+        assert!(a.allowlist_for_path("/admin/nobody-has-this").is_empty());
+        assert_eq!(a.version(), Some(3));
     }
 
     #[test]

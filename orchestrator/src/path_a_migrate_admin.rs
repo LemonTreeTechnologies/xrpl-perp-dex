@@ -41,6 +41,9 @@ pub struct AdminState {
     pub default_old_api_base: String,
     /// Default NEW enclave HTTPS base URL; request body can override.
     pub default_new_api_base: String,
+    /// Operator roster authority (model B): the migrate-state route requires a signed request
+    /// from an operator the roster permits. Fail-closed when no roster is configured.
+    pub authority: std::sync::Arc<crate::operator_roster::RosterAuthority>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -280,9 +283,15 @@ async fn handle_migrate_state(
 }
 
 pub fn router(state: Arc<AdminState>) -> Router {
+    let authority = state.authority.clone();
     Router::new()
         .route("/admin/migrate-state", post(handle_migrate_state))
         .with_state(state)
+        // Model B: migrate-state moves sealed state to a new enclave — gated by the roster.
+        .layer(axum::middleware::from_fn_with_state(
+            authority,
+            crate::auth::operator_only,
+        ))
 }
 
 /// Bind a 127.0.0.1-only admin HTTP listener. Errors if listen_addr
@@ -340,6 +349,9 @@ mod tests {
             path_a_delegation_tx: tx,
             default_old_api_base: "https://localhost:9088".into(),
             default_new_api_base: "https://localhost:9089".into(),
+            authority: std::sync::Arc::new(
+                crate::operator_roster::RosterAuthority::fail_closed(),
+            ),
         });
         let err = spawn_admin_listener("0.0.0.0:7095".into(), state)
             .await

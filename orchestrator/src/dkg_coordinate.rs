@@ -90,6 +90,9 @@ pub struct CoordinatorState {
     pub dkg_step_pub: mpsc::Sender<DkgStepMessage>,
     pub share_v2_pub: mpsc::Sender<ShareEnvelopeV2Message>,
     pub active: Arc<Mutex<Option<ActiveCeremony>>>,
+    /// Operator roster authority (model B): `/admin/dkg/start` requires a signed request from an
+    /// operator the roster permits. Fail-closed when no roster is configured.
+    pub authority: Arc<crate::operator_roster::RosterAuthority>,
 }
 
 /// Follower handler — runs as a tokio task per orchestrator. Reads
@@ -607,9 +610,15 @@ fn validate_threshold(threshold: u32, n: u32) -> Result<(), String> {
 }
 
 pub fn router(state: Arc<CoordinatorState>) -> Router {
+    let authority = state.authority.clone();
     Router::new()
         .route("/admin/dkg/start", post(handle_start_dkg))
         .with_state(state)
+        // Model B: starting a DKG ceremony is gated by the roster.
+        .layer(axum::middleware::from_fn_with_state(
+            authority,
+            crate::auth::operator_only,
+        ))
 }
 
 pub async fn spawn_admin_listener(listen_addr: String, state: Arc<CoordinatorState>) -> Result<()> {

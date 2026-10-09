@@ -34,10 +34,10 @@ pub struct AdminState {
     pub client: PoolPathAClient,
     pub share_v2_pub_tx: mpsc::Sender<ShareEnvelopeV2Message>,
     pub groups: Vec<PathAGroup>,
-    /// The cluster's operator XRPL addresses. EVERY route on this listener requires a signed
-    /// request from one of them. Empty is not "allow all" — `verify_operator_request` refuses
-    /// everything, which is the correct reading of a missing allowlist.
-    pub operators: Vec<String>,
+    /// The operator roster authority. EVERY route on this listener requires a signed request from
+    /// an operator the roster permits THAT route's op. A fail-closed authority (no roster) refuses
+    /// everything — the correct reading of a missing allowlist.
+    pub authority: std::sync::Arc<crate::operator_roster::RosterAuthority>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,7 +169,7 @@ async fn handle_share_export(
 }
 
 pub fn router(state: Arc<AdminState>) -> Router {
-    let operators = Arc::new(state.operators.clone());
+    let authority = state.authority.clone();
     Router::new()
         .route("/admin/path-a/share-export", post(handle_share_export))
         .with_state(state)
@@ -216,7 +216,7 @@ pub fn router(state: Arc<AdminState>) -> Router {
         // lives in auth.rs (`operator_only`), shared with the other admin surfaces, because a
         // per-module copy is how membership-change ended up unguarded while this one was fixed.
         .layer(axum::middleware::from_fn_with_state(
-            operators.clone(),
+            authority,
             crate::auth::operator_only,
         ))
 }
@@ -298,13 +298,49 @@ mod admin_surface_tests {
     }
 
     /// Serve the real admin router on an ephemeral loopback port and return its base URL.
+    /// Build a roster authority granting every given address all of this surface's ops, so the
+    /// tests exercise the LAYER (signed/stranger/unsigned), not per-op capability. An empty list
+    /// yields a fail-closed authority — the "serves nothing" case.
+    fn authority_of(addrs: Vec<String>) -> Arc<crate::operator_roster::RosterAuthority> {
+        use crate::operator_roster::{OperatorEntry, Roster, RosterAuthority};
+        if addrs.is_empty() {
+            return Arc::new(RosterAuthority::fail_closed());
+        }
+        let ops: Vec<String> = [
+            "path-a/share-export",
+            "frost/round",
+            "safe/exec",
+            "safe/projection",
+            "safe/derive-step",
+            "safe/attest-projection",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let operators = addrs
+            .into_iter()
+            .enumerate()
+            .map(|(i, a)| OperatorEntry {
+                handle: format!("op{i}"),
+                xrpl_address: a,
+                ops: ops.clone(),
+            })
+            .collect();
+        Arc::new(RosterAuthority::new(Roster {
+            version: 1,
+            cluster_escrow: "rX".into(),
+            operators,
+            op_thresholds: Default::default(),
+        }))
+    }
+
     async fn serve(operators: Vec<String>) -> String {
         let (tx, _rx) = mpsc::channel(1);
         let state = Arc::new(AdminState {
             client: PoolPathAClient::new("https://localhost:9088/v1").unwrap(),
             share_v2_pub_tx: tx,
             groups: vec![],
-            operators,
+            authority: authority_of(operators),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
