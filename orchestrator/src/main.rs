@@ -28,6 +28,7 @@ mod membership_submit;
 mod membership_sync;
 mod mrenclave_governance;
 mod node_deploy;
+mod operator_roster; // authority model B: per-operator roster gating the admin surface
 mod orderbook;
 mod p2p;
 mod path_a_capacity;
@@ -603,6 +604,19 @@ struct RunArgs {
     /// If not set, withdrawals fall back to single-operator mode.
     #[arg(long)]
     signers_config: Option<PathBuf>,
+
+    /// Operator roster file (`cluster_roster.vN.toml`) — authority model B. It is the SOURCE of
+    /// the allowlist for EVERY admin listener: who may request which admin op. Requires
+    /// `--operator-pub` (the baked SSHSIG key that signs it). If either is unset, or the roster
+    /// does not verify/load, every admin surface comes up FAIL-CLOSED (serves nothing) — never
+    /// open. Replaces the old `signers_config.signers[]` allowlist source.
+    #[arg(long)]
+    operator_roster: Option<PathBuf>,
+
+    /// The baked operator public key (ssh allowed_signers / bare pubkey) that signed the roster.
+    /// The detached signature is expected beside the roster as `<roster>.sig`.
+    #[arg(long)]
+    operator_pub: Option<PathBuf>,
 
     /// Enable the Market Making Vault (automated liquidity provider).
     /// The vault deposits initial margin and continuously quotes bid/ask
@@ -1565,40 +1579,65 @@ async fn main() -> Result<()> {
         });
     }
 
+    // THE OPERATOR ROSTER AUTHORITY, built ONCE and shared by every admin listener below
+    // (authority model B). It is the single source of the allowlist: who may request which admin
+    // op. Replaces the old per-listener `signers_config.signers[]` lists, which named the enclave
+    // node identities — keys nobody holds off-enclave, so nothing could ever authenticate to
+    // them. If --operator-roster/--operator-pub are unset, or the roster fails to verify/load,
+    // this is FAIL-CLOSED: every admin surface serves nothing. On testnet-under-construction that
+    // is acceptable; what is not acceptable is a surface that is open or that admits a credential
+    // no operator holds.
+    let roster_authority = {
+        use crate::operator_roster::RosterAuthority;
+        match (cli.operator_roster.clone(), cli.operator_pub.clone()) {
+            (Some(roster_path), Some(pub_path)) => {
+                // Fail fast if the verification tool itself is missing/old, so the reason reads
+                // as "the box lacks ssh-keygen -Y" rather than "the roster is bad".
+                if let Err(e) = operator_roster::probe_ssh_keygen() {
+                    warn!("roster verification unavailable ({e}) — admin surfaces FAIL CLOSED");
+                }
+                let sig_path = roster_path.with_extension(format!(
+                    "{}.sig",
+                    roster_path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("toml")
+                ));
+                match operator_roster::load(
+                    &roster_path,
+                    &sig_path,
+                    &pub_path,
+                    &escrow_address,
+                    None,
+                ) {
+                    Ok(r) => {
+                        let a = Arc::new(RosterAuthority::new(r));
+                        info!(version = ?a.version(), "operator roster loaded and SSHSIG-verified; admin surfaces gated by it");
+                        a
+                    }
+                    Err(e) => {
+                        warn!("operator roster did NOT load ({e}) — admin surfaces FAIL CLOSED (serve nothing)");
+                        Arc::new(RosterAuthority::fail_closed())
+                    }
+                }
+            }
+            _ => {
+                warn!("no --operator-roster/--operator-pub — admin surfaces FAIL CLOSED (serve nothing). This is authority model B; configure a roster to serve them.");
+                Arc::new(RosterAuthority::fail_closed())
+            }
+        }
+    };
+
     // Path A re-DKG share-v2 export driver — spawned only when the
     // operator opts in via --admin-listen. Binds loopback-only; the
     // export function it fronts is also callable as a library from any
     // future in-process driver (e.g., automated re-DKG orchestration).
     if let Some(admin_listen) = cli.admin_listen.clone() {
-        // THE OPERATOR ALLOWLIST FOR THIS LISTENER. Until 2026-10-08 the admin app was built
-        // with no auth layer at all, so share-export, the FROST round driver and the four Safe
-        // routes were behind loopback and nothing else. Audit ruling Q1: the allowlist is a
-        // precondition to serving the surface, and loopback is a mitigation rather than the
-        // control (a co-located process or an SSRF reaches loopback).
-        //
-        // Without --signers-config this is EMPTY, and empty means the surface serves nothing.
-        // Said out loud, because an operator who brings the listener up and gets 403 on
-        // everything deserves to know why rather than reading the refusal as a bug.
-        let operators: Vec<String> = signers_config
-            .as_ref()
-            .map(|c| c.signers.iter().map(|s| s.xrpl_address.clone()).collect())
-            .unwrap_or_default();
-        if operators.is_empty() {
-            warn!(
-                "--admin-listen is set but the operator allowlist is EMPTY (no --signers-config): \
-                 every route on that listener will refuse with 403. This is fail-closed, not a bug."
-            );
-        } else {
-            info!(
-                operators = operators.len(),
-                "admin listener: every route requires a signed request from a cluster operator"
-            );
-        }
         let admin_state = Arc::new(path_a_redkg::AdminState {
             client: pool_path_a_client::PoolPathAClient::new(&cli.enclave_url)?,
             share_v2_pub_tx: share_v2_pub_tx.clone(),
             groups: shard_router.path_a_groups().to_vec(),
-            operators,
+            authority: roster_authority.clone(),
         });
         let _admin_handle = tokio::spawn(async move {
             if let Err(e) = path_a_redkg::spawn_admin_listener(admin_listen, admin_state).await {
@@ -1645,6 +1684,7 @@ async fn main() -> Result<()> {
                     dkg_step_pub: dkg_step_pub_tx.clone(),
                     share_v2_pub: share_v2_pub_tx.clone(),
                     active: dkg_active.clone(),
+                    authority: roster_authority.clone(),
                 });
 
                 // Always spawn the follower handler.
@@ -1756,6 +1796,7 @@ async fn main() -> Result<()> {
                     signers_config: cfg.clone(),
                     signing_request_tx,
                     enclave_url: cli.enclave_url.clone(),
+                    authority: roster_authority.clone(),
                 });
                 tokio::spawn(async move {
                     if let Err(e) = signerlist_update::spawn_admin_listener(addr, admin_state).await
@@ -1835,10 +1876,9 @@ async fn main() -> Result<()> {
                     unl_policy_tx,
                     unl_status_tx,
                     operator_capital_account_ids: operator_capital_account_ids.clone(),
-                    // The operator allowlist for `operator_only`, from the SAME signer set
-                    // this arm already decoded into current_signers. Non-empty by the match
-                    // guard (`Some(cfg)`), so the surface never comes up serving nothing.
-                    operators: cfg.signers.iter().map(|s| s.xrpl_address.clone()).collect(),
+                    // The shared roster authority (model B). Replaces the signers[]-derived list,
+                    // which named enclave identities nobody can sign as.
+                    authority: roster_authority.clone(),
                 });
                 tokio::spawn(async move {
                     if let Err(e) = membership_admin::spawn_admin_listener(addr, admin_state).await
@@ -1880,6 +1920,7 @@ async fn main() -> Result<()> {
                     path_a_delegation_tx: delegation_tx,
                     default_old_api_base: strip_v1(&cli.enclave_url),
                     default_new_api_base: "https://localhost:9089".into(),
+                    authority: roster_authority.clone(),
                 });
                 tokio::spawn(async move {
                     if let Err(e) =

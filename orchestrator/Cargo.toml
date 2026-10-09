@@ -33,6 +33,11 @@ futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Secure temp files for the roster's allowed_signers materialization (0600, owner-only,
+# in a private runtime dir — NOT /tmp). Promoted from dev-dependencies: the roster verifier
+# needs it at runtime, and the version is already locked, so this adds no new crate.
+tempfile = "3"
+
 # Crypto (XRPL address derivation, DER encoding, SHA-512Half)
 k256 = { version = "0.13", features = ["ecdsa"] }
 # BIP340 Schnorr verification for FROST rounds. Deliberately a DIFFERENT
@@ -90,5 +95,4 @@ anyhow = "1"
 async-trait = "0.1"
 
 [dev-dependencies]
-# Test fixtures (O-L3: escrow-seed file resolver)
-tempfile = "3"
+# (tempfile moved to [dependencies] — the roster verifier uses it at runtime)

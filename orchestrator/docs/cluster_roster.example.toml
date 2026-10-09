@@ -1,0 +1,52 @@
+# cluster_roster.vN.example.toml — operator roster TEMPLATE (authority model B)
+#
+# This is an EXAMPLE with placeholder addresses. A real roster is authored by hand, SSHSIG-signed
+# by the governance operator key, and deployed beside its detached signature as
+# `cluster_roster.vN.toml` + `cluster_roster.vN.toml.sig`. See the ceremony runbook
+# (operator-roster-ceremony) for how to generate the keys, sign, and bake the public key.
+#
+# The orchestrator loads it via --operator-roster <this file> --operator-pub <operator.pub>.
+# If it does not SSHSIG-verify against operator.pub (namespace `perp-roster`, identity
+# `perp-cluster-operator`), or any invariant below fails, every admin surface FAILS CLOSED.
+
+# Monotonic. A node refuses a roster whose version is not strictly greater than the one in force
+# (anti-rollback). Bump it on every change.
+version = 1
+
+# The escrow this roster authorizes. Must equal the escrow the cluster runs, or the node refuses
+# it (a roster for one cluster must not authorize another).
+cluster_escrow = "rfYnJDSAeFuDCUTq2oYbckbJcz3gAJTNCd"
+
+# Each operator: a handle, the XRPL r-address their REQUEST signatures derive to (their OWN
+# secp256k1 key, held on their machine — NOT an enclave identity, NOT the escrow key), and the
+# admin operations they may request. The op name is the admin path after `/admin/`
+# (e.g. `/admin/membership-change` -> "membership-change", `/admin/safe/projection` ->
+# "safe/projection").
+
+[[operators]]
+handle = "operator-1"
+xrpl_address = "rOPERATOR1xxxxxxxxxxxxxxxxxxxxxxxxx"
+ops = [
+  "membership-change",
+  "mrenclave-govern",
+  "safe/projection",
+  "safe/exec",
+]
+
+[[operators]]
+handle = "operator-2"
+xrpl_address = "rOPERATOR2xxxxxxxxxxxxxxxxxxxxxxxxx"
+ops = [
+  "membership-change",
+  "mrenclave-govern",
+  "signerlist-update",
+  "migrate-state",
+]
+
+# Per-op threshold: how many DISTINCT operators must co-sign a request for that op. Carried here
+# so the quorum layer (owner decision b) enforces it without a format change. The single-
+# membership check (shipped) does not read it; until the quorum layer lands, one permitted
+# operator's signature authorizes the op.
+[op_thresholds]
+membership-change = 2
+mrenclave-govern = 2

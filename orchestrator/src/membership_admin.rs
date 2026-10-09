@@ -88,11 +88,10 @@ pub struct MembershipAdminState {
     /// hex (decoded from OPERATOR_CAPITAL_SENDERS — the SAME config the scanner uses),
     /// committed into the baseline marker's excluded_senders_hash.
     pub operator_capital_account_ids: Vec<String>,
-    /// The operator allowlist — XRPL r-addresses from `signers_config.signers[]`, the same
-    /// source the re-DKG surface uses. The `operator_only` layer admits only a request signed
-    /// by one of these. EMPTY means this surface serves nothing (fail closed), which is why the
-    /// spawn populates it from the signer set that is already required to be present here.
-    pub operators: Vec<String>,
+    /// The operator roster authority. The `operator_only` layer admits only a request signed by
+    /// an operator the roster permits THAT route's op. A fail-closed authority (no roster) refuses
+    /// everything — this surface then serves nothing, which on testnet construction is acceptable.
+    pub authority: std::sync::Arc<crate::operator_roster::RosterAuthority>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -835,7 +834,7 @@ pub fn router(state: Arc<MembershipAdminState>) -> Router {
     // measurement), so the layer is a PRECONDITION to serving it, not a hardening pass. Until now
     // this router was `with_state(state)` and nothing else: signed by no one, loopback its only
     // gate — and loopback is reached by any co-located process or an SSRF.
-    let operators = Arc::new(state.operators.clone());
+    let authority = state.authority.clone();
     Router::new()
         .route("/admin/membership-change", post(handle_membership_change))
         .route("/admin/membership-genesis", post(handle_membership_genesis))
@@ -849,7 +848,7 @@ pub fn router(state: Arc<MembershipAdminState>) -> Router {
         .route("/admin/unl-cluster-status", get(handle_unl_cluster_status))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
-            operators,
+            authority,
             crate::auth::operator_only,
         ))
 }
@@ -910,8 +909,44 @@ mod tests {
             unl_policy_tx: f,
             unl_status_tx: g,
             operator_capital_account_ids: vec![],
-            operators,
+            authority: authority_of(operators),
         })
+    }
+
+    /// Build a roster authority granting each address every op this surface serves, so the tests
+    /// exercise the layer (signed/stranger/unsigned/empty), not per-op capability. Empty ⇒
+    /// fail-closed.
+    fn authority_of(addrs: Vec<String>) -> Arc<crate::operator_roster::RosterAuthority> {
+        use crate::operator_roster::{OperatorEntry, Roster, RosterAuthority};
+        if addrs.is_empty() {
+            return Arc::new(RosterAuthority::fail_closed());
+        }
+        let ops: Vec<String> = [
+            "membership-change",
+            "membership-genesis",
+            "mrenclave-govern",
+            "reserves-spv-baseline",
+            "unl-refresh",
+            "unl-policy",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let operators = addrs
+            .into_iter()
+            .enumerate()
+            .map(|(i, a)| OperatorEntry {
+                handle: format!("op{i}"),
+                xrpl_address: a,
+                ops: ops.clone(),
+            })
+            .collect();
+        Arc::new(RosterAuthority::new(Roster {
+            version: 1,
+            cluster_escrow: "rX".into(),
+            operators,
+            op_thresholds: Default::default(),
+        }))
     }
 
     /// Sign a request the ADMIN canonical way:

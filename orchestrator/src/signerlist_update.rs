@@ -56,6 +56,9 @@ pub struct AdminState {
     /// `<enclave_url>/admin/signerlist/seal-update` so the enclave
     /// can update its sealed copy of the SignerList.
     pub enclave_url: String,
+    /// Operator roster authority (model B): every route requires a signed request from an
+    /// operator the roster permits that op. Fail-closed when no roster is configured.
+    pub authority: std::sync::Arc<crate::operator_roster::RosterAuthority>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -893,6 +896,7 @@ pub async fn handle_signerlist_bootstrap_rotate(
 }
 
 pub fn router(state: Arc<AdminState>) -> Router {
+    let authority = state.authority.clone();
     Router::new()
         .route("/admin/signerlist-update", post(handle_signerlist_update))
         .route(
@@ -900,6 +904,12 @@ pub fn router(state: Arc<AdminState>) -> Router {
             post(handle_signerlist_bootstrap_rotate),
         )
         .with_state(state)
+        // Model B: these routes drive on-chain SignerListSet — gated by the roster, no longer
+        // served to anyone who can reach loopback.
+        .layer(axum::middleware::from_fn_with_state(
+            authority,
+            crate::auth::operator_only,
+        ))
 }
 
 pub async fn spawn_admin_listener(listen_addr: String, state: Arc<AdminState>) -> Result<()> {

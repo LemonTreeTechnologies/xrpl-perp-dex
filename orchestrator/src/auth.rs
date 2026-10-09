@@ -511,7 +511,7 @@ pub fn verify_operator_request(
 /// particular router's state, because some routes are `merge`d as stateless sub-routers and
 /// would otherwise sit outside it.
 pub async fn operator_only(
-    State(operators): State<std::sync::Arc<Vec<String>>>,
+    State(authority): State<std::sync::Arc<crate::operator_roster::RosterAuthority>>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -531,8 +531,12 @@ pub async fn operator_only(
                 .into_response()
         }
     };
+    // PER-OP allowlist: the roster says who may request THIS route's op, not a flat surface list.
+    // A fail-closed authority (no roster) or an op no operator holds yields an empty allowlist,
+    // which verify_operator_request refuses — so an unconfigured surface serves nothing.
+    let allowlist = authority.allowlist_for_path(&uri);
     if let Err((code, msg)) =
-        verify_operator_request(&headers, &method, &body_bytes, &uri, &operators)
+        verify_operator_request(&headers, &method, &body_bytes, &uri, &allowlist)
     {
         // Logged with the route and the reason: a refusal nobody can read is how an admin
         // surface comes to look protected while it asks for nothing.
