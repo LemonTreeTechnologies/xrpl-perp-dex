@@ -101,6 +101,23 @@ pub struct MembershipChangeRequest {
     pub new_signers: Vec<String>,
     /// The new SignerQuorum.
     pub quorum: u32,
+    /// decision (b): the operator-authorized transition descriptor. `op` (1=ADD/2=REMOVE/3=SET);
+    /// `new_member_mrenclave_hex` the 32-byte measurement of the member being added (hex, omit or
+    /// all-zero for REMOVE/SET); `descriptor_sigs_hex` the concatenated 64-byte ed25519
+    /// signature(s) over the in-enclave descriptor digest, produced by the operator's
+    /// sign-descriptor subcommand with the governance key. Defaulted so an older client that omits
+    /// them produces a consent that FAIL-CLOSES in the enclave (no valid descriptor), never one
+    /// that is silently accepted.
+    #[serde(default = "default_op_set")]
+    pub op: u8,
+    #[serde(default)]
+    pub new_member_mrenclave_hex: String,
+    #[serde(default)]
+    pub descriptor_sigs_hex: String,
+}
+
+fn default_op_set() -> u8 {
+    crate::membership_coordinator::MEMBERSHIP_DESC_OP_SET
 }
 
 #[derive(Debug, Serialize)]
@@ -206,10 +223,42 @@ async fn drive_change(
     let applier =
         LibP2PMembershipApplier::new(state.membership_apply_tx.clone(), state.cluster_size)
             .with_attesting(attesting_signers, state.current_quorum);
+    // decision (b): op must be one of the known transition kinds. This is input hygiene, not the
+    // authority check (that is the enclave's) — an unknown op would just fail-close in the enclave
+    // anyway, but rejecting it here gives the operator a clear message.
+    use crate::membership_coordinator::{
+        MEMBERSHIP_DESC_OP_ADD, MEMBERSHIP_DESC_OP_REMOVE, MEMBERSHIP_DESC_OP_SET,
+    };
+    if req.op != MEMBERSHIP_DESC_OP_ADD
+        && req.op != MEMBERSHIP_DESC_OP_REMOVE
+        && req.op != MEMBERSHIP_DESC_OP_SET
+    {
+        anyhow::bail!(
+            "membership-change: unknown op {} (expected 1=ADD, 2=REMOVE, 3=SET)",
+            req.op
+        );
+    }
+    // decode the operator-provided descriptor. Lenient — a bad member hash or
+    // odd-length sigs is not trusted here; the enclave is the gate and will refuse. A missing
+    // descriptor ⇒ empty sigs ⇒ the enclave fail-closes (-45).
+    let new_member_mrenclave: [u8; 32] = {
+        let mut m = [0u8; 32];
+        if let Ok(bytes) = hex::decode(req.new_member_mrenclave_hex.trim_start_matches("0x")) {
+            if bytes.len() == 32 {
+                m.copy_from_slice(&bytes);
+            }
+        }
+        m
+    };
+    let descriptor_sigs: Vec<u8> =
+        hex::decode(req.descriptor_sigs_hex.trim_start_matches("0x")).unwrap_or_default();
     let change = run_membership_change(
         state.escrow,
         new_signers.clone(),
         req.quorum,
+        req.op,
+        new_member_mrenclave,
+        descriptor_sigs,
         &digest_src,
         &collector,
         &applier,
