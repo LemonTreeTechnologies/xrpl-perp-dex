@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
-    extract::Request,
+    extract::{Request, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -494,6 +494,57 @@ pub fn verify_operator_request(
         ));
     }
     Ok(user)
+}
+
+/// Admin-surface middleware: refuse anything that is not a signed request from a cluster
+/// operator on the allowlist.
+///
+/// ONE DEFINITION, SHARED. It began life in `path_a_redkg`, guarding only that surface's six
+/// routes. But the orchestrator spawns several admin listeners — re-DKG + Safe, membership-change,
+/// signerlist-update, Path-A migrate — and each used to be `let app = router(state)` with no auth
+/// at all, loopback its only protection. A per-module copy of this check is a second list to
+/// forget: the membership-change surface, which chains to on-chain custody through an
+/// auto-signing consent ecall, was left unguarded while the re-DKG surface was fixed. So the
+/// check lives here, next to `verify_operator_request`, and every admin router layers THIS.
+///
+/// It takes the allowlist as its own `State<Arc<Vec<String>>>` rather than reaching into any
+/// particular router's state, because some routes are `merge`d as stateless sub-routers and
+/// would otherwise sit outside it.
+pub async fn operator_only(
+    State(operators): State<std::sync::Arc<Vec<String>>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method().as_str().to_string();
+    let uri = request.uri().path().to_string();
+    let headers = request.headers().clone();
+    let (parts, body) = request.into_parts();
+    // The body is buffered because the signature covers it. 1 MiB matches the main app's auth
+    // layer.
+    let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"status":"error","message":"failed to read body"})),
+            )
+                .into_response()
+        }
+    };
+    if let Err((code, msg)) =
+        verify_operator_request(&headers, &method, &body_bytes, &uri, &operators)
+    {
+        // Logged with the route and the reason: a refusal nobody can read is how an admin
+        // surface comes to look protected while it asks for nothing.
+        warn!(route = %uri, code, reason = %msg, "admin surface REFUSED a request");
+        return (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::FORBIDDEN),
+            Json(serde_json::json!({"status":"error","message":msg})),
+        )
+            .into_response();
+    }
+    next.run(Request::from_parts(parts, Body::from(body_bytes)))
+        .await
 }
 
 pub async fn auth_middleware(request: Request, next: Next) -> Response {
