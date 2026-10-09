@@ -1835,6 +1835,10 @@ async fn main() -> Result<()> {
                     unl_policy_tx,
                     unl_status_tx,
                     operator_capital_account_ids: operator_capital_account_ids.clone(),
+                    // The operator allowlist for `operator_only`, from the SAME signer set
+                    // this arm already decoded into current_signers. Non-empty by the match
+                    // guard (`Some(cfg)`), so the surface never comes up serving nothing.
+                    operators: cfg.signers.iter().map(|s| s.xrpl_address.clone()).collect(),
                 });
                 tokio::spawn(async move {
                     if let Err(e) = membership_admin::spawn_admin_listener(addr, admin_state).await

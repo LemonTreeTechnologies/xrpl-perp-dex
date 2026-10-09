@@ -88,6 +88,11 @@ pub struct MembershipAdminState {
     /// hex (decoded from OPERATOR_CAPITAL_SENDERS — the SAME config the scanner uses),
     /// committed into the baseline marker's excluded_senders_hash.
     pub operator_capital_account_ids: Vec<String>,
+    /// The operator allowlist — XRPL r-addresses from `signers_config.signers[]`, the same
+    /// source the re-DKG surface uses. The `operator_only` layer admits only a request signed
+    /// by one of these. EMPTY means this surface serves nothing (fail closed), which is why the
+    /// spawn populates it from the signer set that is already required to be present here.
+    pub operators: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -823,6 +828,14 @@ async fn handle_unl_policy(
 }
 
 pub fn router(state: Arc<MembershipAdminState>) -> Router {
+    // The allowlist is lifted out of state before `with_state` consumes it, and the auth layer
+    // takes it as its own State — so it still covers the routes even though `with_state` has
+    // moved `state`. EVERY route on this surface reaches on-chain custody or the trusted-MRENCLAVE
+    // allowlist (membership-change auto-signs a well-formed set; mrenclave-govern admits a
+    // measurement), so the layer is a PRECONDITION to serving it, not a hardening pass. Until now
+    // this router was `with_state(state)` and nothing else: signed by no one, loopback its only
+    // gate — and loopback is reached by any co-located process or an SSRF.
+    let operators = Arc::new(state.operators.clone());
     Router::new()
         .route("/admin/membership-change", post(handle_membership_change))
         .route("/admin/membership-genesis", post(handle_membership_genesis))
@@ -835,6 +848,10 @@ pub fn router(state: Arc<MembershipAdminState>) -> Router {
         .route("/admin/unl-policy", post(handle_unl_policy))
         .route("/admin/unl-cluster-status", get(handle_unl_cluster_status))
         .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            operators,
+            crate::auth::operator_only,
+        ))
 }
 
 pub async fn spawn_admin_listener(
@@ -864,6 +881,185 @@ mod tests {
             ok,
             error: err.map(Into::into),
         }
+    }
+
+    /// A MembershipAdminState sufficient to STAND UP the router. The auth layer rejects before
+    /// any handler runs, so the senders never fire — dummy channels are enough, and that is the
+    /// point: the test exercises the layer, not the handlers behind it.
+    fn dummy_state(operators: Vec<String>) -> Arc<MembershipAdminState> {
+        let (a, _ra) = mpsc::channel(1);
+        let (b, _rb) = mpsc::channel(1);
+        let (c, _rc) = mpsc::channel(1);
+        let (d, _rd) = mpsc::channel(1);
+        let (e, _re) = mpsc::channel(1);
+        let (f, _rf) = mpsc::channel(1);
+        let (g, _rg) = mpsc::channel(1);
+        Arc::new(MembershipAdminState {
+            xrpl_url: "http://127.0.0.1:1".into(),
+            escrow: [0u8; 20],
+            escrow_r_address: "rEscrow".into(),
+            enclave_base: "http://127.0.0.1:1".into(),
+            cluster_size: 3,
+            membership_epoch_tx: a,
+            membership_apply_tx: b,
+            signing_tx: c,
+            current_signers: vec![],
+            current_quorum: 2,
+            mrenclave_governance_tx: d,
+            spv_baseline_tx: e,
+            unl_policy_tx: f,
+            unl_status_tx: g,
+            operator_capital_account_ids: vec![],
+            operators,
+        })
+    }
+
+    /// Sign a request the ADMIN canonical way:
+    /// SHA-256("xperp/v1/admin|" ‖ method ‖ "|" ‖ uri_path ‖ "|" ‖ body ‖ "|" ‖ timestamp).
+    ///
+    /// Written out here rather than shared, and that is SAFE in this direction: the REAL
+    /// `verify_operator_request` is what accepts or rejects, so a wrong replication makes the
+    /// test FAIL, never pass. A fixture can only co-delude when both sides are mine.
+    fn operator_headers(
+        method: &str,
+        uri_path: &str,
+        body: &[u8],
+    ) -> (reqwest::header::HeaderMap, String) {
+        use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
+        use sha2::{Digest, Sha256};
+
+        let sk = SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let pubkey = sk.verifying_key().to_sec1_bytes();
+        let pubkey_hex = hex::encode(&pubkey);
+        let address = crate::auth::pubkey_to_xrpl_address(&pubkey);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        let mut h = Sha256::new();
+        h.update(b"xperp/v1/admin|");
+        h.update(method.as_bytes());
+        h.update(b"|");
+        h.update(uri_path.as_bytes());
+        h.update(b"|");
+        h.update(body);
+        h.update(b"|");
+        h.update(ts.as_bytes());
+        let (sig, _): (Signature, _) = sk.sign_prehash(&h.finalize()).unwrap();
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-xrpl-address", address.parse().unwrap());
+        headers.insert("x-xrpl-publickey", pubkey_hex.parse().unwrap());
+        headers.insert(
+            "x-xrpl-signature",
+            hex::encode(sig.to_der().as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-xrpl-timestamp", ts.parse().unwrap());
+        (headers, address)
+    }
+
+    async fn serve(operators: Vec<String>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(dummy_state(operators));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// THE LAYER IS WIRED onto the custody-reaching surface, proven over real HTTP against the
+    /// real router — not that `operator_only` works in isolation (auth.rs proves that). The
+    /// route used is `/admin/membership-change`, the one that chains to on-chain custody.
+    #[tokio::test]
+    async fn membership_change_refuses_unsigned_and_stranger_but_admits_an_operator() {
+        let body = br#"{"probe":true}"#;
+        let (headers, operator_addr) = operator_headers("POST", "/admin/membership-change", body);
+        let c = reqwest::Client::new();
+
+        // (1) operator configured, request UNSIGNED -> 401
+        let base = serve(vec![operator_addr.clone()]).await;
+        let unsigned = c
+            .post(format!("{base}/admin/membership-change"))
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unsigned.status().as_u16(), 401, "unsigned must be 401");
+
+        // (2) SIGNED, but the signer is not on the allowlist -> 403
+        let base2 = serve(vec!["rSomeoneElseEntirely".to_string()]).await;
+        let stranger = c
+            .post(format!("{base2}/admin/membership-change"))
+            .headers(headers.clone())
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stranger.status().as_u16(), 403, "a stranger must be 403");
+
+        // (3) SIGNED by an operator -> the layer must NOT be what stops it. The handler then
+        // fails on its own (the request body is not a real membership change, and no cluster is
+        // reachable), which is some OTHER status — never 401/403.
+        let ok = c
+            .post(format!("{base}/admin/membership-change"))
+            .headers(headers)
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        let s = ok.status().as_u16();
+        assert!(
+            s != 401 && s != 403,
+            "an operator's signed request must get past the layer; got {s}"
+        );
+    }
+
+    /// Every route on this surface is behind the layer, not just membership-change —
+    /// mrenclave-govern admits a MEASUREMENT and must be no weaker.
+    #[tokio::test]
+    async fn the_layer_covers_mrenclave_govern_and_the_rest() {
+        let base = serve(vec!["rOperator".to_string()]).await;
+        let c = reqwest::Client::new();
+        for route in [
+            "/admin/membership-change",
+            "/admin/membership-genesis",
+            "/admin/mrenclave-govern",
+            "/admin/reserves-spv-baseline",
+            "/admin/unl-refresh",
+            "/admin/unl-policy",
+        ] {
+            let r = c
+                .post(format!("{base}{route}"))
+                .body(b"{}".to_vec())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status().as_u16(),
+                401,
+                "{route} answered {} to an unsigned request — it is NOT behind the layer",
+                r.status()
+            );
+        }
+    }
+
+    /// An EMPTY allowlist serves nothing, end to end: the surface must not come up open because
+    /// its operator set was not populated.
+    #[tokio::test]
+    async fn an_empty_allowlist_serves_nothing() {
+        let body = br#"{"probe":true}"#;
+        let (headers, _) = operator_headers("POST", "/admin/membership-change", body);
+        let base = serve(vec![]).await;
+        let r = reqwest::Client::new()
+            .post(format!("{base}/admin/membership-change"))
+            .headers(headers)
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 403);
     }
 
     /// The partial-outcome messages tell the operator to "retry the failed nodes".

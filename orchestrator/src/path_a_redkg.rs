@@ -211,55 +211,14 @@ pub fn router(state: Arc<AdminState>) -> Router {
         // Q1: the allowlist is a PRECONDITION to serving this surface, and loopback is a
         // mitigation rather than the control, because a co-located process or an SSRF reaches
         // loopback.
+        // APPLIED TO THE WHOLE ROUTER, not to the Safe routes, so a route ADDED here later
+        // inherits the check instead of needing to remember it. The middleware itself now
+        // lives in auth.rs (`operator_only`), shared with the other admin surfaces, because a
+        // per-module copy is how membership-change ended up unguarded while this one was fixed.
         .layer(axum::middleware::from_fn_with_state(
             operators.clone(),
-            operator_only,
+            crate::auth::operator_only,
         ))
-}
-
-/// Refuse anything that is not a signed request from a cluster operator.
-///
-/// Takes the allowlist as its own state rather than reading it off `AdminState`, because two
-/// of the six routes are `merge`d as stateless sub-routers and would otherwise be outside it.
-async fn operator_only(
-    axum::extract::State(operators): axum::extract::State<Arc<Vec<String>>>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    let method = request.method().as_str().to_string();
-    let uri = request.uri().path().to_string();
-    let headers = request.headers().clone();
-    let (parts, body) = request.into_parts();
-    // The body must be buffered because the signature covers it. 1 MiB is the same bound the
-    // main app's auth layer uses.
-    let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"status":"error","message":"failed to read body"})),
-            )
-                .into_response()
-        }
-    };
-    if let Err((code, msg)) =
-        crate::auth::verify_operator_request(&headers, &method, &body_bytes, &uri, &operators)
-    {
-        // Logged with the route and the reason: a refusal nobody can read is how this surface
-        // came to look protected while it asked for nothing.
-        warn!(route = %uri, code, reason = %msg, "admin surface REFUSED a request");
-        return (
-            StatusCode::from_u16(code).unwrap_or(StatusCode::FORBIDDEN),
-            Json(serde_json::json!({"status":"error","message":msg})),
-        )
-            .into_response();
-    }
-    next.run(axum::extract::Request::from_parts(
-        parts,
-        axum::body::Body::from(body_bytes),
-    ))
-    .await
 }
 
 /// Bind a 127.0.0.1-only admin HTTP listener. Errors if `listen_addr`
