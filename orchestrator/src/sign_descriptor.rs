@@ -130,6 +130,12 @@ pub fn sign_descriptor(
     signers: &[SignerEntry],
     quorum: u32,
     new_member_mrenclave: &[u8; 32],
+    // The gov pub the key must derive to — the enclave verifies against the pub BAKED into its
+    // measurement. Defaults (via the CLI) to the production BAKED_GOV_PUB; set to a test pub ONLY
+    // for a test measurement (M_test) with a throwaway key. Keeps the wrong-key self-check — it is
+    // parameterised, not removed: signing with a key that does not match the TARGET measurement's
+    // baked pub still refuses.
+    expect_gov_pub: &[u8; 32],
 ) -> Result<([u8; 32], [u8; 64])> {
     let set_hash = compute_set_hash(signers, quorum);
     let digest = compute_membership_descriptor_digest(
@@ -144,13 +150,13 @@ pub fn sign_descriptor(
     let seed = parse_openssh_ed25519_seed(key_pem)?;
     let sk = SigningKey::from_bytes(&seed);
     let derived_pub = sk.verifying_key().to_bytes();
-    if derived_pub != BAKED_GOV_PUB {
+    if derived_pub != *expect_gov_pub {
         bail!(
-            "this key is NOT the baked governance key — its public key {} does not match the one \
-             the enclave verifies against ({}). Refusing to sign; a signature by the wrong key \
-             would fail-close in every node's enclave.",
+            "this key is NOT the expected governance key — its public key {} does not match the one \
+             the target enclave verifies against ({}). Refusing to sign; a signature by the wrong \
+             key would fail-close in every node's enclave.",
             hex::encode(derived_pub),
-            hex::encode(BAKED_GOV_PUB)
+            hex::encode(expect_gov_pub)
         );
     }
     // RAW ed25519 over the 32-byte digest — exactly what crypto_ed25519_check verifies in-enclave.
@@ -242,10 +248,10 @@ mod tests {
                 weight: 1,
             },
         ];
-        let err = sign_descriptor(&pem, 3, &escrow, 1, &prev, &signers, 2, &member)
+        let err = sign_descriptor(&pem, 3, &escrow, 1, &prev, &signers, 2, &member, &BAKED_GOV_PUB)
             .expect_err("a non-governance key must be refused");
         assert!(
-            format!("{err}").contains("NOT the baked governance key"),
+            format!("{err}").contains("NOT the expected governance key"),
             "the refusal must say the key is wrong: {err}"
         );
     }
