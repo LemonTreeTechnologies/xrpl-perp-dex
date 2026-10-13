@@ -300,6 +300,10 @@ pub async fn corpus_genesis(
         escrow,
         genesis_signers?,
         quorum,
+        // (b)/(B) Finding 2: the corpus supplies no baked-gov-key genesis descriptor. On a pre-(b)
+        // enclave this is a no-op (genesis consent is not (b)-gated); on a (b)/M_f enclave the
+        // founding fail-closes here — a (b) corpus run must author a gov descriptor first (follow-up).
+        Vec::new(),
         &collector,
         &applier,
     )

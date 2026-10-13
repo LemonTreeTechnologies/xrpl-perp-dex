@@ -445,20 +445,27 @@ pub async fn run_genesis_bootstrap(
     escrow: [u8; 20],
     genesis_signers: Vec<SignerEntry>,
     genesis_quorum: u32,
+    // decision (b)/(B) Finding 2: the baked-gov-key descriptor signature(s) over the GENESIS
+    // founding set (op=SET, epoch 1, all-zero sentinel prev, all-zero member), produced offline by
+    // the operator's sign-descriptor subcommand with the governance key. Threaded into the founding
+    // consent so each node's ecall_sign_membership_consent (genesis branch, EDIT 1) authorises the
+    // founding set against the baked gov key. Empty → the enclave FAIL-CLOSES (no gov authority at
+    // genesis), never a silent accept.
+    genesis_descriptor_sigs: Vec<u8>,
     collector: &dyn MembershipBundleCollector,
     applier: &dyn ClusterGenesisApplier,
 ) -> Result<MembershipChangeOutcome> {
     let statement = prepare_statement(
         escrow,
         /* current_epoch */ 0,
-        /* current_epoch_digest */ [0u8; 32],
+        /* current_epoch_digest = the all-zero GENESIS SENTINEL prev_epoch_hash */ [0u8; 32],
         genesis_signers,
         genesis_quorum,
-        /* op: genesis seals the initial set via the seal-initial path, not the consent
-        descriptor gate, so a SET op with no member/sigs is the correct no-descriptor shape */
+        /* op: genesis founds a wholesale SET; the gov descriptor is over (SET, epoch 1, zero
+        sentinel prev, zero member) — matching the enclave genesis consent branch + seal-initial. */
         MEMBERSHIP_DESC_OP_SET,
         [0u8; 32],
-        Vec::new(),
+        genesis_descriptor_sigs,
     )
     .map_err(|e| anyhow!("prepare genesis statement: {e:?}"))?;
 
@@ -860,6 +867,7 @@ mod tests {
             [0xAA; 20],
             vec![entry(0x01, 1), entry(0x02, 2)],
             2,
+            vec![0u8; 64], // (b) genesis gov descriptor sig (mock collector does not verify it)
             &collector,
             &applier,
         )
@@ -892,6 +900,7 @@ mod tests {
             [0xAA; 20],
             vec![entry(0x01, 1), entry(0x02, 1)],
             99, // > sum of weights
+            Vec::new(), // quorum is rejected before the descriptor matters
             &collector,
             &applier,
         )

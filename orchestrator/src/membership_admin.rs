@@ -391,10 +391,16 @@ async fn drive_genesis(
     let collector = LibP2PMembershipCollector::new(state.membership_epoch_tx.clone());
     let applier =
         LibP2PMembershipApplier::new(state.membership_apply_tx.clone(), state.cluster_size);
+    // (b)/(B) Finding 2: the baked-gov-key genesis descriptor signature(s), produced offline by
+    // the operator's sign-descriptor subcommand (op=SET, epoch 1, zero sentinel prev, founding set).
+    // Empty/absent → the enclave fail-closes the founding (no gov authority), never a silent accept.
+    let genesis_descriptor_sigs: Vec<u8> =
+        hex::decode(req.descriptor_sigs_hex.trim_start_matches("0x")).unwrap_or_default();
     let outcome = run_genesis_bootstrap(
         state.escrow,
         genesis_signers,
         req.quorum,
+        genesis_descriptor_sigs,
         &collector,
         &applier,
     )
