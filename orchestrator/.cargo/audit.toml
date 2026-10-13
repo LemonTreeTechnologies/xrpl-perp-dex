@@ -23,4 +23,19 @@ ignore = [
     # ruint 1.17 — incorrect Uint shift overflow flags. Fix is ruint 1.20, whose
     # MSRV (rustc 1.90) exceeds our 1.88 CI baseline. Revisit on a toolchain bump.
     "RUSTSEC-2026-0220",
+    # quinn-proto 0.11.15 — five QUIC-transport advisories (2026-10). NOT COMPILED
+    # into the orchestrator: it is in Cargo.lock's full graph but reached only via
+    # feature-gated-OFF paths — libp2p is declared default-features=false without
+    # "quic" (transport is .with_tcp), and reqwest without "http3". Verified by
+    # ARTIFACT, not grep: `cargo tree -i quinn-proto` with our enabled features
+    # resolves to nothing while `-i libp2p-tcp` resolves (positive control), and no
+    # *quinn* rlib is built in target/ while liblibp2p*.rlib are. So the advisories
+    # are not in the binary. No patched version is reachable without bumping libp2p
+    # itself (0.11.15 is the latest within its pin) — not worth a libp2p ripple for a
+    # non-compiled crate. Revisit (and prefer a real bump) on the next libp2p bump.
+    "RUSTSEC-2026-0338",
+    "RUSTSEC-2026-0339",
+    "RUSTSEC-2026-0340",
+    "RUSTSEC-2026-0341",
+    "RUSTSEC-2026-0342",
 ]

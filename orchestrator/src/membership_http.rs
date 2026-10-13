@@ -682,6 +682,9 @@ mod tests {
             [0xBB; 32],
             vec![entry(0x01, 1), entry(0x02, 2)],
             2,
+            crate::membership_coordinator::MEMBERSHIP_DESC_OP_SET,
+            [0u8; 32],
+            vec![],
         )
         .expect("valid")
     }
@@ -692,7 +695,17 @@ mod tests {
     /// caller-supplied, so a mismatch is unrepresentable on the wire.
     #[test]
     fn bootstrap_attested_request_is_self_attesting_and_in_sync() {
-        let st = prepare_statement([0xAA; 20], 0, [0u8; 32], vec![entry(0x01, 1)], 1).expect("ok");
+        let st = prepare_statement(
+            [0xAA; 20],
+            0,
+            [0u8; 32],
+            vec![entry(0x01, 1)],
+            1,
+            crate::membership_coordinator::MEMBERSHIP_DESC_OP_SET,
+            [0u8; 32],
+            vec![],
+        )
+        .expect("ok");
         let body = build_bootstrap_attested_request(&st, &[0xBE, 0xEF]);
 
         assert_eq!(body["escrow_account_id"], "aa".repeat(20));

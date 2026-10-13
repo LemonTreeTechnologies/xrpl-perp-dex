@@ -413,6 +413,9 @@ mod tests {
                 weight: 1,
             }],
             1,
+            crate::membership_coordinator::MEMBERSHIP_DESC_OP_SET,
+            [0u8; 32],
+            vec![],
         )
         .unwrap();
         let out = applier.apply_seal(&st, &[0xDE, 0xAD]).await.unwrap();
@@ -468,6 +471,9 @@ mod tests {
                 weight: 1,
             }],
             1,
+            crate::membership_coordinator::MEMBERSHIP_DESC_OP_SET,
+            [0u8; 32],
+            vec![],
         )
         .unwrap();
         let out = applier.apply_seal(&st, &[0x00]).await.unwrap();

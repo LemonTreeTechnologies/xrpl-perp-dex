@@ -48,6 +48,7 @@ mod safe_governance; // #131 Safe owner-management calldata + signature ordering
 mod safe_projection; // #131 the Safe owner set as a projection of sealed membership
 mod session_key_revoke; // rotate a leaked session key out of existence, with a live-key guard
 pub mod shard_router;
+mod sign_descriptor; // decision (b): operator signs a membership transition descriptor digest
 mod signerlist_update;
 mod singleton;
 mod spv_proof; // AC-BASE-2″ P2-d — XRPL SPV proof builder/fetcher
@@ -435,6 +436,43 @@ enum Command {
         /// discarding it. Only when the account must remain drivable.
         #[arg(long)]
         save_new: Option<PathBuf>,
+    },
+
+    /// decision (b): sign a membership-transition DESCRIPTOR with the governance key, producing
+    /// the `descriptor_sigs` that `/admin/membership-change` carries to each node's enclave
+    /// consent. The enclave recomputes this digest in-enclave and verifies the signature against
+    /// the BAKED governance key, so a signature from the wrong key — or over the wrong fields —
+    /// is refused there. This tool computes the digest EXACTLY as the enclave does (pinned
+    /// cross-language) and refuses outright if the key file does not derive to the baked pub.
+    SignDescriptorDigest {
+        /// The governance OpenSSH private key (ed25519, unencrypted for the testnet ceremony),
+        /// e.g. `~/.config/perp-roster/operator.key`. A FILE, never an argv value.
+        #[arg(long)]
+        key_file: PathBuf,
+        /// Transition kind: `add`, `remove`, or `set`.
+        #[arg(long)]
+        op: String,
+        /// The cluster escrow r-address (the transition is bound to it).
+        #[arg(long)]
+        escrow: String,
+        /// The epoch this transition moves TO (= current sealed epoch + 1). Read it from the
+        /// cluster; a wrong value is refused in-enclave (chain check).
+        #[arg(long)]
+        proposed_epoch: u64,
+        /// 32-byte hash-chain link to the CURRENT epoch, hex. Must equal the node's sealed epoch
+        /// digest or the enclave refuses (-43).
+        #[arg(long)]
+        prev_epoch_hash: String,
+        /// The full proposed signer set as r-addresses (equal weight 1 each, cluster convention).
+        /// Repeat the flag per signer. Used to compute the set hash the descriptor binds.
+        #[arg(long = "signer")]
+        signers: Vec<String>,
+        /// The proposed SignerQuorum.
+        #[arg(long)]
+        quorum: u32,
+        /// For `add`: the new member's MRENCLAVE, hex. Omit (or all-zero) for `remove`/`set`.
+        #[arg(long)]
+        new_member_mrenclave: Option<String>,
     },
 
     /// Phase 2.1c-E — node-local deploy. Each operator runs this on
@@ -984,6 +1022,75 @@ async fn main() -> Result<()> {
                 save_new.as_ref(),
             )
             .await;
+        }
+        Some(Command::SignDescriptorDigest {
+            key_file,
+            op,
+            escrow,
+            proposed_epoch,
+            prev_epoch_hash,
+            signers,
+            quorum,
+            new_member_mrenclave,
+        }) => {
+            let op_code = match op.to_ascii_lowercase().as_str() {
+                "add" => membership_coordinator::MEMBERSHIP_DESC_OP_ADD,
+                "remove" => membership_coordinator::MEMBERSHIP_DESC_OP_REMOVE,
+                "set" => membership_coordinator::MEMBERSHIP_DESC_OP_SET,
+                other => anyhow::bail!("--op must be add|remove|set, got {other:?}"),
+            };
+            let escrow_id = xrpl_signer::decode_xrpl_address(&escrow)
+                .context("--escrow must be a valid XRPL r-address")?;
+            let prev = {
+                let b = hex::decode(prev_epoch_hash.trim_start_matches("0x"))
+                    .context("--prev-epoch-hash must be hex")?;
+                anyhow::ensure!(b.len() == 32, "--prev-epoch-hash must be 32 bytes");
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                a
+            };
+            let member = {
+                let mut a = [0u8; 32];
+                if let Some(h) = new_member_mrenclave.as_ref() {
+                    let b = hex::decode(h.trim_start_matches("0x"))
+                        .context("--new-member-mrenclave must be hex")?;
+                    anyhow::ensure!(b.len() == 32, "--new-member-mrenclave must be 32 bytes");
+                    a.copy_from_slice(&b);
+                }
+                a
+            };
+            if op_code == membership_coordinator::MEMBERSHIP_DESC_OP_ADD && member == [0u8; 32] {
+                anyhow::bail!("--op add requires a non-zero --new-member-mrenclave");
+            }
+            let mut entries = Vec::with_capacity(signers.len());
+            for r in &signers {
+                entries.push(membership_canonical::SignerEntry {
+                    account_id: xrpl_signer::decode_xrpl_address(r)
+                        .with_context(|| format!("--signer {r:?} is not a valid r-address"))?,
+                    weight: 1,
+                });
+            }
+            let key_pem = std::fs::read_to_string(&key_file)
+                .with_context(|| format!("cannot read governance key {}", key_file.display()))?;
+            let (digest, sig) = sign_descriptor::sign_descriptor(
+                &key_pem,
+                op_code,
+                &escrow_id,
+                proposed_epoch,
+                &prev,
+                &entries,
+                quorum,
+                &member,
+            )?;
+            println!("descriptor_digest: {}", hex::encode(digest));
+            println!("descriptor_sigs:   {}", hex::encode(sig));
+            println!();
+            println!("Paste `descriptor_sigs` (and op / new_member_mrenclave) into the");
+            println!(
+                "/admin/membership-change request. For an M-of-N (S2) descriptor, concatenate"
+            );
+            println!("each operator's 64-byte signature in descriptor_sigs.");
+            return Ok(());
         }
         Some(Command::SignerlistBootstrapRotate {
             admin_url,

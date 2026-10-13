@@ -32,6 +32,10 @@ pub struct SignerEntry {
 /// prefix (REQ-β1.1 §2 / O-β1-3).
 const MEMBERSHIP_EPOCH_DOMAIN: &[u8] = b"PERP_MEMBERSHIP_EPOCH_v1"; // 24 bytes
 const EPOCH_DIGEST_DOMAIN: &[u8] = b"PERP_EPOCH_DIGEST_v1"; // 20 bytes
+/// decision (b): the descriptor digest domain. MUST be byte-identical to the enclave's
+/// `kMembershipDescriptorDomain` in membership_descriptor.cpp — the enclave recomputes this digest
+/// and verifies the operator signature against it, so any drift fails EVERY operator signature.
+const MEMBERSHIP_DESCRIPTOR_DOMAIN: &[u8] = b"PERP_MEMBERSHIP_DESCRIPTOR_v1"; // 29 bytes
 
 /// Canonical set hash. The input order is irrelevant — a copy is sorted
 /// ascending by `account_id` (mirrors the XRPL `Signers[]` AccountID sort).
@@ -84,9 +88,72 @@ pub fn compute_membership_message_hash(
     h.finalize().into()
 }
 
+/// decision (b): the canonical digest of a membership transition DESCRIPTOR — the bytes an
+/// operator signs with the governance key and the enclave recomputes in `ecall_sign_membership_
+/// consent`. Byte-for-byte mirror of the enclave's `compute_membership_descriptor_digest`
+/// (membership_descriptor.cpp): distinct domain from the consent message hash, little-endian
+/// scalar, the op and the member-being-added bound. Pinned cross-language in the tests.
+pub fn compute_membership_descriptor_digest(
+    op: u8,
+    escrow: &[u8; 20],
+    proposed_epoch: u64,
+    prev_epoch_hash: &[u8; 32],
+    new_set_hash: &[u8; 32],
+    new_member_mrenclave: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(MEMBERSHIP_DESCRIPTOR_DOMAIN);
+    h.update([op]);
+    h.update(escrow);
+    h.update(proposed_epoch.to_le_bytes());
+    h.update(prev_epoch_hash);
+    h.update(new_set_hash);
+    h.update(new_member_mrenclave);
+    h.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CROSS-LANGUAGE PIN (decision (b)). The descriptor digest the operator CLI signs must be
+    /// byte-identical to the one the enclave recomputes, or every operator signature fail-closes
+    /// and looks like "nobody signed". This vector's expected value was produced by the ENCLAVE
+    /// C++ `compute_membership_descriptor_digest` (EthSignerEnclave host build) for the SAME
+    /// inputs: op=1 (ADD), escrow=0x10×20, epoch=7, prev=0x20×32, set_hash=0x30×32, member=0x40×32.
+    /// If the Rust and C++ encodings ever drift, this fails loudly instead of silently breaking
+    /// consent. Regenerate the expected value from the C++ side if the canonical form changes.
+    #[test]
+    fn descriptor_digest_matches_the_enclave_cpp_vector() {
+        let escrow = [0x10u8; 20];
+        let prev = [0x20u8; 32];
+        let set_hash = [0x30u8; 32];
+        let member = [0x40u8; 32];
+        let d = compute_membership_descriptor_digest(1, &escrow, 7, &prev, &set_hash, &member);
+        assert_eq!(
+            hex::encode(d),
+            "06eb009cb9e8c32b87f1727665b4519550584eac6a24e5f3a143e1a93daa04ae",
+            "Rust descriptor digest diverged from the enclave C++ — every operator signature \
+             would fail-close. Fix the canonical encoding, do not update this vector blindly."
+        );
+    }
+
+    /// Domain separation (the enclave side asserts the same): the descriptor digest must NOT equal
+    /// the consent message hash over the same core, so a consent signature can never authorize a
+    /// descriptor.
+    #[test]
+    fn descriptor_digest_is_distinct_from_the_consent_hash() {
+        let escrow = [0x10u8; 20];
+        let prev = [0x20u8; 32];
+        let set_hash = [0x30u8; 32];
+        let member = [0u8; 32];
+        let desc = compute_membership_descriptor_digest(3, &escrow, 7, &prev, &set_hash, &member);
+        let consent = compute_membership_message_hash(&escrow, 7, &prev, &set_hash);
+        assert_ne!(
+            desc, consent,
+            "descriptor digest must be domain-separated from consent"
+        );
+    }
 
     fn entry(fill: u8, weight: u32) -> SignerEntry {
         SignerEntry {
