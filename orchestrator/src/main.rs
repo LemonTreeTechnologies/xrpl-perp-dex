@@ -473,6 +473,11 @@ enum Command {
         /// For `add`: the new member's MRENCLAVE, hex. Omit (or all-zero) for `remove`/`set`.
         #[arg(long)]
         new_member_mrenclave: Option<String>,
+        /// TEST-ONLY override: the expected governance pub (hex) the key is self-checked against,
+        /// = the pub BAKED into the TARGET enclave measurement. Defaults to the production baked
+        /// pub. Set ONLY for a test measurement (M_test) founded with a throwaway gov key.
+        #[arg(long)]
+        expect_gov_pub: Option<String>,
     },
 
     /// Phase 2.1c-E — node-local deploy. Each operator runs this on
@@ -566,6 +571,12 @@ enum Command {
         /// use it" are different states. The caller restarts both nodes between the two phases.
         #[arg(long)]
         stop_after_genesis: bool,
+        /// (b)/(B): the TEST gov key (ed25519 OpenSSH) for a (b)-gated measurement (e.g. the M_test
+        /// rehearsal). The corpus signs the genesis descriptor internally with it after generating
+        /// the founding pool. Omit for a pre-(b) corpus run. THROWAWAY test key only — never the
+        /// real perp gov key in automation.
+        #[arg(long)]
+        genesis_gov_key: Option<PathBuf>,
     },
 }
 
@@ -910,6 +921,7 @@ async fn main() -> Result<()> {
             signers,
             skip_genesis,
             stop_after_genesis,
+            genesis_gov_key,
         }) => {
             return cli_upgrade_corpus_ceremony(
                 &old_url,
@@ -919,6 +931,7 @@ async fn main() -> Result<()> {
                 &signers,
                 skip_genesis,
                 stop_after_genesis,
+                genesis_gov_key,
             )
             .await;
         }
@@ -1032,6 +1045,7 @@ async fn main() -> Result<()> {
             signers,
             quorum,
             new_member_mrenclave,
+            expect_gov_pub,
         }) => {
             let op_code = match op.to_ascii_lowercase().as_str() {
                 "add" => membership_coordinator::MEMBERSHIP_DESC_OP_ADD,
@@ -1072,6 +1086,17 @@ async fn main() -> Result<()> {
             }
             let key_pem = std::fs::read_to_string(&key_file)
                 .with_context(|| format!("cannot read governance key {}", key_file.display()))?;
+            let expect_pub: [u8; 32] = match expect_gov_pub.as_ref() {
+                None => sign_descriptor::BAKED_GOV_PUB,
+                Some(h) => {
+                    let b = hex::decode(h.trim_start_matches("0x"))
+                        .context("--expect-gov-pub must be hex")?;
+                    anyhow::ensure!(b.len() == 32, "--expect-gov-pub must be 32 bytes");
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&b);
+                    a
+                }
+            };
             let (digest, sig) = sign_descriptor::sign_descriptor(
                 &key_pem,
                 op_code,
@@ -1081,6 +1106,7 @@ async fn main() -> Result<()> {
                 &entries,
                 quorum,
                 &member,
+                &expect_pub,
             )?;
             println!("descriptor_digest: {}", hex::encode(digest));
             println!("descriptor_sigs:   {}", hex::encode(sig));
@@ -3093,6 +3119,7 @@ async fn cli_upgrade_corpus_ceremony(
     signer_specs: &[String],
     skip_genesis: bool,
     stop_after_genesis: bool,
+    genesis_gov_key: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use anyhow::{bail, Context};
     use upgrade_corpus::CorpusSigner;
@@ -3148,8 +3175,15 @@ async fn cli_upgrade_corpus_ceremony(
     if skip_genesis {
         println!("corpus: genesis SKIPPED on request");
     } else {
-        upgrade_corpus::corpus_genesis(escrow, &signers, signers.len() as u32, old_url, new_url)
-            .await?;
+        upgrade_corpus::corpus_genesis(
+            escrow,
+            &signers,
+            signers.len() as u32,
+            old_url,
+            new_url,
+            genesis_gov_key.clone(),
+        )
+        .await?;
         println!("corpus: founding epoch sealed on both nodes");
     }
 
