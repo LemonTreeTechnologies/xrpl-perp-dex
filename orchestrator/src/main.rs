@@ -40,6 +40,7 @@ mod path_a_redkg;
 mod perp_client;
 mod pool_path_a_client;
 mod price_feed;
+mod price_publisher; // signs price quotes + assembles the enclave's XPQ1 blob
 mod quorum_bundle;
 mod rate_limit;
 mod reserves_baseline; // AC-BASE — one-time custody-baseline ceremony (hash + recovery + bundle)
@@ -2835,9 +2836,80 @@ async fn main() -> Result<()> {
     loop {
         tick.tick().await;
 
-        // Sequencer-only work: price feed, deposits, liquidations, funding.
-        // Validators only replay batches from the sequencer (handled above).
-        if !is_sequencer.load(Ordering::Relaxed) {
+        // Loaded ONCE per tick: the role watcher runs in another task and can flip
+        // this between statements, so read it to a local and use that local for both
+        // the price-tick decision below and the sequencer gate, rather than loading
+        // twice and racing within a single iteration.
+        let is_seq = is_sequencer.load(Ordering::Relaxed);
+
+        // ── Price tick — shared by ALL nodes ─────────────────────────────────
+        // Fetch the price and derive the live price path at most ONCE per interval,
+        // BEFORE the sequencer gate, so validators reach the per-node signed push.
+        // The timer advances here, so neither the per-node signed push (all nodes)
+        // nor the sequencer-only operator-feed push below can double-fetch or
+        // double-advance it. `priced_this_tick` carries the single fetched price
+        // into the sequencer-only section; `None` means no fetch happened this tick.
+        let mut priced_this_tick: Option<f64> = None;
+        if last_price_update.elapsed() >= price_interval {
+            // DERIVE which price path is live; do not carry our own copy of the
+            // switch. Publishers are anchored by a RECOMPILE of the enclave, and
+            // that same constant turns ecall_perp_update_price into a -94 refusal
+            // — so a config flag here would have to agree with a constant we
+            // cannot see, and the two would eventually disagree. Ask instead.
+            //
+            // Cached because it only changes across an enclave rebuild, and a
+            // status call on every price tick would be pure noise. Unknown means
+            // "we have not been told yet", not "operator feed": pushing the raw
+            // feed at an enclave that has moved on is how the mark goes stale
+            // while every call still returns a tidy error.
+            if live_price_path.is_none() {
+                match perp.price_publisher_status().await {
+                    Ok(v) => match price_feed::live_price_path(&v) {
+                        Ok(p) => {
+                            info!(path = ?p, "price path derived from the enclave");
+                            live_price_path = Some(p);
+                        }
+                        Err(e) => warn!("publisher status unreadable: {e}"),
+                    },
+                    // An older enclave has no such route. That is not an error: it
+                    // predates the signed track entirely, so the operator feed IS
+                    // the path, and saying so once beats asking forever.
+                    Err(e) => {
+                        info!(
+                            "no publisher-status route ({e}) — treating this \
+                             enclave as operator-fed"
+                        );
+                        live_price_path = Some(price_feed::LivePricePath::OperatorFeed);
+                    }
+                }
+            }
+
+            // Who needs a price this tick? The sequencer ALWAYS does (mark/ws, and
+            // current_price feeds liquidation + funding). A validator needs one ONLY
+            // on the signed-median path, to sign its per-node quote — in operator-feed
+            // mode a validator fetches nothing, exactly as before this change.
+            let want_price =
+                is_seq || live_price_path == Some(price_feed::LivePricePath::SignedMedian);
+            if want_price {
+                match price_feed::fetch_xrp_price(&http_client).await {
+                    Ok(price) => {
+                        priced_this_tick = Some(price);
+                        // PER-NODE signed-median push: runs on EVERY node (sequencer
+                        // AND validators). The operator-feed push stays sequencer-only,
+                        // in the gated section below.
+                        if live_price_path == Some(price_feed::LivePricePath::SignedMedian) {
+                            push_signed_median_quote(&perp, price).await;
+                        }
+                    }
+                    Err(e) => warn!("price fetch failed: {:#}", e),
+                }
+            }
+            last_price_update = Instant::now();
+        }
+
+        // Sequencer-only work: operator-feed price push, deposits, liquidations,
+        // funding, reserves. Validators only replay batches from the sequencer.
+        if !is_seq {
             // Validators still save their own sealed state periodically
             if last_state_save.elapsed() >= STATE_SAVE_INTERVAL {
                 if let Err(e) = perp.save_state().await {
@@ -2853,79 +2925,40 @@ async fn main() -> Result<()> {
             .unwrap()
             .as_secs();
 
-        // Price update
-        if last_price_update.elapsed() >= price_interval {
-            match price_feed::fetch_xrp_price(&http_client).await {
-                Ok(price) => {
-                    current_price = price;
-                    let index_fp8 = float_to_fp8_string(price);
-                    // Mark price = orderbook mid if available, else index
-                    let mark = match app_state.engine.ticker().await {
-                        (_, _, Some(mid)) => mid.to_f64(),
-                        _ => price,
-                    };
-                    let mark_fp8 = float_to_fp8_string(mark);
-                    // DERIVE which price path is live; do not carry our own copy of the
-                    // switch. Publishers are anchored by a RECOMPILE of the enclave, and
-                    // that same constant turns ecall_perp_update_price into a -94 refusal
-                    // — so a config flag here would have to agree with a constant we
-                    // cannot see, and the two would eventually disagree. Ask instead.
-                    //
-                    // Cached because it only changes across an enclave rebuild, and a
-                    // status call on every price tick would be pure noise. Unknown means
-                    // "we have not been told yet", not "operator feed": pushing the raw
-                    // feed at an enclave that has moved on is how the mark goes stale
-                    // while every call still returns a tidy error.
-                    if live_price_path.is_none() {
-                        match perp.price_publisher_status().await {
-                            Ok(v) => match price_feed::live_price_path(&v) {
-                                Ok(p) => {
-                                    info!(path = ?p, "price path derived from the enclave");
-                                    live_price_path = Some(p);
-                                }
-                                Err(e) => warn!("publisher status unreadable: {e}"),
-                            },
-                            // An older enclave has no such route. That is not an error: it
-                            // predates the signed track entirely, so the operator feed IS
-                            // the path, and saying so once beats asking forever.
-                            Err(e) => {
-                                info!(
-                                    "no publisher-status route ({e}) — treating this \
-                                     enclave as operator-fed"
-                                );
-                                live_price_path = Some(price_feed::LivePricePath::OperatorFeed);
-                            }
-                        }
+        // Operator-feed price push + local mark/ws — SEQUENCER-ONLY, reusing the one
+        // price fetched above this tick (no second fetch, no second timer advance).
+        if let Some(price) = priced_this_tick {
+            current_price = price;
+            let index_fp8 = float_to_fp8_string(price);
+            // Mark price = orderbook mid if available, else index
+            let mark = match app_state.engine.ticker().await {
+                (_, _, Some(mid)) => mid.to_f64(),
+                _ => price,
+            };
+            let mark_fp8 = float_to_fp8_string(mark);
+            match live_price_path {
+                Some(price_feed::LivePricePath::OperatorFeed) => {
+                    if let Err(e) = perp.update_price(&mark_fp8, &index_fp8, now_ts).await {
+                        error!("price update failed: {:#}", e);
                     }
-                    match live_price_path {
-                        Some(price_feed::LivePricePath::OperatorFeed) => {
-                            if let Err(e) = perp.update_price(&mark_fp8, &index_fp8, now_ts).await {
-                                error!("price update failed: {:#}", e);
-                            }
-                        }
-                        Some(price_feed::LivePricePath::SignedMedian) => {
-                            // Publishers are anchored: this feed is no longer allowed to
-                            // set the mark, and pretending otherwise would earn -94 every
-                            // tick. Signed quotes arrive by their own path; there is
-                            // nothing for this loop to push.
-                            tracing::debug!(
-                                "signed-median path is live; not pushing the operator feed"
-                            );
-                        }
-                        None => {}
-                    }
-                    app_state
-                        .mark_price
-                        .store(crate::types::FP8::from_f64(mark).raw(), Ordering::Relaxed);
-                    let _ = app_state.ws_tx.send(WsEvent::Ticker {
-                        mark_price: mark_fp8,
-                        index_price: index_fp8,
-                        timestamp: now_ts,
-                    });
                 }
-                Err(e) => warn!("price fetch failed: {:#}", e),
+                Some(price_feed::LivePricePath::SignedMedian) => {
+                    // Publishers are anchored: the operator feed is no longer allowed
+                    // to set the mark, and pretending otherwise would earn -94 every
+                    // tick. The signed quotes were already pushed per-node above; there
+                    // is nothing for this sequencer-only block to push.
+                    tracing::debug!("signed-median path is live; not pushing the operator feed");
+                }
+                None => {}
             }
-            last_price_update = Instant::now();
+            app_state
+                .mark_price
+                .store(crate::types::FP8::from_f64(mark).raw(), Ordering::Relaxed);
+            let _ = app_state.ws_tx.send(WsEvent::Ticker {
+                mark_price: mark_fp8,
+                index_price: index_fp8,
+                timestamp: now_ts,
+            });
         }
 
         // Deposit scanning
@@ -3121,6 +3154,85 @@ async fn main() -> Result<()> {
             }
             last_state_save = Instant::now();
         }
+    }
+}
+
+/// XRPL testnet network id for signed price quotes.
+///
+/// = xrpl_anchor_network_id() = FNV-1a over the 6 baked anchored validator masters
+/// (enclave xrpl_anchored_validators.h); recompute if the validator anchor changes;
+/// a mismatch makes the enclave reject the quote with -93.
+const NETWORK_ID_TESTNET: u32 = 959_427_577;
+
+/// Market id for the signed price push. The enclave accepts any market_id and routes
+/// it; we sign and POST with the same value.
+const SIGNED_PRICE_MARKET_ID: u32 = 0;
+
+/// Per-node signed-median price push — the signed path's "own path".
+///
+/// Runs on EVERY node (sequencer AND validators) when the live price path is
+/// SignedMedian. It does NOT fetch a price of its own — the caller passes the one
+/// price already fetched this tick — then signs a quote bundle and POSTs it to the
+/// LOCAL enclave's median consumer (`update_price_signed`).
+///
+/// MECHANISM-PROOF ONLY: the N quotes are all signed by THIS node from the test keys
+/// in `PRICE_PUBLISHER_KEYS`. In production each quote comes from an INDEPENDENT
+/// publisher service; one node signing all N is a 1-of-1 costume that proves the
+/// enclave's verify+median+threshold mechanism, not publisher independence.
+async fn push_signed_median_quote(perp: &PerpClient, price: f64) {
+    // No key file configured => do nothing (a key is NEVER hardcoded). A node that
+    // should drive the signed feed sets PRICE_PUBLISHER_KEYS to its test-key JSON.
+    let keys_path = match std::env::var("PRICE_PUBLISHER_KEYS") {
+        Ok(p) if !p.is_empty() => p,
+        _ => {
+            warn!(
+                "signed-median path is live but PRICE_PUBLISHER_KEYS is unset; skipping the \
+                 per-node signed push (no key is ever hardcoded)"
+            );
+            return;
+        }
+    };
+
+    // price_fp8 = round(price * 1e8) via the crate's ONE float->fp8 conversion.
+    let price_fp8 = crate::types::FP8::from_f64(price).raw();
+
+    // publish_time: ripple-epoch seconds = unix_secs - 946_684_800. Subtract with
+    // saturating_sub, never a wrapping `-`: a clock before the ripple epoch (2000)
+    // is nonsense, and 0 lets the enclave reject it rather than us wrapping below
+    // zero. unix secs come from SystemTime as a u64, no cast.
+    let unix_now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => {
+            warn!("system clock is before the unix epoch; skipping the signed push");
+            return;
+        }
+    };
+    let publish_time = unix_now.saturating_sub(price_publisher::RIPPLE_EPOCH_OFFSET_SECS);
+
+    let blob = match price_publisher::test_sign_local_quotes(
+        &keys_path,
+        NETWORK_ID_TESTNET,
+        SIGNED_PRICE_MARKET_ID,
+        price_fp8,
+        publish_time,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("signed-median quote signing failed: {:#}", e);
+            return;
+        }
+    };
+
+    match perp.update_price_signed(&blob, SIGNED_PRICE_MARKET_ID).await {
+        // The enclave accepted the bundle and recomputed the median mark.
+        Ok(_) => {
+            info!(price_fp8, publish_time, "signed-median price accepted by the local enclave")
+        }
+        // Classify the common refusals so the log says WHICH gate rejected it:
+        //   -93  network/market id or a signature mismatch
+        //   -92  no attested clock yet (the signed path needs the clock running)
+        //    -7  NOT_ENOUGH distinct valid quotes to meet the threshold
+        Err(e) => warn!("signed-median push refused by the local enclave: {:#}", e),
     }
 }
 
