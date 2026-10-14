@@ -453,6 +453,33 @@ pub enum SigningMessage {
         /// and thus the cosigned message — diverges.
         excluded_hex: Vec<String>,
     },
+    /// #131 AC-BASE-2″ P2-c SPV baseline APPLY-broadcast. Parallels `MembershipApply`:
+    /// after the driver has assembled ONE 2-of-N cosignature bundle (via
+    /// `SpvBaselineRequest`) and asserted diversity, it broadcasts the SAME untrusted
+    /// proof + bundle to every node, and each node applies it to its OWN loopback enclave
+    /// (`reserves_spv_apply`). The enclave RE-VERIFIES the SPV proof and the 2-of-N bundle
+    /// in-enclave before sealing and has no role gate, so broadcasting the untrusted bytes
+    /// is safe — each node independently re-derives and seals its OWN `reserves_ledger_floor`
+    /// (the leader-only apply left validators unsealed → they later failed to arm with -84).
+    /// The enclaves are loopback-only (X-C1), so the apply CANNOT be an HTTP POST to a remote
+    /// enclave — it must ride p2p, each node applying locally.
+    ///
+    /// `request_id` MUST start with `"beta-apply-"` so Response (ack) routing forwards to the
+    /// apply collector's mpsc (multi-responder), exactly like `MembershipApply`.
+    SpvBaselineApply {
+        request_id: String,
+        requester_peer_id: String,
+        /// The full XSPV transport blob, lowercase hex (untrusted — re-verified in-enclave).
+        proof_blob_hex: String,
+        /// The assembled 2-of-N wire bundle `seal_verify_quorum_bundle_with_set` consumes, hex.
+        bundle_hex: String,
+        /// The diversity source fingerprints the sealed baseline marker records.
+        fingerprints: Vec<String>,
+        /// The agreed operator-capital excluded set (20-byte AccountID hex). MUST match what
+        /// the cosigners used, or the bound excluded_senders_hash — and the re-derived figure —
+        /// diverges.
+        excluded_hex: Vec<String>,
+    },
 }
 
 /// One signer in a β1 membership-epoch transition, as carried on the wire.
@@ -822,6 +849,28 @@ pub struct SpvBaselineRelay {
     pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
 }
 
+/// #131 AC-BASE-2″ P2-c outbound SPV-baseline APPLY-broadcast. The ceremony driver builds
+/// one after it has assembled the 2-of-N bundle + diversity fingerprints, sends it down
+/// `set_spv_baseline_apply_channel`; the run-loop applies locally + broadcasts
+/// `SpvBaselineApply` and forwards each node's ack `Response` here until all expected nodes
+/// ack or the window closes. Mirrors `MembershipApplyRelay` (seal the custody floor on EVERY
+/// node, not just the leader).
+#[derive(Debug)]
+pub struct SpvBaselineApplyRelay {
+    /// Unique id; MUST start with `"beta-apply-"` so ack routing forwards here.
+    pub request_id: String,
+    /// The full XSPV transport blob, lowercase hex (untrusted — re-verified in-enclave).
+    pub proof_blob_hex: String,
+    /// The assembled 2-of-N wire bundle, hex.
+    pub bundle_hex: String,
+    /// The diversity source fingerprints the sealed baseline marker records.
+    pub fingerprints: Vec<String>,
+    /// The agreed operator-capital excluded set (20-byte AccountID hex).
+    pub excluded_hex: Vec<String>,
+    /// Channel to receive per-node ack `Response`s.
+    pub responses_tx: tokio::sync::mpsc::Sender<SigningMessage>,
+}
+
 /// Per-node cosigner config: the LOCAL escrow this node holds custody for, and this
 /// node's OWN XRPL endpoint. `None` on a node = it never cosigns (fail-closed).
 ///
@@ -1127,6 +1176,10 @@ pub struct P2PNode {
     // validator-quorum-attested proof instead of a host figure)
     spv_baseline_rx: Option<mpsc::Receiver<SpvBaselineRelay>>,
     pending_spv_baseline: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
+    // #131 AC-BASE-2″ P2-c — SPV baseline APPLY-broadcast (mirrors membership_apply but
+    // seals the custody floor on EVERY node's loopback enclave, not just the leader's)
+    spv_baseline_apply_rx: Option<mpsc::Receiver<SpvBaselineApplyRelay>>,
+    pending_spv_baseline_apply: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
     // #131 §6 — UNL policy governance (quorum + freshness anchor)
     unl_policy_rx: Option<mpsc::Receiver<UnlPolicyRelay>>,
     pending_unl_policy: HashMap<String, tokio::sync::mpsc::Sender<SigningMessage>>,
@@ -1318,6 +1371,8 @@ impl P2PNode {
             pending_mrenclave_governance: HashMap::new(),
             spv_baseline_rx: None,
             pending_spv_baseline: HashMap::new(),
+            spv_baseline_apply_rx: None,
+            pending_spv_baseline_apply: HashMap::new(),
             unl_policy_rx: None,
             pending_unl_policy: HashMap::new(),
             unl_status_rx: None,
@@ -1478,6 +1533,16 @@ impl P2PNode {
     #[allow(dead_code)]
     pub fn set_membership_apply_channel(&mut self, rx: mpsc::Receiver<MembershipApplyRelay>) {
         self.membership_apply_rx = Some(rx);
+    }
+
+    /// #131 AC-BASE-2″ P2-c: wire the SPV baseline ceremony's apply-broadcast channel. The
+    /// driver sends one `SpvBaselineApplyRelay` once the 2-of-N bundle is assembled; the
+    /// run-loop applies it to the LOCAL enclave + broadcasts `SpvBaselineApply` and forwards
+    /// each node's ack `Response` back via `responses_tx`, so EVERY node seals its own
+    /// `reserves_ledger_floor` (not just the leader).
+    #[allow(dead_code)]
+    pub fn set_spv_baseline_apply_channel(&mut self, rx: mpsc::Receiver<SpvBaselineApplyRelay>) {
+        self.spv_baseline_apply_rx = Some(rx);
     }
 
     /// Set events publish channel (sequencer sends events to broadcast).
@@ -3064,6 +3129,67 @@ impl P2PNode {
         }
     }
 
+    /// #131 AC-BASE-2″ P2-c: apply an `SpvBaselineApply` broadcast to THIS node's LOCAL
+    /// enclave (loopback-only, X-C1). The enclave RE-VERIFIES the SPV proof + the 2-of-N
+    /// bundle in-enclave before sealing — nothing carried on the wire is trusted — so every
+    /// node independently re-derives and seals its OWN `reserves_ledger_floor` (the
+    /// leader-only apply left validators unsealed → they later failed to arm with -84).
+    /// `host_timestamp_ms` is this node's local wall-clock, sourced exactly as the ceremony
+    /// driver does; it is NOT part of the cosigned message hash (only the sealed marker's
+    /// timestamp), so per-node clocks are safe. The ack is a `Response` with `error: None`
+    /// on success — the same shape the apply collector reads — mirroring
+    /// `handle_membership_apply`.
+    async fn handle_spv_baseline_apply(
+        local_signer: &LocalSigner,
+        request_id: &str,
+        proof_blob_hex: &str,
+        bundle_hex: &str,
+        fingerprints: &[String],
+        excluded_hex: &[String],
+    ) -> SigningMessage {
+        // PerpClient::new enforces the loopback invariant (O-L4) and fails closed on a
+        // non-loopback base, so a misconfigured local_signer can never POST an apply to a
+        // remote enclave. local_signer.enclave_url is the `.../v1` base PerpClient expects.
+        let perp = match crate::perp_client::PerpClient::new(&local_signer.enclave_url) {
+            Ok(p) => p,
+            Err(e) => {
+                return Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("apply.spv-baseline: {e:#}"),
+                )
+            }
+        };
+        // Same host-clock source as the ceremony driver (drive_reserves_spv_baseline).
+        let host_timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        match perp
+            .reserves_spv_apply(
+                proof_blob_hex,
+                host_timestamp_ms,
+                bundle_hex,
+                fingerprints,
+                excluded_hex,
+            )
+            .await
+        {
+            Ok(_) => SigningMessage::Response {
+                request_id: request_id.to_string(),
+                signer_xrpl_address: local_signer.xrpl_address.clone(),
+                der_signature: None,
+                compressed_pubkey: None,
+                error: None, // ack: applied + custody floor sealed locally
+            },
+            Err(e) => Self::membership_sign_error(
+                local_signer,
+                request_id,
+                format!("apply.spv-baseline: {e:#}"),
+            ),
+        }
+    }
+
     async fn handle_signing_request(
         local_signer: &LocalSigner,
         escrow_xrpl_address: Option<&str>,
@@ -3248,6 +3374,7 @@ impl P2PNode {
         let mut membership_epoch_rx = self.membership_epoch_rx.take();
         let mut mrenclave_governance_rx = self.mrenclave_governance_rx.take();
         let mut spv_baseline_rx = self.spv_baseline_rx.take();
+        let mut spv_baseline_apply_rx = self.spv_baseline_apply_rx.take();
         let mut unl_policy_rx = self.unl_policy_rx.take();
         let mut unl_status_rx = self.unl_status_rx.take();
         let mut membership_apply_rx = self.membership_apply_rx.take();
@@ -3687,6 +3814,56 @@ impl P2PNode {
                     }
                 }
 
+                // #131 AC-BASE-2″ P2-c: SPV-baseline apply-broadcast. After the driver
+                // assembles ONE 2-of-N bundle, it broadcasts the SAME untrusted proof +
+                // bundle to all so every node re-verifies in-enclave and seals its OWN
+                // custody floor + acks (not just the leader). Mirrors membership-apply.
+                Some(relay) = async {
+                    match &mut spv_baseline_apply_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<SpvBaselineApplyRelay>>().await,
+                    }
+                } => {
+                    // The local node is also a member: gossipsub doesn't deliver to the
+                    // publisher, so apply locally too (the leader seals via THIS path).
+                    if let Some(ref local) = self.local_signer {
+                        let local_ack = Self::handle_spv_baseline_apply(
+                            local,
+                            &relay.request_id,
+                            &relay.proof_blob_hex,
+                            &relay.bundle_hex,
+                            &relay.fingerprints,
+                            &relay.excluded_hex,
+                        ).await;
+                        let _ = relay.responses_tx.send(local_ack).await;
+                    }
+
+                    let msg = SigningMessage::SpvBaselineApply {
+                        request_id: relay.request_id.clone(),
+                        requester_peer_id: self.peer_id.to_string(),
+                        proof_blob_hex: relay.proof_blob_hex.clone(),
+                        bundle_hex: relay.bundle_hex.clone(),
+                        fingerprints: relay.fingerprints.clone(),
+                        excluded_hex: relay.excluded_hex.clone(),
+                    };
+                    match self.publish_signing(&msg) {
+                        Ok(_) => {
+                            self.pending_spv_baseline_apply.insert(
+                                relay.request_id, relay.responses_tx);
+                        }
+                        Err(e) => {
+                            warn!("#131 spv-baseline-apply publish failed: {:#}", e);
+                            let _ = relay.responses_tx.send(SigningMessage::Response {
+                                request_id: relay.request_id,
+                                signer_xrpl_address: String::new(),
+                                der_signature: None,
+                                compressed_pubkey: None,
+                                error: Some(format!("P2P publish failed: {e}")),
+                            }).await;
+                        }
+                    }
+                }
+
                 // Publish state events (sequencer → validators)
                 Some(event) = async {
                     match &mut events_rx {
@@ -3795,6 +3972,8 @@ impl P2PNode {
                     self.pending_mrenclave_governance.retain(|_, tx| !tx.is_closed());
                     // β3.2b membership-apply collectors: same GC.
                     self.pending_membership_apply.retain(|_, tx| !tx.is_closed());
+                    // #131 AC-BASE-2″ P2-c SPV-baseline-apply collectors: same GC.
+                    self.pending_spv_baseline_apply.retain(|_, tx| !tx.is_closed());
                 }
 
                 // Handle swarm events
@@ -3945,8 +4124,18 @@ impl P2PNode {
                                         }
                                     }
                                 } else if request_id.starts_with("beta-apply-") {
+                                    // Both the membership-apply and the #131 SPV-baseline-apply
+                                    // broadcasts use the "beta-apply-" prefix; each request_id
+                                    // (a fresh UUID) lives in exactly one of the two pending
+                                    // maps, so try membership first and fall back to the SPV
+                                    // baseline apply collector.
                                     if let Some(tx) =
                                         self.pending_membership_apply.get(&request_id) {
+                                        if let Ok(msg) = serde_json::from_slice::<SigningMessage>(&message.data) {
+                                            let _ = tx.send(msg).await;
+                                        }
+                                    } else if let Some(tx) =
+                                        self.pending_spv_baseline_apply.get(&request_id) {
                                         if let Ok(msg) = serde_json::from_slice::<SigningMessage>(&message.data) {
                                             let _ = tx.send(msg).await;
                                         }
@@ -4426,6 +4615,64 @@ impl P2PNode {
                                 }
                                 if let Err(e) = self.publish_signing(&response) {
                                     error!("failed to publish β membership-apply ack: {:#}", e);
+                                }
+                            }
+                            Ok(SigningMessage::SpvBaselineApply {
+                                request_id,
+                                requester_peer_id,
+                                proof_blob_hex,
+                                bundle_hex,
+                                fingerprints,
+                                excluded_hex,
+                            }) => {
+                                // #131 AC-BASE-2″ P2-c: an SPV-baseline apply broadcast from
+                                // the ceremony driver. Apply to THIS node's loopback enclave
+                                // and publish an ack. handle_spv_baseline_apply targets
+                                // localhost only (PerpClient O-L4 loopback guard inside), and
+                                // the enclave re-verifies the proof + bundle before sealing,
+                                // so nothing carried on the wire is trusted.
+                                let local_opt = self.local_signer.clone();
+                                let Some(local) = local_opt else {
+                                    continue;
+                                };
+
+                                // X-C1: peer allowlist + rate limit + replay guard,
+                                // mirroring the membership-apply path.
+                                if let Some(ref allow) = self.allowed_signing_peers {
+                                    if !allow.contains(&propagation_source) {
+                                        warn!(
+                                            req_id = %request_id,
+                                            from = %propagation_source,
+                                            "X-C1: #131 spv-baseline-apply from peer outside allowlist — dropped"
+                                        );
+                                        continue;
+                                    }
+                                }
+                                if !self.check_signing_rate(&propagation_source) {
+                                    warn!(req_id = %request_id, "X-C1: #131 spv-baseline-apply rate-limited");
+                                    continue;
+                                }
+                                if !self.mark_signing_request_fresh(&request_id) {
+                                    warn!(req_id = %request_id, "X-C1: duplicate #131 spv-baseline-apply request_id — dropped");
+                                    continue;
+                                }
+
+                                info!(
+                                    req_id = %request_id,
+                                    from = %requester_peer_id,
+                                    propagation = %propagation_source,
+                                    "#131 spv-baseline-apply received — re-verifying + sealing custody floor locally"
+                                );
+                                let response = Self::handle_spv_baseline_apply(
+                                    &local,
+                                    &request_id,
+                                    &proof_blob_hex,
+                                    &bundle_hex,
+                                    &fingerprints,
+                                    &excluded_hex,
+                                ).await;
+                                if let Err(e) = self.publish_signing(&response) {
+                                    error!("failed to publish #131 spv-baseline-apply ack: {:#}", e);
                                 }
                             }
                             Err(e) => {

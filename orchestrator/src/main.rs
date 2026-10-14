@@ -1420,6 +1420,15 @@ async fn main() -> Result<()> {
     } else {
         (None, None)
     };
+    // #131 AC-BASE-2″ P2-c: the SPV baseline APPLY-broadcast channel — the ceremony
+    // broadcasts the assembled proof + bundle so EVERY node seals its own custody floor
+    // (mirrors membership_apply; the leader-only apply left validators unsealed → -84).
+    let (spv_baseline_apply_rx_holder, _spv_baseline_apply_tx) = if signers_config.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<p2p::SpvBaselineApplyRelay>(8);
+        (Some(rx), Some(tx))
+    } else {
+        (None, None)
+    };
     // #131 §6: the UNL policy ceremony channel.
     let (unl_policy_rx_holder, _unl_policy_tx) = if signers_config.is_some() {
         let (tx, rx) = tokio::sync::mpsc::channel::<p2p::UnlPolicyRelay>(8);
@@ -1960,6 +1969,7 @@ async fn main() -> Result<()> {
             app_state.signing_tx.clone(),
             _mrenclave_governance_tx.clone(),
             _spv_baseline_tx.clone(),
+            _spv_baseline_apply_tx.clone(),
             _unl_policy_tx.clone(),
             _unl_status_tx.clone(),
         ) {
@@ -1970,6 +1980,7 @@ async fn main() -> Result<()> {
                 Some(signing_tx),
                 Some(mrenclave_governance_tx),
                 Some(spv_baseline_tx),
+                Some(spv_baseline_apply_tx),
                 Some(unl_policy_tx),
                 Some(unl_status_tx),
             ) if !cli.membership_node_urls.is_empty() => {
@@ -2006,6 +2017,7 @@ async fn main() -> Result<()> {
                     current_quorum: cfg.quorum as u32,
                     mrenclave_governance_tx,
                     spv_baseline_tx,
+                    spv_baseline_apply_tx,
                     unl_policy_tx,
                     unl_status_tx,
                     operator_capital_account_ids: operator_capital_account_ids.clone(),
@@ -2174,6 +2186,11 @@ async fn main() -> Result<()> {
         // #131 AC-BASE-2″ P2-c: the SPV backing-gate collection channel.
         if let Some(rx) = spv_baseline_rx_holder {
             p2p_node.set_spv_baseline_channel(rx);
+        }
+        // #131 AC-BASE-2″ P2-c: the SPV baseline APPLY-broadcast channel (every node
+        // seals its own custody floor, not just the leader).
+        if let Some(rx) = spv_baseline_apply_rx_holder {
+            p2p_node.set_spv_baseline_apply_channel(rx);
         }
         // #131 §6: the UNL policy collection channel.
         if let Some(rx) = unl_status_rx_holder {
@@ -2704,9 +2721,8 @@ async fn main() -> Result<()> {
                 dcfg,
                 perp.clone(),
                 buffer.clone(),
-                is_sequencer.clone(),
             ));
-            info!("deposit-spv ENABLED (collector always; scanner sequencer-only)");
+            info!("deposit-spv ENABLED — scanner PER-NODE (each node SPV-verifies + credits its own enclave; E 2026-10-14)");
         }
         // THE ONE WAY THE STALE-PIN BRICK RETURNS (audit 2026-10-06). The clock is
         // OFF-by-default and unl-refresh is ON-by-default, so the dangerous configuration is
@@ -3111,6 +3127,7 @@ async fn main() -> Result<()> {
 /// §10.5 corpus, ceremony half. Parses the signer triples, seals the founding epoch, admits NEW's
 /// measurement onto OLD's allowlist, and runs the real ceremony. Every step refuses a non-loopback
 /// base before it contacts anything.
+#[allow(clippy::too_many_arguments)]
 async fn cli_upgrade_corpus_ceremony(
     old_url: &str,
     new_url: &str,

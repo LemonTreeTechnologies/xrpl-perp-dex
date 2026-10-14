@@ -78,6 +78,10 @@ pub struct MembershipAdminState {
     /// #131 AC-BASE-2″ P2-c: drives `LibP2PSpvBaselineCollector` (the SPV backing-gate
     /// ceremony — broadcast one proof, collect 2-of-N SPV cosignatures, apply).
     pub spv_baseline_tx: mpsc::Sender<crate::p2p::SpvBaselineRelay>,
+    /// #131 AC-BASE-2″ P2-c: the SPV baseline APPLY-broadcast channel. After the bundle is
+    /// assembled, the ceremony broadcasts the proof + bundle so EVERY node seals its own
+    /// custody floor (the leader-only apply left validators unsealed → they failed to arm -84).
+    pub spv_baseline_apply_tx: mpsc::Sender<crate::p2p::SpvBaselineApplyRelay>,
     /// #131 §6: drives `LibP2PUnlPolicyCollector` (quorum fraction + freshness anchor).
     pub unl_policy_tx: mpsc::Sender<crate::p2p::UnlPolicyRelay>,
     /// #131 sweep Finding 2: drives `LibP2PUnlStatusCollector` — the read-only
@@ -652,18 +656,12 @@ async fn drive_reserves_spv_baseline(
         collect_secs: req.collect_secs.unwrap_or(45),
     };
     let collector = LibP2PSpvBaselineCollector::new(state.spv_baseline_tx.clone());
-    let enclave_v1 = format!("{}/v1", state.enclave_base.trim_end_matches('/'));
-    let host_ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
     let res = run_reserves_spv_baseline_ceremony(
         &collector,
-        &enclave_v1,
+        state.spv_baseline_apply_tx.clone(),
         &fetch_cfg,
         &roster,
         req.cosign_quorum,
-        host_ts,
         &state.operator_capital_account_ids,
     )
     .await?;
@@ -948,6 +946,7 @@ mod tests {
         let (e, _re) = mpsc::channel(1);
         let (f, _rf) = mpsc::channel(1);
         let (g, _rg) = mpsc::channel(1);
+        let (h, _rh) = mpsc::channel(1);
         Arc::new(MembershipAdminState {
             xrpl_url: "http://127.0.0.1:1".into(),
             escrow: [0u8; 20],
@@ -961,6 +960,7 @@ mod tests {
             current_quorum: 2,
             mrenclave_governance_tx: d,
             spv_baseline_tx: e,
+            spv_baseline_apply_tx: h,
             unl_policy_tx: f,
             unl_status_tx: g,
             operator_capital_account_ids: vec![],

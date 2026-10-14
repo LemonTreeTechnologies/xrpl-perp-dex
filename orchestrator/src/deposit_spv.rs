@@ -667,9 +667,7 @@ pub async fn run_deposit_scanner(
     cfg: DepositDriverConfig,
     perp: crate::perp_client::PerpClient,
     buffer: std::sync::Arc<std::sync::Mutex<ValidationBuffer>>,
-    is_sequencer: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    use std::sync::atomic::Ordering;
     let http = reqwest::Client::new();
     // In-memory, deliberately. The enclave's watermark is the durable record of what has
     // been credited, and it refuses anything at or below it — so a restart that rescans
@@ -679,9 +677,11 @@ pub async fn run_deposit_scanner(
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(cfg.scan_interval_secs)).await;
-        if !is_sequencer.load(Ordering::Relaxed) {
-            continue;
-        }
+        // Per-node by design (E / owner+auditor ruling 2026-10-14): every node independently
+        // scans -> builds its OWN SPV proof -> submits to its OWN enclave's ecall_perp_deposit_spv,
+        // which re-verifies the proof against THIS node's sealed pinned-UNL and credits only what
+        // it itself derived. No is_sequencer gate: observation-security must be per-node, so each
+        // cosigner re-derives the deposit from XRPL rather than trusting the sequencer's view.
 
         // First endpoint that answers. Unlike the clock there is no "newest" to prefer here:
         // the scanner walks forward from where it left off, so a lagging endpoint costs a

@@ -324,18 +324,21 @@ impl LibP2PSpvBaselineCollector {
 /// #131 AC-BASE-2″ P2-c ceremony driver. The leader fetches ONE validator-quorum-attested
 /// proof (the untrusted patched node produces it, the enclave verifies it), broadcasts it,
 /// collects ≥`cosign_quorum` SPV cosignatures over the SPV-DERIVED figure, asserts cosigner
-/// diversity, then applies on the LOCAL sequencer enclave (re-derive → verify 2-of-N →
-/// seed custody := the SPV-PROVEN balance → seal the one-shot). Returns the apply response.
+/// diversity, then APPLIES ON EVERY NODE via an apply-broadcast (each enclave re-derives →
+/// verifies 2-of-N → seeds custody := the SPV-PROVEN balance → seals its OWN one-shot). The
+/// earlier leader-only apply sealed `reserves_ledger_floor` on the leader alone, so validators
+/// later failed to arm with -84; this mirrors the β3.2b membership apply-broadcast so every
+/// node seals. Returns a summary reporting how many distinct nodes sealed.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_reserves_spv_baseline_ceremony(
     collector: &LibP2PSpvBaselineCollector,
-    enclave_perp_v1_base: &str,
+    apply_tx: tokio::sync::mpsc::Sender<crate::p2p::SpvBaselineApplyRelay>,
     fetch_cfg: &crate::spv_proof::SpvFetchConfig,
     roster: &[BaselineNode],
     cosign_quorum: usize,
-    host_timestamp_ms: u64,
     excluded_account_ids: &[String],
 ) -> Result<serde_json::Value> {
+    use uuid::Uuid;
     // (0) C-Q1.1 pre-flight: every roster entry must be a DISTINCT node. In the SPV
     // ceremony the endpoint is an identity label (all cosigners verify the SAME proof,
     // so it is no longer an independent XRPL query), and `assert_bundle_diversity` maps
@@ -371,26 +374,98 @@ pub async fn run_reserves_spv_baseline_ceremony(
     let source_fingerprints = assert_bundle_diversity(&pubkeys, roster, cosign_quorum)?;
     let distinct = source_fingerprints.len();
 
-    // (4) Apply on the LOCAL sequencer enclave: it INDEPENDENTLY re-derives the figure from
-    // the same proof, verifies the 2-of-N over it, seeds custody + seals the one-shot.
-    let perp = crate::perp_client::PerpClient::new(enclave_perp_v1_base)?;
-    let res = perp
-        .reserves_spv_apply(
-            &proof_blob_hex,
-            host_timestamp_ms,
-            &hex::encode(&bundle),
-            &source_fingerprints,
-            excluded_account_ids,
-        )
-        .await?;
+    // (4) Apply on EVERY node's loopback enclave via an apply-broadcast (mirrors the β3.2b
+    // membership apply). The enclaves are loopback-only (X-C1), so the apply CANNOT be an HTTP
+    // POST to a remote enclave — it rides p2p: broadcast the SAME untrusted proof + assembled
+    // bundle, and each node's enclave INDEPENDENTLY re-derives the figure, re-verifies the
+    // 2-of-N over it, seeds custody + seals its OWN one-shot. The orchestrator stays untrusted
+    // (it only passes proof + bundle through). The run-loop applies locally for the driving
+    // node too (gossipsub does not self-deliver), so the leader seals via this path as well.
+    let request_id = format!("beta-apply-{}", Uuid::new_v4());
+    let (responses_tx, mut responses_rx) = tokio::sync::mpsc::channel(32);
+    apply_tx
+        .send(crate::p2p::SpvBaselineApplyRelay {
+            request_id,
+            proof_blob_hex: proof_blob_hex.clone(),
+            bundle_hex: hex::encode(&bundle),
+            fingerprints: source_fingerprints.clone(),
+            excluded_hex: excluded_account_ids.to_vec(),
+            responses_tx,
+        })
+        .await
+        .context("send SpvBaselineApplyRelay to p2p run-loop")?;
 
+    // Collect per-node acks until every roster node seals or the window closes. An enclave
+    // re-runs the WHOLE in-enclave SPV verify before sealing, so the window matches the cosign
+    // collector's (150s). Dedup by signer address (the local self-apply + that node's gossipsub
+    // round-trip can both arrive). An ack with `error: None` means that node SEALED its floor.
+    let expected_nodes = roster.len().max(1);
+    let apply_timeout = std::time::Duration::from_secs(150);
+    let mut sealed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut failures: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + apply_timeout;
+    loop {
+        if sealed.len() >= expected_nodes {
+            break; // every node sealed — done early
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let resp = match tokio::time::timeout(remaining, responses_rx.recv()).await {
+            Ok(Some(m)) => m,
+            _ => break, // all senders dropped or window closed
+        };
+        if let crate::p2p::SigningMessage::Response {
+            signer_xrpl_address,
+            error,
+            ..
+        } = resp
+        {
+            let node = if signer_xrpl_address.is_empty() {
+                "<unknown>".to_string()
+            } else {
+                signer_xrpl_address
+            };
+            if !seen.insert(node.clone()) {
+                continue; // dedup: node already accounted for
+            }
+            match error {
+                None => {
+                    tracing::info!(node = %node, "#131 SPV baseline: node sealed its custody floor");
+                    sealed.insert(node);
+                }
+                Some(e) => {
+                    tracing::warn!(node = %node, err = %e, "#131 SPV baseline: node rejected the apply");
+                    failures.push(format!("{node}: {e}"));
+                }
+            }
+        }
+    }
+
+    let sealed_nodes = sealed.len();
+    let status = if sealed_nodes >= expected_nodes {
+        "applied"
+    } else {
+        "partial"
+    };
     tracing::info!(
         distinct_cosigners = distinct,
-        "#131 SPV baseline applied — custody seeded from an SPV-PROVEN escrow balance, \
-         cosigned by {} independent operator enclaves",
-        distinct
+        sealed_nodes,
+        expected_nodes,
+        "#131 SPV baseline applied — custody floor seeded from an SPV-PROVEN escrow balance \
+         + sealed on {sealed_nodes}/{expected_nodes} nodes, cosigned by {distinct} independent \
+         operator enclaves"
     );
-    Ok(res)
+    Ok(serde_json::json!({
+        "status": status,
+        "sealed_nodes": sealed_nodes,
+        "expected_nodes": expected_nodes,
+        "distinct_cosigners": distinct,
+        "source_fingerprints": source_fingerprints,
+        "failures": failures,
+    }))
 }
 
 #[cfg(test)]
