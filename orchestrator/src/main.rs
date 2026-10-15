@@ -2690,6 +2690,12 @@ async fn main() -> Result<()> {
     // (2) step 3), so the collector is started when EITHER driver is on and the buffer is
     // shared. Two collectors on one rippled would double the subscription for no gain.
     let deposit_cfg = deposit_spv::DepositDriverConfig::from_env(&escrow_address);
+    // F1 (REQ-e2e-deposit-auth-surface-gaps, auditor ruling 2026-10-15): when this node runs
+    // SPV deposits, the per-node SPV scanner is the SOLE crediting path. The legacy credit
+    // path in the tick loop stands down so exactly one path ever credits a deposit (no
+    // double-credit); pre-arm the enclave refuses legacy with -85 anyway, post-arm the SPV
+    // scanner credits. The enclave -85 remains the backstop.
+    let spv_deposits_enabled = deposit_cfg.is_some();
     let clock_cfg = attested_clock::ClockDriverConfig::from_env();
     if deposit_cfg.is_some() || clock_cfg.is_some() {
         // The UNION of whatever both configs name, deduplicated. Either driver alone is
@@ -2965,6 +2971,11 @@ async fn main() -> Result<()> {
         match monitor.scan_deposits(last_ledger).await {
             Ok((deposits, new_ledger)) => {
                 for deposit in &deposits {
+                    if spv_deposits_enabled {
+                        // F1: SPV scanner owns crediting on this node; legacy path stands
+                        // down (exactly one crediting path; enclave -85 is the backstop).
+                        continue;
+                    }
                     // REQ-20-impl R2: thread destination_tag through to
                     // perp.deposit. Enclave routes the credit per the
                     // bindings map (REQ-20 §4.2): bound → bound user;

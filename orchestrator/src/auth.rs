@@ -53,6 +53,57 @@ pub struct OrderSignatureBinding {
     pub signer_pubkey_hex: String,
 }
 
+/// Verify an XRPL request signature, dispatching STRICTLY on the public-key prefix
+/// (REQ-e2e-deposit-auth-surface-gaps F2, auditor ruling 2026-10-15):
+///   0x02 / 0x03 -> secp256k1 ECDSA, DER-encoded signature
+///   0xED        -> ed25519 EdDSA, 64-byte raw signature
+/// ONE algorithm per prefix -- never "try both" -- over the same canonical `hash`
+/// preimage, accepting the XRPL SHA-512Half wrap as the alternative form for either
+/// (matches cli_tools::sign_hash and XRPL wallets' ripple-keypairs). The key-type set
+/// admitted here MUST equal the set admitted at deposit, or a wallet could fund the
+/// vault and be unable to withdraw -- stranded funds (the F2 invariant).
+fn verify_xrpl_sig(pubkey_bytes: &[u8], sig_bytes: &[u8], hash: &[u8]) -> Result<(), String> {
+    let sha512_half: [u8; 32] = {
+        let full = Sha512::digest(hash);
+        full[..32].try_into().unwrap()
+    };
+    match pubkey_bytes.first() {
+        Some(0x02) | Some(0x03) => {
+            let vk = VerifyingKey::from_sec1_bytes(pubkey_bytes)
+                .map_err(|_| "invalid secp256k1 public key")?;
+            let sig = Signature::from_der(sig_bytes).map_err(|_| "invalid DER signature")?;
+            if vk.verify_prehash(hash, &sig).is_ok()
+                || vk.verify_prehash(&sha512_half, &sig).is_ok()
+            {
+                Ok(())
+            } else {
+                Err("signature verification failed".to_string())
+            }
+        }
+        Some(0xED) => {
+            if pubkey_bytes.len() != 33 {
+                return Err("invalid ed25519 public key length".to_string());
+            }
+            let pk: [u8; 32] = pubkey_bytes[1..].try_into().unwrap();
+            let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk)
+                .map_err(|_| "invalid ed25519 public key")?;
+            let sig_arr: [u8; 64] = sig_bytes
+                .try_into()
+                .map_err(|_| "invalid ed25519 signature length (expected 64 bytes)")?;
+            let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+            if vk.verify_strict(hash, &sig).is_ok()
+                || vk.verify_strict(&sha512_half, &sig).is_ok()
+            {
+                Ok(())
+            } else {
+                Err("signature verification failed".to_string())
+            }
+        }
+        _ => Err("unsupported public key type (expected secp256k1 0x02/0x03 or ed25519 0xED)"
+            .to_string()),
+    }
+}
+
 /// O-H4: re-verify a persisted signature binding without the timestamp
 /// drift check. Used on validator failover when rebuilding the CLOB from
 /// PG. Returns Ok iff:
@@ -61,8 +112,6 @@ pub struct OrderSignatureBinding {
 ///      (either directly or via the XRPL SHA-512Half wrap).
 pub fn verify_signature_only(binding: &OrderSignatureBinding) -> Result<(), String> {
     let pubkey_bytes = hex::decode(&binding.signer_pubkey_hex).map_err(|_| "invalid pubkey hex")?;
-    let verifying_key =
-        VerifyingKey::from_sec1_bytes(&pubkey_bytes).map_err(|_| "invalid secp256k1 public key")?;
 
     let sha256_hash = Sha256::digest(&pubkey_bytes);
     let ripemd_hash = Ripemd160::digest(sha256_hash);
@@ -95,17 +144,7 @@ pub fn verify_signature_only(binding: &OrderSignatureBinding) -> Result<(), Stri
     let hash = hasher.finalize();
 
     let sig_bytes = hex::decode(&binding.signature_hex).map_err(|_| "invalid signature hex")?;
-    let signature = Signature::from_der(&sig_bytes).map_err(|_| "invalid DER signature")?;
-
-    if verifying_key.verify_prehash(&hash, &signature).is_ok() {
-        return Ok(());
-    }
-    let sha512_full = Sha512::digest(hash);
-    let sha512_half: [u8; 32] = sha512_full[..32].try_into().unwrap();
-    verifying_key
-        .verify_prehash(&sha512_half, &signature)
-        .map_err(|_| "signature verification failed".to_string())?;
-    Ok(())
+    verify_xrpl_sig(&pubkey_bytes, &sig_bytes, hash.as_slice())
 }
 
 // ── Replay-protection drift window ──────────────────────────────
@@ -263,8 +302,6 @@ fn verify_request_with(
 
     // Decode public key
     let pubkey_bytes = hex::decode(pubkey_hex).map_err(|_| "invalid public key hex")?;
-    let verifying_key =
-        VerifyingKey::from_sec1_bytes(&pubkey_bytes).map_err(|_| "invalid secp256k1 public key")?;
 
     // Verify pubkey → XRPL address derivation
     // XRPL: SHA-256(compressed_pubkey) → RIPEMD-160 → Base58Check with prefix 0x00
@@ -331,39 +368,19 @@ fn verify_request_with(
         hasher.finalize()
     };
 
-    // Decode and verify signature
+    // Decode and verify signature. Key-type dispatched STRICTLY on the pubkey prefix
+    // (secp256k1 0x02/0x03 -> DER ECDSA; ed25519 0xED -> 64-byte EdDSA) over the same
+    // canonical `hash`, accepting the XRPL SHA-512Half wrap as the alternative form.
     let sig_bytes = hex::decode(sig_hex).map_err(|_| "invalid signature hex")?;
-    let signature = Signature::from_der(&sig_bytes).map_err(|_| "invalid DER signature")?;
-
-    // Verify ECDSA signature over pre-hashed data.
-    // Mode 1 (default): client signs the canonical hash directly (Python,
-    //   Node.js, raw secp256k1).
-    // Mode 2 (XRPL wallets): Crossmark/GemWallet use ripple-keypairs which
-    //   applies SHA-512Half(message) before ECDSA. The client passes the
-    //   hex of the canonical hash as message; the wallet internally signs
-    //   SHA512(hex_bytes)[0..32].
-    let verified = {
-        // Mode 1: direct canonical hash.
-        if verifying_key.verify_prehash(&hash, &signature).is_ok() {
-            true
-        } else {
-            // Mode 2: SHA-512Half wrap.
-            let sha512_full = Sha512::digest(hash);
-            let sha512_half: [u8; 32] = sha512_full[..32].try_into().unwrap();
-            verifying_key
-                .verify_prehash(&sha512_half, &signature)
-                .is_ok()
-        }
-    };
-
-    if !verified {
+    if let Err(e) = verify_xrpl_sig(&pubkey_bytes, &sig_bytes, hash.as_slice()) {
         tracing::debug!(
             hash_hex = %hex::encode(hash),
             sig_hex = %sig_hex,
             pubkey_hex = %pubkey_hex,
-            "signature verification failed (tried both direct SHA-256 and XRPL SHA-512Half)"
+            error = %e,
+            "signature verification failed"
         );
-        return Err("signature verification failed".into());
+        return Err(e);
     }
 
     Ok(AuthenticatedUser {
