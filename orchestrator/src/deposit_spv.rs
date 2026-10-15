@@ -676,16 +676,14 @@ pub async fn run_deposit_scanner(
     let mut next_ledger: Option<u64> = None;
 
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(cfg.scan_interval_secs)).await;
-        // Per-node by design (E / owner+auditor ruling 2026-10-14): every node independently
-        // scans -> builds its OWN SPV proof -> submits to its OWN enclave's ecall_perp_deposit_spv,
-        // which re-verifies the proof against THIS node's sealed pinned-UNL and credits only what
-        // it itself derived. No is_sequencer gate: observation-security must be per-node, so each
-        // cosigner re-derives the deposit from XRPL rather than trusting the sequencer's view.
-
         // First endpoint that answers. Unlike the clock there is no "newest" to prefer here:
         // the scanner walks forward from where it left off, so a lagging endpoint costs a
         // round rather than stalling us, and the next tick asks again.
+        //
+        // Per-node by design (E / owner+auditor ruling 2026-10-14): every node independently
+        // scans -> builds its OWN SPV proof -> submits to its OWN enclave's ecall_perp_deposit_spv,
+        // which re-verifies the proof against THIS node's sealed pinned-UNL and credits only what
+        // it itself derived. No is_sequencer gate: observation-security must be per-node.
         let Some(primary) = first_reachable(&http, &cfg.http_urls).await else {
             tracing::warn!(
                 tried = cfg.http_urls.len(),
@@ -698,27 +696,39 @@ pub async fn run_deposit_scanner(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "deposit-spv: cannot read the validated index");
+                tokio::time::sleep(std::time::Duration::from_secs(cfg.scan_interval_secs)).await;
                 continue;
             }
         };
         let start = *next_ledger.get_or_insert(validated);
         if start > validated {
+            // Caught up to the validated tip: sleep ONE interval waiting for new ledgers.
+            // The sleep lives HERE, not at the top of the loop, so it fires only when there
+            // is nothing to do; while BEHIND we fall through and process back-to-back.
+            tokio::time::sleep(std::time::Duration::from_secs(cfg.scan_interval_secs)).await;
             continue;
         }
 
-        // One ledger per pass. Deliberately unhurried: a backlog is not urgent (the
-        // deposits are already on XRPL and the watermark keeps them creditable), and
-        // sprinting through hundreds of ledgers would hold the enclave busy against the
-        // hourly reserves commit, which IS time-sensitive.
+        // KEEP UP WITH LEDGER CLOSE (deposit-scanner-keep-up fix, 2026-10-15). Validations are
+        // buffered LIVE only (rippled serves none from history) in a bounded buffer
+        // (VALIDATION_BUFFER_LEDGERS). An unconditional per-ledger sleep longer than the ~4s
+        // ledger close made the scanner DRIFT behind the tip, so it eventually reached a deposit's
+        // ledger after its validations were evicted -> unprovable ("needs reconciliation"). So
+        // while BEHIND (start <= validated) we advance WITHOUT sleeping, bounded only by the
+        // per-ledger RPC round-trip, and stay at the tip. This does not sprint through "hundreds":
+        // next_ledger starts AT the validated tip on (re)start, so no large backlog accumulates,
+        // and empty ledgers are cheap (one RPC + a tx-set scan, no enclave work).
         match scan_one_ledger(&http, &primary, &cfg, &perp, &buffer, start).await {
             Ok(()) => next_ledger = Some(start + 1),
             Err(e) => {
                 // Do NOT advance. A ledger that failed for a transient reason must be
                 // retried, and one that failed permanently will keep failing loudly
                 // rather than being skipped silently — a skipped ledger is a deposit
-                // nobody will ever notice was lost.
+                // nobody will ever notice was lost. Back off one interval so a persistent
+                // failure (e.g. evicted validations needing reconciliation) is not a tight loop.
                 tracing::warn!(ledger = start, error = %format!("{e:#}"),
                                "deposit-spv: ledger scan failed, will retry");
+                tokio::time::sleep(std::time::Duration::from_secs(cfg.scan_interval_secs)).await;
             }
         }
     }
