@@ -210,11 +210,34 @@ impl TradingEngine {
             None
         };
 
+        // Determinism (part-2 Q3): read the enclave's ATTESTED close-time BEFORE the book
+        // lock (async). The matcher stamps orders/trades with this, not wall-clock, so every
+        // node replaying the batch derives the same time-dependent state. A clock that has
+        // not advanced (ripple epoch 0) PAUSES matching here -- fail-safe, a consistency
+        // property not a new failure mode (auditor Q3).
+        let attested_ms: u64 = {
+            let st = self.perp.attested_clock_status().await.map_err(|e| {
+                anyhow::anyhow!("matching paused: attested clock unavailable ({e})")
+            })?;
+            let ripple = st["attested_close_time_ripple_epoch"].as_u64().unwrap_or(0);
+            if ripple == 0 {
+                anyhow::bail!(
+                    "matching paused: attested clock has not advanced (no live close-time \
+                     to stamp a deterministic trade with)"
+                );
+            }
+            // ripple epoch (seconds since 2000-01-01) -> unix ms
+            (ripple + 946_684_800) * 1_000
+        };
+
         // Step 1: under the book lock — reserve-at-placement margin check (#114)
         // then match/rest. Both under the SAME lock so no order can slip in
         // between the check and the submit (no TOCTOU on the reservation).
         let (mut order, trades, stp_cancelled) = {
             let mut book = self.book.lock().await;
+            // part-2 Q3: hand the matcher the attested time under the SAME lock as the
+            // submit, so the stamp cannot be raced by another order between set and use.
+            book.set_attested_ms(attested_ms);
             if let Some(avail) = avail {
                 // A limit order that finds no match returns Ok below WITHOUT ever
                 // reaching the enclave open_position gate (Step 2), so this is the
@@ -393,10 +416,10 @@ impl TradingEngine {
         // Publish batch via P2P (sequencer mode)
         if !trades.is_empty() {
             if let Some(tx) = &self.batch_tx {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                // part-2 Q3: the batch inherits the SAME attested close-time the matcher
+                // stamped (unix seconds), so its timestamp + state_hash are reproducible by
+                // a validator from an attested fact, not the sequencer's wall-clock.
+                let now = attested_ms / 1_000;
 
                 let batch_seq = self.seq_num.fetch_add(1, Ordering::SeqCst);
                 let batch = OrderBatch {
@@ -595,22 +618,29 @@ mod tests {
     /// `available_margin`. Returns the base URL (with the `/v1` the client expects).
     async fn spawn_mock_enclave(available_margin: &str) -> String {
         let avail = available_margin.to_string();
-        let app = Router::new().route(
-            "/v1/perp/balance",
-            get(move || {
-                let avail = avail.clone();
-                async move {
-                    Json(json!({
-                        "status": "success",
-                        "data": {
-                            "available_margin": avail,
-                            "margin_balance": avail,
-                            "positions": []
-                        }
-                    }))
-                }
-            }),
-        );
+        let app = Router::new()
+            .route(
+                "/v1/perp/balance",
+                get(move || {
+                    let avail = avail.clone();
+                    async move {
+                        Json(json!({
+                            "status": "success",
+                            "data": {
+                                "available_margin": avail,
+                                "margin_balance": avail,
+                                "positions": []
+                            }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/perp/attested-clock/status",
+                get(|| async {
+                    Json(json!({ "attested_close_time_ripple_epoch": 800_000_000u64 }))
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -621,6 +651,62 @@ mod tests {
 
     fn engine(base: &str) -> TradingEngine {
         TradingEngine::new("XRP-USD-PERP", PerpClient::new(base).unwrap(), "test-peer")
+    }
+
+    /// Mock enclave whose attested clock reads 0 (not advanced). Serves balance so the
+    /// margin step passes, isolating the clock-pause as the reason the order is refused.
+    async fn spawn_mock_enclave_stalled_clock(available_margin: &str) -> String {
+        let avail = available_margin.to_string();
+        let app = Router::new()
+            .route(
+                "/v1/perp/balance",
+                get(move || {
+                    let avail = avail.clone();
+                    async move {
+                        Json(json!({ "status": "success", "data": {
+                            "available_margin": avail, "margin_balance": avail, "positions": [] } }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/perp/attested-clock/status",
+                get(|| async { Json(json!({ "attested_close_time_ripple_epoch": 0u64 })) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/v1")
+    }
+
+    #[tokio::test]
+    async fn engine_pauses_matching_when_the_attested_clock_has_not_advanced() {
+        // part-2 Q3: with a 0 attested clock the engine must refuse BEFORE matching, so no
+        // trade is ever stamped with a time a validator cannot reproduce. Fail-safe pause.
+        let base = spawn_mock_enclave_stalled_clock("100.00000000").await;
+        let eng = engine(&base);
+        let res = eng
+            .submit_order(
+                test_authorization_for("alice"),
+                "alice".into(),
+                Side::Long,
+                OrderType::Limit,
+                FP8::from_f64(0.55),
+                FP8::from_f64(1.0),
+                1,
+                TimeInForce::Gtc,
+                false,
+                None,
+            )
+            .await;
+        let msg = res
+            .expect_err("must pause when the attested clock is 0")
+            .to_string();
+        assert!(
+            msg.contains("matching paused"),
+            "refusal should name the pause, got: {msg}"
+        );
     }
 
     // #114: an account with zero available margin must NOT be able to rest a
