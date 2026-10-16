@@ -3269,10 +3269,16 @@ async fn push_signed_median_quote(perp: &PerpClient, price: f64) {
         }
     };
 
-    match perp.update_price_signed(&blob, SIGNED_PRICE_MARKET_ID).await {
+    match perp
+        .update_price_signed(&blob, SIGNED_PRICE_MARKET_ID)
+        .await
+    {
         // The enclave accepted the bundle and recomputed the median mark.
         Ok(_) => {
-            info!(price_fp8, publish_time, "signed-median price accepted by the local enclave")
+            info!(
+                price_fp8,
+                publish_time, "signed-median price accepted by the local enclave"
+            )
         }
         // Classify the common refusals so the log says WHICH gate rejected it:
         //   -93  network/market id or a signature mismatch

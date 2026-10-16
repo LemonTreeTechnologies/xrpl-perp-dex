@@ -899,7 +899,7 @@ mod tests {
         let err = run_genesis_bootstrap(
             [0xAA; 20],
             vec![entry(0x01, 1), entry(0x02, 1)],
-            99, // > sum of weights
+            99,         // > sum of weights
             Vec::new(), // quorum is rejected before the descriptor matters
             &collector,
             &applier,

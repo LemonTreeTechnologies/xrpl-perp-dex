@@ -248,8 +248,18 @@ mod tests {
                 weight: 1,
             },
         ];
-        let err = sign_descriptor(&pem, 3, &escrow, 1, &prev, &signers, 2, &member, &BAKED_GOV_PUB)
-            .expect_err("a non-governance key must be refused");
+        let err = sign_descriptor(
+            &pem,
+            3,
+            &escrow,
+            1,
+            &prev,
+            &signers,
+            2,
+            &member,
+            &BAKED_GOV_PUB,
+        )
+        .expect_err("a non-governance key must be refused");
         assert!(
             format!("{err}").contains("NOT the expected governance key"),
             "the refusal must say the key is wrong: {err}"

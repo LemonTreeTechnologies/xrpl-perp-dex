@@ -289,12 +289,7 @@ mod tests {
 
     /// SMOKE round-trip: this is NOT the authoritative verifier (the enclave's
     /// price_quotes.cpp is). It only proves this producer agrees with itself.
-    fn verify_one(
-        pubkey: &[u8; 33],
-        price_fp8: i64,
-        publish_time: u64,
-        der_sig: &[u8],
-    ) -> bool {
+    fn verify_one(pubkey: &[u8; 33], price_fp8: i64, publish_time: u64, der_sig: &[u8]) -> bool {
         let vk = match VerifyingKey::from_sec1_bytes(pubkey) {
             Ok(vk) => vk,
             Err(_) => return false,
@@ -384,7 +379,10 @@ mod tests {
 
         // ALL 4 must verify against their carried pubkey.
         for (i, (pk, price, ptime, sig)) in parsed.iter().enumerate() {
-            assert!(verify_one(pk, *price, *ptime, sig), "quote {i} should verify");
+            assert!(
+                verify_one(pk, *price, *ptime, sig),
+                "quote {i} should verify"
+            );
         }
 
         // --- flip ONE byte of ONE signature; that quote fails, others still pass ---
@@ -408,17 +406,28 @@ mod tests {
     #[test]
     fn assemble_rejects_overflowing_counts() {
         // count > 16 is refused rather than truncated by `as u8`.
-        let (pk, der) =
-            sign_quote(&gen_distinct_keypairs(1)[0], NETWORK_ID, MARKET_ID, 1, PUBLISH_TIME)
-                .unwrap();
+        let (pk, der) = sign_quote(
+            &gen_distinct_keypairs(1)[0],
+            NETWORK_ID,
+            MARKET_ID,
+            1,
+            PUBLISH_TIME,
+        )
+        .unwrap();
         let too_many: Vec<QuoteEntry> = (0..17)
             .map(|_| (pk, 1i64, PUBLISH_TIME, der.clone()))
             .collect();
-        assert!(assemble_xpq1(&too_many).is_err(), "17 quotes must be rejected");
+        assert!(
+            assemble_xpq1(&too_many).is_err(),
+            "17 quotes must be rejected"
+        );
 
         // sig_len > 72 is refused.
         let one_bad: Vec<QuoteEntry> = vec![(pk, 1i64, PUBLISH_TIME, vec![0u8; 73])];
-        assert!(assemble_xpq1(&one_bad).is_err(), "73-byte sig must be rejected");
+        assert!(
+            assemble_xpq1(&one_bad).is_err(),
+            "73-byte sig must be rejected"
+        );
     }
 
     #[test]

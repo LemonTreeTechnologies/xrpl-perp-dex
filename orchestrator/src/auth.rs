@@ -91,16 +91,17 @@ fn verify_xrpl_sig(pubkey_bytes: &[u8], sig_bytes: &[u8], hash: &[u8]) -> Result
                 .try_into()
                 .map_err(|_| "invalid ed25519 signature length (expected 64 bytes)")?;
             let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
-            if vk.verify_strict(hash, &sig).is_ok()
-                || vk.verify_strict(&sha512_half, &sig).is_ok()
+            if vk.verify_strict(hash, &sig).is_ok() || vk.verify_strict(&sha512_half, &sig).is_ok()
             {
                 Ok(())
             } else {
                 Err("signature verification failed".to_string())
             }
         }
-        _ => Err("unsupported public key type (expected secp256k1 0x02/0x03 or ed25519 0xED)"
-            .to_string()),
+        _ => Err(
+            "unsupported public key type (expected secp256k1 0x02/0x03 or ed25519 0xED)"
+                .to_string(),
+        ),
     }
 }
 
