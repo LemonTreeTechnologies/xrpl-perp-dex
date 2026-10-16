@@ -2364,6 +2364,7 @@ async fn main() -> Result<()> {
     let validator_db = app_state.db.clone();
     let validator_leader_rx = leader_rx.clone();
     let validator_replication = replication_health.clone();
+    let validator_clock = clock_health.clone();
     // A vault quote carries no user signature, so the only thing standing between a
     // sequencer-invented "vault" order and our state is which vaults WE are configured to
     // run. Empty here means every ProtocolVault order in a batch is refused.
@@ -2498,6 +2499,40 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 info!(seq = batch.seq_num, "state hash verified");
+            }
+
+            // part-2 Q3/Q4 increment 2: independently verify the batch's close-time against
+            // THIS node's OWN derived attested clock before folding its fills into our state.
+            // The hash above only proves the message is intact (same author on both sides);
+            // `timestamp` is a sequencer field, so a compromised sequencer could stamp a false
+            // time to skew funding / liquidation. Refuse a batch whose time our own clock has
+            // not reached -- fail-safe, the co-sign then cannot form on an unverified time.
+            {
+                let my_ripple = validator_clock.attested_close_time.load(Ordering::Relaxed);
+                let batch_ripple = batch
+                    .timestamp
+                    .saturating_sub(crate::attested_clock::RIPPLE_EPOCH_OFFSET_SECS);
+                if let Some(reason) = crate::attested_clock::batch_time_divergence(
+                    batch_ripple,
+                    my_ripple,
+                    crate::attested_clock::BATCH_TIME_FWD_TOL_SECS,
+                    crate::attested_clock::BATCH_TIME_MAX_LAG_SECS,
+                ) {
+                    validator_replication
+                        .batch_time_divergences
+                        .fetch_add(1, Ordering::Relaxed);
+                    error!(
+                        reason,
+                        metric = "batch_time_divergences_total",
+                        sequencer_id = %batch.sequencer_id,
+                        seq = batch.seq_num,
+                        batch_ripple,
+                        my_ripple,
+                        "BATCH TIME DIVERGENCE -- skipping replay (fail-safe: the co-sign will \
+                         not form on a time this node did not derive)"
+                    );
+                    continue;
+                }
             }
 
             // Replay each fill: open positions in local enclave

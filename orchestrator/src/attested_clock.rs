@@ -137,6 +137,50 @@ pub struct ClockHealth {
 /// 30-year error that still looks like a plausible timestamp.
 pub const RIPPLE_EPOCH_OFFSET_SECS: u64 = 946_684_800;
 
+/// part-2 Q3/Q4 increment 2 -- how far a batch's attested close-time may LEAD this node's
+/// own derived clock before it is forgery rather than gossip-ordering skew. A validator
+/// processes a batch slightly AFTER the sequencer matched it, so its own clock is normally
+/// at or ahead of the batch's; a small forward tolerance covers this node momentarily
+/// lagging the sequencer by a few XRPL ledgers (~4s each).
+pub const BATCH_TIME_FWD_TOL_SECS: u64 = 30;
+
+/// How far a batch's attested close-time may TRAIL this node's clock before it is a stale /
+/// replayed batch. Generous: honest batches arrive within seconds over gossip.
+pub const BATCH_TIME_MAX_LAG_SECS: u64 = 600;
+
+/// part-2 Q3/Q4 increment 2: is the sequencer's batch close-time OUTSIDE the window this
+/// validator's OWN attested clock has independently reached? `Some(reason)` = refuse to apply
+/// (fail-safe); `None` = within the derived window.
+///
+/// The "derived, not received" check for TIME: the batch hash only proves a batch is intact
+/// (same author on both sides), and `timestamp` is a sequencer field, so a compromised
+/// sequencer could stamp a false time to skew funding / liquidation. A time AHEAD of our own
+/// derived clock (beyond gossip skew) is one we have NOT reached -- forgery, not skew. A time
+/// far BEHIND is stale. A dead own-clock cannot verify anything, so it also refuses.
+///
+/// LIMIT (named): this BOUNDS the time to a live window; within it the sequencer still chooses
+/// the exact value. Exact per-ledger derivation (carry the attested ledger seq + a derived
+/// close-time history, check equality) is the stronger follow-up.
+pub fn batch_time_divergence(
+    batch_ripple: u64,
+    my_ripple: u64,
+    fwd_tol_secs: u64,
+    max_lag_secs: u64,
+) -> Option<&'static str> {
+    if my_ripple == 0 {
+        return Some(
+            "own attested clock is not live -- cannot independently verify the batch time",
+        );
+    }
+    if batch_ripple > my_ripple.saturating_add(fwd_tol_secs) {
+        return Some("batch close-time is AHEAD of this node's derived attested clock");
+    }
+    if my_ripple.saturating_sub(batch_ripple) > max_lag_secs {
+        return Some("batch close-time is stale relative to this node's attested clock");
+    }
+    None
+}
+
 pub struct ClockDriverConfig {
     /// SEVERAL endpoints, not one, and no rippled of our own in the path.
     ///
@@ -489,6 +533,38 @@ pub async fn run_attested_clock(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn batch_time_within_the_derived_window_is_accepted() {
+        // a batch 5s behind our clock, equal, and 10s ahead (within the 30s skew tol) all pass.
+        assert_eq!(batch_time_divergence(995, 1000, 30, 600), None);
+        assert_eq!(batch_time_divergence(1000, 1000, 30, 600), None);
+        assert_eq!(batch_time_divergence(1010, 1000, 30, 600), None);
+    }
+
+    #[test]
+    fn a_batch_time_ahead_of_our_derived_clock_is_divergence_not_skew() {
+        // 31s ahead with a 30s tolerance -> a time we have not reached -> refuse.
+        assert!(batch_time_divergence(1031, 1000, 30, 600)
+            .unwrap()
+            .contains("AHEAD"));
+    }
+
+    #[test]
+    fn a_stale_batch_time_is_divergence() {
+        // 601s behind with a 600s lag bound -> stale -> refuse.
+        assert!(batch_time_divergence(399, 1000, 30, 600)
+            .unwrap()
+            .contains("stale"));
+    }
+
+    #[test]
+    fn a_dead_own_clock_cannot_verify_and_refuses() {
+        // my_ripple == 0 -> cannot verify -> refuse regardless of the batch time.
+        assert!(batch_time_divergence(1000, 0, 30, 600)
+            .unwrap()
+            .contains("not live"));
+    }
+
     #[test]
     fn the_clock_refuses_to_arm_only_when_the_trust_root_is_off() {
         // The whole truth table, because the point is that three of the four are FINE and

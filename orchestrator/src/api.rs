@@ -76,6 +76,10 @@ pub struct ReplicationHealth {
     /// the loudest signal in this struct, and the one that says the book you are being
     /// asked to agree with is not one you could have derived.
     pub unverified_orders: std::sync::atomic::AtomicU64,
+    /// Batches skipped because their attested close-time fell OUTSIDE the window this node's
+    /// own derived clock had reached (increment 2) -- a time we did not derive. Non-zero means
+    /// a sequencer stamped a time this node refused to fold into state (fail-safe).
+    pub batch_time_divergences: std::sync::atomic::AtomicU64,
     /// Highest batch sequence number seen.
     pub last_batch_seq: std::sync::atomic::AtomicU64,
 }
@@ -334,6 +338,7 @@ async fn system_status(State(state): State<Arc<AppState>>) -> impl IntoResponse 
             "replay_failures": state.replication.replay_failures.load(Ordering::Relaxed),
             "state_hash_mismatches": state.replication.state_hash_mismatches.load(Ordering::Relaxed),
             "unverified_orders": state.replication.unverified_orders.load(Ordering::Relaxed),
+            "batch_time_divergences": state.replication.batch_time_divergences.load(Ordering::Relaxed),
             "last_batch_seq": state.replication.last_batch_seq.load(Ordering::Relaxed),
         },
         // The attested clock, reported whether or not a driver runs here. A node with the
