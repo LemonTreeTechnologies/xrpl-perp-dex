@@ -1301,10 +1301,17 @@ async fn main() -> Result<()> {
         Err(_) => info!("no persisted state, starting fresh"),
     }
 
-    // Create trading engine — always wire batch publisher (gated by is_sequencer flag)
-    let node_id = format!("{}:p{}", cli.p2p_listen, cli.priority);
+    // Create trading engine — always wire batch publisher (gated by is_sequencer flag).
+    // bug-#2 fix: the sequencer identity stamped on every OrderBatch MUST be the libp2p PeerID
+    // the election and the validator leader-gate use -- ONE identity, from the persisted p2p key,
+    // never a separately-constructed string. Load the key HERE (before the engine) so the PeerID
+    // is a construction invariant of the engine -- it can never exist with a wrong/unset
+    // sequencer_id. The keypair is moved into P2PNode::new below, which derives the same PeerID.
+    let p2p_keypair = p2p::load_or_create_identity(&cli.p2p_key_path)
+        .context("failed to load or create libp2p identity")?;
+    let our_peer_id = p2p_keypair.public().to_peer_id().to_string();
     let (trade_batch_tx, mut trade_batch_rx) = tokio::sync::mpsc::channel::<p2p::OrderBatch>(100);
-    let mut engine = TradingEngine::new(&cli.market, perp_for_api, &node_id);
+    let mut engine = TradingEngine::new(&cli.market, perp_for_api, &our_peer_id);
     engine = engine.with_batch_publisher(trade_batch_tx.clone());
 
     let is_sequencer = Arc::new(AtomicBool::new(cli.priority == 0));
@@ -1500,8 +1507,6 @@ async fn main() -> Result<()> {
     let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<p2p::OrderBatch>(100);
     let (election_inbound_tx, election_inbound_rx) =
         tokio::sync::mpsc::channel::<election::ElectionMessage>(100);
-    let p2p_keypair = p2p::load_or_create_identity(&cli.p2p_key_path)
-        .context("failed to load or create libp2p identity")?;
     let mut p2p_node = p2p::P2PNode::new(
         &cli.p2p_listen,
         p2p_keypair,
@@ -1511,6 +1516,19 @@ async fn main() -> Result<()> {
     )
     .await
     .context("failed to start P2P node")?;
+
+    // bug-#2 regression guard: the identity we STAMP on batches (engine sequencer_id ==
+    // our_peer_id) MUST equal the libp2p PeerID the election + leader-gate compare against. Both
+    // derive from the same persisted p2p key, so this holds by construction; assert it at boot so
+    // a future reorder that re-splits the two identities fails LOUDLY here instead of going
+    // silently inert (validators dropping every batch) -- exactly how this bug hid all along.
+    if our_peer_id != p2p_node.peer_id.to_string() {
+        anyhow::bail!(
+            "sequencer identity split: batches stamped {our_peer_id} but the leader-gate uses \
+             {} -- validators would drop every batch (bug #2)",
+            p2p_node.peer_id
+        );
+    }
 
     // Wire P2P publishing channels
     let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<p2p::OrderBatch>(100);
