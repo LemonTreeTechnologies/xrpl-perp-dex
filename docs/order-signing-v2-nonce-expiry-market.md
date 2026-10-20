@@ -1,8 +1,8 @@
 # Order Signing v2 — add `market`, `nonce`, `expiry` to the client-signed order body
 
-**Status: DRAFT.** Pending the auditor's security-design review of the nonce scheme (below); only
-after that should Tom implement the client side and we implement the server side. This is our API
-contract (our scope); the client is Tom's black box built against it.
+**Status: FINALIZED — auditor-ruled 2026-10-20** (see "Auditor rulings" at the end; the draft
+below stands with the tightenings noted there). This is our API contract (our scope); Tom builds
+the client as a black box against it. Enclave + orch impl pending; auditor will IMPL-review when built.
 
 Related: `docs/audit/REQ-matcher-determinism-q3-impl.md` (private enclave repo) — this is the
 "nonce/expiry/market" part-2 item named there (auditor item-1 Challenge 2).
@@ -126,3 +126,29 @@ Concurrent orders from one user must serialise nonce assignment client-side.
 4. Привязка рынка по равенству строк vs числовой id — подтвердить.
 5. Оставить окно дрейфа `X-XRPL-Timestamp` вместе с `nonce`+`expiry`? (Свежесть запроса и
    уникальность ордера — разные слои; черновик оставляет оба.)
+
+
+---
+
+## Auditor rulings (FINAL, 2026-10-20) — the format is now stable for Tom
+
+1. **nonce** = monotonic per-user u64 (NOT a seen-set/window). One u64/user is trivially re-derivable on replay (take the max); a window adds replicated state + an eviction boundary. Client serialises nonce assignment (a UX cost, not a security one).
+2. **state + check** = per-user u64 in SEALED, replicated perp state, applied in ORDER-LOG order. The check-and-set lives in the DETERMINISTIC APPLY path, **never at ingress** (an ingress-only check isn't re-derivable → the co-sign would form on unverified nonces). SEALED is load-bearing: if `last_applied` reset on restart, every past nonce replays again.
+3. **expiry** = refuse if `attested_close_time > expiry`, checked **at APPLY against the BATCH's attested time** (what the matcher stamped), not ingress against a live clock (else replay is non-deterministic). A resting order re-checked across batches uses each batch's attested time. `MAX_ORDER_TTL`: set as SHORT as the real max order lifetime allows (24h conservative default; tighten toward the true longest legitimate resting-order lifetime). nonce kills a leaked order when a later order applies; expiry kills it on wall-time regardless — complementary.
+4. **market** = EXACT-BYTES string equality to the one configured market: no case-fold, trim, or unicode normalization (a canonicalization gap = cross-market injection). Not an integer id (an id needs a drift-prone registry). If many markets ever justify an id, it must be a stable append-only registry (ids never reused).
+5. **X-XRPL-Timestamp** = KEPT, separate layer. It is the general request-auth replay guard over EVERY signed request (incl. non-order balance/account calls that have no nonce/expiry) — transport-freshness at ingress vs the server clock (±30s, non-deterministic by design, a filter). Do NOT collapse it into expiry (deterministic state check at apply vs the attested clock).
+
+**Three cross-cutting (load-bearing):**
+- All three fields live in the SIGNED BODY, never a header — in a header they are sequencer-forgeable and the checks are theater.
+- The validator RE-PARSES the signed bytes and re-derives market/nonce/expiry from them, never from a struct the sequencer parsed (derived-not-received, same as the batch-time check).
+- The exposed `last_applied_nonce` (on `GET /v1/account/balance`) is a CONVENIENCE for the client to pick the next nonce, NOT a trust input; the binding check is apply-time `nonce > last_applied` (fail-closed on a stale client nonce).
+
+## Вердикты аудитора (ФИНАЛ, 2026-10-20) — формат стабилен для Tom
+
+1. **nonce** = монотонный u64 на пользователя (НЕ seen-set). Тривиально воспроизводим на реплее (max); окно = лишнее реплицируемое состояние + граница вытеснения. Клиент сериализует назначение nonce (UX-цена, не security).
+2. **состояние + проверка** = u64 на пользователя в ЗАПЕЧАТАННОМ реплицируемом perp-состоянии, применяется в порядке ORDER-LOG. Check-and-set в ДЕТЕРМИНИРОВАННОМ APPLY-пути, **не на ingress** (ingress-проверка не воспроизводима → co-sign соберётся на непроверенных nonce). SEALED критично: если `last_applied` сбросится на рестарте — все прошлые nonce снова проиграются.
+3. **expiry** = отказ если `attested_close_time > expiry`, проверка **на APPLY против аттестованного времени БАТЧА** (что проштамповал матчер), не на ingress против живых часов (иначе реплей недетерминирован). `MAX_ORDER_TTL`: как можно КОРОЧЕ (24ч консервативно; ужимать к реальному максимуму жизни ордера). nonce убивает утёкший ордер при следующем ордере; expiry — по времени независимо.
+4. **market** = ТОЧНЫЕ БАЙТЫ, строковое равенство настроенному рынку: без case-fold/trim/нормализации (разрыв канонизации = межрыночная инъекция). Не числовой id.
+5. **X-XRPL-Timestamp** = ОСТАВИТЬ, отдельный слой: общий anti-replay транспорта над КАЖДЫМ подписанным запросом (вкл. balance/account без nonce/expiry), свежесть на ingress против серверных часов (±30с). НЕ сливать с expiry.
+
+**Три сквозных:** все три поля в ПОДПИСАННОМ ТЕЛЕ, не в заголовке; валидатор ПЕРЕПАРСИВАЕТ подписанные байты (derived-not-received); отданный `last_applied_nonce` — удобство, не доверенный вход (связывает apply-time `nonce > last_applied`, fail-closed).
