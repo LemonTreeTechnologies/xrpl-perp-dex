@@ -197,7 +197,18 @@ impl TxShaMap {
     /// map, so a single missing or extra transaction changes it and the proof stops
     /// matching the header. There is no partial rebuild.
     pub fn build(items: &[(Vec<u8>, Vec<u8>)]) -> Result<Self> {
-        let mut root = Node::Empty;
+        // The SHAMap root is ALWAYS an inner node when the map is non-empty, exactly as
+        // rippled: a single transaction is a LEAF under the root inner node (addressed by its
+        // key's first nibble), so the root hash is the inner-node hash, NOT the leaf hash.
+        // Seeding `root` as a bare `Empty` left a 1-tx ledger's root a bare Leaf, whose hash is
+        // the leaf's -- mismatching the signed transaction_hash and silently restricting deposit
+        // crediting to multi-tx ledgers (n>=2 collapsed into an inner node and happened to work).
+        // n=0 (no transactions) keeps rippled's convention: the empty tx tree hashes to zero.
+        let mut root = if items.is_empty() {
+            Node::Empty
+        } else {
+            Node::empty_inner()
+        };
         for (tx, meta) in items {
             let key = tx_id(tx);
             let leaf = tx_leaf_hash(tx, meta)?;
@@ -311,6 +322,40 @@ mod tests {
              (ledger {})",
             v::LEDGER_INDEX
         );
+    }
+
+    /// REGRESSION, single-tx ledger: rippled's transaction_hash is the ROOT INNER NODE's
+    /// hash even for n=1 (the one leaf sits UNDER an inner node addressed by its key nibble),
+    /// NOT the leaf hash. A rebuild that leaves the root a bare Leaf returns the leaf hash and
+    /// fails against the signed header -- so deposit crediting silently worked only on
+    /// multi-tx ledgers. Real vector: testnet ledger 21680810 (exactly 1 tx), captured
+    /// 2026-10-20; the expected root is the header's transaction_hash, read not computed.
+    #[test]
+    fn single_transaction_ledger_root_is_the_inner_node_not_the_leaf() {
+        const TXB: &str = "12000024014AD2A6201B014AD2BC6140000000017D784068400000000000000A73210361CE459DD591768AF359D025631E5DAD9F253A17A8EF5ABC9D55297DEB8E106E7446304402200AA6AFC5E68AAF7C3C07C1121203C6F9638DE6C288F9B479241B8944E39CD00802206C1A9F2092F2780E668615389982379A1A7DCD171BF934CF51BD54F2DD0FEF158114AF6DCED2E1CB786E8B8BE1DEC7D007F0509C477F831447B13C7EC1823651F3C4B2CCA52CBAB6773A98C8";
+        const MET: &str = "201C00000000F8E511006125014AD2A655A4A50D6B4A3BFED96B18CF7BC9DCE3EDDAFA0BD190FFC45B7F3EFBB39C12073B5678645E3D210BBE001704106E0E7402FDD9689EBAD89F603D4455C79A14AC0EC7E624014AD2A6624000000005F5E100E1E7220000000024014AD2A72D000000006240000000047868B68114AF6DCED2E1CB786E8B8BE1DEC7D007F0509C477FE1E1E5110061250149478A55D18A1608444F4CBA3613331428C256F8A9E54F3D0DE56113F01DFEE948D86DE556CB3C4E8D792409E9A7E458897B3B5E35246469AF1DE2D2B3E155DDF8CBFA6CE6E6624000000010CE3EE8E1E722001000002401296DC32D000000016240000000124BB728811447B13C7EC1823651F3C4B2CCA52CBAB6773A98C8E1E1F1031000";
+        const TXH: &str = "85dfea99a0513b5f8e76527327bd138837bd72bf6a3c4dd63d46313588bca429";
+        let items = vec![(unhex(TXB), unhex(MET))];
+        let map = TxShaMap::build(&items).unwrap();
+        let want = unhex(TXH);
+        assert_eq!(
+            map.root_hash().as_slice(),
+            want.as_slice(),
+            "1-tx ledger root must be the inner-node hash, not the bare leaf"
+        );
+        // the single tx must still prove inclusion, with the root inner node on the path
+        let key = tx_id(&items[0].0);
+        let proof = map.inclusion_proof(&key).unwrap();
+        assert!(
+            !proof.inner_root_to_leaf.is_empty(),
+            "n=1 inclusion path must contain the root inner node, not be empty"
+        );
+        let mut root = [0u8; 32];
+        root.copy_from_slice(&want);
+        let derived =
+            verify_tx_inclusion(&root, &items[0].0, &items[0].1, &proof.inner_root_to_leaf)
+                .expect("n=1 tx must prove inclusion");
+        assert_eq!(derived, key);
     }
 
     #[test]
