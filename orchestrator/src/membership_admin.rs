@@ -371,12 +371,13 @@ async fn handle_membership_change(
 // initial `SignerListSet` is already on-chain (escrow-init, master-signed); this
 // only seals epoch 1 as each enclave's version=1 baseline so the cluster can
 // cosign thereafter.
-/// GAP A: does the escrow's ON-CHAIN SignerList (accounts + quorum) equal the sealed founding set?
-/// Order-independent on the accounts. `false` means the cluster sealed epoch 1 internally but is
-/// NOT authorised on-chain -- every escrow cosign would fail tefBAD_SIGNATURE, so the genesis must
-/// not claim "cosign-ready" until an operator projects the founding signers (a custody SignerListSet).
+/// GAP A: does the escrow's ON-CHAIN SignerList (accounts + WEIGHTS + quorum) equal the sealed
+/// founding set? Order-independent on the accounts. `false` means the cluster sealed epoch 1
+/// internally but is NOT authorised on-chain -- every escrow cosign would fail tefBAD_SIGNATURE,
+/// so the genesis must not claim "cosign-ready" until an operator projects the founding signers
+/// (a custody SignerListSet).
 fn signer_sets_match(
-    onchain: &[String],
+    onchain: &[(String, u32)],
     onchain_quorum: u32,
     founding: &[String],
     founding_quorum: u32,
@@ -384,9 +385,15 @@ fn signer_sets_match(
     if onchain_quorum != founding_quorum {
         return false;
     }
-    let mut a: Vec<&str> = onchain.iter().map(|s| s.as_str()).collect();
+    // The cluster builds every SignerListSet with uniform SignerWeight 1 (new_signers /
+    // genesis_signers above, and signerlist_update's SignerEntry builder), so the sealed founding
+    // set is {account: weight 1} per r-address. Comparing accounts + quorum ONLY would ACCEPT an
+    // on-chain list with the right accounts and quorum number but skewed weights ({2,1,1} @ quorum
+    // 2 is effectively 1-of-signer-0 -- a weaker, DIFFERENT threshold), so compare the FULL list:
+    // (account, weight) pairs AND quorum. A non-uniform on-chain weight fails the match.
+    let mut a: Vec<(&str, u32)> = onchain.iter().map(|(s, w)| (s.as_str(), *w)).collect();
     a.sort_unstable();
-    let mut b: Vec<&str> = founding.iter().map(|s| s.as_str()).collect();
+    let mut b: Vec<(&str, u32)> = founding.iter().map(|s| (s.as_str(), 1u32)).collect();
     b.sort_unstable();
     a == b
 }
@@ -473,7 +480,14 @@ async fn drive_genesis(
         )
     } else {
         let onchain_desc = match &onchain {
-            Ok((sgs, q)) => format!("on-chain {{{}}} quorum {}", sgs.join(","), q),
+            Ok((sgs, q)) => format!(
+                "on-chain {{{}}} quorum {}",
+                sgs.iter()
+                    .map(|(a, w)| format!("{a}=w{w}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                q
+            ),
             Err(e) => format!("on-chain SignerList unreadable ({e})"),
         };
         format!(
@@ -992,11 +1006,15 @@ mod tests {
 
     #[test]
     fn signer_sets_match_is_order_independent_and_quorum_sensitive() {
-        let onchain = vec!["rB".to_string(), "rA".to_string(), "rC".to_string()];
+        let onchain = vec![
+            ("rB".to_string(), 1u32),
+            ("rA".to_string(), 1u32),
+            ("rC".to_string(), 1u32),
+        ];
         let founding = vec!["rA".to_string(), "rB".to_string(), "rC".to_string()];
         assert!(
             signer_sets_match(&onchain, 2, &founding, 2),
-            "same set any order + same quorum"
+            "same accounts any order, uniform weight 1, same quorum"
         );
         assert!(
             !signer_sets_match(&onchain, 2, &founding, 3),
@@ -1011,6 +1029,17 @@ mod tests {
         assert!(
             !signer_sets_match(&onchain, 2, &subset, 2),
             "a subset is not cosign-ready"
+        );
+        // GAP A(b): right accounts + right quorum NUMBER but a skewed weight is a weaker,
+        // DIFFERENT threshold -- it must NOT be accepted as the uniform founding set.
+        let skewed = vec![
+            ("rA".to_string(), 2u32),
+            ("rB".to_string(), 1u32),
+            ("rC".to_string(), 1u32),
+        ];
+        assert!(
+            !signer_sets_match(&skewed, 2, &founding, 2),
+            "a skewed weight 2/1/1 is not the uniform founding set"
         );
     }
 

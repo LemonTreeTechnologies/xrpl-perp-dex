@@ -170,7 +170,9 @@ pub(crate) fn build_unsigned_tx(
 /// returns (`{"SignerEntry": {...}}`) or a flattened variant some
 /// older tooling produces; both round-trip through r-address
 /// extraction the same way.
-pub(crate) fn parse_signer_list_response(resp: &serde_json::Value) -> Result<(Vec<String>, u32)> {
+pub(crate) fn parse_signer_list_response(
+    resp: &serde_json::Value,
+) -> Result<(Vec<(String, u32)>, u32)> {
     let objects = resp
         .pointer("/result/account_objects")
         .and_then(|v| v.as_array())
@@ -188,7 +190,15 @@ pub(crate) fn parse_signer_list_response(resp: &serde_json::Value) -> Result<(Ve
             .pointer("/SignerEntry/Account")
             .and_then(|v| v.as_str())
             .with_context(|| format!("SignerEntries[{i}] missing SignerEntry.Account"))?;
-        entries.push(acct.to_string());
+        // SignerWeight is part of the THRESHOLD, not decoration: {2,1,1} @ quorum 2 is a
+        // DIFFERENT (weaker) signer policy than {1,1,1} @ quorum 2 with the same accounts.
+        // Carry it so a caller verifying threshold integrity compares the FULL list.
+        let weight = e
+            .pointer("/SignerEntry/SignerWeight")
+            .and_then(|v| v.as_u64())
+            .with_context(|| format!("SignerEntries[{i}] missing SignerEntry.SignerWeight"))?
+            as u32;
+        entries.push((acct.to_string(), weight));
     }
     let quorum = signer_list["SignerQuorum"]
         .as_u64()
@@ -199,7 +209,7 @@ pub(crate) fn parse_signer_list_response(resp: &serde_json::Value) -> Result<(Ve
 pub(crate) async fn fetch_current_signerlist(
     xrpl_url: &str,
     escrow: &str,
-) -> Result<(Vec<String>, u32)> {
+) -> Result<(Vec<(String, u32)>, u32)> {
     let client = reqwest::Client::new();
     let resp: serde_json::Value = client
         .post(xrpl_url)
@@ -277,8 +287,10 @@ async fn drive(
     req: SignerlistUpdateRequest,
 ) -> Result<SignerlistUpdateResponse> {
     // 1. Read current SignerList from XRPL.
-    let (current_entries, current_quorum) =
+    let (current_pairs, current_quorum) =
         fetch_current_signerlist(&state.xrpl_url, &state.escrow_address).await?;
+    // This path edits membership by ACCOUNT; weights are uniform-1 by construction, so drop them.
+    let current_entries: Vec<String> = current_pairs.into_iter().map(|(a, _w)| a).collect();
     info!(
         size = current_entries.len(),
         quorum = current_quorum,
@@ -670,8 +682,10 @@ async fn drive_bootstrap_rotate(
     //    escrow-init time). This IS the target — we re-emit the
     //    identical SignerEntries + SignerQuorum to produce a
     //    multisig-cosigned envelope.
-    let (entries, quorum) =
+    let (entry_pairs, quorum) =
         fetch_current_signerlist(&state.xrpl_url, &state.escrow_address).await?;
+    // Re-emits an identical SignerList by ACCOUNT (build_unsigned_tx hardcodes weight 1).
+    let entries: Vec<String> = entry_pairs.into_iter().map(|(a, _w)| a).collect();
     info!(
         size = entries.len(),
         quorum, "bootstrap-rotate: fetched current on-chain SignerList"
@@ -1090,7 +1104,31 @@ mod tests {
         let (entries, quorum) = parse_signer_list_response(&resp).expect("parse");
         assert_eq!(entries.len(), 3);
         assert_eq!(quorum, 2);
-        assert!(entries.contains(&ADDR_A.to_string()));
+        assert!(entries.iter().any(|(a, _w)| a == ADDR_A));
+        assert!(
+            entries.iter().all(|(_a, w)| *w == 1),
+            "fixture is uniform weight 1"
+        );
+    }
+
+    #[test]
+    fn parse_signer_list_reads_nonuniform_weights_it_does_not_hardcode_one() {
+        // A skewed SignerWeight must survive parsing so the genesis cosign-ready check can
+        // reject it; a parser that dropped weights (or hardcoded 1) would hide the gap.
+        let resp = serde_json::json!({
+            "result": { "account_objects": [ {
+                "LedgerEntryType": "SignerList",
+                "SignerQuorum": 2,
+                "SignerEntries": [
+                    {"SignerEntry": {"Account": ADDR_A, "SignerWeight": 2}},
+                    {"SignerEntry": {"Account": ADDR_B, "SignerWeight": 1}},
+                    {"SignerEntry": {"Account": ADDR_C, "SignerWeight": 1}},
+                ],
+            } ] }
+        });
+        let (entries, _quorum) = parse_signer_list_response(&resp).expect("parse");
+        let wa = entries.iter().find(|(a, _)| a == ADDR_A).unwrap().1;
+        assert_eq!(wa, 2, "the skewed weight must be read, not normalised to 1");
     }
 
     #[test]
