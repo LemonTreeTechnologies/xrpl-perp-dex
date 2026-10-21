@@ -181,6 +181,44 @@ pub fn batch_time_divergence(
     None
 }
 
+/// Validator replay-loop decision: must this batch be SKIPPED because its attested
+/// close-time is outside the window THIS node's own derived clock has reached (increment
+/// 2)? Returns `true` = skip, and RECORDS the skip as a side effect (increments
+/// `divergences` + emits the `batch_time_divergences_total` alarm). Pulled out of the
+/// inline replay loop so the skip DECISION and the counter increment are provable
+/// TOGETHER against a crafted batch time -- the exact wiring a positive-only E2E leaves
+/// dark ("is increment 2 actually live, or is the counter never touched?"). The only
+/// sliver this does not cover is the loop's one-line `if batch_time_skip(..) { continue }`.
+pub fn batch_time_skip(
+    batch_timestamp_unix: u64,
+    my_ripple: u64,
+    divergences: &AtomicU64,
+    sequencer_id: &str,
+    seq_num: u64,
+) -> bool {
+    let batch_ripple = batch_timestamp_unix.saturating_sub(RIPPLE_EPOCH_OFFSET_SECS);
+    if let Some(reason) = batch_time_divergence(
+        batch_ripple,
+        my_ripple,
+        BATCH_TIME_FWD_TOL_SECS,
+        BATCH_TIME_MAX_LAG_SECS,
+    ) {
+        divergences.fetch_add(1, Ordering::Relaxed);
+        error!(
+            reason,
+            metric = "batch_time_divergences_total",
+            sequencer_id,
+            seq = seq_num,
+            batch_ripple,
+            my_ripple,
+            "BATCH TIME DIVERGENCE -- skipping replay (fail-safe: the co-sign will \
+             not form on a time this node did not derive)"
+        );
+        return true;
+    }
+    false
+}
+
 pub struct ClockDriverConfig {
     /// SEVERAL endpoints, not one, and no rippled of our own in the path.
     ///
@@ -563,6 +601,39 @@ mod tests {
         assert!(batch_time_divergence(1000, 0, 30, 600)
             .unwrap()
             .contains("not live"));
+    }
+
+    #[test]
+    fn a_crafted_future_batch_time_increments_the_counter_and_signals_skip() {
+        // part-2 Q4 (b), the negative test at the decision seam: a batch stamped with a
+        // close-time AHEAD of this node's derived clock must (1) be skipped AND (2) bump
+        // the divergence counter the status endpoint exposes. Both together -- a dead
+        // increment-2 would return false here and leave the counter at 0.
+        let div = AtomicU64::new(0);
+        let my_ripple = 1_000u64;
+        // 100s ahead of our clock, well past the 30s gossip-skew tolerance.
+        let crafted_unix = RIPPLE_EPOCH_OFFSET_SECS + my_ripple + 100;
+        let skip = batch_time_skip(crafted_unix, my_ripple, &div, "rogue-seq", 42);
+        assert!(skip, "a future-dated batch must be skipped");
+        assert_eq!(
+            div.load(Ordering::Relaxed),
+            1,
+            "the divergence counter must be bumped"
+        );
+    }
+
+    #[test]
+    fn an_in_window_batch_time_is_not_skipped_and_leaves_the_counter_untouched() {
+        let div = AtomicU64::new(0);
+        let my_ripple = 1_000u64;
+        let honest_unix = RIPPLE_EPOCH_OFFSET_SECS + my_ripple - 5; // 5s behind, in-window
+        let skip = batch_time_skip(honest_unix, my_ripple, &div, "elected-seq", 43);
+        assert!(!skip, "an in-window batch must replay");
+        assert_eq!(
+            div.load(Ordering::Relaxed),
+            0,
+            "no divergence must be recorded"
+        );
     }
 
     #[test]

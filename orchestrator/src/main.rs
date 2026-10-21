@@ -2527,28 +2527,13 @@ async fn main() -> Result<()> {
             // not reached -- fail-safe, the co-sign then cannot form on an unverified time.
             {
                 let my_ripple = validator_clock.attested_close_time.load(Ordering::Relaxed);
-                let batch_ripple = batch
-                    .timestamp
-                    .saturating_sub(crate::attested_clock::RIPPLE_EPOCH_OFFSET_SECS);
-                if let Some(reason) = crate::attested_clock::batch_time_divergence(
-                    batch_ripple,
+                if crate::attested_clock::batch_time_skip(
+                    batch.timestamp,
                     my_ripple,
-                    crate::attested_clock::BATCH_TIME_FWD_TOL_SECS,
-                    crate::attested_clock::BATCH_TIME_MAX_LAG_SECS,
+                    &validator_replication.batch_time_divergences,
+                    &batch.sequencer_id,
+                    batch.seq_num,
                 ) {
-                    validator_replication
-                        .batch_time_divergences
-                        .fetch_add(1, Ordering::Relaxed);
-                    error!(
-                        reason,
-                        metric = "batch_time_divergences_total",
-                        sequencer_id = %batch.sequencer_id,
-                        seq = batch.seq_num,
-                        batch_ripple,
-                        my_ripple,
-                        "BATCH TIME DIVERGENCE -- skipping replay (fail-safe: the co-sign will \
-                         not form on a time this node did not derive)"
-                    );
                     continue;
                 }
             }
