@@ -371,6 +371,26 @@ async fn handle_membership_change(
 // initial `SignerListSet` is already on-chain (escrow-init, master-signed); this
 // only seals epoch 1 as each enclave's version=1 baseline so the cluster can
 // cosign thereafter.
+/// GAP A: does the escrow's ON-CHAIN SignerList (accounts + quorum) equal the sealed founding set?
+/// Order-independent on the accounts. `false` means the cluster sealed epoch 1 internally but is
+/// NOT authorised on-chain -- every escrow cosign would fail tefBAD_SIGNATURE, so the genesis must
+/// not claim "cosign-ready" until an operator projects the founding signers (a custody SignerListSet).
+fn signer_sets_match(
+    onchain: &[String],
+    onchain_quorum: u32,
+    founding: &[String],
+    founding_quorum: u32,
+) -> bool {
+    if onchain_quorum != founding_quorum {
+        return false;
+    }
+    let mut a: Vec<&str> = onchain.iter().map(|s| s.as_str()).collect();
+    a.sort_unstable();
+    let mut b: Vec<&str> = founding.iter().map(|s| s.as_str()).collect();
+    b.sort_unstable();
+    a == b
+}
+
 async fn drive_genesis(
     state: &MembershipAdminState,
     req: MembershipChangeRequest,
@@ -412,31 +432,74 @@ async fn drive_genesis(
     .context("β4 genesis bootstrap (collect founding consent + seal epoch 1 across the cluster)")?;
 
     let sealed_nodes = outcome.node_results.iter().filter(|r| r.ok).count();
+
+    // GAP A fix (seam, not instance): genesis does NO projection -- the escrow SignerListSet is a
+    // custody act. It USED to declare "cluster can now cosign" on the internal BELIEF that the
+    // escrow-init on-chain SignerList still matched the founding set; when it does not, the cluster
+    // seals epoch 1 but every on-chain escrow tx fails tefBAD_SIGNATURE ("non-signer"). VERIFY FROM
+    // CHAIN that the escrow SignerList IS the founding set + quorum before claiming cosign-ready;
+    // fail-closed (a fetch error or any mismatch => NOT ready) so the claim can never outrun chain.
+    let onchain = crate::signerlist_update::fetch_current_signerlist(
+        &state.xrpl_url,
+        &state.escrow_r_address,
+    )
+    .await;
+    let cosign_ready = match &onchain {
+        Ok((onchain_signers, onchain_quorum)) => signer_sets_match(
+            onchain_signers,
+            *onchain_quorum,
+            &req.new_signers,
+            req.quorum,
+        ),
+        Err(_) => false,
+    };
+
+    let status = if !outcome.all_sealed() {
+        "partial_seal"
+    } else if cosign_ready {
+        "ok"
+    } else {
+        "sealed_not_cosign_ready"
+    };
+    let message = if !outcome.all_sealed() {
+        "genesis sealed on a subset of nodes -- retry the failed nodes (bootstrap is idempotent \
+         under the (P) single-successor guard)"
+            .to_string()
+    } else if cosign_ready {
+        format!(
+            "genesis epoch {} sealed on all {sealed_nodes} nodes; on-chain SignerList VERIFIED == \
+             founding set -- cluster can now cosign",
+            outcome.proposed_epoch
+        )
+    } else {
+        let onchain_desc = match &onchain {
+            Ok((sgs, q)) => format!("on-chain {{{}}} quorum {}", sgs.join(","), q),
+            Err(e) => format!("on-chain SignerList unreadable ({e})"),
+        };
+        format!(
+            "genesis epoch {} sealed on all {sealed_nodes} nodes, BUT the escrow on-chain \
+             SignerList is NOT the founding set ({}; founding {{{}}} quorum {}) -- the cluster \
+             CANNOT cosign on-chain until an operator PROJECTS the founding signers via \
+             SignerListSet (a custody act); on-chain escrow txs fail tefBAD_SIGNATURE until then.",
+            outcome.proposed_epoch,
+            onchain_desc,
+            req.new_signers.join(","),
+            req.quorum
+        )
+    };
+
     Ok(MembershipChangeResponse {
-        status: if outcome.all_sealed() {
-            "ok".into()
-        } else {
-            "partial_seal".into()
-        },
+        status: status.into(),
         proposed_epoch: outcome.proposed_epoch,
         message_hash_hex: hex::encode(outcome.message_hash),
         sealed_nodes,
-        // Genesis performs NO projection: the SignerListSet is already on-chain.
+        // Genesis performs NO projection (the SignerListSet is a custody act); cosign-readiness is
+        // instead VERIFIED from-chain above.
         projection_tx_hash_hex: None,
         projection_ledger_index: None,
         confirmed_nodes: 0,
         failed_nodes: failed_seal_nodes(&outcome.node_results),
-        message: if outcome.all_sealed() {
-            format!(
-                "genesis epoch {} sealed on all {sealed_nodes} nodes; SignerListSet already \
-                 on-chain (escrow-init) — cluster can now cosign",
-                outcome.proposed_epoch
-            )
-        } else {
-            "genesis sealed on a subset of nodes — retry the failed nodes \
-             (bootstrap is idempotent under the (P) single-successor guard)"
-                .into()
-        },
+        message,
     })
 }
 
@@ -926,6 +989,30 @@ pub async fn spawn_admin_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signer_sets_match_is_order_independent_and_quorum_sensitive() {
+        let onchain = vec!["rB".to_string(), "rA".to_string(), "rC".to_string()];
+        let founding = vec!["rA".to_string(), "rB".to_string(), "rC".to_string()];
+        assert!(
+            signer_sets_match(&onchain, 2, &founding, 2),
+            "same set any order + same quorum"
+        );
+        assert!(
+            !signer_sets_match(&onchain, 2, &founding, 3),
+            "quorum mismatch is not cosign-ready"
+        );
+        let different = vec!["rA".to_string(), "rB".to_string(), "rZ".to_string()];
+        assert!(
+            !signer_sets_match(&onchain, 2, &different, 2),
+            "a different signer is not cosign-ready"
+        );
+        let subset = vec!["rA".to_string(), "rB".to_string()];
+        assert!(
+            !signer_sets_match(&onchain, 2, &subset, 2),
+            "a subset is not cosign-ready"
+        );
+    }
 
     fn seal(node: &str, ok: bool, err: Option<&str>) -> NodeSealResult {
         NodeSealResult {

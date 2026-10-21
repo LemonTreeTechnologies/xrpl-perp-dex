@@ -196,7 +196,10 @@ pub(crate) fn parse_signer_list_response(resp: &serde_json::Value) -> Result<(Ve
     Ok((entries, quorum))
 }
 
-async fn fetch_current_signerlist(xrpl_url: &str, escrow: &str) -> Result<(Vec<String>, u32)> {
+pub(crate) async fn fetch_current_signerlist(
+    xrpl_url: &str,
+    escrow: &str,
+) -> Result<(Vec<String>, u32)> {
     let client = reqwest::Client::new();
     let resp: serde_json::Value = client
         .post(xrpl_url)
