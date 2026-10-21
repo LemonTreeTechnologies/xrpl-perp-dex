@@ -18,6 +18,7 @@ mod dkg_coordinate;
 mod election;
 mod frost_round; // FROST threshold-Schnorr signing round driver
 mod http_helpers;
+mod leader_gate; // O-H3 — validator leader-gate provenance decision (extracted + unit-tested)
 mod membership_admin;
 mod membership_apply;
 mod membership_canonical;
@@ -1504,7 +1505,8 @@ async fn main() -> Result<()> {
     });
 
     // Start P2P node (gossipsub for order flow replication + election)
-    let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<p2p::OrderBatch>(100);
+    let (batch_tx, mut batch_rx) =
+        tokio::sync::mpsc::channel::<(p2p::OrderBatch, Option<String>)>(100);
     let (election_inbound_tx, election_inbound_rx) =
         tokio::sync::mpsc::channel::<election::ElectionMessage>(100);
     let mut p2p_node = p2p::P2PNode::new(
@@ -2408,37 +2410,55 @@ async fn main() -> Result<()> {
         let mut replay_failures: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
         let mut replay_ok_total: u64 = 0;
-        while let Some(batch) = batch_rx.recv().await {
+        while let Some((batch, src_peer)) = batch_rx.recv().await {
             if is_seq_validator.load(Ordering::Relaxed) {
                 continue; // sequencer doesn't replay its own batches
             }
 
             let total_fills: usize = batch.orders.iter().map(|o| o.fills.len()).sum();
 
-            // O-H3: gate the batch source on the *elected* leader from the
-            // election state machine — no TOFU on first-observed peer.
-            // A rogue peer cannot lock itself in as sequencer by beating
-            // the real leader to the first publish; the election channel
-            // is the source of truth.
-            let elected = validator_leader_rx.borrow().clone();
-            match elected {
-                Some(ref elected_id) if *elected_id == batch.sequencer_id => {
-                    // elected leader matches sender → proceed
-                }
-                Some(ref elected_id) => {
-                    warn!(
-                        elected = %elected_id,
-                        got = %batch.sequencer_id,
-                        seq = batch.seq_num,
-                        "batch from non-elected sequencer — ignoring"
-                    );
-                    continue;
-                }
-                None => {
+            // O-H3: bind the batch's AUTHENTICATED gossip origin (src_peer) to the elected
+            // leader; the self-declared sequencer_id field alone is forgeable by any meshed peer.
+            // Decision extracted to `leader_gate` so the binding is unit-tested, not review-only.
+            let elected_snapshot = validator_leader_rx.borrow().clone();
+            match leader_gate::leader_gate_decision(
+                src_peer.as_deref(),
+                elected_snapshot.as_deref(),
+                &batch.sequencer_id,
+            ) {
+                leader_gate::LeaderGate::Accept => {}
+                leader_gate::LeaderGate::NoLeader => {
                     warn!(
                         got = %batch.sequencer_id,
                         seq = batch.seq_num,
                         "no elected leader yet — ignoring batch"
+                    );
+                    continue;
+                }
+                leader_gate::LeaderGate::NotLeader => {
+                    warn!(
+                        elected = elected_snapshot.as_deref().unwrap_or(""),
+                        authed_source = src_peer.as_deref().unwrap_or(""),
+                        claimed = %batch.sequencer_id,
+                        seq = batch.seq_num,
+                        "O-H3: batch publisher is not the elected leader — ignoring"
+                    );
+                    continue;
+                }
+                leader_gate::LeaderGate::Unsigned => {
+                    warn!(
+                        elected = elected_snapshot.as_deref().unwrap_or(""),
+                        seq = batch.seq_num,
+                        "O-H3: batch has no authenticated publisher (unsigned) — ignoring"
+                    );
+                    continue;
+                }
+                leader_gate::LeaderGate::FieldMismatch => {
+                    warn!(
+                        elected = elected_snapshot.as_deref().unwrap_or(""),
+                        claimed = %batch.sequencer_id,
+                        seq = batch.seq_num,
+                        "sequencer_id field disagrees with the authenticated publisher — ignoring"
                     );
                     continue;
                 }

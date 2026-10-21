@@ -1144,8 +1144,10 @@ pub struct P2PNode {
     bootstrap_topic: gossipsub::IdentTopic,
     /// Phase 2.1c-D: DKG ceremony coordination (leader-driven, libp2p).
     dkg_step_topic: gossipsub::IdentTopic,
-    /// Channel to send received batches to the orchestrator (validator).
-    batch_tx: mpsc::Sender<OrderBatch>,
+    /// Channel to send received batches to the orchestrator (validator), paired with the
+    /// AUTHENTICATED gossip publisher identity (message.source as a PeerId string, or None if
+    /// unsigned) so the validator can bind the batch origin to the elected leader (O-H3).
+    batch_tx: mpsc::Sender<(OrderBatch, Option<String>)>,
     /// Channel to receive batches to publish (sequencer).
     publish_rx: Option<mpsc::Receiver<OrderBatch>>,
     /// Election messages received from gossipsub → forwarded to election module.
@@ -1292,7 +1294,7 @@ impl P2PNode {
     pub async fn new(
         listen_addr: &str,
         keypair: Keypair,
-        batch_tx: mpsc::Sender<OrderBatch>,
+        batch_tx: mpsc::Sender<(OrderBatch, Option<String>)>,
         election_inbound_tx: mpsc::Sender<ElectionMessage>,
         peer_count: Arc<std::sync::atomic::AtomicU32>,
     ) -> Result<Self> {
@@ -3989,13 +3991,20 @@ impl P2PNode {
                     if message.topic == orders_topic_hash {
                         match serde_json::from_slice::<OrderBatch>(&message.data) {
                             Ok(batch) => {
+                                // O-H3: carry the AUTHENTICATED publisher identity. gossipsub
+                                // Signed + ValidationMode::Strict set+verify message.source to the
+                                // signing key's PeerId, so this is the origin a meshed peer cannot
+                                // forge. propagation_source is only the relay hop. The validator
+                                // binds authed_source to the elected leader at the leader-gate.
+                                let authed_source = message.source.map(|p| p.to_string());
                                 info!(
                                     seq = batch.seq_num,
                                     orders = batch.orders.len(),
-                                    from = %propagation_source,
+                                    relay = %propagation_source,
+                                    source = authed_source.as_deref().unwrap_or("<unsigned>"),
                                     "received order batch"
                                 );
-                                if let Err(e) = self.batch_tx.send(batch).await {
+                                if let Err(e) = self.batch_tx.send((batch, authed_source)).await {
                                     error!("failed to forward batch: {:#}", e);
                                 }
                             }
