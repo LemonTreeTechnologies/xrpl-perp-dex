@@ -49,12 +49,27 @@ pub mod limits {
     pub const SEAL_OVERHEAD_BYTES: u64 = 592;
 
     // ── AC-E1-3 (#131 E-1) perp-meta schema pre-flight ──────────────────────
-    /// Byte offset of `sgx_aes_gcm_data_t.payload_size` (u32 LE) inside a sealed
-    /// blob: `sizeof(sgx_key_request_t)`(512) + `plain_text_offset`(4) +
-    /// `reserved`(12) = 528. With no AAD (seal_part uses add_mac_txt=0) this
-    /// payload size EQUALS the plaintext length — the exact number we assert on,
-    /// read WITHOUT unsealing (no SGX runtime needed on the pre-flight host).
+    /// Byte offset of `plain_text_offset` (u32 LE) in `sgx_sealed_data_t`, right after
+    /// `sgx_key_request_t`(512). SGX fills it with the ENCRYPTED-text length — i.e. the
+    /// sizeof the sealed struct (the PerpMeta plaintext). THIS is the number we classify on.
+    ///
+    /// ⚠️ It is NOT `payload_size` (below). `seal_part` seals the β18 section stamp as
+    /// ADDITIONAL AUTHENTICATED DATA, so from β18 on a section's `payload_size`
+    /// (= encrypt_txt_len + add_mac_txt_len) is 16 BYTES LARGER than the plaintext. Reading
+    /// payload_size as the plaintext length false-STOPped a live GAP-B migration: a plain
+    /// b18 meta (192B) seals with a 16B stamp and reads back 208 at offset 528, which matches
+    /// no golden → "Unknown" → STOP. `plain_text_offset` is the plaintext either way (it
+    /// equals payload_size for a legacy unstamped section, aad=0). Read WITHOUT unsealing.
+    pub const PLAIN_TEXT_OFFSET: u64 = 512;
+    /// Byte offset of `sgx_aes_gcm_data_t.payload_size` (u32 LE) = encrypt_txt_len +
+    /// add_mac_txt_len. Used only for the fixed-header overhead self-check and to bound the
+    /// AAD; the plaintext length comes from `PLAIN_TEXT_OFFSET`.
     pub const SEALED_PAYLOAD_SIZE_OFFSET: u64 = 528;
+    /// Sanity bound on a section's AAD (`payload_size − plaintext`): 0 for a legacy
+    /// unstamped section, 16 for a β18+ section stamp. Bounded generously so a future stamp
+    /// growth does not re-introduce the false-STOP this gate just fixed — the plaintext
+    /// length is read directly, so it does not depend on this.
+    pub const SEAL_SECTION_STAMP_MAX: u64 = 64;
     /// Plausible fixed sealed-header overhead band (`sizeof(sgx_sealed_data_t)` ≈
     /// 560; bracketed generously). `file_size − payload_len` must fall here, else
     /// the value read at offset 528 is not a trustworthy payload length → STOP.
@@ -245,16 +260,30 @@ fn read_sealed_payload_len(path: &Path) -> Option<u64> {
     if file_len < limits::SEALED_PAYLOAD_SIZE_OFFSET + 4 {
         return None; // too short to hold the payload_size field
     }
-    f.seek(SeekFrom::Start(limits::SEALED_PAYLOAD_SIZE_OFFSET))
-        .ok()?;
-    let mut buf = [0u8; 4];
-    f.read_exact(&mut buf).ok()?;
-    let payload_len = u32::from_le_bytes(buf) as u64;
-    // Self-check: file_size − payload_len must be a plausible fixed sealed-header
-    // overhead. If not, the offset-528 read is not a trustworthy length.
-    match file_len.checked_sub(payload_len) {
+    let read_u32 = |f: &mut std::fs::File, off: u64| -> Option<u64> {
+        f.seek(SeekFrom::Start(off)).ok()?;
+        let mut b = [0u8; 4];
+        f.read_exact(&mut b).ok()?;
+        Some(u32::from_le_bytes(b) as u64)
+    };
+    // The PLAINTEXT length (the PerpMeta struct) is the encrypted-text length, which SGX
+    // stores as `plain_text_offset` — NOT `payload_size`, which also counts the β18 section
+    // stamp carried as AAD (see the const docs; this is what false-STOPped a live migration).
+    let plaintext_len = read_u32(&mut f, limits::PLAIN_TEXT_OFFSET)?;
+    let payload_size = read_u32(&mut f, limits::SEALED_PAYLOAD_SIZE_OFFSET)?;
+    // payload_size = plaintext + AAD; the AAD is 0 (legacy) or a small section stamp. A value
+    // that is smaller than the plaintext, or an implausibly large AAD, means the offsets are
+    // not a trustworthy sealed header → STOP (fail-safe).
+    let aad = payload_size.checked_sub(plaintext_len)?;
+    if aad > limits::SEAL_SECTION_STAMP_MAX {
+        return None;
+    }
+    // Self-check: file_size − payload_size must be the fixed sealed-header overhead (stamp
+    // -independent, since the stamp lives inside payload_size). If not, the read is not a
+    // trustworthy header.
+    match file_len.checked_sub(payload_size) {
         Some(oh) if (limits::SEAL_HEADER_MIN..=limits::SEAL_HEADER_MAX).contains(&oh) => {
-            Some(payload_len)
+            Some(plaintext_len)
         }
         _ => None,
     }
@@ -515,17 +544,29 @@ mod tests {
         f.write_all(&vec![0u8; bytes]).unwrap();
     }
 
-    /// Write a fake sealed blob: `560 (≈ sizeof sgx_sealed_data_t) + payload_len`
-    /// bytes with `payload_len` (u32 LE) planted at offset 528, modelling the
-    /// sealed header enough for read_sealed_payload_len (overhead 560 ∈ [520,640]).
-    fn write_sealed_meta(dir: &Path, name: &str, payload_len: u64) {
-        let overhead = 560u64;
-        let total = (overhead + payload_len) as usize;
+    /// Write a fake sealed blob modelling `sgx_sealed_data_t`: a fixed 560-byte header
+    /// then a payload of `plaintext_len + aad`. The ENCRYPTED-text length (`plaintext_len`,
+    /// the PerpMeta struct) is planted at `plain_text_offset` (512); `aad` (0 = legacy
+    /// unstamped, 16 = a β18+ section stamp) makes `payload_size` (528) = plaintext + aad.
+    /// read_sealed_payload_len must return the PLAINTEXT, not payload_size.
+    fn write_sealed_meta_aad(dir: &Path, name: &str, plaintext_len: u64, aad: u64) {
+        let payload_size = plaintext_len + aad;
+        let overhead = 560u64; // key_request 512 + plain_text_offset 4 + reserved 12 + payload_size 4 + reserved 12 + tag 16
+        let total = (overhead + payload_size) as usize;
         let mut bytes = vec![0u8; total];
+        let pto = limits::PLAIN_TEXT_OFFSET as usize;
+        bytes[pto..pto + 4].copy_from_slice(&(plaintext_len as u32).to_le_bytes());
         let off = limits::SEALED_PAYLOAD_SIZE_OFFSET as usize;
-        bytes[off..off + 4].copy_from_slice(&(payload_len as u32).to_le_bytes());
-        let mut f = std::fs::File::create(dir.join(name)).unwrap();
-        f.write_all(&bytes).unwrap();
+        bytes[off..off + 4].copy_from_slice(&(payload_size as u32).to_le_bytes());
+        std::fs::File::create(dir.join(name))
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+    }
+
+    /// A legacy (pre-β18) UNSTAMPED section: payload_size == plaintext (aad = 0).
+    fn write_sealed_meta(dir: &Path, name: &str, plaintext_len: u64) {
+        write_sealed_meta_aad(dir, name, plaintext_len, 0);
     }
 
     fn meta_check(r: &CapacityReport) -> &CapacityCheck {
@@ -727,6 +768,51 @@ mod tests {
         assert!(r.ok(), "GAP B meta must pass: {}", render(&r));
         assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB19);
         assert!(render(&r).contains("no-op"));
+    }
+
+    /// REGRESSION (the live false-STOP, 2026-10-22): a β18 section carries a 16-byte stamp
+    /// as AAD, so its sealed payload_size reads 208 while the PLAINTEXT is 192. The pre-flight
+    /// must classify by the plaintext (192 → B18, migratable), NOT by payload_size (208 →
+    /// Unknown → STOP). This models a stamped section; the old helper modelled only unstamped
+    /// ones, which is exactly why the gap was invisible until a live GAP-B migration hit it.
+    #[test]
+    fn perp_meta_stamped_b18_reads_plaintext_not_payload_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        // plaintext 192 (b18) + 16-byte β18 stamp AAD → payload_size 208 on disk.
+        write_sealed_meta_aad(d, "s0_perp_meta.sealed", limits::PERP_META_B18_LEN, 16);
+        let r = assess_accounts_dir(d).unwrap();
+        assert!(
+            r.ok(),
+            "a stamped b18 meta must be MIGRATABLE, not a false STOP: {}",
+            render(&r)
+        );
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::LegacyB18);
+        assert_eq!(
+            r.perp_meta_findings[0].payload_len,
+            Some(limits::PERP_META_B18_LEN)
+        );
+    }
+
+    /// The GAP-B current schema, stamped: plaintext 200 + 16 AAD = 216 payload → AlreadyB19.
+    #[test]
+    fn perp_meta_stamped_gapb_current_is_the_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        write_sealed_meta_aad(d, "s0_perp_meta.sealed", limits::PERP_META_B19_LEN, 16);
+        let r = assess_accounts_dir(d).unwrap();
+        assert!(r.ok(), "a stamped GAP-B meta must pass: {}", render(&r));
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB19);
+    }
+
+    /// An implausibly large AAD (offsets that are not a real sealed header) must STOP.
+    #[test]
+    fn perp_meta_absurd_aad_is_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        write_sealed_meta_aad(d, "s0_perp_meta.sealed", limits::PERP_META_B18_LEN, 200);
+        let r = assess_accounts_dir(d).unwrap();
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::Unknown);
     }
 
     /// β17 must read as MIGRATABLE, not as current. Left as AlreadyB17 it would clear a
