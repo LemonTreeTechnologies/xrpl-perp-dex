@@ -200,6 +200,13 @@ async fn sign_via_p2p(
 /// Submit a multisig withdrawal: margin check in enclave + 2-of-N signing.
 /// If `signing_tx` is provided, uses P2P relay for remote signatures.
 /// Otherwise falls back to direct HTTP (legacy, requires SSH tunnels).
+/// GAP B: how many ledgers past the current validated ledger a withdrawal Payment stays valid
+/// (LastLedgerSequence = validated + this). Bounds the reconcile window — the enclave's R-b
+/// (expired-unconsumed) rollback can only fire once a validated ledger passes LastLedgerSequence;
+/// ~40 ledgers ≈ 160s on XRPL, generous for multi-cosign collection + submit. Matches the
+/// AccountSet path's LAST_LEDGER_WINDOW.
+const WITHDRAWAL_LAST_LEDGER_WINDOW: u64 = 40;
+
 pub async fn process_withdrawal(
     perp: &crate::perp_client::PerpClient,
     xrpl_url: &str,
@@ -228,6 +235,20 @@ pub async fn process_withdrawal(
         .await
         .unwrap_or(1);
 
+    // GAP B: bind the Payment to a ledger window (LastLedgerSequence) so a reserved-but-unconfirmed
+    // withdrawal becomes DECIDABLY dead once a validated ledger passes it — the precondition for the
+    // enclave's R-b (expired-unconsumed) rollback. Refuse the withdrawal if the current ledger is
+    // unreadable: a wrong (or absent) LLS is worse than not withdrawing — it would make the Payment
+    // either never-expiring (unreconcilable) or expire prematurely. Mirrors the AccountSet path.
+    let validated_ledger = crate::unl_policy::own_validated_ledger(xrpl_url)
+        .await
+        .context("reading the validated ledger for the withdrawal LastLedgerSequence")?;
+    let last_ledger = validated_ledger
+        .checked_add(WITHDRAWAL_LAST_LEDGER_WINDOW)
+        .context("withdrawal LastLedgerSequence overflow")?;
+    let last_ledger_u32 = u32::try_from(last_ledger)
+        .context("withdrawal LastLedgerSequence exceeds the XRPL 32-bit field")?;
+
     // Fee for multisig = base_fee * (1 + N_signers). Use generous fee.
     let fee = format!("{}", 12 * (1 + signers_config.quorum as u64));
     // Derive the drops ONCE and use the same number for the blob and for the co-sign
@@ -244,6 +265,7 @@ pub async fn process_withdrawal(
         "Amount": format!("{}", amount_drops),
         "Fee": fee,
         "Sequence": sequence,
+        "LastLedgerSequence": last_ledger_u32,
         "SigningPubKey": ""
     });
     if let Some(tag) = req.destination_tag {
