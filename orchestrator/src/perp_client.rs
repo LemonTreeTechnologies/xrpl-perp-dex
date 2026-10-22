@@ -21,8 +21,12 @@ pub struct PerpClient {
 /// than re-implemented per driver — `deposit_spv::outcome_from_error` grew its own copy
 /// and a second divergent one is how two drivers end up disagreeing about what -89 means.
 pub fn rc_from_error(msg: &str) -> Option<i64> {
-    let i = msg.find("rc=")?;
-    let rest = &msg[i + 3..];
+    // Anchored to the FULL "(rc=" token, not a bare "rc=": every enclave error body emits
+    // "(rc=N)" (the C++ handlers all build `"... (rc=" + to_string(rc) + ")"`), and a bare
+    // "rc=" would also match inside an unrelated token like "src=" and parse the wrong
+    // integer — the whole -69 finalize->R-a routing rests on this being exact.
+    let i = msg.find("(rc=")?;
+    let rest = &msg[i + 4..];
     let end = rest
         .find(|c: char| !c.is_ascii_digit() && c != '-')
         .unwrap_or(rest.len());
@@ -548,5 +552,31 @@ impl PerpClient {
             .json()
             .await?;
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rc_from_error;
+
+    #[test]
+    fn rc_from_error_extracts_the_rc_token() {
+        assert_eq!(
+            rc_from_error("https://localhost:9088/v1/perp/withdraw/finalize -> HTTP 400 Bad Request: {\"status\":\"error\",\"message\":\"withdrawal finalize refused (rc=-69)\"}"),
+            Some(-69)
+        );
+        assert_eq!(rc_from_error("SPV deposit refused (rc=-85)"), Some(-85));
+        assert_eq!(rc_from_error("... (rc=0)"), Some(0));
+    }
+
+    #[test]
+    fn rc_from_error_is_anchored_and_ignores_bare_rc_substrings() {
+        // "src=" contains "rc="; a bare-"rc=" parser would read the 5 here. The "(rc="
+        // anchor skips it and finds the real code.
+        assert_eq!(rc_from_error("source=5 src=5 (rc=-74)"), Some(-74));
+        // No "(rc=" token at all -> no code (e.g. a transport error, "Invalid JSON format").
+        assert_eq!(rc_from_error("connection refused"), None);
+        assert_eq!(rc_from_error("Invalid JSON format"), None);
+        assert_eq!(rc_from_error("ledger src=21680810"), None);
     }
 }

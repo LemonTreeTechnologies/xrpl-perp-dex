@@ -398,6 +398,36 @@ async fn fetch_full_ledger(http: &reqwest::Client, url: &str, ledger_index: u32)
     Ok(r["result"].clone())
 }
 
+/// Whether an enclave rc from a finalize / rollback refusal is RETRYABLE — a future ledger,
+/// a fresher or rebuilt proof, a UNL refresh, or enclave arming could change it — versus a
+/// terminal ANOMALY an operator must look at.
+///
+/// FAIL-LOUD DEFAULT (auditor Ruling-1(a)): this enumerates ONLY the known-retryable codes;
+/// EVERY other rc — an unmapped one, and the withdrawal parse-reject family (a validly
+/// included tx at Sequence S that is not a clean native-XRP withdrawal Payment: not-a-payment,
+/// partial, failed, non-native, bad-amount, missing-field) whose on-chain fact is SETTLED —
+/// falls through to anomaly. An unknown terminal must alarm loudly, never retry silently
+/// forever (that is the silent-strand failure in slow motion). The safe direction is a false
+/// alarm (row kept, operator looks), never a false retry (a stranded, debited row).
+fn rc_is_retryable(rc: i64) -> bool {
+    // ecall-level transients: enclave not yet armed (no SignerList / no pinned UNL / quorum
+    // floor), the R-b window not yet past L (-74), the R-b UNL freshness window (-77 before
+    // pin, -81 beyond window — clears on a forward re-pin), and tx-inclusion (-87: node lag
+    // or a rebuildable proof).
+    const RETRYABLE_ECALL: &[i64] = &[-60, -70, -71, -74, -77, -81, -87];
+    if RETRYABLE_ECALL.contains(&rc) {
+        return true;
+    }
+    // SPV-band transients (base -200): under-quorum (-8, more validations arrive),
+    // wrong-ledger-hash (-9) / bad-validation (-10) / signer-not-in-pinned-UNL (-11, UNL
+    // refresh) / state-path-mismatch (-12) — all clear with more validations, a UNL refresh,
+    // or a rebuilt proof from a fresher ledger. The parse-reject SPV sub-codes (-14..-22,
+    // and -1..-7 producer-malformed, -13 wrong-keylet, -99 internal) are NOT here: they are
+    // settled or a producer bug, so they fall through to anomaly.
+    let spv = rc - crate::attested_clock::SPV_HOST_RC_BASE;
+    matches!(spv, -12..=-8)
+}
+
 /// One reconcile pass over one reserved withdrawal: read XRPL, decide the verdict, build the
 /// matching SPV proof, drive the enclave.
 ///
@@ -523,8 +553,21 @@ async fn reconcile_consumed_slot(
                         "finalize reported content mismatch (-69) but R-a rollback was refused: {e2:#}"
                     )),
                 },
-                Some(rc) => ReconcileOutcome::Deferred(format!("finalize refused rc={rc}: {msg}")),
-                None => ReconcileOutcome::Deferred(format!("finalize failed (no rc): {msg}")),
+                // FAIL-LOUD: known-retryable -> Deferred; everything else (parse-reject of a
+                // settled tx at S, value-latch, user-gone, any unmapped terminal) -> ANOMALY.
+                Some(rc) if rc_is_retryable(rc) => {
+                    ReconcileOutcome::Deferred(format!("finalize refused rc={rc} (retryable): {msg}"))
+                }
+                Some(rc) => ReconcileOutcome::Anomaly(format!(
+                    "finalize refused rc={rc} — a settled on-chain fact at Sequence {} or an \
+                     unmapped terminal, not retryable: {msg}",
+                    entry.sequence
+                )),
+                // No enclave rc parsed => the enclave was not reached (transport / HTTP) =>
+                // transient, retry.
+                None => ReconcileOutcome::Deferred(format!(
+                    "finalize failed, no enclave rc (transport?): {msg}"
+                )),
             }
         }
     }
@@ -555,13 +598,19 @@ async fn reconcile_expired(
         Err(e) => {
             let msg = format!("{e:#}");
             match rc_from_error(&msg) {
-                Some(-74) => {
-                    ReconcileOutcome::Deferred("R-b proof ledger not yet past L; retry".into())
-                }
-                Some(rc) => {
-                    ReconcileOutcome::Deferred(format!("R-b rollback refused rc={rc}: {msg}"))
-                }
-                None => ReconcileOutcome::Deferred(format!("R-b rollback failed (no rc): {msg}")),
+                // FAIL-LOUD, same partition as finalize: -74 (not yet past L) and the other
+                // known-retryable codes -> Deferred; everything else -> ANOMALY. In
+                // particular -73 (the margin's user record is gone) is terminal, not a quiet
+                // defer (auditor Ruling-1(a)); it falls through to the anomaly arm here.
+                Some(rc) if rc_is_retryable(rc) => ReconcileOutcome::Deferred(format!(
+                    "R-b rollback refused rc={rc} (retryable): {msg}"
+                )),
+                Some(rc) => ReconcileOutcome::Anomaly(format!(
+                    "R-b rollback refused rc={rc} — terminal or unmapped, not retryable: {msg}"
+                )),
+                None => ReconcileOutcome::Deferred(format!(
+                    "R-b rollback failed, no enclave rc (transport?): {msg}"
+                )),
             }
         }
     }
@@ -940,5 +989,46 @@ mod tests {
         assert!(decode_tx_id(&"AB".repeat(32)).is_some());
         assert!(decode_tx_id(&"AB".repeat(31)).is_none()); // 31 bytes
         assert!(decode_tx_id("nothex").is_none());
+    }
+
+    // ── rc partition (auditor Ruling-1(a) fail-loud) ───────────────────────
+
+    const B: i64 = crate::attested_clock::SPV_HOST_RC_BASE; // -200
+
+    #[test]
+    fn rc_partition_retryable_set() {
+        // ecall transients
+        for rc in [-60, -70, -71, -74, -77, -81, -87] {
+            assert!(rc_is_retryable(rc), "ecall rc {rc} must be retryable");
+        }
+        // SPV-band transients: under-quorum(-8)/hash(-9)/badsig(-10)/not-in-UNL(-11)/path(-12)
+        for off in [-8, -9, -10, -11, -12] {
+            assert!(rc_is_retryable(B + off), "spv {off} must be retryable");
+        }
+    }
+
+    #[test]
+    fn rc_partition_anomaly_is_fail_loud_default() {
+        // enclave terminals
+        for rc in [-17, -72, -73] {
+            assert!(
+                !rc_is_retryable(rc),
+                "enclave rc {rc} must be a terminal anomaly"
+            );
+        }
+        // SPV parse-reject / producer-bug / internal family -> anomaly
+        for off in [-1, -7, -13, -14, -17, -19, -20, -21, -22, -99] {
+            assert!(
+                !rc_is_retryable(B + off),
+                "spv {off} (settled/producer) must be a terminal anomaly"
+            );
+        }
+        // unmapped codes default to anomaly (fail-loud), never silent retry
+        for rc in [-5000, -1, -100, 0, 42] {
+            assert!(
+                !rc_is_retryable(rc),
+                "unmapped rc {rc} must default to anomaly"
+            );
+        }
     }
 }
