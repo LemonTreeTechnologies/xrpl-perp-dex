@@ -217,6 +217,48 @@ impl PerpClient {
         .await
     }
 
+    /// GAP B reconcile — finalize a reserved withdrawal the proof shows LANDED (XDEP
+    /// tx-inclusion). Only the blob goes over the wire; the enclave matches the reserved
+    /// PendingWithdrawal row by Sequence slot + content (from the DELIVERED amount) and
+    /// turns the margin hold into a permanent custody-out. Idempotent: a replayed proof
+    /// after the row is gone comes back rc=0. On refusal the enclave code survives in the
+    /// error body (-69 content mismatch -> a different tx took the slot, use
+    /// rollback_slot_stolen; plus the shared SPV-proof codes), parseable with `rc_from_error`.
+    pub async fn withdraw_finalize(&self, proof_blob: &[u8]) -> Result<Value> {
+        self.post(
+            "/perp/withdraw/finalize",
+            serde_json::json!({ "proof_blob": hex::encode(proof_blob) }),
+        )
+        .await
+    }
+
+    /// GAP B reconcile — roll back a reserved withdrawal whose Sequence slot was consumed
+    /// by a DIFFERENT transaction (R-a, slot stolen; XDEP tx-inclusion of that other tx).
+    /// Restores the held margin and drops the row; the per-escrow high-water STAYS, so the
+    /// stolen slot can never be re-signed. rc=0 rolled back; -72 the proof's content MATCHES
+    /// the row (that is a finalize, not a rollback), -73 user gone.
+    pub async fn withdraw_rollback_slot_stolen(&self, proof_blob: &[u8]) -> Result<Value> {
+        self.post(
+            "/perp/withdraw/rollback/slot-stolen",
+            serde_json::json!({ "proof_blob": hex::encode(proof_blob) }),
+        )
+        .await
+    }
+
+    /// GAP B reconcile — roll back a reserved withdrawal that EXPIRED unconsumed (R-b; XSPV
+    /// AccountRoot state-inclusion proving the escrow Sequence is still the reserved slot at
+    /// a validated ledger PAST the Payment's LastLedgerSequence, so it can never be included).
+    /// Restores the held margin and drops the row; the high-water STAYS. rc=0 rolled back;
+    /// -73 user gone, -74 the proof's ledger is not yet past LastLedgerSequence (retry later
+    /// — an ordinary state, not a fault).
+    pub async fn withdraw_rollback_expired(&self, proof_blob: &[u8]) -> Result<Value> {
+        self.post(
+            "/perp/withdraw/rollback/expired",
+            serde_json::json!({ "proof_blob": hex::encode(proof_blob) }),
+        )
+        .await
+    }
+
     /// Trusted-price — feed a quorum-signed XRPL ledger header ('XCLK') so the enclave
     /// can learn the time from something it verifies rather than something we assert.
     pub async fn attested_clock_advance(&self, clock_blob: &[u8]) -> Result<Value> {

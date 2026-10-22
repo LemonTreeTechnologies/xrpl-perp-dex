@@ -214,6 +214,7 @@ pub async fn process_withdrawal(
     signers_config: &SignersConfig,
     req: &WithdrawRequest,
     signing_tx: Option<&mpsc::Sender<SigningRelay>>,
+    journal: Option<&crate::withdrawal_reconcile::JournalHandle>,
 ) -> Result<WithdrawResult> {
     info!(
         user = %req.user_id,
@@ -333,6 +334,31 @@ pub async fn process_withdrawal(
         }
     }
 
+    // GAP B: the enclave has now RESERVED this withdrawal — the margin is debited into a
+    // sealed PendingWithdrawal row and the per-escrow high-water has advanced over this
+    // Sequence. Record it in the durable journal BEFORE we attempt to submit, so that an
+    // insufficient-signatures return, a failed submission, or a crash all still leave the
+    // reconcile loop able to settle (finalize) or unwind (R-b expired) the reserved row. The
+    // submitted hash is only a lookup hint and is filled in after submission.
+    let mk_journal_entry =
+        |submitted_hash: Option<String>| crate::withdrawal_reconcile::PendingWithdrawal {
+            escrow: escrow_address.to_string(),
+            sequence,
+            last_ledger_sequence: last_ledger_u32,
+            amount_drops,
+            destination: req.destination.clone(),
+            destination_tag: req.destination_tag,
+            submitted_hash,
+            user_id: req.user_id.clone(),
+            reserved_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        };
+    if let Some(j) = journal {
+        j.record(mk_journal_entry(None));
+    }
+
     // Step 3: Collect signatures from quorum signers.
     //
     // O-L4 known gap: each `signer.enclave_url` points at a cross-VM
@@ -442,6 +468,11 @@ pub async fn process_withdrawal(
                 xrpl_hash = %xrpl_hash,
                 "multisig withdrawal submitted to XRPL"
             );
+            // Refresh the journal entry with the submitted hash (a lookup hint for the
+            // reconcile loop; the reconcile key stays the Sequence slot + enclave content).
+            if let Some(j) = journal {
+                j.record(mk_journal_entry(Some(xrpl_hash.clone())));
+            }
             Ok(WithdrawResult {
                 status: "success".into(),
                 amount: req.amount.clone(),

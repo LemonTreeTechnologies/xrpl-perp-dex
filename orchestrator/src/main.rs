@@ -67,6 +67,7 @@ mod upgrade_corpus;
 mod validator_manifests; // AC-BASE-2″ §6 — feed the enclave's measured-anchor validator root
 mod vault_mm;
 mod withdrawal;
+mod withdrawal_reconcile; // GAP B — reserve→finalize/rollback journal + reconcile driver
 mod ws;
 mod xrpl_monitor;
 mod xrpl_signer;
@@ -1467,6 +1468,22 @@ async fn main() -> Result<()> {
     let reserves_figures_cache: reserves_publisher::ReservesFiguresCache =
         std::sync::Arc::new(std::sync::Mutex::new(None));
 
+    // GAP B withdrawal reconcile journal (producer side). Gated on PERP_WITHDRAWAL_RECONCILE,
+    // the same switch as the reconcile loop, so reserved withdrawals are durably recorded for
+    // the loop + boot sweep to settle (finalize) or unwind (R-b). A corrupt/unreadable journal
+    // FAILS startup rather than silently stranding in-flight rows (margin debited, slot held).
+    let withdrawal_journal =
+        if std::env::var("PERP_WITHDRAWAL_RECONCILE").ok().as_deref() == Some("1") {
+            let path = std::env::var("PERP_WITHDRAWAL_JOURNAL")
+                .unwrap_or_else(|_| "withdrawal_reconcile_journal.json".to_string());
+            let handle = withdrawal_reconcile::JournalHandle::open(&path)
+                .context("opening the withdrawal reconcile journal")?;
+            info!(path = %path, "withdrawal-reconcile journal opened");
+            Some(handle)
+        } else {
+            None
+        };
+
     let app_state = Arc::new(AppState {
         engine,
         perp: PerpClient::new(&cli.enclave_url)?,
@@ -1483,6 +1500,7 @@ async fn main() -> Result<()> {
         } else {
             None
         },
+        withdrawal_journal: withdrawal_journal.clone(),
         db: db.clone(),
         shard_router: shard_router.clone(),
         peer_count: peer_count.clone(),
@@ -2755,7 +2773,11 @@ async fn main() -> Result<()> {
     // scanner credits. The enclave -85 remains the backstop.
     let spv_deposits_enabled = deposit_cfg.is_some();
     let clock_cfg = attested_clock::ClockDriverConfig::from_env();
-    if deposit_cfg.is_some() || clock_cfg.is_some() {
+    // GAP B withdrawal reconcile (consumer side). Shares the validations collector + buffer:
+    // finalize / R-a need the validator signatures for the ledger a withdrawal landed in,
+    // exactly as the deposit scanner does.
+    let reconcile_cfg = withdrawal_reconcile::ReconcileLoopConfig::from_env(&escrow_address);
+    if deposit_cfg.is_some() || clock_cfg.is_some() || reconcile_cfg.is_some() {
         // The UNION of whatever both configs name, deduplicated. Either driver alone is
         // enough to want the collector, and if both are on they should not open the same
         // subscription twice.
@@ -2770,7 +2792,13 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        assert!(!ws_urls.is_empty(), "one of the two configs is present");
+        if let Some(r) = reconcile_cfg.as_ref() {
+            let u = r.ws_url().to_string();
+            if !ws_urls.contains(&u) {
+                ws_urls.push(u);
+            }
+        }
+        assert!(!ws_urls.is_empty(), "one of the configs is present");
         let buffer =
             std::sync::Arc::new(std::sync::Mutex::new(deposit_spv::ValidationBuffer::new()));
         info!(
@@ -2788,6 +2816,17 @@ async fn main() -> Result<()> {
                 buffer.clone(),
             ));
             info!("deposit-spv ENABLED — scanner PER-NODE (each node SPV-verifies + credits its own enclave; E 2026-10-14)");
+        }
+        if let (Some(rcfg), Some(journal)) = (reconcile_cfg, withdrawal_journal.clone()) {
+            tokio::spawn(withdrawal_reconcile::run_withdrawal_reconcile(
+                rcfg,
+                perp.clone(),
+                journal,
+                buffer.clone(),
+            ));
+            info!(
+                "withdrawal-reconcile ENABLED — reserve->finalize/rollback driver + boot sweep (per-node)"
+            );
         }
         // THE ONE WAY THE STALE-PIN BRICK RETURNS (audit 2026-10-06). The clock is
         // OFF-by-default and unl-refresh is ON-by-default, so the dangerous configuration is

@@ -102,6 +102,10 @@ pub struct AppState {
     pub signers_config: Option<crate::withdrawal::SignersConfig>,
     /// P2P signing relay channel (None = fall back to direct HTTP)
     pub signing_tx: Option<tokio::sync::mpsc::Sender<crate::p2p::SigningRelay>>,
+    /// GAP B withdrawal reconcile journal (None = reconcile not enabled). When present,
+    /// `process_withdrawal` records each reserved withdrawal here so the reconcile loop can
+    /// drive it to finalize or rollback.
+    pub withdrawal_journal: Option<crate::withdrawal_reconcile::JournalHandle>,
     /// PostgreSQL for history (optional — trading works without it)
     pub db: Option<crate::db::Db>,
     /// Shard router — routes user_id → shard → enclave. Phase 1: single shard.
@@ -1579,6 +1583,7 @@ async fn withdraw(
         &signers,
         &req,
         state.signing_tx.as_ref(),
+        state.withdrawal_journal.as_ref(),
     )
     .await
     {
