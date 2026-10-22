@@ -378,7 +378,7 @@ fn verify_request_with(
             hash_hex = %hex::encode(hash),
             sig_hex = %sig_hex,
             pubkey_hex = %pubkey_hex,
-            error = %e,
+            error = %format!("{e:#}"),
             "signature verification failed"
         );
         return Err(e);

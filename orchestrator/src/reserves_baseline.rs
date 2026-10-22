@@ -437,7 +437,7 @@ pub async fn run_reserves_spv_baseline_ceremony(
                     sealed.insert(node);
                 }
                 Some(e) => {
-                    tracing::warn!(node = %node, err = %e, "#131 SPV baseline: node rejected the apply");
+                    tracing::warn!(node = %node, err = %format!("{e:#}"), "#131 SPV baseline: node rejected the apply");
                     failures.push(format!("{node}: {e}"));
                 }
             }
