@@ -82,7 +82,8 @@ pub mod limits {
     pub const PERP_META_B16_LEN: u64 = 176;
     /// β17 = β16 + 8 (trusted-price price_publisher_disabled_mask, the RESTRICT dial).
     pub const PERP_META_B17_LEN: u64 = 184;
-    /// β18 = β17 + 8 (`save_seq`, the torn-set discriminator) — current.
+    /// β18 = β17 + 8 (`save_seq`, the torn-set discriminator). No longer current — GAP B
+    /// froze it as a legacy and appended 8 more bytes (below).
     ///
     /// The section-version stamp lives in each section's sealed AAD precisely so the meta
     /// size would NOT move — and then the discriminator had to be re-keyed from
@@ -90,6 +91,11 @@ pub mod limits {
     /// after all, and this mirror is exactly the thing that has been two schemas behind the
     /// enclave once before and surfaced as a false STOP under live-migration pressure.
     pub const PERP_META_B18_LEN: u64 = 192;
+    /// GAP B (β19) = β18 + 8 — CURRENT. The 8 bytes are the withdrawal reserve/reconcile
+    /// scalars (`withdrawal_sequence_high_water` and `pending_withdrawal_count`). The enclave
+    /// froze `PerpMetaLegacyB18` at 192 and `static_assert(sizeof(PerpMeta) == 200)`; this
+    /// mirror follows.
+    pub const PERP_META_B19_LEN: u64 = 200;
 }
 
 /// One limit check with the numbers behind the verdict.
@@ -190,8 +196,12 @@ pub enum MetaSchema {
     /// carries a stamp and the cross-section check stays disarmed, which is correct: there
     /// is no reference value to compare against yet.
     LegacyB17,
-    /// == 192: the β18 schema. Already current — nothing to upgrade.
-    AlreadyB18,
+    /// == 192: the β18 schema. GAP B load upgrades it to 200 (zero-fills the withdrawal
+    /// high-water + pending-withdrawal count). Migratable — this is the OLD size for a
+    /// β18 → GAP B migration.
+    LegacyB18,
+    /// == 200: the GAP B (β19) schema. Already current — nothing to upgrade.
+    AlreadyB19,
     /// Any other length, an unreadable header, or a size that doesn't reconcile with the
     /// file. The current enclave load HARD-FAILS this (AC-CHUNK3-3) — so promoting a node
     /// in this state would strand it. STOP before the point of no return.
@@ -262,7 +272,8 @@ fn classify_perp_meta(payload_len: Option<u64>) -> MetaSchema {
         Some(limits::PERP_META_B15_LEN) => MetaSchema::LegacyB15,
         Some(limits::PERP_META_B16_LEN) => MetaSchema::LegacyB16,
         Some(limits::PERP_META_B17_LEN) => MetaSchema::LegacyB17,
-        Some(limits::PERP_META_B18_LEN) => MetaSchema::AlreadyB18,
+        Some(limits::PERP_META_B18_LEN) => MetaSchema::LegacyB18,
+        Some(limits::PERP_META_B19_LEN) => MetaSchema::AlreadyB19,
         _ => MetaSchema::Unknown,
     }
 }
@@ -429,7 +440,8 @@ pub fn render(report: &CapacityReport) -> String {
                 MetaSchema::LegacyB15 => "β15 (160B) → upgrades to β17 (184B): zero-fills the attested clock (the migrated enclave starts with NO verified time) and the publisher RESTRICT mask. Inert while no publishers are anchored; the split halt reads a zero clock as NOT FRESH the moment they are",
                 MetaSchema::LegacyB16 => "β16 (176B) → upgrades to β17 (184B): zero-fills price_publisher_disabled_mask, so no publisher inherits a RESTRICT nobody re-authorised",
                 MetaSchema::LegacyB17 => "β17 (184B) → upgrades to β18 (192B): zero-fills save_seq, so the first β18 save writes 1 and stamps every sealed section; the torn-set check is disarmed until then because no section carries a stamp",
-                MetaSchema::AlreadyB18 => "β18 (192B) → already current schema (no-op)",
+                MetaSchema::LegacyB18 => "β18 (192B) → upgrades to GAP B (200B): zero-fills withdrawal_sequence_high_water + pending_withdrawal_count (the high-water starts at 0, correct for a cluster with no reserved withdrawals in flight)",
+                MetaSchema::AlreadyB19 => "GAP B (200B) → already current schema (no-op)",
                 MetaSchema::Unknown => {
                     "UNKNOWN size → NON-migratable — current load HARD-FAILS (STOP)"
                 }
@@ -635,6 +647,7 @@ mod tests {
         assert_eq!(limits::PERP_META_B16_LEN, 176);
         assert_eq!(limits::PERP_META_B17_LEN, 184);
         assert_eq!(limits::PERP_META_B18_LEN, 192);
+        assert_eq!(limits::PERP_META_B19_LEN, 200);
         // Each bump appends whole u64 fields, so the sizes must be strictly increasing and
         // 8-aligned. A new entry that breaks either is a transcription error, not a schema.
         let all = [
@@ -692,14 +705,27 @@ mod tests {
         assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::LegacyB16);
     }
 
+    /// β18 must now read as MIGRATABLE, not current — GAP B appended 8 bytes (high-water +
+    /// pending count), so a 192-byte record is the OLD size for a β18 → GAP B migration.
+    /// Left as "already current" it would clear a migration the GAP B enclave then upgrades.
     #[test]
-    fn perp_meta_already_b18_is_the_no_op() {
+    fn perp_meta_b18_is_now_a_legacy_upgrade() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         write_sealed_meta(d, "s0_perp_meta.sealed", limits::PERP_META_B18_LEN);
         let r = assess_accounts_dir(d).unwrap();
-        assert!(r.ok(), "β18 meta must pass: {}", render(&r));
-        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB18);
+        assert!(r.ok(), "β18 meta must still be migratable: {}", render(&r));
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::LegacyB18);
+    }
+
+    #[test]
+    fn perp_meta_already_b19_gapb_is_the_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        write_sealed_meta(d, "s0_perp_meta.sealed", limits::PERP_META_B19_LEN);
+        let r = assess_accounts_dir(d).unwrap();
+        assert!(r.ok(), "GAP B meta must pass: {}", render(&r));
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB19);
         assert!(render(&r).contains("no-op"));
     }
 
