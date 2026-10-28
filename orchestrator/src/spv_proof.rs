@@ -204,6 +204,209 @@ pub fn verify_inclusion(proof: &XspvProof, account_hash: &[u8; 32]) -> bool {
     &running == account_hash
 }
 
+/// Decode a 32-byte hex string into a key/hash.
+fn hex32_str(s: &str) -> Result<[u8; 32]> {
+    let b = hex::decode(s).context("not hex")?;
+    if b.len() != 32 {
+        bail!("expected 32 bytes, got {}", b.len());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&b);
+    Ok(out)
+}
+
+/// Nibble selector into a 32-byte SHAMap key at `depth` (high nibble of byte depth/2 at
+/// even depth, low at odd) — the SAME indexing `verify_inclusion` walks.
+fn state_nibble(key: &[u8; 32], depth: usize) -> usize {
+    if depth % 2 == 0 {
+        (key[depth / 2] >> 4) as usize
+    } else {
+        (key[depth / 2] & 0x0F) as usize
+    }
+}
+
+/// A node of the ACCOUNT-STATE SHAMap, rebuilt host-side from a full `ledger_data` dump.
+/// Mirrors `tx_shamap::Node`, but a leaf carries its serialized object `data` (needed for
+/// the XSPV `leaf_data`) and the leaf hash is the account-state hash
+/// `SHA512Half('MLN\0' ‖ data ‖ index)`. Inner hashing (`'MIN\0'` over the 512-byte child
+/// array) is identical to the tx tree. See `verify_inclusion` for the reading half.
+enum StateNode {
+    Empty,
+    Leaf { key: [u8; 32], data: Vec<u8> },
+    Inner(Box<[StateNode; 16]>),
+}
+
+impl StateNode {
+    fn empty_inner() -> StateNode {
+        StateNode::Inner(Box::new(std::array::from_fn(|_| StateNode::Empty)))
+    }
+    fn hash(&self) -> [u8; 32] {
+        match self {
+            StateNode::Empty => [0u8; 32],
+            StateNode::Leaf { key, data } => sha512half(&[&HP_LEAF, data, key]),
+            StateNode::Inner(_) => {
+                let flat = self.flat_children().expect("inner node has a flat form");
+                sha512half(&[&HP_INNER, &flat])
+            }
+        }
+    }
+    fn flat_children(&self) -> Option<[u8; 512]> {
+        match self {
+            StateNode::Inner(children) => {
+                let mut flat = [0u8; 512];
+                for (i, c) in children.iter().enumerate() {
+                    flat[i * 32..i * 32 + 32].copy_from_slice(&c.hash());
+                }
+                Some(flat)
+            }
+            _ => None,
+        }
+    }
+    fn insert(&mut self, key: [u8; 32], data: Vec<u8>, depth: usize) -> Result<()> {
+        if depth >= 64 {
+            bail!("two state entries share a full 32-byte index — impossible without a SHA-512 collision");
+        }
+        match self {
+            StateNode::Empty => {
+                *self = StateNode::Leaf { key, data };
+                Ok(())
+            }
+            StateNode::Leaf {
+                key: ek,
+                data: ed,
+            } => {
+                if *ek == key {
+                    // Same index twice (paginated-dump overlap) — keep the first, idempotent.
+                    return Ok(());
+                }
+                // SHAMap collapse: two keys meeting here push BOTH down while their nibbles agree.
+                let (ek, ed) = (*ek, std::mem::take(ed));
+                *self = StateNode::empty_inner();
+                self.insert(ek, ed, depth)?;
+                self.insert(key, data, depth)
+            }
+            StateNode::Inner(children) => {
+                let nib = state_nibble(&key, depth);
+                children[nib].insert(key, data, depth + 1)
+            }
+        }
+    }
+}
+
+/// An account-state SHAMap rebuilt from a full `ledger_data` state dump. The proof producer
+/// is UNTRUSTED: the enclave re-verifies, and the host `verify_inclusion` self-check against
+/// the signed `account_hash` catches any reconstruction error before a blob ships.
+pub struct StateShaMap {
+    root: StateNode,
+}
+
+impl StateShaMap {
+    /// Build from EVERY state object `(index, serialized_data)` in one ledger. All are
+    /// required — the root hashes the whole map, so a missing/extra object changes it and
+    /// the proof stops matching the signed `account_hash`. The root is an inner node for a
+    /// non-empty map (rippled convention), matching the tx-tree regression lesson.
+    pub fn build(items: Vec<([u8; 32], Vec<u8>)>) -> Result<Self> {
+        let mut root = if items.is_empty() {
+            StateNode::Empty
+        } else {
+            StateNode::empty_inner()
+        };
+        for (key, data) in items {
+            root.insert(key, data, 0)?;
+        }
+        Ok(StateShaMap { root })
+    }
+    /// Root hash — EQUALS the signed `account_hash` (header offset 76) for a correct rebuild.
+    pub fn root_hash(&self) -> [u8; 32] {
+        self.root.hash()
+    }
+    /// Read one AccountRoot's inclusion path, shaped as the `XspvProof` the enclave consumes
+    /// (inner nodes root→leaf; `verify_inclusion` is the matching verifier).
+    pub fn state_proof(&self, target: &[u8; 32]) -> Result<XspvProof> {
+        let mut inner_root_to_leaf = Vec::new();
+        let mut node = &self.root;
+        let mut depth = 0usize;
+        loop {
+            match node {
+                StateNode::Inner(children) => {
+                    inner_root_to_leaf.push(node.flat_children().expect("inner node"));
+                    node = &children[state_nibble(target, depth)];
+                    depth += 1;
+                }
+                StateNode::Leaf { key, data } => {
+                    if key != target {
+                        bail!("state entry not in this ledger (a different index sits at its slot)");
+                    }
+                    return Ok(XspvProof {
+                        kind: 0,
+                        leaf_index: *target,
+                        leaf_data: data.clone(),
+                        inner_root_to_leaf,
+                    });
+                }
+                StateNode::Empty => {
+                    bail!("state entry not in this ledger (empty slot at depth {depth})")
+                }
+            }
+        }
+    }
+}
+
+/// Paginate `ledger_data {binary:true}` to collect EVERY account-state object `(index, data)`
+/// at `seq` from a STANDARD node — the input to a host-side state-tree rebuild (no patch,
+/// no dedicated node). Uses the `marker` cursor until the state is exhausted.
+async fn fetch_state_objects(http_url: &str, seq: u64) -> Result<Vec<([u8; 32], Vec<u8>)>> {
+    let mut out: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+    let mut marker = serde_json::Value::Null;
+    loop {
+        let mut params = serde_json::json!({"ledger_index": seq, "binary": true, "limit": 2048});
+        if !marker.is_null() {
+            params["marker"] = marker.clone();
+        }
+        let r = http_rpc(http_url, "ledger_data", params)
+            .await
+            .context("ledger_data fetch")?;
+        let state = r["state"]
+            .as_array()
+            .context("ledger_data response has no state array")?;
+        for o in state {
+            let idx = hex32_str(o["index"].as_str().context("state object index")?)
+                .context("state object index")?;
+            let data = hex::decode(o["data"].as_str().context("state object data")?)
+                .context("state object data hex")?;
+            out.push((idx, data));
+        }
+        match r.get("marker") {
+            Some(m) if !m.is_null() => marker = m.clone(),
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+
+/// Host-side escrow AccountRoot proof from a STANDARD node's `ledger_data` — NO getProofPath,
+/// NO patched node. Fetches the escrow's SHAMap index, rebuilds the full state tree, and
+/// reads the inclusion path off it. The caller self-checks the result with `verify_inclusion`
+/// against the signed `account_hash` (and the enclave re-verifies independently).
+async fn reconstruct_state_proof(http_url: &str, seq: u64, escrow: &str) -> Result<XspvProof> {
+    // standard ledger_entry (no `proof` flag) returns the AccountRoot's SHAMap key (`index`).
+    let le = http_rpc(
+        http_url,
+        "ledger_entry",
+        serde_json::json!({"account_root": escrow, "ledger_index": seq, "binary": true}),
+    )
+    .await
+    .context("ledger_entry (index) fetch")?;
+    let index = hex32_str(
+        le["index"]
+            .as_str()
+            .context("ledger_entry has no index for the escrow AccountRoot")?,
+    )?;
+    let objects = fetch_state_objects(http_url, seq).await?;
+    let map = StateShaMap::build(objects)?;
+    map.state_proof(&index)
+}
+
 fn push_be16(v: &mut Vec<u8>, x: u16) {
     v.extend_from_slice(&x.to_be_bytes());
 }
@@ -746,6 +949,12 @@ pub struct SpvFetchConfig {
     pub escrow_account: String,
     pub quorum: usize,     // stop once one ledger has this many full validations
     pub collect_secs: u64, // ws collect window
+    /// Prefer the patched node's getProofPath (one tiny inclusion path) over a full
+    /// `ledger_data` state dump. Set true for a dedicated/patched proof node (the reserves
+    /// baseline against our own xrpld+getProofPath); leave false for a standard public node
+    /// that only serves `ledger_data`. Either producer is UNTRUSTED — only the account_hash
+    /// match makes a proof good — so this is a performance/availability choice, not trust.
+    pub prefer_getproofpath: bool,
 }
 
 async fn http_rpc(url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
@@ -761,6 +970,58 @@ async fn http_rpc(url: &str, method: &str, params: serde_json::Value) -> Result<
 /// ledger and assemble the XSPV blob the enclave verifies. Host-side sanity-checks the
 /// chaining (header→ledger_hash the validations attest, proof→account_hash) before
 /// returning — a producer bug fails here loudly rather than shipping an unverifiable blob.
+/// Escrow AccountRoot proof from a PATCHED node's getProofPath (one tiny path). RETRY: the
+/// node can lag a few seconds behind the attested ledger before it can walk the state map,
+/// so `ledger_entry` may lack `proof_path` momentarily.
+async fn proof_via_getproofpath(
+    cfg: &SpvFetchConfig,
+    seq: u64,
+    account_hash: &[u8; 32],
+) -> Result<XspvProof> {
+    let mut le = serde_json::Value::Null;
+    for attempt in 0..10u32 {
+        let r = http_rpc(
+            &cfg.http_url,
+            "ledger_entry",
+            serde_json::json!({"account_root": cfg.escrow_account, "ledger_index": seq, "binary": true, "proof": true}),
+        )
+        .await
+        .context("ledger_entry proof fetch")?;
+        if r.get("proof_path").and_then(|p| p.as_array()).is_some() {
+            le = r;
+            break;
+        }
+        tracing::debug!(attempt, seq, "#131 SPV: no proof_path yet — retrying");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let path: Vec<Vec<u8>> = le["proof_path"]
+        .as_array()
+        .context("node served no getProofPath (not a patched node)")?
+        .iter()
+        .map(|v| hex::decode(v.as_str().unwrap_or_default()).context("proof node hex"))
+        .collect::<Result<_>>()?;
+    let p = proof_from_getproofpath(&path, 0)?;
+    if !verify_inclusion(&p, account_hash) {
+        bail!("getProofPath proof does not hash to the ledger's account_hash");
+    }
+    Ok(p)
+}
+
+/// Escrow AccountRoot proof rebuilt host-side from a STANDARD node's full `ledger_data`
+/// state dump (no patch needed). The rebuilt path is self-checked against `account_hash`,
+/// so a reconstruction bug fails here rather than shipping an unverifiable blob.
+async fn proof_via_ledger_data(
+    cfg: &SpvFetchConfig,
+    seq: u64,
+    account_hash: &[u8; 32],
+) -> Result<XspvProof> {
+    let p = reconstruct_state_proof(&cfg.http_url, seq, &cfg.escrow_account).await?;
+    if !verify_inclusion(&p, account_hash) {
+        bail!("ledger_data reconstruction did not hash to the ledger's account_hash");
+    }
+    Ok(p)
+}
+
 pub async fn fetch_spv_bundle(cfg: &SpvFetchConfig) -> Result<Vec<u8>> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
@@ -841,44 +1102,35 @@ pub async fn fetch_spv_bundle(cfg: &SpvFetchConfig) -> Result<Vec<u8>> {
     }
     let seq = as_u64(&ledger["ledger_index"]).context("ledger_index")?;
 
-    // 3. escrow AccountRoot proof at that ledger (patched-node getProofPath).
-    //
-    // RETRY for the same reason as the header fetch above: having the ledger HEADER does
-    // not guarantee the node has the state map to walk yet, so `ledger_entry` can come back
-    // without `proof_path` for a few seconds. Observed live on the second real ceremony,
-    // one step past where the first retry was added.
-    let mut le = serde_json::Value::Null;
-    for attempt in 0..10u32 {
-        let r = http_rpc(
-            &cfg.http_url,
-            "ledger_entry",
-            serde_json::json!({"account_root": cfg.escrow_account, "ledger_index": seq, "binary": true, "proof": true}),
-        )
-        .await
-        .context("ledger_entry proof fetch")?;
-        if r.get("proof_path").and_then(|p| p.as_array()).is_some() {
-            le = r;
-            break;
-        }
-        tracing::debug!(
-            attempt,
-            seq,
-            reply = %r,
-            "#131 SPV: no proof_path yet at that ledger — retrying"
-        );
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-    let path: Vec<Vec<u8>> = le["proof_path"]
-        .as_array()
-        .context("no proof_path after ~20s (is the node the patched build?)")?
-        .iter()
-        .map(|v| hex::decode(v.as_str().unwrap_or_default()).context("proof node hex"))
-        .collect::<Result<_>>()?;
-    let proof = proof_from_getproofpath(&path, 0)?;
+    // 3. escrow AccountRoot proof — host-side reconstruction from a STANDARD node's
+    //    `ledger_data` (node-free, patch-free): rebuild the full state SHAMap and read the
+    //    inclusion path off it. The enclave re-verifies independently, and `verify_inclusion`
+    //    below self-checks the rebuilt path against the validator-signed `account_hash`, so a
+    //    reconstruction bug FAILS here, never forges. If a node will not serve the full state,
+    //    fall back to a patched node's getProofPath — both producers are UNTRUSTED; only the
+    //    account_hash match makes a proof good.
     let ah = hex32(ledger, "account_hash")?;
-    if !verify_inclusion(&proof, &ah) {
-        bail!("escrow proof does not hash to the ledger's account_hash");
-    }
+    // Two UNTRUSTED producers; only the account_hash match makes a proof good. Prefer
+    // getProofPath (one tiny path) for our patched proof node, else rebuild from a full
+    // `ledger_data` dump for a standard node. A miss on the preferred producer falls through
+    // to the other, so a mis-set flag costs latency, never correctness.
+    let proof = if cfg.prefer_getproofpath {
+        match proof_via_getproofpath(cfg, seq, &ah).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(seq, err = %format!("{e:#}"), "#131 SPV: getProofPath failed — trying ledger_data");
+                proof_via_ledger_data(cfg, seq, &ah).await?
+            }
+        }
+    } else {
+        match proof_via_ledger_data(cfg, seq, &ah).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(seq, err = %format!("{e:#}"), "#131 SPV: ledger_data failed — trying getProofPath");
+                proof_via_getproofpath(cfg, seq, &ah).await?
+            }
+        }
+    };
 
     // 4. assemble the XSPV blob.
     build_xspv_blob(&header, &datas, &[proof])
@@ -950,6 +1202,70 @@ mod tests {
             .leaf_data
             .windows(4)
             .any(|w| w == [0x06, 0x13, 0xA9, 0xE8]));
+    }
+
+    // LIVE capture from OUR OWN patched xrpld 3.4.1 proof-node (Hetzner ~/perp-rippled),
+    // ledger seq 21873212 (validated/closed). Firsthand confirmation on real 3.4.1 data that
+    // the getProofPath path reconstructs byte-exact to the VALIDATED account_hash, AND that
+    // every tamper direction is refused ("ship on reconstructs AND tampered-refused").
+    const LIVE_ACCOUNT_HASH: &str =
+        "E9C8C2121F1E8C27FC70825F30A314755E594DFE3BE33FC9B3703BA493CDB838";
+    const LIVE_LEAF_INDEX: &str =
+        "CB3C4E8D792409E9A7E458897B3B5E35246469AF1DE2D2B3E155DDF8CBFA6CE6";
+    const LIVE_PROOF_PATH: &[&str] = &[
+        "11006122001000002401296DC325014B33C82D00000001558FB8A92D1D9FD6FA5EF53FC24AA603A09EE181039ECDA47FCCFD47C9B679EB83624000000018419828811447B13C7EC1823651F3C4B2CCA52CBAB6773A98C8CB3C4E8D792409E9A7E458897B3B5E35246469AF1DE2D2B3E155DDF8CBFA6CE601",
+        "0579768BC6A13EB44A267B3DABC325F0292325FA85428C636B5BA5F0786B3F6208EDADF2A450A06DC215FA0B265DF2D3DEED8800C3D8998D4EADE5300CCCF72E970903",
+        "00000000000000000000000000000000000000000000000000000000000000006BBC4F2C0120A3B49AFE99548A2443A02F79C06523176BB6B7A4C91C8627DBB9CAB252DF8CF8FD8C81AAE15043828E1EEA6D0FEC2B5B53DE9C614DC9767B204BABFAFB6D6BEB2D8E4A9F30E82D25AC7AC5C2568C7AE72A34E68F11C31D60DE87203DC1416929E58E4EFE36D5167B102CDDE8A90F3DFE7003AF25BE62481D66A32AB65CCCA6D6F793853620AC10381A7921D32ED7EFCA0099C7766347373CF29B00000000000000000000000000000000000000000000000000000000000000004A7F60470DFBC2719408834F5DBC6B6AC746FFA1E83986230A138A1DC681CE1BC4704EE750D4DB765D973EC809213CF2CE8987FF161F25A16A69369E8399EE7C000000000000000000000000000000000000000000000000000000000000000090770D99CDC356488FE0C594CCFDBDFE30518F9858C438ECFA1E5E1E38456B7BE45017D05C5A9266567D0B1C2241D4E950002A627447E8930E614B7DC44EF3248DEBD33E5F692FE18149F21012CFE019838A9EACC376894D27835F1C7230AB9EC62726D730601960B0653CA08F90EA105757081F71E4FE080EFA1EE5E584FA1CEF3034BED2A9F72EB93EFD505963057A6AD6C1439FD2F7953AB8C4D1568FB3948FC28E1B53340EA19DD5923D0B0C2F38AAD02B47F756A807690B38124BAA7E1E02",
+        "816D38B105AF841D7B6EF1C5EC8405A01846C1942A5BD8AE09C57AB71EE27830F5007BD95624EEEE5653A4286BE201221F72B941F6E1261D0B0FAF646E72517D97D78A06C9BC7BFA1EA48AAEF1F42BE299ED581BCDC2D197FB8E07D6CFBA518E8E27C7BB72928D379FC0446933FEDE39EAB4FF17F2280890077BCA4FB4F3850AC611BC5730FAD77B2CE9B7AC8F9290C5747EC8ACA1CB5E7BD55401A17B791A38DD3C1CE2DF262ECCE392271F0951CD1CA795DA35621DF22E937BD8FEE1E3814C7307EC81C796AAD87D03DE333C777922F741FECB6F24E4756B79A151F41877B662F3E1C2B181455AF9900DE5EA778109D9D87C74B924D02596C7BC5DF3BC8A1BFAD791F788A61CAC832F232FB7A37A69A5816475766070E54B5EFEE0F76819DA329A0063E0657A2F68529163622B493214DAB1E7C0D22B3C072AB1BCFEC575F48B01219D562F71EC61836B8823E27A028F72CE902D455D1E6A9323AFBBC583D47801A6306003A957DC211831E66EFDBB683E78A2F4F0D9F3EE5350240F47505D6CF3763BC551AE8CD8DC7311706A105D86E1D1571F2544BD5F2AC0E0AB8314143D0224125E728EE8E7D9F0490325232664BC1D1B0CF0D12E45D59E628FB7FA51DDDE37CE9F01B3CE813FEB2506096135684D343C7A98BBD0BF3EF0B4B1E3CCE71D2907F4DF72A7F917C8BD6E84BC19C11C75052FCFAC218B677C2A0E1A60A56702",
+        "EBB1D9128549677B49EF44C05A7C55CD1A3E6D34E6B6947FB4A3C847FDAD45949740B97906639C44345A2ABEE65890F59131F27934CC03C9A97A55FDE09959C724106146966A2B0411E0933E5D795E04D0BEB60FDBD9E882D7074CF5586610F7D1AEE34BC3D5E4368F71E40F02740CEF6FA90DDA84CEBF2C4900437043D1A2377152DC141C1355F9D2444D723BD2AE24A83893114B8FB392466E24E50618D224AFFA39BDBD0DADB9B0E6316578A68FC75F504370E3070201B0441CD35293B1F55462DC3AD3E2C23024200A6CB39ACECE088645C243B305323B670666A8DD3E14DB4310E5BF145B62E56942A3EB37125D704D6A7DB3005C29EB910B6FAB41FC473B0EBF0FFDFD8F85BC16AD34372AAF921F544C3488D6042D047E615C1CC7E343B9B59F1B52BFE4E92D3836DB8A7CC3799EA430251812D8257E96CD80BF7A0B16328F77C8325E2DAA885DFEF0CA82E5024BAAC6FE96C5450DFBD07E6D23B94693A5D455849DDF124331B14DF794F36AFEA0F6C507371EF9EF2FA3EA3AA7A39468CD153E05D65564002E93B9C058C794FE2A3FA43DCFA841DAE9E82C433408A6A920D7C6FB764660A55F38FE9C6D09C0335A0E3145C7BE21487ED1D61982E2A3DC65822A9AF4E7C69FE2797BF6FD51449DAB5A2C33120C3DC4EF127956684A3A00166A1C68861DF636CA5052BD81502B44FB82DB5607DFC787ABAEC544E290F09102",
+        "49F3CA61A35A3271701B1276C083764FDD7B4B613037EE42C77E0518C362502EFED5F11D5A3C1716978A485ECEA44FE15371DE3D625D66C04C0B6C62F39A2C79B955D3E9B14E33DBE64C3BD5C37979E453F1B2F50F22F2063EC8EFE06F21535E6D42FD264840602288D0728EBA03D986C7A47A1FEAE37AF982C6DDF102BF93795DDF981448F982DAD117EDC7EAB921999736DBF7788AF89C0AAB82DB4874354E383D6332085A095E98BA03E701CA4F23D46FF6F427E264DFEF48E810E54BB929121263D884183ED8FEF67F4B26946F695BBD02F6FC1C1C0E456922D254FE7E2F87A63B24FFEA7C3CA4BA9F862422BD2ECA6FFD01177597BA23987340B2693A374F006C46A0DBA46D2B42570C3B2653C54084B638CF05783E64C2F22231A7C16A38897727D1DFFE06CE33DE80828049EAD6C658A921CF431B687065CD14BC32379877EE89C512DBE79CCC672FBA8C1F35768CEA91CACC5E91821DDF96A4E17B78E45942E24A42E75FDFE24F36866E77E6FD514E5760EF8045A047D27BC39630D2336B298EB7B50C0A547011AF96B7F48B0E1E4230EAFF7E9934E6B566AA5460AC50FD1BD7323862A66830A3A7D7D4E8F11100E737DDFF7DE83FFDC6637AE44B82B128D6116D5153D07F0F22B20A8EFC39D0B47256ABC4CA045F4C0B6000242A3D836A55B2D9A5523D79CA6960A7308043B771299CE53928A4BFDD0963355D895902",
+        "A19983B7F06A0CA8A4AB9A3B6037F62D2B5F49303E1EB2C1BB7BE152E9F535E7514859412E463F259CBD55F7EEAA090DFC3B1268382CF5AF3B4ABB21290CE8EBAD5FF73ED19D4753A49CE37AE4D4B471AE538DCC1E0B0AE33A11BC7975CF8CDE94F78635B204D18DB188E6D3C5C2520742CD443FFAD6A08B26CF8320843B49F1367DF7B773D95EEC1F38F9FBF4ACBD7401DA1F3C8BF216B61CCC4A3E7DB9A2C7A442A6821E1D547E9D138E37118911EB934C20419E4C42FD6713C3243CC1208F036A41382246ADE4E316440FFF9316F2647179B2D2BAF861FA92E4869251AF1A58107E78084E70C6CA598795459559C867ABBF056A4A25558D8EC1FB42DF7C72AF2F0F056DD8AAA157476ED466B98E43BE733788C8CBA1299D38D7E45347DBF15118078DFD4B8FF57ED8AABC30156372A315E7E2E35AA7C80C4542BEC03D4ECA9815055E6B09103E399D5E4B090CADE5659F77AB87CE90B264D11FB589254488649AA1E51748D5B6C9337E113B193C27A26AF5472DD2870711BA8F2293813ADD55BA9116908C74AB6829B320244F78743690C4D69E9056A6A53A809772899E679EB13491D4B3FC38CCFEE07DA88F1A35A3EC4CA77E5439D3C8BE6836844DE7509EE615CA0F22113B3DE669340304EABE8A18A1EA323B07FD65C06BECD2495709E5C2065F32668FC877823991C30F1CEA5044FB48C3EE1B1C78A88EFC6820427102",
+        "3E13F8D3162E0F3B3CAC114E1D6DA0E9E3D11C8119B9007FF30029372B57990DAE31188FE143BDE3E87FAB0841BA9894F6C83EC0D9D86B235BEFB912C75B9E1008730CCC025E34C6B0AC0705184CE6807073813D59BD08A0B618BC9530499C019863FB2F01E4D56863BECB60063F7F9B77C8A8B08B1476411C69569299691A601C61C8B8AE808EAFED0D548672F17F8206B40BBBB6C3DD9F90ABD606997943ECB5ABEC2FB9106618E885305AB824CDE280019C70C26099CF1CA4ED27C9502181D499EFAA988609B6E7E65361664886F02FBA776C885165BE19FECB6ABB92526CC25CE97C8A6F303B7087D90BB88D55ED9BC3B29C9BAAF2C807951598CB97D287E365DFF5B18E43136D922508AA27AE1AD93978B1EA2EE84327062E782A46F2D3682F17EDC8766F5DE23B277B25080466DCBAA413106FE2B858D91536CB78845CB55FBD8C999A44317D11ACD661FA523100AABFC85C9BE6D816BC5CA9A5D1D1AD49D5E7C61028BDD92E796D11C6DA56A5F93F338280BBC83286FC4ED4C689A7901903181FCFEF98F51188DD421218AEE9D1100511778C819061B8FB946FF673F918428C890125851CDA3528B6DE1F142F4B686984BC68541B88B95013024FE596BA2DC9E4E787CC7DE250108D2E482D5E852AE4077C6CF93AAD374211A68902F1C2A536B46637F43B8B8C68304FAE7415FD7DFB61419FC8D0D5F95B8B091AF51702",
+    ];
+
+    #[test]
+    fn live_escrow_proof_selfcheck_and_breaktest() {
+        let path: Vec<Vec<u8>> =
+            LIVE_PROOF_PATH.iter().map(|w| hex::decode(w).unwrap()).collect();
+        let proof = proof_from_getproofpath(&path, 0).expect("convert live getProofPath");
+        assert_eq!(
+            hex::encode_upper(proof.leaf_index),
+            LIVE_LEAF_INDEX,
+            "leaf key == escrow keylet"
+        );
+        let mut ah = [0u8; 32];
+        ah.copy_from_slice(&hex::decode(LIVE_ACCOUNT_HASH).unwrap());
+
+        // SELF-CHECK (invariant ii/iii firsthand): the live path reconstructs byte-exact to
+        // the VALIDATED account_hash. This is what the enclave re-does; equal => offsets +
+        // MLN/MIN hashing are correct on real 3.4.1 data.
+        assert!(
+            verify_inclusion(&proof, &ah),
+            "SELF-CHECK: live path must hash to the validated account_hash"
+        );
+
+        // BREAK-TEST A: flip one byte in an inner node -> REFUSE
+        let mut a = proof_from_getproofpath(&path, 0).unwrap();
+        a.inner_root_to_leaf[0][0] ^= 0x01;
+        assert!(!verify_inclusion(&a, &ah), "tampered inner node must be refused");
+
+        // BREAK-TEST B: wrong account_hash (one bit) -> REFUSE
+        let mut ah_bad = ah;
+        ah_bad[0] ^= 0x01;
+        assert!(
+            !verify_inclusion(&proof, &ah_bad),
+            "wrong account_hash must be refused"
+        );
+
+        // BREAK-TEST C: tamper the leaf data (e.g. a balance byte) -> REFUSE
+        let mut c = proof_from_getproofpath(&path, 0).unwrap();
+        c.leaf_data[0] ^= 0x01;
+        assert!(!verify_inclusion(&c, &ah), "tampered leaf must be refused");
+
+        // BREAK-TEST D: wrong leaf index (a different account's key) -> REFUSE
+        let mut d = proof_from_getproofpath(&path, 0).unwrap();
+        d.leaf_index[0] ^= 0x01;
+        assert!(!verify_inclusion(&d, &ah), "wrong leaf index must be refused");
     }
 
     use super::REAL_VALIDATION_HEX as VAL_DATA;
@@ -1099,6 +1415,7 @@ mod tests {
             escrow_account: "rfYnJDSAeFuDCUTq2oYbckbJcz3gAJTNCd".into(),
             quorum: 4,
             collect_secs: 45,
+            prefer_getproofpath: true,
         };
         let blob = fetch_spv_bundle(&cfg).await.expect("fetch_spv_bundle");
         assert_eq!(&blob[..4], b"XSPV", "magic");
@@ -1214,6 +1531,43 @@ mod tests {
         assert!(
             !verify_inclusion(&proof, &[0xEE; 32]),
             "a wrong root must be rejected"
+        );
+    }
+
+    /// NODE-FREE state-tree reconstruction against a real recent testnet ledger from a
+    /// STANDARD public node (s.altnet) — no getProofPath, no patched/dedicated node. The
+    /// correctness pin: the FULL rebuilt state-SHAMap root EQUALS the validator-signed
+    /// `account_hash` (read from the header, not computed), and the escrow AccountRoot
+    /// inclusion path verifies to it. #[ignore]: live network fetch (dumps full state).
+    #[tokio::test]
+    #[ignore = "live testnet fetch (full ledger_data state dump)"]
+    async fn state_reconstruction_root_equals_account_hash() {
+        const URL: &str = "https://s.altnet.rippletest.net:51234";
+        const ESCROW: &str = "rfYnJDSAeFuDCUTq2oYbckbJcz3gAJTNCd";
+        let val = http_rpc(
+            URL,
+            "ledger",
+            serde_json::json!({"ledger_index": "validated", "transactions": false}),
+        )
+        .await
+        .unwrap();
+        let seq = as_u64(&val["ledger"]["ledger_index"]).unwrap();
+        let ah = hex32(&val["ledger"], "account_hash").unwrap();
+        let objects = fetch_state_objects(URL, seq).await.unwrap();
+        eprintln!("// ledger {seq}: {} state objects dumped", objects.len());
+        let map = StateShaMap::build(objects).unwrap();
+        assert_eq!(
+            map.root_hash(),
+            ah,
+            "rebuilt state-tree root must EQUAL the signed account_hash (ledger {seq})"
+        );
+        let proof = reconstruct_state_proof(URL, seq, ESCROW).await.unwrap();
+        assert!(
+            verify_inclusion(&proof, &ah),
+            "escrow AccountRoot proof must verify to the signed account_hash"
+        );
+        eprintln!(
+            "// node-free state reconstruction CONFIRMED: root==account_hash + escrow proof verifies (ledger {seq})"
         );
     }
 }

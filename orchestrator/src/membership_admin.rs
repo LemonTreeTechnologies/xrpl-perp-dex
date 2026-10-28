@@ -731,6 +731,9 @@ async fn drive_reserves_spv_baseline(
         escrow_account: req.escrow.clone(),
         quorum: req.validations_quorum,
         collect_secs: req.collect_secs.unwrap_or(45),
+        // our own dedicated xrpld 3.4.1 proof node serves getProofPath — prefer the tiny
+        // inclusion path over a full ledger_data state dump over the tunnel.
+        prefer_getproofpath: true,
     };
     let collector = LibP2PSpvBaselineCollector::new(state.spv_baseline_tx.clone());
     let res = run_reserves_spv_baseline_ceremony(

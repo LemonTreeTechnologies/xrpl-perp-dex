@@ -722,14 +722,22 @@ impl ReconcileLoopConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
+        // R-b rollback SPV-proves the escrow AccountRoot's Sequence (a STATE-tree inclusion).
+        // A dedicated patched getProofPath node (our own xrpld 3.4.1) serves that as one tiny
+        // path; PERP_WITHDRAWAL_RECONCILE_PROOF_URL points the rb_fetch at it and flips the
+        // producer to getProofPath. Unset → keep the public-node ledger_data reconstruction.
+        let rb_proof_url = std::env::var("PERP_WITHDRAWAL_RECONCILE_PROOF_URL").ok();
+        let rb_prefer_gpp = rb_proof_url.is_some();
+        let rb_http_url = rb_proof_url.unwrap_or_else(|| http_url.clone());
         Some(Self {
             xrpl_http_url: http_url.clone(),
             rb_fetch: SpvFetchConfig {
-                http_url,
+                http_url: rb_http_url,
                 ws_url,
                 escrow_account: escrow.to_string(),
                 quorum,
                 collect_secs,
+                prefer_getproofpath: rb_prefer_gpp,
             },
             interval_secs,
         })
