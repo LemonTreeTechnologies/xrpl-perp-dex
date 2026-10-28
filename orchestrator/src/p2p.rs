@@ -2683,13 +2683,29 @@ impl P2PNode {
                 ))
             }
         };
-        let rbody: serde_json::Value = match resp.json().await {
-            Ok(v) => v,
+        let rtext = match resp.text().await {
+            Ok(t) => t,
             Err(e) => {
                 return Some(Self::membership_sign_error(
                     local_signer,
                     request_id,
-                    format!("enclave response parse: {e}"),
+                    format!("enclave response read: {e}"),
+                ))
+            }
+        };
+        // The enclave's civetweb wraps error bodies as "Error NNN: <reason>\n{json}" with
+        // content-type text/plain, which serde refuses — so an enclave refusal used to surface
+        // as a generic "parse" error and the real reason was swallowed. Parse from the first
+        // '{' so the enclave's own message (e.g. an SPV quorum/sig/ledger refusal) is preserved.
+        let json_slice = rtext.find('{').map(|i| &rtext[i..]).unwrap_or(rtext.as_str());
+        let rbody: serde_json::Value = match serde_json::from_str(json_slice) {
+            Ok(v) => v,
+            Err(e) => {
+                let raw: String = rtext.chars().take(240).collect();
+                return Some(Self::membership_sign_error(
+                    local_signer,
+                    request_id,
+                    format!("enclave response parse: {e}; raw={raw}"),
                 ))
             }
         };

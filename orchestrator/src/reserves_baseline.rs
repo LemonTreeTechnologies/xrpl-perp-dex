@@ -295,16 +295,29 @@ impl LibP2PSpvBaselineCollector {
                 _ => break,
             };
             if let crate::p2p::SigningMessage::Response {
-                der_signature: Some(der_hex),
-                compressed_pubkey: Some(pk_hex),
-                error: None,
+                der_signature,
+                compressed_pubkey,
+                error,
+                signer_xrpl_address,
                 ..
             } = resp
             {
-                let pk = hex::decode(&pk_hex).unwrap_or_default();
-                let der = hex::decode(&der_hex).unwrap_or_default();
-                if pk.len() == 33 && !der.is_empty() && !entries.iter().any(|(p, _)| *p == pk) {
-                    entries.push((pk, der));
+                // Surface a cosigner's refusal instead of silently dropping it (a dropped
+                // refusal is why the ceremony used to report only "collected zero").
+                if let Some(e) = error {
+                    tracing::warn!(
+                        signer = %signer_xrpl_address,
+                        "#131 SPV cosign REJECTED by a cosigner: {e}"
+                    );
+                    continue;
+                }
+                if let (Some(pk_hex), Some(der_hex)) = (compressed_pubkey, der_signature) {
+                    let pk = hex::decode(&pk_hex).unwrap_or_default();
+                    let der = hex::decode(&der_hex).unwrap_or_default();
+                    if pk.len() == 33 && !der.is_empty() && !entries.iter().any(|(p, _)| *p == pk) {
+                        tracing::info!(signer = %signer_xrpl_address, "#131 SPV cosign ACCEPTED");
+                        entries.push((pk, der));
+                    }
                 }
             }
         }
