@@ -30,6 +30,32 @@ pub const OP_REMOVE: u8 = 2;
 /// clear operator message instead of after a round-trip.
 pub const REPRO_MIN: usize = 2;
 
+/// Governance-descriptor domain — MUST be byte-identical to the enclave's
+/// `kTrustedMrenclaveGovDescriptorDomain` (32 bytes, no NUL).
+const MRENCLAVE_GOV_DESCRIPTOR_DOMAIN: &[u8; 32] = b"PERP_MRENCLAVE_GOV_DESCRIPTOR_v1";
+
+/// The allowlist governance descriptor digest, exactly as the enclave re-derives it in
+/// `ecall_govern_trusted_mrenclaves` (trusted_mrenclaves_canonical.cpp):
+///   SHA-256(domain || op || mrenclave || escrow[20] || le64(epoch) || prev_allowlist_hash).
+/// Pinned cross-language by the same golden vector the enclave's host test asserts.
+pub fn compute_trusted_mrenclave_descriptor_digest(
+    op: u8,
+    mrenclave: &[u8; 32],
+    escrow: &[u8; 20],
+    proposed_epoch: u64,
+    prev_allowlist_hash: &[u8; 32],
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(MRENCLAVE_GOV_DESCRIPTOR_DOMAIN);
+    h.update([op]);
+    h.update(mrenclave);
+    h.update(escrow);
+    h.update(proposed_epoch.to_le_bytes());
+    h.update(prev_allowlist_hash);
+    h.finalize().into()
+}
+
 /// One allowlist operation, exactly as the enclave will re-derive it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GovernanceOp {
@@ -68,6 +94,7 @@ pub trait ClusterGovernApplier: Send + Sync {
         op: &GovernanceOp,
         quorum_bundle: &[u8],
         repro_bundle: &[u8],
+        descriptor_sigs: &[u8],
     ) -> Result<Vec<NodeSealResult>>;
 }
 
@@ -96,12 +123,25 @@ pub async fn run_mrenclave_governance(
     op: u8,
     mrenclave: [u8; 32],
     escrow: [u8; 20],
+    // The governance-key descriptor signature(s) over THIS op (concatenated 64-byte raw
+    // ed25519), produced offline by `sign-mrenclave-govern-descriptor`. The enclave is the gate;
+    // this side only refuses an obviously malformed value so the operator gets a message instead
+    // of a rejection code after the quorum round.
+    descriptor_sigs: Vec<u8>,
     status: &dyn AllowlistStatusSource,
     collector: &dyn GovernanceBundleCollector,
     applier: &dyn ClusterGovernApplier,
 ) -> Result<GovernanceOutcome> {
     if op != OP_ADD && op != OP_REMOVE {
         bail!("unknown allowlist op {op} (expected {OP_ADD}=add or {OP_REMOVE}=remove)");
+    }
+    if descriptor_sigs.is_empty() || descriptor_sigs.len() % 64 != 0 {
+        bail!(
+            "governance descriptor signature missing or malformed ({} bytes; need a non-empty \
+             multiple of 64) — sign it with `sign-mrenclave-govern-descriptor` against the \
+             allowlist head this op chains onto (the enclave refuses without it)",
+            descriptor_sigs.len()
+        );
     }
 
     let (current_epoch, prev_allowlist_hash) = status
@@ -144,7 +184,7 @@ pub async fn run_mrenclave_governance(
         .context("collect the cluster's authorisation of this allowlist operation")?;
 
     let node_results = applier
-        .apply_govern(&gov_op, &quorum_bundle, &repro_bundle)
+        .apply_govern(&gov_op, &quorum_bundle, &repro_bundle, &descriptor_sigs)
         .await
         .context("apply the allowlist operation across the cluster")?;
 
@@ -331,7 +371,11 @@ mod tests {
     }
 
     /// What the applier was broadcast: (operation, governance bundle, repro bundle).
-    type SeenApply = Option<(GovernanceOp, Vec<u8>, Vec<u8>)>;
+    type SeenApply = Option<(GovernanceOp, Vec<u8>, Vec<u8>, Vec<u8>)>;
+
+    /// A well-formed (64-byte) governance descriptor signature for the plumbing tests. Its
+    /// cryptographic validity is the ENCLAVE's check; here we prove it is carried unchanged.
+    const DESC: [u8; 64] = [0x5A; 64];
 
     struct Applier {
         nodes: Vec<String>,
@@ -352,9 +396,14 @@ mod tests {
             op: &GovernanceOp,
             quorum_bundle: &[u8],
             repro_bundle: &[u8],
+            descriptor_sigs: &[u8],
         ) -> Result<Vec<NodeSealResult>> {
-            *self.seen.lock().unwrap() =
-                Some((op.clone(), quorum_bundle.to_vec(), repro_bundle.to_vec()));
+            *self.seen.lock().unwrap() = Some((
+                op.clone(),
+                quorum_bundle.to_vec(),
+                repro_bundle.to_vec(),
+                descriptor_sigs.to_vec(),
+            ));
             Ok(self
                 .nodes
                 .iter()
@@ -375,7 +424,13 @@ mod tests {
         let applier = Applier::new(3);
 
         let out = run_mrenclave_governance(
-            OP_ADD, [0x11; 32], [0xAA; 20], &status, &collector, &applier,
+            OP_ADD,
+            [0x11; 32],
+            [0xAA; 20],
+            DESC.to_vec(),
+            &status,
+            &collector,
+            &applier,
         )
         .await
         .unwrap();
@@ -384,7 +439,12 @@ mod tests {
         assert_eq!(out.repro_signers, 3);
         assert!(out.all_applied());
 
-        let (op, gov, repro) = applier.seen.lock().unwrap().clone().unwrap();
+        let (op, gov, repro, desc) = applier.seen.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            desc,
+            DESC.to_vec(),
+            "the descriptor must reach every node unchanged"
+        );
         assert_eq!(op.proposed_epoch, 5);
         assert_eq!(
             op.prev_allowlist_hash, [0xBB; 32],
@@ -404,7 +464,13 @@ mod tests {
         let applier = Applier::new(3);
 
         let err = run_mrenclave_governance(
-            OP_ADD, [0x11; 32], [0xAA; 20], &status, &collector, &applier,
+            OP_ADD,
+            [0x11; 32],
+            [0xAA; 20],
+            DESC.to_vec(),
+            &status,
+            &collector,
+            &applier,
         )
         .await
         .unwrap_err();
@@ -429,7 +495,13 @@ mod tests {
         let applier = Applier::new(2);
 
         let out = run_mrenclave_governance(
-            OP_REMOVE, [0x22; 32], [0xAA; 20], &status, &collector, &applier,
+            OP_REMOVE,
+            [0x22; 32],
+            [0xAA; 20],
+            DESC.to_vec(),
+            &status,
+            &collector,
+            &applier,
         )
         .await
         .unwrap();
@@ -440,7 +512,8 @@ mod tests {
             !*collector.repro_called.lock().unwrap(),
             "a veto must not even ask for a reproduction proof"
         );
-        let (_, _, repro) = applier.seen.lock().unwrap().clone().unwrap();
+        let (_, _, repro, desc) = applier.seen.lock().unwrap().clone().unwrap();
+        assert_eq!(desc, DESC.to_vec(), "a veto carries the descriptor too");
         assert!(repro.is_empty(), "a veto carries no repro bundle");
     }
 
@@ -503,13 +576,80 @@ mod tests {
         let status = Status(1, [0u8; 32]);
         let collector = Collector::new(9);
         let applier = Applier::new(1);
-        let err =
-            run_mrenclave_governance(9, [0x11; 32], [0xAA; 20], &status, &collector, &applier)
-                .await
-                .unwrap_err();
+        let err = run_mrenclave_governance(
+            9,
+            [0x11; 32],
+            [0xAA; 20],
+            DESC.to_vec(),
+            &status,
+            &collector,
+            &applier,
+        )
+        .await
+        .unwrap_err();
         assert!(
             err.to_string().contains("unknown allowlist op"),
             "got: {err}"
+        );
+    }
+
+    /// A missing or malformed descriptor is refused BEFORE the cluster is touched (no
+    /// quorum round, no apply) — the operator gets the actionable message, not a -18 later.
+    #[tokio::test]
+    async fn a_missing_or_malformed_descriptor_is_refused_before_the_cluster_is_touched() {
+        for bad in [Vec::new(), vec![0x5A; 63], vec![0x5A; 65]] {
+            let status = Status(4, [0xBB; 32]);
+            let collector = Collector::new(3);
+            let applier = Applier::new(3);
+            let err = run_mrenclave_governance(
+                OP_ADD,
+                [0x11; 32],
+                [0xAA; 20],
+                bad.clone(),
+                &status,
+                &collector,
+                &applier,
+            )
+            .await
+            .expect_err("a malformed descriptor must be refused");
+            assert!(
+                format!("{err:#}").contains("governance descriptor"),
+                "{err:#}"
+            );
+            assert!(
+                applier.seen.lock().unwrap().is_none(),
+                "len {}: nothing applied",
+                bad.len()
+            );
+        }
+    }
+
+    /// Cross-language pin: the SAME golden vectors the enclave's host test asserts
+    /// (test_xrpl_signerlist.cpp test_d1_gov_descriptor_frozen_vector), computed independently
+    /// with Python hashlib. A drift on either side fail-closes every governance op.
+    #[test]
+    fn descriptor_digest_matches_the_enclave_golden_vectors() {
+        let d_add = compute_trusted_mrenclave_descriptor_digest(
+            OP_ADD,
+            &[0x11; 32],
+            &[0x33; 20],
+            7,
+            &[0x22; 32],
+        );
+        assert_eq!(
+            hex::encode(d_add),
+            "4f2feefb98d190fdb1a2e32018f2fc69a3a8ab02e01760196cfa2f948eb5b6ac"
+        );
+        let d_rm = compute_trusted_mrenclave_descriptor_digest(
+            OP_REMOVE,
+            &[0x11; 32],
+            &[0x33; 20],
+            7,
+            &[0x22; 32],
+        );
+        assert_eq!(
+            hex::encode(d_rm),
+            "e62e72be1d34384679bbd566da508fd2ddd75eb2a9a945300bac69bc797e9266"
         );
     }
 }

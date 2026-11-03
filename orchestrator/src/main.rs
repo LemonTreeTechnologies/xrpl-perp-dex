@@ -483,6 +483,38 @@ enum Command {
         expect_gov_pub: Option<String>,
     },
 
+    /// Sign a trusted-MRENCLAVE allowlist operation with the governance key, producing the
+    /// `descriptor_sigs_hex` that `/admin/mrenclave-govern` must carry. The enclave re-derives
+    /// SHA-256("PERP_MRENCLAVE_GOV_DESCRIPTOR_v1" || op || mrenclave || escrow || le64(epoch) ||
+    /// prev_allowlist_hash) and verifies it against the BAKED governance key; this tool computes
+    /// it identically (pinned cross-language) and refuses if the key is not the baked one. Read
+    /// `--proposed-epoch` (= allowlist_epoch + 1) and `--prev-allowlist-hash`
+    /// (= allowlist_digest) from GET /v1/admin/mrenclaves/status on a node right before signing:
+    /// if the head moves before the op is applied, the enclave refuses (-19) and you re-sign.
+    SignMrenclaveGovernDescriptor {
+        /// The governance OpenSSH private key (ed25519). A FILE, never an argv value.
+        #[arg(long)]
+        key_file: PathBuf,
+        /// `add` or `remove`.
+        #[arg(long)]
+        op: String,
+        /// The target measurement, 32-byte hex.
+        #[arg(long)]
+        mrenclave: String,
+        /// The cluster escrow r-address.
+        #[arg(long)]
+        escrow: String,
+        /// allowlist_epoch + 1, from mrenclaves/status.
+        #[arg(long)]
+        proposed_epoch: u64,
+        /// allowlist_digest (the current head), 32-byte hex, from mrenclaves/status.
+        #[arg(long)]
+        prev_allowlist_hash: String,
+        /// TEST-ONLY override of the expected governance pub (hex), for a test measurement.
+        #[arg(long)]
+        expect_gov_pub: Option<String>,
+    },
+
     /// Phase 2.1c-E — node-local deploy. Each operator runs this on
     /// their own VM after `cargo build` + Docker `enclave.signed.so`
     /// production. Stops local services, backs up prior binaries with
@@ -1121,6 +1153,56 @@ async fn main() -> Result<()> {
                 "/admin/membership-change request. For an M-of-N (S2) descriptor, concatenate"
             );
             println!("each operator's 64-byte signature in descriptor_sigs.");
+            return Ok(());
+        }
+        Some(Command::SignMrenclaveGovernDescriptor {
+            key_file,
+            op,
+            mrenclave,
+            escrow,
+            proposed_epoch,
+            prev_allowlist_hash,
+            expect_gov_pub,
+        }) => {
+            let op_code = match op.to_ascii_lowercase().as_str() {
+                "add" => mrenclave_governance::OP_ADD,
+                "remove" => mrenclave_governance::OP_REMOVE,
+                other => anyhow::bail!("--op must be add|remove, got {other:?}"),
+            };
+            let hex32 = |name: &str, h: &str| -> Result<[u8; 32]> {
+                let b = hex::decode(h.trim_start_matches("0x"))
+                    .with_context(|| format!("{name} must be hex"))?;
+                anyhow::ensure!(b.len() == 32, "{name} must be 32 bytes");
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                Ok(a)
+            };
+            let mre = hex32("--mrenclave", &mrenclave)?;
+            let prev = hex32("--prev-allowlist-hash", &prev_allowlist_hash)?;
+            let escrow_id = xrpl_signer::decode_xrpl_address(&escrow)
+                .context("--escrow must be a valid XRPL r-address")?;
+            let expect_pub = match expect_gov_pub.as_ref() {
+                None => sign_descriptor::BAKED_GOV_PUB,
+                Some(h) => hex32("--expect-gov-pub", h)?,
+            };
+            let key_pem = std::fs::read_to_string(&key_file)
+                .with_context(|| format!("cannot read governance key {}", key_file.display()))?;
+            let (digest, sig) = sign_descriptor::sign_mrenclave_govern_descriptor(
+                &key_pem,
+                op_code,
+                &mre,
+                &escrow_id,
+                proposed_epoch,
+                &prev,
+                &expect_pub,
+            )?;
+            println!("descriptor_digest:   {}", hex::encode(digest));
+            println!("descriptor_sigs_hex: {}", hex::encode(sig));
+            println!();
+            println!("Pass descriptor_sigs_hex in the /admin/mrenclave-govern request (with op +");
+            println!(
+                "mrenclave). For an M-of-N governance set, concatenate each 64-byte signature."
+            );
             return Ok(());
         }
         Some(Command::SignerlistBootstrapRotate {
@@ -3441,7 +3523,14 @@ async fn cli_upgrade_corpus_ceremony(
         return Ok(());
     }
 
-    upgrade_corpus::corpus_admit_new_on_old(old_url, &signers, escrow, &mrenclave_new).await?;
+    upgrade_corpus::corpus_admit_new_on_old(
+        old_url,
+        &signers,
+        escrow,
+        &mrenclave_new,
+        genesis_gov_key.as_deref(),
+    )
+    .await?;
     println!("corpus: NEW's measurement admitted onto OLD's allowlist");
 
     let nonce =

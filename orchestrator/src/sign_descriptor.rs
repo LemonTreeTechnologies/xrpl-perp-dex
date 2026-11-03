@@ -147,6 +147,40 @@ pub fn sign_descriptor(
         new_member_mrenclave,
     );
 
+    let sig = sign_raw_digest_with_gov_key(key_pem, &digest, expect_gov_pub)?;
+    Ok((digest, sig))
+}
+
+/// Sign the allowlist governance descriptor: the digest the
+/// enclave re-derives in `ecall_govern_trusted_mrenclaves` and verifies under the baked gov key.
+/// Same key, same wrong-key self-check, same raw-ed25519 shape as a membership descriptor.
+pub fn sign_mrenclave_govern_descriptor(
+    key_pem: &str,
+    op: u8,
+    mrenclave: &[u8; 32],
+    escrow: &[u8; 20],
+    proposed_epoch: u64,
+    prev_allowlist_hash: &[u8; 32],
+    expect_gov_pub: &[u8; 32],
+) -> Result<([u8; 32], [u8; 64])> {
+    let digest = crate::mrenclave_governance::compute_trusted_mrenclave_descriptor_digest(
+        op,
+        mrenclave,
+        escrow,
+        proposed_epoch,
+        prev_allowlist_hash,
+    );
+    let sig = sign_raw_digest_with_gov_key(key_pem, &digest, expect_gov_pub)?;
+    Ok((digest, sig))
+}
+
+/// The one place the governance key signs: derive it, REFUSE unless it is the expected baked
+/// key, then RAW ed25519 over the 32-byte digest (what `crypto_ed25519_check` verifies).
+fn sign_raw_digest_with_gov_key(
+    key_pem: &str,
+    digest: &[u8; 32],
+    expect_gov_pub: &[u8; 32],
+) -> Result<[u8; 64]> {
     let seed = parse_openssh_ed25519_seed(key_pem)?;
     let sk = SigningKey::from_bytes(&seed);
     let derived_pub = sk.verifying_key().to_bytes();
@@ -160,8 +194,7 @@ pub fn sign_descriptor(
         );
     }
     // RAW ed25519 over the 32-byte digest — exactly what crypto_ed25519_check verifies in-enclave.
-    let sig = sk.sign(&digest);
-    Ok((digest, sig.to_bytes()))
+    Ok(sk.sign(digest).to_bytes())
 }
 
 #[cfg(test)]
@@ -293,6 +326,71 @@ mod tests {
         assert!(
             vk.verify(&digest, &sig2).is_ok(),
             "the raw ed25519 signature over the digest must verify under the signer's pub"
+        );
+    }
+
+    /// The REAL signing path for an allowlist descriptor, end to end: synth OpenSSH key ->
+    /// sign_mrenclave_govern_descriptor (expecting that key's own pub, as for a test measurement)
+    /// -> the 64-byte signature verifies under that pub over EXACTLY the digest the enclave
+    /// re-derives.
+    #[test]
+    fn mrenclave_govern_descriptor_signature_verifies_over_the_enclave_digest() {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        let seed = [0x42u8; 32];
+        let pem = synth_openssh_key(&seed);
+        let derived = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        let (digest, sig) = sign_mrenclave_govern_descriptor(
+            &pem,
+            1,
+            &[0x11; 32],
+            &[0x33; 20],
+            7,
+            &[0x22; 32],
+            &derived,
+        )
+        .expect("the expected key must sign");
+        assert_eq!(
+            digest,
+            crate::mrenclave_governance::compute_trusted_mrenclave_descriptor_digest(
+                1,
+                &[0x11; 32],
+                &[0x33; 20],
+                7,
+                &[0x22; 32]
+            ),
+            "the signed digest must be the enclave's digest"
+        );
+        let vk = VerifyingKey::from_bytes(&derived).unwrap();
+        assert!(vk.verify(&digest, &Signature::from_bytes(&sig)).is_ok());
+        // and it does NOT verify over a different op (binding is real)
+        let other = crate::mrenclave_governance::compute_trusted_mrenclave_descriptor_digest(
+            2,
+            &[0x11; 32],
+            &[0x33; 20],
+            7,
+            &[0x22; 32],
+        );
+        assert!(vk.verify(&other, &Signature::from_bytes(&sig)).is_err());
+    }
+
+    /// A key that is not the expected (baked) governance key is refused before any
+    /// signature is produced.
+    #[test]
+    fn mrenclave_govern_descriptor_refuses_a_non_governance_key() {
+        let pem = synth_openssh_key(&[0x42u8; 32]);
+        let err = sign_mrenclave_govern_descriptor(
+            &pem,
+            1,
+            &[0x11; 32],
+            &[0x33; 20],
+            7,
+            &[0x22; 32],
+            &BAKED_GOV_PUB,
+        )
+        .expect_err("a non-governance key must be refused");
+        assert!(
+            err.to_string().contains("NOT the expected governance key"),
+            "{err}"
         );
     }
 }

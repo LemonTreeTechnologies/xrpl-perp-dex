@@ -579,6 +579,11 @@ pub enum MembershipApplyPayload {
         prev_allowlist_hash_hex: String,
         quorum_bundle_hex: String,
         repro_bundle_hex: String,
+        /// The governance-key descriptor signature(s). `serde(default)` so a node running
+        /// the previous orchestrator still parses the message during a rolling deploy; an empty
+        /// value reaches the enclave, which refuses it (the enclave is the gate, never the host).
+        #[serde(default)]
+        descriptor_sigs_hex: String,
     },
 }
 
@@ -2994,6 +2999,7 @@ impl P2PNode {
                 prev_allowlist_hash_hex,
                 quorum_bundle_hex,
                 repro_bundle_hex,
+                descriptor_sigs_hex,
             } => {
                 let mrenclave = match decode_32(mrenclave_hex) {
                     Some(a) => a,
@@ -3045,6 +3051,16 @@ impl P2PNode {
                         )
                     }
                 };
+                let descriptor_sigs = match hex::decode(descriptor_sigs_hex) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        return Self::membership_sign_error(
+                            local_signer,
+                            request_id,
+                            "apply.govern: bad descriptor_sigs hex".into(),
+                        )
+                    }
+                };
                 let govop = crate::mrenclave_governance::GovernanceOp {
                     op: *op_code,
                     mrenclave,
@@ -3053,7 +3069,13 @@ impl P2PNode {
                     prev_allowlist_hash: prev,
                 };
                 crate::membership_http::HttpGovernSink::new(client)
-                    .govern_on_node(&base, &govop, &quorum_bundle, &repro_bundle)
+                    .govern_on_node(
+                        &base,
+                        &govop,
+                        &quorum_bundle,
+                        &repro_bundle,
+                        &descriptor_sigs,
+                    )
                     .await
             }
             MembershipApplyPayload::Confirm {

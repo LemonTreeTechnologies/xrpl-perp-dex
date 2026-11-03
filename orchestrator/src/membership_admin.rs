@@ -547,6 +547,11 @@ pub struct MrenclaveGovernRequest {
     pub op: String,
     /// 64-char hex of the 32-byte target measurement.
     pub mrenclave: String,
+    /// The governance-key descriptor signature(s) over this op, from
+    /// `sign-mrenclave-govern-descriptor` (concatenated 64-byte raw ed25519, hex). Defaulted so a
+    /// client that omits it gets a clear refusal, never a silently accepted op.
+    #[serde(default)]
+    pub descriptor_sigs_hex: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -595,10 +600,13 @@ async fn drive_govern(
     let applier =
         LibP2PMembershipApplier::new(state.membership_apply_tx.clone(), state.cluster_size);
 
+    let descriptor_sigs = hex::decode(req.descriptor_sigs_hex.trim_start_matches("0x"))
+        .context("descriptor_sigs_hex not hex")?;
     let outcome = run_mrenclave_governance(
         op,
         mrenclave,
         state.escrow,
+        descriptor_sigs,
         &status_src,
         &collector,
         &applier,
