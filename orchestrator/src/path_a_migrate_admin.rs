@@ -41,6 +41,9 @@ pub struct AdminState {
     pub default_old_api_base: String,
     /// Default NEW enclave HTTPS base URL; request body can override.
     pub default_new_api_base: String,
+    /// The enclave THIS orchestrator serves (its `--enclave-url`). NEW may never be this one:
+    /// a dry run stops NEW and deletes its sealed files.
+    pub own_enclave_base: String,
     /// Operator roster authority (model B): the migrate-state route requires a signed request
     /// from an operator the roster permits. Fail-closed when no roster is configured.
     pub authority: std::sync::Arc<crate::operator_roster::RosterAuthority>,
@@ -134,6 +137,51 @@ async fn handle_migrate_state(
         "admin: migrate-state ceremony driver invoked"
     );
 
+    let refuse = |message: String| {
+        error!(%message, "admin: migrate-state refused before the ceremony started");
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                status: "error",
+                message,
+                state: None,
+            }),
+        )
+            .into_response()
+    };
+    let dry_run = req.dry_run.unwrap_or(false);
+    let ports = (|| -> anyhow::Result<(u16, u16)> {
+        let old_port = crate::node_deploy::port_of_base(&old_base)?;
+        let new_port = crate::node_deploy::port_of_base(&new_base)?;
+        let own_port = crate::node_deploy::port_of_base(&state.own_enclave_base)?;
+        crate::node_deploy::check_migration_ports(old_port, new_port, own_port)?;
+        Ok((old_port, new_port))
+    })();
+    let (old_port, new_port) = match ports {
+        Ok(p) => p,
+        Err(e) => return refuse(format!("{e:#}")),
+    };
+    // The dry run's boot check and cleanup act on a slot's unit and accounts dir, so both
+    // slots are resolved from the ports BEFORE anything runs. A real run does not touch them.
+    let slots = if dry_run {
+        let resolved = (|| -> anyhow::Result<_> {
+            let old_slot = crate::node_deploy::resolve_slot(old_port)?;
+            let new_slot = crate::node_deploy::resolve_slot(new_port)?;
+            anyhow::ensure!(
+                old_slot != new_slot,
+                "OLD and NEW resolve to the same slot {}",
+                new_slot.deploy_dir
+            );
+            Ok((old_slot, new_slot))
+        })();
+        match resolved {
+            Ok(s) => Some(s),
+            Err(e) => return refuse(format!("dry run needs both slots resolved: {e:#}")),
+        }
+    } else {
+        None
+    };
+
     let http = match HttpEnclaveApi::new() {
         Ok(c) => c,
         Err(e) => {
@@ -156,7 +204,6 @@ async fn handle_migrate_state(
 
     let api = ComposedEnclaveApi { http, delegation };
     let mut driver = CeremonyDriver::new(api);
-    let dry_run = req.dry_run.unwrap_or(false);
     let params = CeremonyParams {
         expected_mrenclave_new: req.expected_mrenclave_new,
         old_api_base: old_base,
@@ -187,7 +234,10 @@ async fn handle_migrate_state(
                 //
                 // A dry run is only a PASS if this passes too. On failure the migrated set is
                 // deliberately LEFT in place for diagnosis; the next rehearsal's reset clears it.
-                match crate::node_deploy::boot_new_on_migrated_state().await {
+                let (old_slot, new_slot) = slots.expect("resolved above for every dry run");
+                match crate::node_deploy::boot_new_on_migrated_state(new_slot, new_port, old_slot)
+                    .await
+                {
                     Ok(proof) => {
                         let verdict = crate::node_deploy::judge_boot_proof(&proof);
                         boot_proof = Some(proof);
@@ -216,7 +266,9 @@ async fn handle_migrate_state(
                                 }
                                 // Part C: reset NEW to empty so the REAL ceremony starts clean.
                                 // OLD stayed byte-for-byte inert throughout.
-                                match crate::node_deploy::reset_new_side_after_dry_run().await {
+                                match crate::node_deploy::reset_new_side_after_dry_run(new_slot)
+                                    .await
+                                {
                                     Ok(()) => {
                                         info!(
                                             "admin: DRY-RUN PASS — NEW reset to empty, real \
@@ -225,9 +277,10 @@ async fn handle_migrate_state(
                                         "dry-run-ok"
                                     }
                                     Err(e) => {
-                                        error!(error = %format!("{e:#}"), "admin: DRY-RUN PASSED but NEW-reset \
-                                            FAILED — operator MUST clear perp-next/accounts + \
-                                            restart perp-dex-enclave-next before the real ceremony");
+                                        error!(error = %format!("{e:#}"), unit = new_slot.unit,
+                                            dir = new_slot.deploy_dir, "admin: DRY-RUN PASSED but \
+                                            NEW-reset FAILED — operator MUST clear NEW's accounts \
+                                            dir + restart NEW before the real ceremony");
                                         "dry-run-ok-reset-failed"
                                     }
                                 }
@@ -349,6 +402,7 @@ mod tests {
             path_a_delegation_tx: tx,
             default_old_api_base: "https://localhost:9088".into(),
             default_new_api_base: "https://localhost:9089".into(),
+            own_enclave_base: "https://localhost:9088".into(),
             authority: std::sync::Arc::new(crate::operator_roster::RosterAuthority::fail_closed()),
         });
         let err = spawn_admin_listener("0.0.0.0:7095".into(), state)

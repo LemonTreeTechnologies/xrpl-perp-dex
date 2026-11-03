@@ -83,6 +83,88 @@ const ENCLAVE_UNIT_NEW: &str = "perp-dex-enclave-next";
 /// depending on the operator's TLS-cert + reverse-proxy topology.
 const ENCLAVE_PORT_NEW: u16 = 9089;
 
+/// One enclave slot on a node: its systemd unit and the directory it runs from. The slot's
+/// `config.json` names the port it listens on and its accounts dir.
+///
+/// The dry run's boot check and its cleanup act on whichever slot is NEW for THIS ceremony,
+/// and which slot that is depends on the cluster's layout, not on the slot's name: after a
+/// re-genesis the live cluster can sit in `perp-next/` on 9089 with the free slot in `perp/`
+/// on 9088. So the slot is resolved from the port the request names, never assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnclaveSlot {
+    pub unit: &'static str,
+    pub deploy_dir: &'static str,
+}
+
+const SLOTS: [EnclaveSlot; 2] = [
+    EnclaveSlot {
+        unit: ENCLAVE_UNIT,
+        deploy_dir: DEPLOY_DIR,
+    },
+    EnclaveSlot {
+        unit: ENCLAVE_UNIT_NEW,
+        deploy_dir: DEPLOY_DIR_NEW,
+    },
+];
+
+/// The port of an enclave API base such as `https://localhost:9088` (a trailing `/v1` or other
+/// path is ignored). An explicit port is required: guessing 443 for an enclave base would
+/// resolve to no slot at best.
+pub fn port_of_base(base: &str) -> Result<u16> {
+    let url = reqwest::Url::parse(base).with_context(|| format!("parse enclave base {base:?}"))?;
+    url.port()
+        .ok_or_else(|| anyhow::anyhow!("enclave base {base:?} names no explicit port"))
+}
+
+fn port_from_config_json(json: &str) -> Option<u16> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    u16::try_from(v.get("port")?.as_u64()?).ok()
+}
+
+/// Which slot listens on `port`, judged from each slot's own `config.json`. Exactly one must
+/// match. Pure over `read_config` so every branch can be tested without a node.
+fn resolve_slot_with(
+    port: u16,
+    read_config: impl Fn(&str) -> Option<String>,
+) -> Result<EnclaveSlot> {
+    let matches: Vec<EnclaveSlot> = SLOTS
+        .iter()
+        .copied()
+        .filter(|slot| {
+            read_config(&format!("{}/config.json", slot.deploy_dir))
+                .and_then(|j| port_from_config_json(&j))
+                == Some(port)
+        })
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(*one),
+        [] => bail!("no enclave slot on this node is configured for port {port}"),
+        _ => bail!("more than one enclave slot on this node is configured for port {port}"),
+    }
+}
+
+pub fn resolve_slot(port: u16) -> Result<EnclaveSlot> {
+    resolve_slot_with(port, |path| std::fs::read_to_string(path).ok())
+}
+
+/// The ports a migrate-state request may use. NEW must be neither OLD nor the enclave this
+/// orchestrator serves: a dry run stops NEW and DELETES its sealed files, so pointing NEW at a
+/// live enclave would erase live state. Checked before the ceremony starts, for real runs too —
+/// migrating into the enclave you are exporting from, or into the one you serve, is never
+/// meant.
+pub fn check_migration_ports(old_port: u16, new_port: u16, own_port: u16) -> Result<()> {
+    if new_port == old_port {
+        bail!("NEW and OLD are the same enclave (port {new_port}); refusing");
+    }
+    if new_port == own_port {
+        bail!(
+            "NEW (port {new_port}) is the enclave this orchestrator serves; a dry run would stop \
+             it and delete its sealed state. Refusing"
+        );
+    }
+    Ok(())
+}
+
 pub async fn deploy_local(artefacts: &LocalArtefactSet) -> Result<NodeDeployResult> {
     info!("node-deploy starting (local node only)");
 
@@ -537,6 +619,17 @@ const MAY_BE_ABSENT_FROM_NEW: &[&str] = &[
     "path_a_retired.sealed",
 ];
 
+/// `s<shard>_perp_baseline.sealed`: a WRITE-ONLY audit marker. The enclave never reads it
+/// (Enclave.cpp, "The former load_perp_baseline_marker reader was removed with AC-BASE-3″"),
+/// and it is not a Path-A section by design. The one-shot it records travels in the migrated
+/// `perp_meta`; after a migration a second SPV arm on NEW returns -62. Matched exactly, digits
+/// only, so no other name slips through.
+fn is_write_only_baseline_marker(name: &str) -> bool {
+    name.strip_prefix('s')
+        .and_then(|rest| rest.strip_suffix("_perp_baseline.sealed"))
+        .is_some_and(|shard| !shard.is_empty() && shard.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Absences that do NOT fail the boot but leave a REQUIRED follow-up, each with what is lost.
 ///
 /// A second list rather than more entries in the first one, because these are not the same kind
@@ -606,7 +699,7 @@ pub fn judge_boot_proof(p: &BootProof) -> Result<(), String> {
                  at STARTUP LOAD and a mismatch is a refusal to boot by design."
             ),
             None => "NEW did NOT come back with the migrated set present, and printed no refusal \
-                     sentence. Read perp-next/enclave.log before anything else."
+                     sentence. Read NEW's enclave.log before anything else."
                 .to_string(),
         });
     }
@@ -627,6 +720,7 @@ pub fn judge_boot_proof(p: &BootProof) -> Result<(), String> {
         .missing_from_new
         .iter()
         .filter(|n| !MAY_BE_ABSENT_FROM_NEW.contains(&n.as_str()))
+        .filter(|n| !is_write_only_baseline_marker(n))
         .filter(|n| {
             !ABSENT_BUT_MUST_BE_REESTABLISHED
                 .iter()
@@ -689,9 +783,13 @@ fn file_names(dir: &str) -> Vec<String> {
 /// So this runs BEFORE the reset, while the migrated set is still on disk, and it is ordered
 /// that way deliberately: the reset is what makes the real ceremony start clean, and it must
 /// not happen until the boot it would erase has been proven.
-pub async fn boot_new_on_migrated_state() -> Result<BootProof> {
-    let accounts_dir = format!("{DEPLOY_DIR_NEW}/accounts");
-    let log_path = format!("{DEPLOY_DIR_NEW}/enclave.log");
+pub async fn boot_new_on_migrated_state(
+    new: EnclaveSlot,
+    new_port: u16,
+    old: EnclaveSlot,
+) -> Result<BootProof> {
+    let accounts_dir = format!("{}/accounts", new.deploy_dir);
+    let log_path = format!("{}/enclave.log", new.deploy_dir);
 
     let sealed_files_before = count_files(&accounts_dir);
     // Only the lines THIS boot writes are evidence. Starting the scan at the current length
@@ -700,15 +798,16 @@ pub async fn boot_new_on_migrated_state() -> Result<BootProof> {
 
     info!(
         sealed_files_before,
-        "step 5a: restarting {ENCLAVE_UNIT_NEW} to BOOT it on the migrated state"
+        unit = new.unit,
+        "step 5a: restarting NEW to BOOT it on the migrated state"
     );
-    sudo_systemctl(&["stop", ENCLAVE_UNIT_NEW]).await?;
-    sudo_systemctl(&["start", ENCLAVE_UNIT_NEW]).await?;
+    sudo_systemctl(&["stop", new.unit]).await?;
+    sudo_systemctl(&["start", new.unit]).await?;
 
     // A refusal to boot is an EXPECTED outcome here, not an error: it is what a β18 stamp
     // mismatch looks like. So a timeout is captured as `came_back: false` and judged, never
     // propagated as a transport failure that would hide the finding.
-    let mrenclave_after = curl_version_with_retry(ENCLAVE_PORT_NEW, Duration::from_secs(60))
+    let mrenclave_after = curl_version_with_retry(new_port, Duration::from_secs(60))
         .await
         .ok();
     let came_back = mrenclave_after.is_some();
@@ -725,7 +824,7 @@ pub async fn boot_new_on_migrated_state() -> Result<BootProof> {
 
     // WHAT the migration carried, not just how much. Compared against OLD's live dir rather
     // than a recorded baseline, so it cannot drift out of date.
-    let old_names = file_names(&format!("{DEPLOY_DIR}/accounts"));
+    let old_names = file_names(&format!("{}/accounts", old.deploy_dir));
     let new_names = file_names(&accounts_dir);
     let missing_from_new: Vec<String> = old_names
         .iter()
@@ -759,10 +858,13 @@ pub async fn boot_new_on_migrated_state() -> Result<BootProof> {
 /// empty NEW the side-by-side deploy produced. OLD is NEVER touched (it stayed
 /// byte-for-byte inert through the dry-run — the export skipped the durable
 /// nonce record + pending-migration arming). Only the NEW side is reset.
-pub async fn reset_new_side_after_dry_run() -> Result<()> {
-    let accounts_dir = format!("{DEPLOY_DIR_NEW}/accounts");
-    info!("dry-run cleanup: stopping {ENCLAVE_UNIT_NEW} to reset NEW to empty state");
-    sudo_systemctl(&["stop", ENCLAVE_UNIT_NEW]).await?;
+pub async fn reset_new_side_after_dry_run(new: EnclaveSlot) -> Result<()> {
+    let accounts_dir = format!("{}/accounts", new.deploy_dir);
+    info!(
+        unit = new.unit,
+        "dry-run cleanup: stopping NEW to reset it to empty state"
+    );
+    sudo_systemctl(&["stop", new.unit]).await?;
 
     // The accounts/ subdir holds ONLY sealed migration state (config.json,
     // perp.pem etc. live one level up in perp-next/). Remove every file in it —
@@ -780,9 +882,10 @@ pub async fn reset_new_side_after_dry_run() -> Result<()> {
     }
     info!(
         removed_files = removed,
-        "dry-run cleanup: cleared NEW scratch accounts; restarting {ENCLAVE_UNIT_NEW}"
+        unit = new.unit,
+        "dry-run cleanup: cleared NEW scratch accounts; restarting NEW"
     );
-    sudo_systemctl(&["start", ENCLAVE_UNIT_NEW]).await?;
+    sudo_systemctl(&["start", new.unit]).await?;
     Ok(())
 }
 
@@ -1350,5 +1453,89 @@ mod tests {
         } else {
             assert!(ts.chars().all(|c| c.is_ascii_digit()), "got: {ts}");
         }
+    }
+
+    // ── Slot resolution: the dry run must act on NEW, wherever NEW is ─────────────────────
+
+    /// The 2026-11-03 layout: the live cluster in perp-next/ on 9089, the free slot in perp/
+    /// on 9088.
+    fn cfg_layout(path: &str) -> Option<String> {
+        match path {
+            "/home/azureuser/perp/config.json" => Some(r#"{"port": 9088}"#.into()),
+            "/home/azureuser/perp-next/config.json" => Some(r#"{"port": 9089}"#.into()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn new_on_9088_resolves_to_the_perp_slot_not_perp_next() {
+        // The regression: the dry run used to stop and CLEAR perp-next/ whatever the request
+        // said. With NEW on 9088 that is the live enclave.
+        let new = resolve_slot_with(9088, cfg_layout).unwrap();
+        assert_eq!(new.unit, "perp-dex-enclave");
+        assert_eq!(new.deploy_dir, "/home/azureuser/perp");
+        let old = resolve_slot_with(9089, cfg_layout).unwrap();
+        assert_eq!(old.unit, "perp-dex-enclave-next");
+        assert_eq!(old.deploy_dir, "/home/azureuser/perp-next");
+    }
+
+    #[test]
+    fn a_port_no_slot_is_configured_for_is_refused() {
+        let e = resolve_slot_with(9090, cfg_layout).unwrap_err();
+        assert!(e.to_string().contains("no enclave slot"), "{e}");
+        let e = resolve_slot_with(9088, |_| None).unwrap_err();
+        assert!(e.to_string().contains("no enclave slot"), "{e}");
+        let e = resolve_slot_with(9088, |_| Some("not json".into())).unwrap_err();
+        assert!(e.to_string().contains("no enclave slot"), "{e}");
+    }
+
+    #[test]
+    fn two_slots_on_one_port_is_refused() {
+        let e = resolve_slot_with(9088, |_| Some(r#"{"port": 9088}"#.into())).unwrap_err();
+        assert!(e.to_string().contains("more than one"), "{e}");
+    }
+
+    #[test]
+    fn port_of_base_reads_the_explicit_port() {
+        assert_eq!(port_of_base("https://localhost:9088").unwrap(), 9088);
+        assert_eq!(port_of_base("https://localhost:9089/v1").unwrap(), 9089);
+        assert!(port_of_base("https://localhost").is_err());
+        assert!(port_of_base("not a url").is_err());
+    }
+
+    #[test]
+    fn new_may_be_neither_old_nor_the_enclave_this_orchestrator_serves() {
+        // Today's ceremony: OLD = own = 9089, NEW = 9088.
+        assert!(check_migration_ports(9089, 9088, 9089).is_ok());
+        // The default new base (9089) on this layout would be the live enclave itself.
+        let e = check_migration_ports(9089, 9089, 9089).unwrap_err();
+        assert!(e.to_string().contains("same enclave"), "{e}");
+        let e = check_migration_ports(9088, 9089, 9089).unwrap_err();
+        assert!(e.to_string().contains("this orchestrator serves"), "{e}");
+    }
+
+    #[test]
+    fn the_write_only_baseline_marker_may_be_absent_but_nothing_else_slips_through() {
+        for ok in ["s0_perp_baseline.sealed", "s12_perp_baseline.sealed"] {
+            assert!(is_write_only_baseline_marker(ok), "{ok}");
+        }
+        for no in [
+            "s_perp_baseline.sealed",
+            "sx_perp_baseline.sealed",
+            "perp_baseline.sealed",
+            "s0_perp_baseline.sealed.bak",
+            "s0_perp_baseline.new",
+            "s0_perp_meta.sealed",
+            "xs0_perp_baseline.sealed",
+        ] {
+            assert!(!is_write_only_baseline_marker(no), "{no}");
+        }
+        // Through the verdict: missing only the marker passes...
+        let mut p = good_proof();
+        p.missing_from_new = vec!["s0_perp_baseline.sealed".into()];
+        assert!(judge_boot_proof(&p).is_ok());
+        // ...and a look-alike still fails.
+        p.missing_from_new = vec!["s0_perp_baseline.sealed.bak".into()];
+        assert!(judge_boot_proof(&p).is_err());
     }
 }
