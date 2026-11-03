@@ -2188,6 +2188,7 @@ async fn main() -> Result<()> {
                     path_a_delegation_tx: delegation_tx,
                     default_old_api_base: strip_v1(&cli.enclave_url),
                     default_new_api_base: "https://localhost:9089".into(),
+                    own_enclave_base: strip_v1(&cli.enclave_url),
                     authority: roster_authority.clone(),
                 });
                 tokio::spawn(async move {
