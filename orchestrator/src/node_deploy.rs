@@ -639,26 +639,17 @@ fn is_write_only_baseline_marker(name: &str) -> bool {
 /// an invisible one. So they pass the gate and are REPORTED, loudly, every time.
 const ABSENT_BUT_MUST_BE_REESTABLISHED: &[(&str, &str)] = &[(
     "trusted_mrenclaves.sealed",
-    "the GOVERNED MRENCLAVE ALLOWLIST. Path-A's section table (kPathASectionTable) has no \
-     entry for it — note that `recent_nonces.sealed` carries an explicit INTENTIONALLY NOT \
-     MIGRATED decision with a written rationale, and this file has nothing, so it is an \
-     omission rather than a choice. Nothing breaks today: SELF is always implicitly admitted, \
-     so the cluster cannot lock itself out and a node joining with the SAME measurement is \
-     admitted without any allowlist. What IS lost is the 2-of-3 governance round that admitted \
-     this target. TWO purposes consult the allowlist, not one — PATHA_TARGET and \
-     NODE_BOOTSTRAP (audit 2026-10-05, correcting my first reading) — and both lose only \
-     the ability to admit a DIFFERENT governed measurement, never gaining the ability to \
-     admit an UNGOVERNED one, which is the asymmetry that keeps this low. The NEXT bump needs ITS OWN \
-     target admitted, which was always the procedure, so having the previous measurement \
-     listed does not help it. The sharper loss is the epoch CHAIN: governance is \
-     replay-protected by binding each op to {op, mrenclave, epoch, prev_allowlist_hash}, and \
-     with no sealed allowlist the enclave falls back to the implicit empty genesis state — \
-     observed after the 2026-10-05 migration as epoch=0 digest=63e0a485f9ce159c, byte for \
-     byte what it was before the first governance round. So every bundle ever signed for \
-     epoch 1 is valid AGAIN. Nil exposure here (the only such bundle admitted the \
-     measurement now running), but that is the real reason to fix the section table. \
-     Re-governing after promotion is OPTIONAL and tidy — it moves the chain off genesis — \
-     and see runbook §5.3, which first said MANDATORY and was corrected.",
+    "the GOVERNED MRENCLAVE ALLOWLIST. Not migrated, by design: each enclave generation \
+     starts trusting only SELF, and admits any OTHER measurement only through a new \
+     owner-signed governance descriptor (auditor ruling 2026-11-03, fresh trust per \
+     generation). Do NOT add this file to Path-A's section table: carrying the allowlist \
+     forward would hand the previous generation's trust to the new one. Nothing breaks: SELF \
+     is always implicitly admitted, so the cluster cannot lock itself out, and a node joining \
+     with the SAME measurement is admitted without any allowlist. Both purposes that consult \
+     the allowlist (PATHA_TARGET, NODE_BOOTSTRAP) lose only the ability to admit a DIFFERENT \
+     measurement until the owner governs one. The allowlist epoch chain likewise restarts \
+     at its genesis state in each generation. Re-governing after promotion is an OPTIONAL, \
+     owner-signed step; the next bump admits its own target as always.",
 )];
 
 /// What a sound migration nonetheless leaves for the operator to redo, with why.
@@ -1223,12 +1214,9 @@ mod tests {
 
     #[test]
     fn the_governed_allowlist_not_being_carried_passes_but_is_reported() {
-        // Path-A's section table has no entry for it at all — recent_nonces.sealed carries an
-        // explicit INTENTIONALLY-NOT-MIGRATED decision with a rationale, and this file carries
-        // nothing, so it is an omission. It does not make the migration unsound: SELF is always
-        // implicitly admitted, so the cluster cannot lock itself out and a node joining with
-        // the SAME measurement needs no allowlist. What is lost is the governance round, whose
-        // only consumer is the NEXT bump.
+        // Not migrated BY DESIGN (auditor ruling 2026-11-03, fresh trust per generation). It
+        // must not fail an otherwise sound migration — SELF is always implicitly admitted — and
+        // it must not pass silently either.
         let p = BootProof {
             missing_from_new: vec!["trusted_mrenclaves.sealed".into()],
             ..good_proof()
@@ -1240,17 +1228,22 @@ mod tests {
         let f = boot_followups(&p);
         assert_eq!(f.len(), 1, "and it must NOT pass silently: {f:?}");
         assert!(f[0].contains("GOVERNED MRENCLAVE ALLOWLIST"), "{:?}", f[0]);
-        // The message first said re-governing was MANDATORY and named -25 as the consequence.
-        // Both were wrong — the next bump needs ITS OWN target admitted either way — so these
-        // assertions moved WITH the correction rather than being loosened to keep passing.
         assert!(
-            f[0].contains("epoch CHAIN"),
-            "the real loss must be named: {:?}",
+            f[0].contains("by design"),
+            "the omission is a decision: {:?}",
+            f[0]
+        );
+        // The earlier text called this an omission and pointed at fixing the section table,
+        // i.e. carrying the allowlist forward. That is the regression the ruling forbids, so
+        // the text must now say the opposite and the old pointer must not come back.
+        assert!(
+            f[0].contains("Do NOT add this file to Path-A's section table"),
+            "the forbidden fix must be named as forbidden: {:?}",
             f[0]
         );
         assert!(
-            f[0].contains("valid AGAIN"),
-            "and its consequence: {:?}",
+            !f[0].contains("fix the section table") && !f[0].contains("omission rather than"),
+            "the old pointer toward migrating the allowlist must not survive: {:?}",
             f[0]
         );
         assert!(
@@ -1258,10 +1251,6 @@ mod tests {
             "re-governing is not mandatory: {:?}",
             f[0]
         );
-        // The retracted CLAIM, not the bare word: the text legitimately says "first said
-        // MANDATORY and was corrected", and an assertion on the word alone caught the
-        // retraction's own reference to it. A check that fires on its own correction is too
-        // broad, which is its own small lesson about asserting on substrings.
         assert!(
             !f[0].contains("MANDATORY after promotion"),
             "the retracted claim must not survive in the text: {:?}",

@@ -126,13 +126,16 @@ Promote NEW into the canonical `:9088` slot so the orchestrator (which targets `
 
 ---
 
-### 5.3 Re-govern the MRENCLAVE allowlist — MANDATORY after promotion
+### 5.3 The MRENCLAVE allowlist after promotion — not migrated, by design
 
 **Path-A does not carry `trusted_mrenclaves.sealed`.** Found on 2026-10-05 by the dry run's
 inventory diff: OLD holds 183 sealed files and the migration writes 182, and the one left behind
 is the governed allowlist. `kPathASectionTable` has no entry for it — note that
 `recent_nonces.sealed` carries an explicit INTENTIONALLY-NOT-MIGRATED decision with a written
-rationale and this file carries nothing, so it is an omission rather than a choice. It also
+rationale and this file carried nothing, so it began as an omission. **Since 2026-11-03 it is a
+decision** (auditor ruling, fresh trust per generation): each enclave generation starts trusting
+only SELF and admits any other measurement only through a new owner-signed governance descriptor.
+It also
 explains §11.4's observation that a cluster with 14 completed migrations had no allowlist at all.
 
 **Nothing breaks on promotion.** SELF is always implicitly admitted — "the cluster must never be
@@ -169,7 +172,8 @@ bundle ever signed for epoch 1 is valid AGAIN.
 On this cluster the only epoch-1 bundle ever signed admitted the measurement now running, so the
 concrete exposure is nil. On a cluster where some OTHER measurement had been admitted at epoch 1,
 the reset would reopen the replay of a bundle admitting THAT one. That is a much stronger reason
-for the section-table fix than losing a governance round, and it is the reason to prioritise it.
+than losing a governance round. It is tracked separately and is NOT a reason to carry the
+allowlist forward (see below).
 
 **So: re-governing after promotion is OPTIONAL and tidy, not mandatory.** It advances the chain
 off the genesis state, which closes the replay window for that one old bundle — worth doing when
@@ -179,9 +183,10 @@ convenient, not a step to run under pressure. The command, if you want it:
 bash orchestrator/scripts/govern-b18-and-dryrun.sh      # with MRENCLAVE = the RUNNING measurement
 ```
 
-**The forward fix** is a section-table entry for it, mirroring `pinned_unl.sealed` (optional=true,
-added for exactly this reason — "the governance-pinned XRPL UNL must survive MRENCLAVE bumps").
-That is an enclave change, so it belongs in the next bump, not this one.
+**Do NOT add `trusted_mrenclaves.sealed` to the section table.** This section first recommended
+exactly that, by analogy with `pinned_unl.sealed`. Carrying the allowlist forward would hand the
+previous generation's trust to the new one, which is the regression the 2026-11-03 ruling forbids.
+The epoch-chain concern above is handled on its own track, not by migrating the allowlist.
 
 ---
 
