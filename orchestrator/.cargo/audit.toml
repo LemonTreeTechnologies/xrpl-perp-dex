@@ -38,4 +38,19 @@ ignore = [
     "RUSTSEC-2026-0340",
     "RUSTSEC-2026-0341",
     "RUSTSEC-2026-0342",
+    # crypto-bigint 0.5.5 (via elliptic-curve 0.13 <- k256 0.13 + alloy-signer 1.x)
+    # — timing variability in constant-time ops (2026-10-23). OWNER-APPROVED
+    # 2026-11-03 on the auditor's ruling: custody/value keys live in the ENCLAVE,
+    # not k256; the secret-bearing k256 uses are the operator CLI `sign-request`
+    # (cli_tools.rs, local interactive one-shot signatures) and the #131 gas key
+    # (commitment.rs, publishing halted since 2026-09-21); auth.rs only VERIFIES
+    # public data. No path gives an attacker many timing samples. Fix = alloy 1->2
+    # + k256 0.14 + elliptic-curve 0.14 (owed, own PR + re-audit of signing paths).
+    # MANDATORY UN-IGNORE TRIGGERS — remove this ignore:
+    #   1. BEFORE #131 gas-key publishing is reactivated;
+    #   2. BEFORE mainnet;
+    #   3. BEFORE/WHEN adding ANY automatic or remotely-triggerable k256 signing
+    #      path (e.g. an auto-signer for operator requests, a sign-on-demand
+    #      service) — that creates the mass-timing oracle this rationale says is absent.
+    "RUSTSEC-2026-0387",
 ]
