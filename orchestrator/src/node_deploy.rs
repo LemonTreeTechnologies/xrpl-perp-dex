@@ -754,12 +754,18 @@ fn count_files(dir: &str) -> usize {
 
 /// Sorted file names in a directory; empty when it cannot be read. Directories are skipped,
 /// so `.dcap-helper` does not count as sealed state.
+///
+/// `*.new` files are skipped too: they are an enclave save IN FLIGHT (every part is written as
+/// `.new`, then all are renamed to `.sealed`), never sealed state. OLD keeps running and saving
+/// during the dry run, so a listing taken mid-save would otherwise report every in-flight part
+/// as "missing from NEW" and fail a sound migration.
 fn file_names(dir: &str) -> Vec<String> {
     let mut v: Vec<String> = match std::fs::read_dir(dir) {
         Ok(entries) => entries
             .flatten()
             .filter(|e| e.path().is_file())
             .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| !n.ends_with(".new"))
             .collect(),
         Err(_) => Vec::new(),
     };
@@ -1537,5 +1543,23 @@ mod tests {
         // ...and a look-alike still fails.
         p.missing_from_new = vec!["s0_perp_baseline.sealed.bak".into()];
         assert!(judge_boot_proof(&p).is_err());
+    }
+
+    #[test]
+    fn an_enclave_save_in_flight_is_not_sealed_state() {
+        // node-2, 2026-11-03: OLD was mid-save when the dry run listed its dir, so 22
+        // `*.new` parts read as "missing from NEW" and a sound migration was refused.
+        let dir = std::env::temp_dir().join(format!("nd-inflight-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".dcap-helper")).unwrap();
+        for f in [
+            "s0_perp_meta.sealed",
+            "s0_perp_users_0.new",
+            "s0_perp_positions_7.new",
+        ] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let names = file_names(dir.to_str().unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(names, vec!["s0_perp_meta.sealed".to_string()]);
     }
 }
