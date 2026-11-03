@@ -372,6 +372,9 @@ fn verify_roster_signature(
 /// `allowed_signers_path`  the baked operator.pub, as an ssh allowed_signers file
 /// `running_escrow`  the escrow this node actually runs, for the cluster-binding check
 /// `version_in_force`  the version already loaded, for anti-rollback (None at first load)
+/// TEST-ONLY: a file-supplied key. Production goes through `load_baked`, whose trust root is
+/// compiled in — this path does not exist in a release build.
+#[cfg(test)]
 pub fn load(
     roster_path: &Path,
     sig_path: &Path,
@@ -379,19 +382,124 @@ pub fn load(
     running_escrow: &str,
     version_in_force: Option<u64>,
 ) -> Result<Roster, RosterError> {
-    let bytes = std::fs::read(roster_path)
-        .map_err(|e| RosterError::Missing(format!("{}: {e}", roster_path.display())))?;
+    let bytes = read_roster(roster_path)?;
     let pubkey = std::fs::read_to_string(operator_pub_path).map_err(|e| {
-        // A missing baked key is fail-closed, not "skip verification".
+        // A missing key is fail-closed, not "skip verification".
         RosterError::SignatureUnverified(format!(
-            "baked operator.pub unreadable at {}: {e}",
+            "operator.pub unreadable at {}: {e}",
             operator_pub_path.display()
         ))
     })?;
+    load_bytes_with_pubkey(&bytes, sig_path, &pubkey, running_escrow, version_in_force)
+}
+
+/// Read the roster first, so a missing roster keeps its own distinct cause (`Missing`).
+fn read_roster(roster_path: &Path) -> Result<Vec<u8>, RosterError> {
+    std::fs::read(roster_path)
+        .map_err(|e| RosterError::Missing(format!("{}: {e}", roster_path.display())))
+}
+
+/// The production loader. The trust root is the governance key COMPILED INTO this binary
+/// (`sign_descriptor::BAKED_GOV_PUB`, byte-identical to the enclave's `kMembershipGovPubs[0]`),
+/// never a file on the node: a deploy-time `operator.pub` is writable by whoever runs the node, so
+/// trusting it let anyone with that access re-sign the operator set (REQ
+/// roster-trust-boundary, finding 2). `cross_check_pub` is the legacy `--operator-pub` file,
+/// still accepted so existing start scripts keep working. It is NOT trusted: if given, it must
+/// encode exactly the baked key, otherwise the load refuses instead of silently ignoring it.
+pub fn load_baked(
+    roster_path: &Path,
+    sig_path: &Path,
+    cross_check_pub: Option<&Path>,
+    running_escrow: &str,
+    version_in_force: Option<u64>,
+) -> Result<Roster, RosterError> {
+    if let Some(p) = cross_check_pub {
+        let line = std::fs::read_to_string(p).map_err(|e| {
+            RosterError::SignatureUnverified(format!(
+                "--operator-pub {} unreadable: {e}",
+                p.display()
+            ))
+        })?;
+        match ed25519_raw_from_ssh_pubkey(&line) {
+            Some(raw) if raw == crate::sign_descriptor::BAKED_GOV_PUB => {}
+            _ => {
+                return Err(RosterError::SignatureUnverified(format!(
+                    "--operator-pub {} does not encode the compiled-in governance key — refusing \
+                     (the file is no longer a trust root; drop the flag or fix the file)",
+                    p.display()
+                )))
+            }
+        }
+    }
+    let bytes = read_roster(roster_path)?;
+    load_bytes_with_pubkey(
+        &bytes,
+        sig_path,
+        &baked_operator_pub_line(),
+        running_escrow,
+        version_in_force,
+    )
+}
+
+/// The compiled-in governance key as an OpenSSH public-key line (`ssh-ed25519 <base64>`).
+pub fn baked_operator_pub_line() -> String {
+    use base64::Engine;
+    let algo = b"ssh-ed25519";
+    let mut blob = Vec::with_capacity(4 + algo.len() + 4 + 32);
+    blob.extend_from_slice(&(algo.len() as u32).to_be_bytes());
+    blob.extend_from_slice(algo);
+    blob.extend_from_slice(&32u32.to_be_bytes());
+    blob.extend_from_slice(&crate::sign_descriptor::BAKED_GOV_PUB);
+    format!(
+        "ssh-ed25519 {}",
+        base64::engine::general_purpose::STANDARD.encode(blob)
+    )
+}
+
+/// Extract the raw 32-byte ed25519 key from an OpenSSH public-key line, with or without a
+/// leading principal. `None` for anything that is not exactly one well-formed ssh-ed25519 key.
+fn ed25519_raw_from_ssh_pubkey(line: &str) -> Option<[u8; 32]> {
+    use base64::Engine;
+    let mut toks = line.split_whitespace();
+    let mut t = toks.next()?;
+    if t != "ssh-ed25519" {
+        t = toks.next()?; // first token was a principal
+        if t != "ssh-ed25519" {
+            return None;
+        }
+    }
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(toks.next()?)
+        .ok()?;
+    let rd = |b: &[u8], at: usize| -> Option<usize> {
+        let s: [u8; 4] = b.get(at..at.checked_add(4)?)?.try_into().ok()?;
+        Some(u32::from_be_bytes(s) as usize)
+    };
+    let alen = rd(&blob, 0)?;
+    let aend = 4usize.checked_add(alen)?;
+    if blob.get(4..aend)? != b"ssh-ed25519" {
+        return None;
+    }
+    let klen = rd(&blob, aend)?;
+    let kstart = aend.checked_add(4)?;
+    let kend = kstart.checked_add(klen)?;
+    if klen != 32 || kend != blob.len() {
+        return None;
+    }
+    blob.get(kstart..kend)?.try_into().ok()
+}
+
+fn load_bytes_with_pubkey(
+    bytes: &[u8],
+    sig_path: &Path,
+    pubkey: &str,
+    running_escrow: &str,
+    version_in_force: Option<u64>,
+) -> Result<Roster, RosterError> {
     // Signature FIRST, over the RAW bytes: an unverified file's contents are never parsed into
     // authority. (Kept deliberately stronger than sgx-dev's parse-first — auditor RESP.)
-    verify_roster_signature(&bytes, sig_path, &pubkey)?;
-    let text = std::str::from_utf8(&bytes)
+    verify_roster_signature(bytes, sig_path, pubkey)?;
+    let text = std::str::from_utf8(bytes)
         .map_err(|e| RosterError::Malformed(format!("roster is not UTF-8: {e}")))?;
     let roster = Roster::parse(text)?;
     roster.check_invariants(running_escrow, version_in_force)?;
@@ -640,6 +748,94 @@ ops = ["membership-change"]
         let r = load(&rp, &sig, &ap, ESCROW, None).expect("a correctly signed roster must load");
         assert_eq!(r.version, 7);
         assert!(r.can_op("rBob000000000000000000000000000000", "membership-change"));
+    }
+
+    /// The baked line must decode back to exactly the compiled-in governance key.
+    #[test]
+    fn baked_operator_pub_line_roundtrips_to_baked_gov_pub() {
+        assert_eq!(
+            ed25519_raw_from_ssh_pubkey(&baked_operator_pub_line()),
+            Some(crate::sign_descriptor::BAKED_GOV_PUB)
+        );
+    }
+
+    /// The operator.pub content deployed on the nodes today (a PUBLIC key, with its comment)
+    /// must pass the cross-check, or every existing start script would fail closed on the next
+    /// restart.
+    #[test]
+    fn the_deployed_operator_pub_line_matches_the_baked_key() {
+        let deployed = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILSLvDUzjfQaCesyDRjO+P94ieSbLku/ISlVSm2hGV5l perp-cluster-operator\n";
+        assert_eq!(
+            ed25519_raw_from_ssh_pubkey(deployed),
+            Some(crate::sign_descriptor::BAKED_GOV_PUB)
+        );
+        // also in allowed_signers form (principal first)
+        let principal_first = format!("perp-cluster-operator {}", baked_operator_pub_line());
+        assert_eq!(
+            ed25519_raw_from_ssh_pubkey(&principal_first),
+            Some(crate::sign_descriptor::BAKED_GOV_PUB)
+        );
+    }
+
+    /// The production loader keeps the distinct cause for a missing roster.
+    #[test]
+    fn load_baked_reports_a_missing_roster_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let rp = dir.path().join("nope.toml");
+        let sp = dir.path().join("nope.sig");
+        match load_baked(&rp, &sp, None, ESCROW, None) {
+            Err(RosterError::Missing(_)) => {}
+            other => panic!("a missing roster must fail closed as Missing, got {other:?}"),
+        }
+    }
+
+    /// A non-baked `--operator-pub` is refused BEFORE anything else is read: the file is a
+    /// cross-check, never a trust root (finding 2).
+    #[test]
+    fn load_baked_refuses_a_foreign_operator_pub() {
+        let dir = tempfile::tempdir().unwrap();
+        let ap = dir.path().join("operator.pub");
+        // a valid ssh-ed25519 line for a DIFFERENT key (baked key with its first byte flipped)
+        let mut other = crate::sign_descriptor::BAKED_GOV_PUB;
+        other[0] ^= 0xff;
+        let line = {
+            use base64::Engine;
+            let mut blob = Vec::new();
+            blob.extend_from_slice(&11u32.to_be_bytes());
+            blob.extend_from_slice(b"ssh-ed25519");
+            blob.extend_from_slice(&32u32.to_be_bytes());
+            blob.extend_from_slice(&other);
+            format!(
+                "ssh-ed25519 {}",
+                base64::engine::general_purpose::STANDARD.encode(blob)
+            )
+        };
+        std::fs::write(&ap, line).unwrap();
+        let missing = dir.path().join("no-roster.toml");
+        let err = load_baked(&missing, &missing, Some(&ap), ESCROW, None).unwrap_err();
+        assert!(
+            matches!(&err, RosterError::SignatureUnverified(m) if m.contains("does not encode")),
+            "a foreign operator.pub must be refused at the cross-check, got {err:?}"
+        );
+    }
+
+    /// A roster signed by a TEST key (the one every other test here uses) must NOT load through
+    /// the production loader: production trusts only the compiled-in key.
+    #[test]
+    fn load_baked_refuses_a_roster_signed_by_a_non_baked_key() {
+        if skip_sshsig_unavailable("baked-refusal") {
+            return;
+        }
+        let bytes = roster_toml(7, "mrenclave-govern").into_bytes();
+        let (_pubkey, sig, _d) =
+            ssh_sign(&bytes, ROSTER_NAMESPACE, ROSTER_IDENTITY).expect("ssh-keygen available");
+        let dir = tempfile::tempdir().unwrap();
+        let rp = dir.path().join("cluster_roster.v7.toml");
+        std::fs::write(&rp, &bytes).unwrap();
+        assert!(
+            load_baked(&rp, &sig, None, ESCROW, None).is_err(),
+            "a test-key-signed roster must not verify against the baked governance key"
+        );
     }
 
     /// Each tamper ⇒ refusal. Run only when the positive case could run (ssh-keygen present),

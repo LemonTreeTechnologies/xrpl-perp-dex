@@ -658,14 +658,16 @@ struct RunArgs {
     signers_config: Option<PathBuf>,
 
     /// Operator roster file (`cluster_roster.vN.toml`) — authority model B. It is the SOURCE of
-    /// the allowlist for EVERY admin listener: who may request which admin op. Requires
-    /// `--operator-pub` (the baked SSHSIG key that signs it). If either is unset, or the roster
-    /// does not verify/load, every admin surface comes up FAIL-CLOSED (serves nothing) — never
-    /// open. Replaces the old `signers_config.signers[]` allowlist source.
+    /// the allowlist for EVERY admin listener: who may request which admin op. Its SSHSIG is
+    /// verified against the governance key COMPILED INTO this binary (`BAKED_GOV_PUB`), never a
+    /// file. If unset, or the roster does not verify/load, every admin surface comes up
+    /// FAIL-CLOSED (serves nothing) — never open. Replaces the old `signers_config.signers[]`
+    /// allowlist source.
     #[arg(long)]
     operator_roster: Option<PathBuf>,
 
-    /// The baked operator public key (ssh allowed_signers / bare pubkey) that signed the roster.
+    /// DEPRECATED, not a trust root. Accepted so existing start scripts keep working: if given,
+    /// the file must encode exactly the compiled-in governance key, or the roster load REFUSES.
     /// The detached signature is expected beside the roster as `<roster>.sig`.
     #[arg(long)]
     operator_pub: Option<PathBuf>,
@@ -1770,8 +1772,8 @@ async fn main() -> Result<()> {
     // no operator holds.
     let roster_authority = {
         use crate::operator_roster::RosterAuthority;
-        match (cli.operator_roster.clone(), cli.operator_pub.clone()) {
-            (Some(roster_path), Some(pub_path)) => {
+        match cli.operator_roster.clone() {
+            Some(roster_path) => {
                 // Fail fast if the verification tool itself is missing/old, so the reason reads
                 // as "the box lacks ssh-keygen -Y" rather than "the roster is bad".
                 if let Err(e) = operator_roster::probe_ssh_keygen() {
@@ -1784,10 +1786,10 @@ async fn main() -> Result<()> {
                         .and_then(|s| s.to_str())
                         .unwrap_or("toml")
                 ));
-                match operator_roster::load(
+                match operator_roster::load_baked(
                     &roster_path,
                     &sig_path,
-                    &pub_path,
+                    cli.operator_pub.as_deref(),
                     &escrow_address,
                     None,
                 ) {
@@ -1802,8 +1804,8 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            _ => {
-                warn!("no --operator-roster/--operator-pub — admin surfaces FAIL CLOSED (serve nothing). This is authority model B; configure a roster to serve them.");
+            None => {
+                warn!("no --operator-roster — admin surfaces FAIL CLOSED (serve nothing). This is authority model B; configure a roster to serve them.");
                 Arc::new(RosterAuthority::fail_closed())
             }
         }
