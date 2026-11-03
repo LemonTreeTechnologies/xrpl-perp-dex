@@ -5,7 +5,6 @@
 //! for both maker and taker to validate margin.
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -142,6 +141,12 @@ pub struct OrderBook {
     /// 30/min/user. Records ONLY when an STP event actually fires;
     /// non-self-crossing orders are not counted.
     stp_rate: crate::rate_limit::RateLimiter,
+
+    /// part-2 Q3 (deterministic replay): the ATTESTED close-time (unix ms) stamped onto
+    /// every order and trade produced here, so a validator replaying the batch derives the
+    /// same time-dependent state as the sequencer. Set under the book lock immediately
+    /// before `submit_order` via `set_attested_ms`; 0 means "not fed" and matching pauses.
+    attested_ms: u64,
 }
 
 impl OrderBook {
@@ -155,7 +160,16 @@ impl OrderBook {
             recent_trades: Vec::new(),
             max_recent_trades: 1000,
             stp_rate: crate::rate_limit::RateLimiter::new(std::time::Duration::from_secs(60), 30),
+            attested_ms: 0,
         }
+    }
+
+    /// part-2 Q3: feed the enclave's ATTESTED close-time (unix ms) that the next
+    /// `submit_order` stamps onto its order and trades. The sequencer path sets this under
+    /// the book lock immediately before submitting, so the stamp is deterministic and a
+    /// validator can reproduce it; a stale/zero clock pauses matching (see `submit_order`).
+    pub fn set_attested_ms(&mut self, attested_ms: u64) {
+        self.attested_ms = attested_ms;
     }
 
     /// Best bid price (highest buy order).
@@ -248,10 +262,19 @@ impl OrderBook {
             bail!("self-trade rate exceeded: too many self-crossing orders in the last minute");
         }
 
-        let now_ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        // Determinism (part-2 Q3): stamp with the enclave's ATTESTED close-time, set under
+        // the book lock before this call -- never wall-clock -- so a validator replaying this
+        // batch derives the SAME state (funding/liquidation are time-dependent). A zero clock
+        // means the attested time was not fed: matching PAUSES (fail-safe) rather than
+        // stamping a time no validator can reproduce. Stalled-clock-pauses-matching is a
+        // consistency property, not a new failure mode (auditor Q3).
+        if self.attested_ms == 0 {
+            bail!(
+                "attested clock not set -- matching paused (deterministic replay requires a \
+                 live attested close-time)"
+            );
+        }
+        let now_ms = self.attested_ms;
 
         let order_id = self.next_order_id;
         self.next_order_id += 1;
@@ -618,10 +641,10 @@ impl OrderBook {
                     let trade_id = self.next_trade_id;
                     self.next_trade_id += 1;
 
-                    let now_ms = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
+                    // Determinism (part-2 Q3): same ATTESTED close-time as the order above,
+                    // batch-granularity (every trade in this submit takes one time) -- so a
+                    // validator replaying the fill derives the same state.
+                    let now_ms = self.attested_ms;
 
                     let trade = Trade {
                         trade_id,
@@ -667,7 +690,83 @@ mod tests {
     use super::*;
 
     fn book() -> OrderBook {
-        OrderBook::new("XRP-USD-PERP")
+        let mut ob = OrderBook::new("XRP-USD-PERP");
+        // part-2 Q3: a fixed nonzero attested time so matching is not paused; the value is
+        // arbitrary (no test asserts on the timestamp), it only has to be != 0.
+        ob.set_attested_ms(1_700_000_000_000);
+        ob
+    }
+
+    #[test]
+    fn orders_and_trades_are_stamped_with_the_attested_time_not_wall_clock() {
+        // part-2 Q3: a validator replaying this batch must derive the SAME state, so the
+        // matcher stamps the enclave's ATTESTED close-time, never SystemTime::now(). A value
+        // far from any plausible wall-clock ms makes a regression to wall-clock obvious.
+        const ATT: u64 = 111_222_333_444;
+        let mut ob = OrderBook::new("XRP-USD-PERP");
+        ob.set_attested_ms(ATT);
+
+        let (maker, trades, _stp) = ob
+            .submit_order(
+                "mkr".into(),
+                Side::Long,
+                OrderType::Limit,
+                FP8::from_f64(1.0),
+                FP8::from_f64(10.0),
+                1,
+                TimeInForce::Gtc,
+                false,
+                None,
+            )
+            .unwrap();
+        assert!(trades.is_empty());
+        assert_eq!(
+            maker.timestamp_ms, ATT,
+            "resting order must carry the attested time"
+        );
+
+        let (_taker, trades, _stp) = ob
+            .submit_order(
+                "tkr".into(),
+                Side::Short,
+                OrderType::Limit,
+                FP8::from_f64(1.0),
+                FP8::from_f64(10.0),
+                1,
+                TimeInForce::Ioc,
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(trades.len(), 1);
+        assert_eq!(
+            trades[0].timestamp_ms, ATT,
+            "trade must carry the attested time"
+        );
+    }
+
+    #[test]
+    fn matching_pauses_when_the_attested_clock_is_not_set() {
+        // A zero clock means the attested time was never fed; stamping wall-clock would make
+        // a validator's replay diverge, so matching must PAUSE (fail-safe), not stamp a guess.
+        let mut ob = OrderBook::new("XRP-USD-PERP"); // attested_ms defaults to 0
+        let err = ob
+            .submit_order(
+                "alice".into(),
+                Side::Long,
+                OrderType::Limit,
+                FP8::from_f64(1.0),
+                FP8::from_f64(10.0),
+                1,
+                TimeInForce::Gtc,
+                false,
+                None,
+            )
+            .expect_err("submit must refuse when the attested clock is not set");
+        assert!(
+            err.to_string().contains("matching paused"),
+            "refusal should name the pause, got: {err}"
+        );
     }
 
     #[test]

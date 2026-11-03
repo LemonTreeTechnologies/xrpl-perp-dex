@@ -196,6 +196,12 @@ impl MembershipBundleCollector for CorpusConsentCollector {
                 "quorum_threshold": statement.new_quorum,
                 "proposed_epoch": statement.proposed_epoch,
                 "prev_epoch_hash": hex::encode(statement.prev_epoch_hash),
+                // (b): carry the transition descriptor to each node's consent — the real p2p
+                // collector forwards these over the relay; the corpus HTTP collector must too, or
+                // the (b)-gated consent fail-closes (-104/-44/-45) for want of a descriptor.
+                "op": statement.op,
+                "new_member_mrenclave": hex::encode(statement.new_member_mrenclave),
+                "descriptor_sigs": hex::encode(&statement.descriptor_sigs),
             });
             let e = sign_with(&http, "/v1/admin/signerlist/sign-consent", signer, body).await?;
             if !entries.iter().any(|(pk, _)| *pk == e.0) {
@@ -278,18 +284,48 @@ pub async fn corpus_genesis(
     quorum: u32,
     old_base: &str,
     new_base: &str,
+    // (b)/(B): the TEST gov key path for a (b)-gated measurement (e.g. the M_test rehearsal). The
+    // corpus generates the founding pool at runtime, so it signs the genesis descriptor INTERNALLY
+    // with this key AFTER it knows the set. None for a pre-(b) run (genesis consent is not (b)-gated
+    // there). Opsec: this is a THROWAWAY test key held only by the harness — never the real gov key.
+    genesis_gov_key: Option<std::path::PathBuf>,
 ) -> Result<()> {
     check_loopback(old_base)?;
     check_loopback(new_base)?;
-    let genesis_signers: Result<Vec<SignerEntry>> = signers
+    let genesis_signers: Vec<SignerEntry> = signers
         .iter()
         .map(|s| {
-            Ok(SignerEntry {
+            Ok::<_, anyhow::Error>(SignerEntry {
                 account_id: s.account_id()?,
                 weight: 1,
             })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
+    // Sign the genesis descriptor over THIS founding set with the test gov key (op=SET, epoch 1,
+    // zero sentinel prev, zero member) — the one canonical shape every founding path checks.
+    let genesis_descriptor_sigs: Vec<u8> = match genesis_gov_key {
+        None => Vec::new(),
+        Some(path) => {
+            let key_pem = std::fs::read_to_string(&path)
+                .with_context(|| format!("read test gov key {}", path.display()))?;
+            let seed = crate::sign_descriptor::parse_openssh_ed25519_seed(&key_pem)?;
+            let derived = ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .to_bytes();
+            let (_digest, sig) = crate::sign_descriptor::sign_descriptor(
+                &key_pem,
+                crate::membership_coordinator::MEMBERSHIP_DESC_OP_SET,
+                &escrow,
+                1,
+                &[0u8; 32],
+                &genesis_signers,
+                quorum,
+                &[0u8; 32],
+                &derived,
+            )?;
+            sig.to_vec()
+        }
+    };
     let collector = CorpusConsentCollector {
         signers: signers.to_vec(),
     };
@@ -298,12 +334,11 @@ pub async fn corpus_genesis(
     };
     let outcome = crate::membership_coordinator::run_genesis_bootstrap(
         escrow,
-        genesis_signers?,
+        genesis_signers,
         quorum,
-        // (b)/(B) Finding 2: the corpus supplies no baked-gov-key genesis descriptor. On a pre-(b)
-        // enclave this is a no-op (genesis consent is not (b)-gated); on a (b)/M_f enclave the
-        // founding fail-closes here — a (b) corpus run must author a gov descriptor first (follow-up).
-        Vec::new(),
+        // (b)/(B) Finding 2: the gov-signed genesis descriptor (empty on a pre-(b) run; required on
+        // a (b)-gated measurement like M_test, else the founding fail-closes).
+        genesis_descriptor_sigs,
         &collector,
         &applier,
     )

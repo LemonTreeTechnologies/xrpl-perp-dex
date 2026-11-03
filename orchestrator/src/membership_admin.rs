@@ -78,6 +78,10 @@ pub struct MembershipAdminState {
     /// #131 AC-BASE-2″ P2-c: drives `LibP2PSpvBaselineCollector` (the SPV backing-gate
     /// ceremony — broadcast one proof, collect 2-of-N SPV cosignatures, apply).
     pub spv_baseline_tx: mpsc::Sender<crate::p2p::SpvBaselineRelay>,
+    /// #131 AC-BASE-2″ P2-c: the SPV baseline APPLY-broadcast channel. After the bundle is
+    /// assembled, the ceremony broadcasts the proof + bundle so EVERY node seals its own
+    /// custody floor (the leader-only apply left validators unsealed → they failed to arm -84).
+    pub spv_baseline_apply_tx: mpsc::Sender<crate::p2p::SpvBaselineApplyRelay>,
     /// #131 §6: drives `LibP2PUnlPolicyCollector` (quorum fraction + freshness anchor).
     pub unl_policy_tx: mpsc::Sender<crate::p2p::UnlPolicyRelay>,
     /// #131 sweep Finding 2: drives `LibP2PUnlStatusCollector` — the read-only
@@ -367,6 +371,33 @@ async fn handle_membership_change(
 // initial `SignerListSet` is already on-chain (escrow-init, master-signed); this
 // only seals epoch 1 as each enclave's version=1 baseline so the cluster can
 // cosign thereafter.
+/// GAP A: does the escrow's ON-CHAIN SignerList (accounts + WEIGHTS + quorum) equal the sealed
+/// founding set? Order-independent on the accounts. `false` means the cluster sealed epoch 1
+/// internally but is NOT authorised on-chain -- every escrow cosign would fail tefBAD_SIGNATURE,
+/// so the genesis must not claim "cosign-ready" until an operator projects the founding signers
+/// (a custody SignerListSet).
+fn signer_sets_match(
+    onchain: &[(String, u32)],
+    onchain_quorum: u32,
+    founding: &[String],
+    founding_quorum: u32,
+) -> bool {
+    if onchain_quorum != founding_quorum {
+        return false;
+    }
+    // The cluster builds every SignerListSet with uniform SignerWeight 1 (new_signers /
+    // genesis_signers above, and signerlist_update's SignerEntry builder), so the sealed founding
+    // set is {account: weight 1} per r-address. Comparing accounts + quorum ONLY would ACCEPT an
+    // on-chain list with the right accounts and quorum number but skewed weights ({2,1,1} @ quorum
+    // 2 is effectively 1-of-signer-0 -- a weaker, DIFFERENT threshold), so compare the FULL list:
+    // (account, weight) pairs AND quorum. A non-uniform on-chain weight fails the match.
+    let mut a: Vec<(&str, u32)> = onchain.iter().map(|(s, w)| (s.as_str(), *w)).collect();
+    a.sort_unstable();
+    let mut b: Vec<(&str, u32)> = founding.iter().map(|s| (s.as_str(), 1u32)).collect();
+    b.sort_unstable();
+    a == b
+}
+
 async fn drive_genesis(
     state: &MembershipAdminState,
     req: MembershipChangeRequest,
@@ -408,31 +439,81 @@ async fn drive_genesis(
     .context("β4 genesis bootstrap (collect founding consent + seal epoch 1 across the cluster)")?;
 
     let sealed_nodes = outcome.node_results.iter().filter(|r| r.ok).count();
+
+    // GAP A fix (seam, not instance): genesis does NO projection -- the escrow SignerListSet is a
+    // custody act. It USED to declare "cluster can now cosign" on the internal BELIEF that the
+    // escrow-init on-chain SignerList still matched the founding set; when it does not, the cluster
+    // seals epoch 1 but every on-chain escrow tx fails tefBAD_SIGNATURE ("non-signer"). VERIFY FROM
+    // CHAIN that the escrow SignerList IS the founding set + quorum before claiming cosign-ready;
+    // fail-closed (a fetch error or any mismatch => NOT ready) so the claim can never outrun chain.
+    let onchain = crate::signerlist_update::fetch_current_signerlist(
+        &state.xrpl_url,
+        &state.escrow_r_address,
+    )
+    .await;
+    let cosign_ready = match &onchain {
+        Ok((onchain_signers, onchain_quorum)) => signer_sets_match(
+            onchain_signers,
+            *onchain_quorum,
+            &req.new_signers,
+            req.quorum,
+        ),
+        Err(_) => false,
+    };
+
+    let status = if !outcome.all_sealed() {
+        "partial_seal"
+    } else if cosign_ready {
+        "ok"
+    } else {
+        "sealed_not_cosign_ready"
+    };
+    let message = if !outcome.all_sealed() {
+        "genesis sealed on a subset of nodes -- retry the failed nodes (bootstrap is idempotent \
+         under the (P) single-successor guard)"
+            .to_string()
+    } else if cosign_ready {
+        format!(
+            "genesis epoch {} sealed on all {sealed_nodes} nodes; on-chain SignerList VERIFIED == \
+             founding set -- cluster can now cosign",
+            outcome.proposed_epoch
+        )
+    } else {
+        let onchain_desc = match &onchain {
+            Ok((sgs, q)) => format!(
+                "on-chain {{{}}} quorum {}",
+                sgs.iter()
+                    .map(|(a, w)| format!("{a}=w{w}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                q
+            ),
+            Err(e) => format!("on-chain SignerList unreadable ({e})"),
+        };
+        format!(
+            "genesis epoch {} sealed on all {sealed_nodes} nodes, BUT the escrow on-chain \
+             SignerList is NOT the founding set ({}; founding {{{}}} quorum {}) -- the cluster \
+             CANNOT cosign on-chain until an operator PROJECTS the founding signers via \
+             SignerListSet (a custody act); on-chain escrow txs fail tefBAD_SIGNATURE until then.",
+            outcome.proposed_epoch,
+            onchain_desc,
+            req.new_signers.join(","),
+            req.quorum
+        )
+    };
+
     Ok(MembershipChangeResponse {
-        status: if outcome.all_sealed() {
-            "ok".into()
-        } else {
-            "partial_seal".into()
-        },
+        status: status.into(),
         proposed_epoch: outcome.proposed_epoch,
         message_hash_hex: hex::encode(outcome.message_hash),
         sealed_nodes,
-        // Genesis performs NO projection: the SignerListSet is already on-chain.
+        // Genesis performs NO projection (the SignerListSet is a custody act); cosign-readiness is
+        // instead VERIFIED from-chain above.
         projection_tx_hash_hex: None,
         projection_ledger_index: None,
         confirmed_nodes: 0,
         failed_nodes: failed_seal_nodes(&outcome.node_results),
-        message: if outcome.all_sealed() {
-            format!(
-                "genesis epoch {} sealed on all {sealed_nodes} nodes; SignerListSet already \
-                 on-chain (escrow-init) — cluster can now cosign",
-                outcome.proposed_epoch
-            )
-        } else {
-            "genesis sealed on a subset of nodes — retry the failed nodes \
-             (bootstrap is idempotent under the (P) single-successor guard)"
-                .into()
-        },
+        message,
     })
 }
 
@@ -650,20 +731,17 @@ async fn drive_reserves_spv_baseline(
         escrow_account: req.escrow.clone(),
         quorum: req.validations_quorum,
         collect_secs: req.collect_secs.unwrap_or(45),
+        // our own dedicated xrpld 3.4.1 proof node serves getProofPath — prefer the tiny
+        // inclusion path over a full ledger_data state dump over the tunnel.
+        prefer_getproofpath: true,
     };
     let collector = LibP2PSpvBaselineCollector::new(state.spv_baseline_tx.clone());
-    let enclave_v1 = format!("{}/v1", state.enclave_base.trim_end_matches('/'));
-    let host_ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
     let res = run_reserves_spv_baseline_ceremony(
         &collector,
-        &enclave_v1,
+        state.spv_baseline_apply_tx.clone(),
         &fetch_cfg,
         &roster,
         req.cosign_quorum,
-        host_ts,
         &state.operator_capital_account_ids,
     )
     .await?;
@@ -929,6 +1007,45 @@ pub async fn spawn_admin_listener(
 mod tests {
     use super::*;
 
+    #[test]
+    fn signer_sets_match_is_order_independent_and_quorum_sensitive() {
+        let onchain = vec![
+            ("rB".to_string(), 1u32),
+            ("rA".to_string(), 1u32),
+            ("rC".to_string(), 1u32),
+        ];
+        let founding = vec!["rA".to_string(), "rB".to_string(), "rC".to_string()];
+        assert!(
+            signer_sets_match(&onchain, 2, &founding, 2),
+            "same accounts any order, uniform weight 1, same quorum"
+        );
+        assert!(
+            !signer_sets_match(&onchain, 2, &founding, 3),
+            "quorum mismatch is not cosign-ready"
+        );
+        let different = vec!["rA".to_string(), "rB".to_string(), "rZ".to_string()];
+        assert!(
+            !signer_sets_match(&onchain, 2, &different, 2),
+            "a different signer is not cosign-ready"
+        );
+        let subset = vec!["rA".to_string(), "rB".to_string()];
+        assert!(
+            !signer_sets_match(&onchain, 2, &subset, 2),
+            "a subset is not cosign-ready"
+        );
+        // GAP A(b): right accounts + right quorum NUMBER but a skewed weight is a weaker,
+        // DIFFERENT threshold -- it must NOT be accepted as the uniform founding set.
+        let skewed = vec![
+            ("rA".to_string(), 2u32),
+            ("rB".to_string(), 1u32),
+            ("rC".to_string(), 1u32),
+        ];
+        assert!(
+            !signer_sets_match(&skewed, 2, &founding, 2),
+            "a skewed weight 2/1/1 is not the uniform founding set"
+        );
+    }
+
     fn seal(node: &str, ok: bool, err: Option<&str>) -> NodeSealResult {
         NodeSealResult {
             node: node.into(),
@@ -948,6 +1065,7 @@ mod tests {
         let (e, _re) = mpsc::channel(1);
         let (f, _rf) = mpsc::channel(1);
         let (g, _rg) = mpsc::channel(1);
+        let (h, _rh) = mpsc::channel(1);
         Arc::new(MembershipAdminState {
             xrpl_url: "http://127.0.0.1:1".into(),
             escrow: [0u8; 20],
@@ -961,6 +1079,7 @@ mod tests {
             current_quorum: 2,
             mrenclave_governance_tx: d,
             spv_baseline_tx: e,
+            spv_baseline_apply_tx: h,
             unl_policy_tx: f,
             unl_status_tx: g,
             operator_capital_account_ids: vec![],

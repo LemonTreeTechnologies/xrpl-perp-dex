@@ -21,8 +21,12 @@ pub struct PerpClient {
 /// than re-implemented per driver — `deposit_spv::outcome_from_error` grew its own copy
 /// and a second divergent one is how two drivers end up disagreeing about what -89 means.
 pub fn rc_from_error(msg: &str) -> Option<i64> {
-    let i = msg.find("rc=")?;
-    let rest = &msg[i + 3..];
+    // Anchored to the FULL "(rc=" token, not a bare "rc=": every enclave error body emits
+    // "(rc=N)" (the C++ handlers all build `"... (rc=" + to_string(rc) + ")"`), and a bare
+    // "rc=" would also match inside an unrelated token like "src=" and parse the wrong
+    // integer — the whole -69 finalize->R-a routing rests on this being exact.
+    let i = msg.find("(rc=")?;
+    let rest = &msg[i + 4..];
     let end = rest
         .find(|c: char| !c.is_ascii_digit() && c != '-')
         .unwrap_or(rest.len());
@@ -212,6 +216,48 @@ impl PerpClient {
     pub async fn deposit_spv(&self, proof_blob: &[u8]) -> Result<Value> {
         self.post(
             "/perp/deposit-spv",
+            serde_json::json!({ "proof_blob": hex::encode(proof_blob) }),
+        )
+        .await
+    }
+
+    /// GAP B reconcile — finalize a reserved withdrawal the proof shows LANDED (XDEP
+    /// tx-inclusion). Only the blob goes over the wire; the enclave matches the reserved
+    /// PendingWithdrawal row by Sequence slot + content (from the DELIVERED amount) and
+    /// turns the margin hold into a permanent custody-out. Idempotent: a replayed proof
+    /// after the row is gone comes back rc=0. On refusal the enclave code survives in the
+    /// error body (-69 content mismatch -> a different tx took the slot, use
+    /// rollback_slot_stolen; plus the shared SPV-proof codes), parseable with `rc_from_error`.
+    pub async fn withdraw_finalize(&self, proof_blob: &[u8]) -> Result<Value> {
+        self.post(
+            "/perp/withdraw/finalize",
+            serde_json::json!({ "proof_blob": hex::encode(proof_blob) }),
+        )
+        .await
+    }
+
+    /// GAP B reconcile — roll back a reserved withdrawal whose Sequence slot was consumed
+    /// by a DIFFERENT transaction (R-a, slot stolen; XDEP tx-inclusion of that other tx).
+    /// Restores the held margin and drops the row; the per-escrow high-water STAYS, so the
+    /// stolen slot can never be re-signed. rc=0 rolled back; -72 the proof's content MATCHES
+    /// the row (that is a finalize, not a rollback), -73 user gone.
+    pub async fn withdraw_rollback_slot_stolen(&self, proof_blob: &[u8]) -> Result<Value> {
+        self.post(
+            "/perp/withdraw/rollback/slot-stolen",
+            serde_json::json!({ "proof_blob": hex::encode(proof_blob) }),
+        )
+        .await
+    }
+
+    /// GAP B reconcile — roll back a reserved withdrawal that EXPIRED unconsumed (R-b; XSPV
+    /// AccountRoot state-inclusion proving the escrow Sequence is still the reserved slot at
+    /// a validated ledger PAST the Payment's LastLedgerSequence, so it can never be included).
+    /// Restores the held margin and drops the row; the high-water STAYS. rc=0 rolled back;
+    /// -73 user gone, -74 the proof's ledger is not yet past LastLedgerSequence (retry later
+    /// — an ordinary state, not a fault).
+    pub async fn withdraw_rollback_expired(&self, proof_blob: &[u8]) -> Result<Value> {
+        self.post(
+            "/perp/withdraw/rollback/expired",
             serde_json::json!({ "proof_blob": hex::encode(proof_blob) }),
         )
         .await
@@ -506,5 +552,31 @@ impl PerpClient {
             .json()
             .await?;
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rc_from_error;
+
+    #[test]
+    fn rc_from_error_extracts_the_rc_token() {
+        assert_eq!(
+            rc_from_error("https://localhost:9088/v1/perp/withdraw/finalize -> HTTP 400 Bad Request: {\"status\":\"error\",\"message\":\"withdrawal finalize refused (rc=-69)\"}"),
+            Some(-69)
+        );
+        assert_eq!(rc_from_error("SPV deposit refused (rc=-85)"), Some(-85));
+        assert_eq!(rc_from_error("... (rc=0)"), Some(0));
+    }
+
+    #[test]
+    fn rc_from_error_is_anchored_and_ignores_bare_rc_substrings() {
+        // "src=" contains "rc="; a bare-"rc=" parser would read the 5 here. The "(rc="
+        // anchor skips it and finds the real code.
+        assert_eq!(rc_from_error("source=5 src=5 (rc=-74)"), Some(-74));
+        // No "(rc=" token at all -> no code (e.g. a transport error, "Invalid JSON format").
+        assert_eq!(rc_from_error("connection refused"), None);
+        assert_eq!(rc_from_error("Invalid JSON format"), None);
+        assert_eq!(rc_from_error("ledger src=21680810"), None);
     }
 }

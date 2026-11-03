@@ -18,6 +18,7 @@ mod dkg_coordinate;
 mod election;
 mod frost_round; // FROST threshold-Schnorr signing round driver
 mod http_helpers;
+mod leader_gate; // O-H3 — validator leader-gate provenance decision (extracted + unit-tested)
 mod membership_admin;
 mod membership_apply;
 mod membership_canonical;
@@ -40,6 +41,7 @@ mod path_a_redkg;
 mod perp_client;
 mod pool_path_a_client;
 mod price_feed;
+mod price_publisher; // signs price quotes + assembles the enclave's XPQ1 blob
 mod quorum_bundle;
 mod rate_limit;
 mod reserves_baseline; // AC-BASE — one-time custody-baseline ceremony (hash + recovery + bundle)
@@ -65,6 +67,7 @@ mod upgrade_corpus;
 mod validator_manifests; // AC-BASE-2″ §6 — feed the enclave's measured-anchor validator root
 mod vault_mm;
 mod withdrawal;
+mod withdrawal_reconcile; // GAP B — reserve→finalize/rollback journal + reconcile driver
 mod ws;
 mod xrpl_monitor;
 mod xrpl_signer;
@@ -473,6 +476,11 @@ enum Command {
         /// For `add`: the new member's MRENCLAVE, hex. Omit (or all-zero) for `remove`/`set`.
         #[arg(long)]
         new_member_mrenclave: Option<String>,
+        /// TEST-ONLY override: the expected governance pub (hex) the key is self-checked against,
+        /// = the pub BAKED into the TARGET enclave measurement. Defaults to the production baked
+        /// pub. Set ONLY for a test measurement (M_test) founded with a throwaway gov key.
+        #[arg(long)]
+        expect_gov_pub: Option<String>,
     },
 
     /// Phase 2.1c-E — node-local deploy. Each operator runs this on
@@ -566,6 +574,12 @@ enum Command {
         /// use it" are different states. The caller restarts both nodes between the two phases.
         #[arg(long)]
         stop_after_genesis: bool,
+        /// (b)/(B): the TEST gov key (ed25519 OpenSSH) for a (b)-gated measurement (e.g. the M_test
+        /// rehearsal). The corpus signs the genesis descriptor internally with it after generating
+        /// the founding pool. Omit for a pre-(b) corpus run. THROWAWAY test key only — never the
+        /// real perp gov key in automation.
+        #[arg(long)]
+        genesis_gov_key: Option<PathBuf>,
     },
 }
 
@@ -910,6 +924,7 @@ async fn main() -> Result<()> {
             signers,
             skip_genesis,
             stop_after_genesis,
+            genesis_gov_key,
         }) => {
             return cli_upgrade_corpus_ceremony(
                 &old_url,
@@ -919,6 +934,7 @@ async fn main() -> Result<()> {
                 &signers,
                 skip_genesis,
                 stop_after_genesis,
+                genesis_gov_key,
             )
             .await;
         }
@@ -1032,6 +1048,7 @@ async fn main() -> Result<()> {
             signers,
             quorum,
             new_member_mrenclave,
+            expect_gov_pub,
         }) => {
             let op_code = match op.to_ascii_lowercase().as_str() {
                 "add" => membership_coordinator::MEMBERSHIP_DESC_OP_ADD,
@@ -1072,6 +1089,17 @@ async fn main() -> Result<()> {
             }
             let key_pem = std::fs::read_to_string(&key_file)
                 .with_context(|| format!("cannot read governance key {}", key_file.display()))?;
+            let expect_pub: [u8; 32] = match expect_gov_pub.as_ref() {
+                None => sign_descriptor::BAKED_GOV_PUB,
+                Some(h) => {
+                    let b = hex::decode(h.trim_start_matches("0x"))
+                        .context("--expect-gov-pub must be hex")?;
+                    anyhow::ensure!(b.len() == 32, "--expect-gov-pub must be 32 bytes");
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&b);
+                    a
+                }
+            };
             let (digest, sig) = sign_descriptor::sign_descriptor(
                 &key_pem,
                 op_code,
@@ -1081,6 +1109,7 @@ async fn main() -> Result<()> {
                 &entries,
                 quorum,
                 &member,
+                &expect_pub,
             )?;
             println!("descriptor_digest: {}", hex::encode(digest));
             println!("descriptor_sigs:   {}", hex::encode(sig));
@@ -1274,10 +1303,17 @@ async fn main() -> Result<()> {
         Err(_) => info!("no persisted state, starting fresh"),
     }
 
-    // Create trading engine — always wire batch publisher (gated by is_sequencer flag)
-    let node_id = format!("{}:p{}", cli.p2p_listen, cli.priority);
+    // Create trading engine — always wire batch publisher (gated by is_sequencer flag).
+    // bug-#2 fix: the sequencer identity stamped on every OrderBatch MUST be the libp2p PeerID
+    // the election and the validator leader-gate use -- ONE identity, from the persisted p2p key,
+    // never a separately-constructed string. Load the key HERE (before the engine) so the PeerID
+    // is a construction invariant of the engine -- it can never exist with a wrong/unset
+    // sequencer_id. The keypair is moved into P2PNode::new below, which derives the same PeerID.
+    let p2p_keypair = p2p::load_or_create_identity(&cli.p2p_key_path)
+        .context("failed to load or create libp2p identity")?;
+    let our_peer_id = p2p_keypair.public().to_peer_id().to_string();
     let (trade_batch_tx, mut trade_batch_rx) = tokio::sync::mpsc::channel::<p2p::OrderBatch>(100);
-    let mut engine = TradingEngine::new(&cli.market, perp_for_api, &node_id);
+    let mut engine = TradingEngine::new(&cli.market, perp_for_api, &our_peer_id);
     engine = engine.with_batch_publisher(trade_batch_tx.clone());
 
     let is_sequencer = Arc::new(AtomicBool::new(cli.priority == 0));
@@ -1394,6 +1430,15 @@ async fn main() -> Result<()> {
     } else {
         (None, None)
     };
+    // #131 AC-BASE-2″ P2-c: the SPV baseline APPLY-broadcast channel — the ceremony
+    // broadcasts the assembled proof + bundle so EVERY node seals its own custody floor
+    // (mirrors membership_apply; the leader-only apply left validators unsealed → -84).
+    let (spv_baseline_apply_rx_holder, _spv_baseline_apply_tx) = if signers_config.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<p2p::SpvBaselineApplyRelay>(8);
+        (Some(rx), Some(tx))
+    } else {
+        (None, None)
+    };
     // #131 §6: the UNL policy ceremony channel.
     let (unl_policy_rx_holder, _unl_policy_tx) = if signers_config.is_some() {
         let (tx, rx) = tokio::sync::mpsc::channel::<p2p::UnlPolicyRelay>(8);
@@ -1423,6 +1468,22 @@ async fn main() -> Result<()> {
     let reserves_figures_cache: reserves_publisher::ReservesFiguresCache =
         std::sync::Arc::new(std::sync::Mutex::new(None));
 
+    // GAP B withdrawal reconcile journal (producer side). Gated on PERP_WITHDRAWAL_RECONCILE,
+    // the same switch as the reconcile loop, so reserved withdrawals are durably recorded for
+    // the loop + boot sweep to settle (finalize) or unwind (R-b). A corrupt/unreadable journal
+    // FAILS startup rather than silently stranding in-flight rows (margin debited, slot held).
+    let withdrawal_journal =
+        if std::env::var("PERP_WITHDRAWAL_RECONCILE").ok().as_deref() == Some("1") {
+            let path = std::env::var("PERP_WITHDRAWAL_JOURNAL")
+                .unwrap_or_else(|_| "withdrawal_reconcile_journal.json".to_string());
+            let handle = withdrawal_reconcile::JournalHandle::open(&path)
+                .context("opening the withdrawal reconcile journal")?;
+            info!(path = %path, "withdrawal-reconcile journal opened");
+            Some(handle)
+        } else {
+            None
+        };
+
     let app_state = Arc::new(AppState {
         engine,
         perp: PerpClient::new(&cli.enclave_url)?,
@@ -1439,6 +1500,7 @@ async fn main() -> Result<()> {
         } else {
             None
         },
+        withdrawal_journal: withdrawal_journal.clone(),
         db: db.clone(),
         shard_router: shard_router.clone(),
         peer_count: peer_count.clone(),
@@ -1461,11 +1523,10 @@ async fn main() -> Result<()> {
     });
 
     // Start P2P node (gossipsub for order flow replication + election)
-    let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<p2p::OrderBatch>(100);
+    let (batch_tx, mut batch_rx) =
+        tokio::sync::mpsc::channel::<(p2p::OrderBatch, Option<String>)>(100);
     let (election_inbound_tx, election_inbound_rx) =
         tokio::sync::mpsc::channel::<election::ElectionMessage>(100);
-    let p2p_keypair = p2p::load_or_create_identity(&cli.p2p_key_path)
-        .context("failed to load or create libp2p identity")?;
     let mut p2p_node = p2p::P2PNode::new(
         &cli.p2p_listen,
         p2p_keypair,
@@ -1475,6 +1536,19 @@ async fn main() -> Result<()> {
     )
     .await
     .context("failed to start P2P node")?;
+
+    // bug-#2 regression guard: the identity we STAMP on batches (engine sequencer_id ==
+    // our_peer_id) MUST equal the libp2p PeerID the election + leader-gate compare against. Both
+    // derive from the same persisted p2p key, so this holds by construction; assert it at boot so
+    // a future reorder that re-splits the two identities fails LOUDLY here instead of going
+    // silently inert (validators dropping every batch) -- exactly how this bug hid all along.
+    if our_peer_id != p2p_node.peer_id.to_string() {
+        anyhow::bail!(
+            "sequencer identity split: batches stamped {our_peer_id} but the leader-gate uses \
+             {} -- validators would drop every batch (bug #2)",
+            p2p_node.peer_id
+        );
+    }
 
     // Wire P2P publishing channels
     let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<p2p::OrderBatch>(100);
@@ -1934,6 +2008,7 @@ async fn main() -> Result<()> {
             app_state.signing_tx.clone(),
             _mrenclave_governance_tx.clone(),
             _spv_baseline_tx.clone(),
+            _spv_baseline_apply_tx.clone(),
             _unl_policy_tx.clone(),
             _unl_status_tx.clone(),
         ) {
@@ -1944,6 +2019,7 @@ async fn main() -> Result<()> {
                 Some(signing_tx),
                 Some(mrenclave_governance_tx),
                 Some(spv_baseline_tx),
+                Some(spv_baseline_apply_tx),
                 Some(unl_policy_tx),
                 Some(unl_status_tx),
             ) if !cli.membership_node_urls.is_empty() => {
@@ -1980,6 +2056,7 @@ async fn main() -> Result<()> {
                     current_quorum: cfg.quorum as u32,
                     mrenclave_governance_tx,
                     spv_baseline_tx,
+                    spv_baseline_apply_tx,
                     unl_policy_tx,
                     unl_status_tx,
                     operator_capital_account_ids: operator_capital_account_ids.clone(),
@@ -2148,6 +2225,11 @@ async fn main() -> Result<()> {
         // #131 AC-BASE-2″ P2-c: the SPV backing-gate collection channel.
         if let Some(rx) = spv_baseline_rx_holder {
             p2p_node.set_spv_baseline_channel(rx);
+        }
+        // #131 AC-BASE-2″ P2-c: the SPV baseline APPLY-broadcast channel (every node
+        // seals its own custody floor, not just the leader).
+        if let Some(rx) = spv_baseline_apply_rx_holder {
+            p2p_node.set_spv_baseline_apply_channel(rx);
         }
         // #131 §6: the UNL policy collection channel.
         if let Some(rx) = unl_status_rx_holder {
@@ -2320,6 +2402,7 @@ async fn main() -> Result<()> {
     let validator_db = app_state.db.clone();
     let validator_leader_rx = leader_rx.clone();
     let validator_replication = replication_health.clone();
+    let validator_clock = clock_health.clone();
     // A vault quote carries no user signature, so the only thing standing between a
     // sequencer-invented "vault" order and our state is which vaults WE are configured to
     // run. Empty here means every ProtocolVault order in a batch is refused.
@@ -2345,37 +2428,55 @@ async fn main() -> Result<()> {
         let mut replay_failures: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
         let mut replay_ok_total: u64 = 0;
-        while let Some(batch) = batch_rx.recv().await {
+        while let Some((batch, src_peer)) = batch_rx.recv().await {
             if is_seq_validator.load(Ordering::Relaxed) {
                 continue; // sequencer doesn't replay its own batches
             }
 
             let total_fills: usize = batch.orders.iter().map(|o| o.fills.len()).sum();
 
-            // O-H3: gate the batch source on the *elected* leader from the
-            // election state machine — no TOFU on first-observed peer.
-            // A rogue peer cannot lock itself in as sequencer by beating
-            // the real leader to the first publish; the election channel
-            // is the source of truth.
-            let elected = validator_leader_rx.borrow().clone();
-            match elected {
-                Some(ref elected_id) if *elected_id == batch.sequencer_id => {
-                    // elected leader matches sender → proceed
-                }
-                Some(ref elected_id) => {
-                    warn!(
-                        elected = %elected_id,
-                        got = %batch.sequencer_id,
-                        seq = batch.seq_num,
-                        "batch from non-elected sequencer — ignoring"
-                    );
-                    continue;
-                }
-                None => {
+            // O-H3: bind the batch's AUTHENTICATED gossip origin (src_peer) to the elected
+            // leader; the self-declared sequencer_id field alone is forgeable by any meshed peer.
+            // Decision extracted to `leader_gate` so the binding is unit-tested, not review-only.
+            let elected_snapshot = validator_leader_rx.borrow().clone();
+            match leader_gate::leader_gate_decision(
+                src_peer.as_deref(),
+                elected_snapshot.as_deref(),
+                &batch.sequencer_id,
+            ) {
+                leader_gate::LeaderGate::Accept => {}
+                leader_gate::LeaderGate::NoLeader => {
                     warn!(
                         got = %batch.sequencer_id,
                         seq = batch.seq_num,
                         "no elected leader yet — ignoring batch"
+                    );
+                    continue;
+                }
+                leader_gate::LeaderGate::NotLeader => {
+                    warn!(
+                        elected = elected_snapshot.as_deref().unwrap_or(""),
+                        authed_source = src_peer.as_deref().unwrap_or(""),
+                        claimed = %batch.sequencer_id,
+                        seq = batch.seq_num,
+                        "O-H3: batch publisher is not the elected leader — ignoring"
+                    );
+                    continue;
+                }
+                leader_gate::LeaderGate::Unsigned => {
+                    warn!(
+                        elected = elected_snapshot.as_deref().unwrap_or(""),
+                        seq = batch.seq_num,
+                        "O-H3: batch has no authenticated publisher (unsigned) — ignoring"
+                    );
+                    continue;
+                }
+                leader_gate::LeaderGate::FieldMismatch => {
+                    warn!(
+                        elected = elected_snapshot.as_deref().unwrap_or(""),
+                        claimed = %batch.sequencer_id,
+                        seq = batch.seq_num,
+                        "sequencer_id field disagrees with the authenticated publisher — ignoring"
                     );
                     continue;
                 }
@@ -2454,6 +2555,25 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 info!(seq = batch.seq_num, "state hash verified");
+            }
+
+            // part-2 Q3/Q4 increment 2: independently verify the batch's close-time against
+            // THIS node's OWN derived attested clock before folding its fills into our state.
+            // The hash above only proves the message is intact (same author on both sides);
+            // `timestamp` is a sequencer field, so a compromised sequencer could stamp a false
+            // time to skew funding / liquidation. Refuse a batch whose time our own clock has
+            // not reached -- fail-safe, the co-sign then cannot form on an unverified time.
+            {
+                let my_ripple = validator_clock.attested_close_time.load(Ordering::Relaxed);
+                if crate::attested_clock::batch_time_skip(
+                    batch.timestamp,
+                    my_ripple,
+                    &validator_replication.batch_time_divergences,
+                    &batch.sequencer_id,
+                    batch.seq_num,
+                ) {
+                    continue;
+                }
             }
 
             // Replay each fill: open positions in local enclave
@@ -2646,8 +2766,18 @@ async fn main() -> Result<()> {
     // (2) step 3), so the collector is started when EITHER driver is on and the buffer is
     // shared. Two collectors on one rippled would double the subscription for no gain.
     let deposit_cfg = deposit_spv::DepositDriverConfig::from_env(&escrow_address);
+    // F1 (REQ-e2e-deposit-auth-surface-gaps, auditor ruling 2026-10-15): when this node runs
+    // SPV deposits, the per-node SPV scanner is the SOLE crediting path. The legacy credit
+    // path in the tick loop stands down so exactly one path ever credits a deposit (no
+    // double-credit); pre-arm the enclave refuses legacy with -85 anyway, post-arm the SPV
+    // scanner credits. The enclave -85 remains the backstop.
+    let spv_deposits_enabled = deposit_cfg.is_some();
     let clock_cfg = attested_clock::ClockDriverConfig::from_env();
-    if deposit_cfg.is_some() || clock_cfg.is_some() {
+    // GAP B withdrawal reconcile (consumer side). Shares the validations collector + buffer:
+    // finalize / R-a need the validator signatures for the ledger a withdrawal landed in,
+    // exactly as the deposit scanner does.
+    let reconcile_cfg = withdrawal_reconcile::ReconcileLoopConfig::from_env(&escrow_address);
+    if deposit_cfg.is_some() || clock_cfg.is_some() || reconcile_cfg.is_some() {
         // The UNION of whatever both configs name, deduplicated. Either driver alone is
         // enough to want the collector, and if both are on they should not open the same
         // subscription twice.
@@ -2662,7 +2792,13 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        assert!(!ws_urls.is_empty(), "one of the two configs is present");
+        if let Some(r) = reconcile_cfg.as_ref() {
+            let u = r.ws_url().to_string();
+            if !ws_urls.contains(&u) {
+                ws_urls.push(u);
+            }
+        }
+        assert!(!ws_urls.is_empty(), "one of the configs is present");
         let buffer =
             std::sync::Arc::new(std::sync::Mutex::new(deposit_spv::ValidationBuffer::new()));
         info!(
@@ -2678,9 +2814,19 @@ async fn main() -> Result<()> {
                 dcfg,
                 perp.clone(),
                 buffer.clone(),
-                is_sequencer.clone(),
             ));
-            info!("deposit-spv ENABLED (collector always; scanner sequencer-only)");
+            info!("deposit-spv ENABLED — scanner PER-NODE (each node SPV-verifies + credits its own enclave; E 2026-10-14)");
+        }
+        if let (Some(rcfg), Some(journal)) = (reconcile_cfg, withdrawal_journal.clone()) {
+            tokio::spawn(withdrawal_reconcile::run_withdrawal_reconcile(
+                rcfg,
+                perp.clone(),
+                journal,
+                buffer.clone(),
+            ));
+            info!(
+                "withdrawal-reconcile ENABLED — reserve->finalize/rollback driver + boot sweep (per-node)"
+            );
         }
         // THE ONE WAY THE STALE-PIN BRICK RETURNS (audit 2026-10-06). The clock is
         // OFF-by-default and unl-refresh is ON-by-default, so the dangerous configuration is
@@ -2793,9 +2939,80 @@ async fn main() -> Result<()> {
     loop {
         tick.tick().await;
 
-        // Sequencer-only work: price feed, deposits, liquidations, funding.
-        // Validators only replay batches from the sequencer (handled above).
-        if !is_sequencer.load(Ordering::Relaxed) {
+        // Loaded ONCE per tick: the role watcher runs in another task and can flip
+        // this between statements, so read it to a local and use that local for both
+        // the price-tick decision below and the sequencer gate, rather than loading
+        // twice and racing within a single iteration.
+        let is_seq = is_sequencer.load(Ordering::Relaxed);
+
+        // ── Price tick — shared by ALL nodes ─────────────────────────────────
+        // Fetch the price and derive the live price path at most ONCE per interval,
+        // BEFORE the sequencer gate, so validators reach the per-node signed push.
+        // The timer advances here, so neither the per-node signed push (all nodes)
+        // nor the sequencer-only operator-feed push below can double-fetch or
+        // double-advance it. `priced_this_tick` carries the single fetched price
+        // into the sequencer-only section; `None` means no fetch happened this tick.
+        let mut priced_this_tick: Option<f64> = None;
+        if last_price_update.elapsed() >= price_interval {
+            // DERIVE which price path is live; do not carry our own copy of the
+            // switch. Publishers are anchored by a RECOMPILE of the enclave, and
+            // that same constant turns ecall_perp_update_price into a -94 refusal
+            // — so a config flag here would have to agree with a constant we
+            // cannot see, and the two would eventually disagree. Ask instead.
+            //
+            // Cached because it only changes across an enclave rebuild, and a
+            // status call on every price tick would be pure noise. Unknown means
+            // "we have not been told yet", not "operator feed": pushing the raw
+            // feed at an enclave that has moved on is how the mark goes stale
+            // while every call still returns a tidy error.
+            if live_price_path.is_none() {
+                match perp.price_publisher_status().await {
+                    Ok(v) => match price_feed::live_price_path(&v) {
+                        Ok(p) => {
+                            info!(path = ?p, "price path derived from the enclave");
+                            live_price_path = Some(p);
+                        }
+                        Err(e) => warn!("publisher status unreadable: {e}"),
+                    },
+                    // An older enclave has no such route. That is not an error: it
+                    // predates the signed track entirely, so the operator feed IS
+                    // the path, and saying so once beats asking forever.
+                    Err(e) => {
+                        info!(
+                            "no publisher-status route ({e}) — treating this \
+                             enclave as operator-fed"
+                        );
+                        live_price_path = Some(price_feed::LivePricePath::OperatorFeed);
+                    }
+                }
+            }
+
+            // Who needs a price this tick? The sequencer ALWAYS does (mark/ws, and
+            // current_price feeds liquidation + funding). A validator needs one ONLY
+            // on the signed-median path, to sign its per-node quote — in operator-feed
+            // mode a validator fetches nothing, exactly as before this change.
+            let want_price =
+                is_seq || live_price_path == Some(price_feed::LivePricePath::SignedMedian);
+            if want_price {
+                match price_feed::fetch_xrp_price(&http_client).await {
+                    Ok(price) => {
+                        priced_this_tick = Some(price);
+                        // PER-NODE signed-median push: runs on EVERY node (sequencer
+                        // AND validators). The operator-feed push stays sequencer-only,
+                        // in the gated section below.
+                        if live_price_path == Some(price_feed::LivePricePath::SignedMedian) {
+                            push_signed_median_quote(&perp, price).await;
+                        }
+                    }
+                    Err(e) => warn!("price fetch failed: {:#}", e),
+                }
+            }
+            last_price_update = Instant::now();
+        }
+
+        // Sequencer-only work: operator-feed price push, deposits, liquidations,
+        // funding, reserves. Validators only replay batches from the sequencer.
+        if !is_seq {
             // Validators still save their own sealed state periodically
             if last_state_save.elapsed() >= STATE_SAVE_INTERVAL {
                 if let Err(e) = perp.save_state().await {
@@ -2811,85 +3028,51 @@ async fn main() -> Result<()> {
             .unwrap()
             .as_secs();
 
-        // Price update
-        if last_price_update.elapsed() >= price_interval {
-            match price_feed::fetch_xrp_price(&http_client).await {
-                Ok(price) => {
-                    current_price = price;
-                    let index_fp8 = float_to_fp8_string(price);
-                    // Mark price = orderbook mid if available, else index
-                    let mark = match app_state.engine.ticker().await {
-                        (_, _, Some(mid)) => mid.to_f64(),
-                        _ => price,
-                    };
-                    let mark_fp8 = float_to_fp8_string(mark);
-                    // DERIVE which price path is live; do not carry our own copy of the
-                    // switch. Publishers are anchored by a RECOMPILE of the enclave, and
-                    // that same constant turns ecall_perp_update_price into a -94 refusal
-                    // — so a config flag here would have to agree with a constant we
-                    // cannot see, and the two would eventually disagree. Ask instead.
-                    //
-                    // Cached because it only changes across an enclave rebuild, and a
-                    // status call on every price tick would be pure noise. Unknown means
-                    // "we have not been told yet", not "operator feed": pushing the raw
-                    // feed at an enclave that has moved on is how the mark goes stale
-                    // while every call still returns a tidy error.
-                    if live_price_path.is_none() {
-                        match perp.price_publisher_status().await {
-                            Ok(v) => match price_feed::live_price_path(&v) {
-                                Ok(p) => {
-                                    info!(path = ?p, "price path derived from the enclave");
-                                    live_price_path = Some(p);
-                                }
-                                Err(e) => warn!("publisher status unreadable: {e}"),
-                            },
-                            // An older enclave has no such route. That is not an error: it
-                            // predates the signed track entirely, so the operator feed IS
-                            // the path, and saying so once beats asking forever.
-                            Err(e) => {
-                                info!(
-                                    "no publisher-status route ({e}) — treating this \
-                                     enclave as operator-fed"
-                                );
-                                live_price_path = Some(price_feed::LivePricePath::OperatorFeed);
-                            }
-                        }
+        // Operator-feed price push + local mark/ws — SEQUENCER-ONLY, reusing the one
+        // price fetched above this tick (no second fetch, no second timer advance).
+        if let Some(price) = priced_this_tick {
+            current_price = price;
+            let index_fp8 = float_to_fp8_string(price);
+            // Mark price = orderbook mid if available, else index
+            let mark = match app_state.engine.ticker().await {
+                (_, _, Some(mid)) => mid.to_f64(),
+                _ => price,
+            };
+            let mark_fp8 = float_to_fp8_string(mark);
+            match live_price_path {
+                Some(price_feed::LivePricePath::OperatorFeed) => {
+                    if let Err(e) = perp.update_price(&mark_fp8, &index_fp8, now_ts).await {
+                        error!("price update failed: {:#}", e);
                     }
-                    match live_price_path {
-                        Some(price_feed::LivePricePath::OperatorFeed) => {
-                            if let Err(e) = perp.update_price(&mark_fp8, &index_fp8, now_ts).await {
-                                error!("price update failed: {:#}", e);
-                            }
-                        }
-                        Some(price_feed::LivePricePath::SignedMedian) => {
-                            // Publishers are anchored: this feed is no longer allowed to
-                            // set the mark, and pretending otherwise would earn -94 every
-                            // tick. Signed quotes arrive by their own path; there is
-                            // nothing for this loop to push.
-                            tracing::debug!(
-                                "signed-median path is live; not pushing the operator feed"
-                            );
-                        }
-                        None => {}
-                    }
-                    app_state
-                        .mark_price
-                        .store(crate::types::FP8::from_f64(mark).raw(), Ordering::Relaxed);
-                    let _ = app_state.ws_tx.send(WsEvent::Ticker {
-                        mark_price: mark_fp8,
-                        index_price: index_fp8,
-                        timestamp: now_ts,
-                    });
                 }
-                Err(e) => warn!("price fetch failed: {:#}", e),
+                Some(price_feed::LivePricePath::SignedMedian) => {
+                    // Publishers are anchored: the operator feed is no longer allowed
+                    // to set the mark, and pretending otherwise would earn -94 every
+                    // tick. The signed quotes were already pushed per-node above; there
+                    // is nothing for this sequencer-only block to push.
+                    tracing::debug!("signed-median path is live; not pushing the operator feed");
+                }
+                None => {}
             }
-            last_price_update = Instant::now();
+            app_state
+                .mark_price
+                .store(crate::types::FP8::from_f64(mark).raw(), Ordering::Relaxed);
+            let _ = app_state.ws_tx.send(WsEvent::Ticker {
+                mark_price: mark_fp8,
+                index_price: index_fp8,
+                timestamp: now_ts,
+            });
         }
 
         // Deposit scanning
         match monitor.scan_deposits(last_ledger).await {
             Ok((deposits, new_ledger)) => {
                 for deposit in &deposits {
+                    if spv_deposits_enabled {
+                        // F1: SPV scanner owns crediting on this node; legacy path stands
+                        // down (exactly one crediting path; enclave -85 is the backstop).
+                        continue;
+                    }
                     // REQ-20-impl R2: thread destination_tag through to
                     // perp.deposit. Enclave routes the credit per the
                     // bindings map (REQ-20 §4.2): bound → bound user;
@@ -3082,9 +3265,95 @@ async fn main() -> Result<()> {
     }
 }
 
+/// XRPL testnet network id for signed price quotes.
+///
+/// = xrpl_anchor_network_id() = FNV-1a over the 6 baked anchored validator masters
+/// (enclave xrpl_anchored_validators.h); recompute if the validator anchor changes;
+/// a mismatch makes the enclave reject the quote with -93.
+const NETWORK_ID_TESTNET: u32 = 959_427_577;
+
+/// Market id for the signed price push. The enclave accepts any market_id and routes
+/// it; we sign and POST with the same value.
+const SIGNED_PRICE_MARKET_ID: u32 = 0;
+
+/// Per-node signed-median price push — the signed path's "own path".
+///
+/// Runs on EVERY node (sequencer AND validators) when the live price path is
+/// SignedMedian. It does NOT fetch a price of its own — the caller passes the one
+/// price already fetched this tick — then signs a quote bundle and POSTs it to the
+/// LOCAL enclave's median consumer (`update_price_signed`).
+///
+/// MECHANISM-PROOF ONLY: the N quotes are all signed by THIS node from the test keys
+/// in `PRICE_PUBLISHER_KEYS`. In production each quote comes from an INDEPENDENT
+/// publisher service; one node signing all N is a 1-of-1 costume that proves the
+/// enclave's verify+median+threshold mechanism, not publisher independence.
+async fn push_signed_median_quote(perp: &PerpClient, price: f64) {
+    // No key file configured => do nothing (a key is NEVER hardcoded). A node that
+    // should drive the signed feed sets PRICE_PUBLISHER_KEYS to its test-key JSON.
+    let keys_path = match std::env::var("PRICE_PUBLISHER_KEYS") {
+        Ok(p) if !p.is_empty() => p,
+        _ => {
+            warn!(
+                "signed-median path is live but PRICE_PUBLISHER_KEYS is unset; skipping the \
+                 per-node signed push (no key is ever hardcoded)"
+            );
+            return;
+        }
+    };
+
+    // price_fp8 = round(price * 1e8) via the crate's ONE float->fp8 conversion.
+    let price_fp8 = crate::types::FP8::from_f64(price).raw();
+
+    // publish_time: ripple-epoch seconds = unix_secs - 946_684_800. Subtract with
+    // saturating_sub, never a wrapping `-`: a clock before the ripple epoch (2000)
+    // is nonsense, and 0 lets the enclave reject it rather than us wrapping below
+    // zero. unix secs come from SystemTime as a u64, no cast.
+    let unix_now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => {
+            warn!("system clock is before the unix epoch; skipping the signed push");
+            return;
+        }
+    };
+    let publish_time = unix_now.saturating_sub(price_publisher::RIPPLE_EPOCH_OFFSET_SECS);
+
+    let blob = match price_publisher::test_sign_local_quotes(
+        &keys_path,
+        NETWORK_ID_TESTNET,
+        SIGNED_PRICE_MARKET_ID,
+        price_fp8,
+        publish_time,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("signed-median quote signing failed: {:#}", e);
+            return;
+        }
+    };
+
+    match perp
+        .update_price_signed(&blob, SIGNED_PRICE_MARKET_ID)
+        .await
+    {
+        // The enclave accepted the bundle and recomputed the median mark.
+        Ok(_) => {
+            info!(
+                price_fp8,
+                publish_time, "signed-median price accepted by the local enclave"
+            )
+        }
+        // Classify the common refusals so the log says WHICH gate rejected it:
+        //   -93  network/market id or a signature mismatch
+        //   -92  no attested clock yet (the signed path needs the clock running)
+        //    -7  NOT_ENOUGH distinct valid quotes to meet the threshold
+        Err(e) => warn!("signed-median push refused by the local enclave: {:#}", e),
+    }
+}
+
 /// §10.5 corpus, ceremony half. Parses the signer triples, seals the founding epoch, admits NEW's
 /// measurement onto OLD's allowlist, and runs the real ceremony. Every step refuses a non-loopback
 /// base before it contacts anything.
+#[allow(clippy::too_many_arguments)]
 async fn cli_upgrade_corpus_ceremony(
     old_url: &str,
     new_url: &str,
@@ -3093,6 +3362,7 @@ async fn cli_upgrade_corpus_ceremony(
     signer_specs: &[String],
     skip_genesis: bool,
     stop_after_genesis: bool,
+    genesis_gov_key: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use anyhow::{bail, Context};
     use upgrade_corpus::CorpusSigner;
@@ -3148,8 +3418,15 @@ async fn cli_upgrade_corpus_ceremony(
     if skip_genesis {
         println!("corpus: genesis SKIPPED on request");
     } else {
-        upgrade_corpus::corpus_genesis(escrow, &signers, signers.len() as u32, old_url, new_url)
-            .await?;
+        upgrade_corpus::corpus_genesis(
+            escrow,
+            &signers,
+            signers.len() as u32,
+            old_url,
+            new_url,
+            genesis_gov_key.clone(),
+        )
+        .await?;
         println!("corpus: founding epoch sealed on both nodes");
     }
 
