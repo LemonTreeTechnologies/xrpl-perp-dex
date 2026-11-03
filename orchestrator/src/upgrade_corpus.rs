@@ -395,6 +395,9 @@ pub async fn corpus_admit_new_on_old(
     signers: &[CorpusSigner],
     escrow: [u8; 20],
     mrenclave_new: &[u8; 32],
+    // The TEST gov key baked into the measurement under test (same throwaway key as the
+    // genesis descriptor). None for an OLD measurement whose govern ecall takes no descriptor.
+    gov_key: Option<&std::path::Path>,
 ) -> Result<()> {
     check_loopback(old_base)?;
     let http = client()?;
@@ -439,8 +442,32 @@ pub async fn corpus_admit_new_on_old(
     let gov_bundle = crate::quorum_bundle::build(&gov);
     let repro_bundle = corpus_repro_bundle(signers, mrenclave_new).await?;
 
+    // The governance-key descriptor over THIS op, signed with the test key the measurement
+    // under test bakes. The expected pub is the key's own (a test measurement), never BAKED_GOV_PUB.
+    let descriptor_sigs: Vec<u8> = match gov_key {
+        None => Vec::new(),
+        Some(path) => {
+            let key_pem = std::fs::read_to_string(path)
+                .with_context(|| format!("read test gov key {}", path.display()))?;
+            let seed = crate::sign_descriptor::parse_openssh_ed25519_seed(&key_pem)?;
+            let derived = ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .to_bytes();
+            let (_digest, sig) = crate::sign_descriptor::sign_mrenclave_govern_descriptor(
+                &key_pem,
+                op.op,
+                &op.mrenclave,
+                &op.escrow,
+                op.proposed_epoch,
+                &op.prev_allowlist_hash,
+                &derived,
+            )?;
+            sig.to_vec()
+        }
+    };
+
     crate::membership_http::HttpGovernSink::new(client()?)
-        .govern_on_node(old_base, &op, &gov_bundle, &repro_bundle)
+        .govern_on_node(old_base, &op, &gov_bundle, &repro_bundle, &descriptor_sigs)
         .await
         .context("govern NEW's measurement onto OLD's allowlist")
 }

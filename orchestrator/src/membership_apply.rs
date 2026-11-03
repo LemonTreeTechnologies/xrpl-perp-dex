@@ -312,6 +312,7 @@ impl ClusterGovernApplier for LibP2PMembershipApplier {
         op: &GovernanceOp,
         quorum_bundle: &[u8],
         repro_bundle: &[u8],
+        descriptor_sigs: &[u8],
     ) -> Result<Vec<NodeSealResult>> {
         let payload = MembershipApplyPayload::GovernMrenclave {
             op_code: op.op,
@@ -321,6 +322,7 @@ impl ClusterGovernApplier for LibP2PMembershipApplier {
             prev_allowlist_hash_hex: hex::encode(op.prev_allowlist_hash),
             quorum_bundle_hex: hex::encode(quorum_bundle),
             repro_bundle_hex: hex::encode(repro_bundle),
+            descriptor_sigs_hex: hex::encode(descriptor_sigs),
         };
         let acks = self.broadcast_and_collect(payload).await?;
         let ok_count = acks.iter().filter(|a| a.ok).count();

@@ -298,6 +298,7 @@ impl HttpGovernSink {
         op: &crate::mrenclave_governance::GovernanceOp,
         quorum_bundle: &[u8],
         repro_bundle: &[u8],
+        descriptor_sigs: &[u8],
     ) -> serde_json::Value {
         let mut req = serde_json::json!({
             "op": op.op,
@@ -306,6 +307,8 @@ impl HttpGovernSink {
             "proposed_epoch": op.proposed_epoch,
             "prev_allowlist_hash": hex::encode(op.prev_allowlist_hash),
             "quorum_bundle": hex::encode(quorum_bundle),
+            // Always sent; an empty value makes the ENCLAVE refuse (-18), never the host.
+            "descriptor_sigs": hex::encode(descriptor_sigs),
         });
         if !repro_bundle.is_empty() {
             req["repro_bundle"] = serde_json::json!(hex::encode(repro_bundle));
@@ -319,6 +322,7 @@ impl HttpGovernSink {
         op: &crate::mrenclave_governance::GovernanceOp,
         quorum_bundle: &[u8],
         repro_bundle: &[u8],
+        descriptor_sigs: &[u8],
     ) -> Result<()> {
         let url = format!(
             "{}{}",
@@ -328,7 +332,12 @@ impl HttpGovernSink {
         let resp = self
             .client
             .post(&url)
-            .json(&Self::build_request(op, quorum_bundle, repro_bundle))
+            .json(&Self::build_request(
+                op,
+                quorum_bundle,
+                repro_bundle,
+                descriptor_sigs,
+            ))
             .send()
             .await
             .with_context(|| format!("POST mrenclaves/govern to {node_admin_url}"))?;
@@ -347,6 +356,10 @@ impl HttpGovernSink {
  * this project a migration, so the interpretation lives at the one call site that knows. */
 const GOVERN_ERR_ALREADY: i64 = -11;
 const GOVERN_ERR_NOT_FOUND: i64 = -12;
+/// The governance descriptor is absent or not a multiple of 64 bytes.
+const GOVERN_ERR_GOV_DESC_MALFORMED: i64 = -18;
+/// The descriptor does not verify under the baked governance key for THIS op.
+const GOVERN_ERR_GOV_NOT_AUTHORIZED: i64 = -19;
 
 /// Parse an allowlist-govern response, separating the two NO-OP refusals from real failures.
 ///
@@ -395,6 +408,17 @@ fn parse_govern_response(op: u8, body: &serde_json::Value) -> Result<()> {
                 "code={} every time.",
             ),
             GOVERN_ERR_NOT_FOUND
+        ),
+        (_, Some(GOVERN_ERR_GOV_DESC_MALFORMED)) => bail!(
+            "the enclave refused: no valid governance descriptor (code={GOVERN_ERR_GOV_DESC_MALFORMED}). An \
+             allowlist operation needs the governance key's signature over it — run \
+             `sign-mrenclave-govern-descriptor` and pass descriptor_sigs_hex."
+        ),
+        (_, Some(GOVERN_ERR_GOV_NOT_AUTHORIZED)) => bail!(
+            "the enclave refused: the governance descriptor is not authorized (code={GOVERN_ERR_GOV_NOT_AUTHORIZED}). Either \
+             it was not signed by the baked governance key, or it was signed against a different \
+             allowlist head (epoch / prev_allowlist_hash moved, or a different op/mrenclave). \
+             Re-read mrenclaves/status and re-sign. Nothing was applied."
         ),
         _ => parse_seal_response(body),
     }
@@ -583,6 +607,34 @@ impl ProjectionConfirmer for HttpProjectionConfirmer {
 
 #[cfg(test)]
 mod tests {
+    /// The govern body must carry the descriptor under EXACTLY the field name the enclave
+    /// handler reads (`signerlist_handler.cpp::handleGovernTrustedMrenclaves` reads
+    /// "descriptor_sigs"). A misnamed field would be a silent -18 on every node.
+    #[test]
+    fn govern_request_carries_the_descriptor_under_the_handler_field_name() {
+        let op = crate::mrenclave_governance::GovernanceOp {
+            op: 1,
+            mrenclave: [0x11; 32],
+            escrow: [0x33; 20],
+            proposed_epoch: 7,
+            prev_allowlist_hash: [0x22; 32],
+        };
+        let req = HttpGovernSink::build_request(&op, &[0xA1], &[0xB2], &[0x5A; 64]);
+        assert_eq!(
+            req["descriptor_sigs"],
+            serde_json::json!(hex::encode([0x5A; 64]))
+        );
+        assert_eq!(req["quorum_bundle"], serde_json::json!("a1"));
+        assert_eq!(req["repro_bundle"], serde_json::json!("b2"));
+        // empty descriptor is still SENT (the enclave refuses it, never the host)
+        let req2 = HttpGovernSink::build_request(&op, &[0xA1], &[], &[]);
+        assert_eq!(req2["descriptor_sigs"], serde_json::json!(""));
+        assert!(
+            req2.get("repro_bundle").is_none(),
+            "veto omits repro_bundle"
+        );
+    }
+
     use crate::mrenclave_governance::{OP_ADD, OP_REMOVE};
 
     fn rejected(code: i64) -> serde_json::Value {
