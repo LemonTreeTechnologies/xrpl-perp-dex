@@ -271,10 +271,7 @@ impl StateNode {
                 *self = StateNode::Leaf { key, data };
                 Ok(())
             }
-            StateNode::Leaf {
-                key: ek,
-                data: ed,
-            } => {
+            StateNode::Leaf { key: ek, data: ed } => {
                 if *ek == key {
                     // Same index twice (paginated-dump overlap) — keep the first, idempotent.
                     return Ok(());
@@ -335,7 +332,9 @@ impl StateShaMap {
                 }
                 StateNode::Leaf { key, data } => {
                     if key != target {
-                        bail!("state entry not in this ledger (a different index sits at its slot)");
+                        bail!(
+                            "state entry not in this ledger (a different index sits at its slot)"
+                        );
                     }
                     return Ok(XspvProof {
                         kind: 0,
@@ -1225,8 +1224,10 @@ mod tests {
 
     #[test]
     fn live_escrow_proof_selfcheck_and_breaktest() {
-        let path: Vec<Vec<u8>> =
-            LIVE_PROOF_PATH.iter().map(|w| hex::decode(w).unwrap()).collect();
+        let path: Vec<Vec<u8>> = LIVE_PROOF_PATH
+            .iter()
+            .map(|w| hex::decode(w).unwrap())
+            .collect();
         let proof = proof_from_getproofpath(&path, 0).expect("convert live getProofPath");
         assert_eq!(
             hex::encode_upper(proof.leaf_index),
@@ -1247,7 +1248,10 @@ mod tests {
         // BREAK-TEST A: flip one byte in an inner node -> REFUSE
         let mut a = proof_from_getproofpath(&path, 0).unwrap();
         a.inner_root_to_leaf[0][0] ^= 0x01;
-        assert!(!verify_inclusion(&a, &ah), "tampered inner node must be refused");
+        assert!(
+            !verify_inclusion(&a, &ah),
+            "tampered inner node must be refused"
+        );
 
         // BREAK-TEST B: wrong account_hash (one bit) -> REFUSE
         let mut ah_bad = ah;
@@ -1265,7 +1269,10 @@ mod tests {
         // BREAK-TEST D: wrong leaf index (a different account's key) -> REFUSE
         let mut d = proof_from_getproofpath(&path, 0).unwrap();
         d.leaf_index[0] ^= 0x01;
-        assert!(!verify_inclusion(&d, &ah), "wrong leaf index must be refused");
+        assert!(
+            !verify_inclusion(&d, &ah),
+            "wrong leaf index must be refused"
+        );
     }
 
     use super::REAL_VALIDATION_HEX as VAL_DATA;

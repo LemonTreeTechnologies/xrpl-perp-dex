@@ -2697,7 +2697,10 @@ impl P2PNode {
         // content-type text/plain, which serde refuses — so an enclave refusal used to surface
         // as a generic "parse" error and the real reason was swallowed. Parse from the first
         // '{' so the enclave's own message (e.g. an SPV quorum/sig/ledger refusal) is preserved.
-        let json_slice = rtext.find('{').map(|i| &rtext[i..]).unwrap_or(rtext.as_str());
+        let json_slice = rtext
+            .find('{')
+            .map(|i| &rtext[i..])
+            .unwrap_or(rtext.as_str());
         let rbody: serde_json::Value = match serde_json::from_str(json_slice) {
             Ok(v) => v,
             Err(e) => {
@@ -2706,7 +2709,7 @@ impl P2PNode {
                     local_signer,
                     request_id,
                     format!("enclave response parse: {e}; raw={raw}"),
-                ))
+                ));
             }
         };
         tracing::info!(
