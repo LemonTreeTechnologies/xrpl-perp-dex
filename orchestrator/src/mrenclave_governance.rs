@@ -32,11 +32,22 @@ pub const REPRO_MIN: usize = 2;
 
 /// Governance-descriptor domain — MUST be byte-identical to the enclave's
 /// `kTrustedMrenclaveGovDescriptorDomain` (32 bytes, no NUL).
-const MRENCLAVE_GOV_DESCRIPTOR_DOMAIN: &[u8; 32] = b"PERP_MRENCLAVE_GOV_DESCRIPTOR_v1";
+const MRENCLAVE_GOV_DESCRIPTOR_DOMAIN: &[u8; 32] = b"PERP_MRENCLAVE_GOV_DESCRIPTOR_v2";
+
+/// The generation a descriptor is valid in. The enclave derives both values itself; the
+/// signer only displays and binds them, so a descriptor authorizes in exactly one generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GovContext {
+    /// MRENCLAVE of the enclave that will verify the descriptor (its `/version`).
+    pub governing_mrenclave: [u8; 32],
+    /// That enclave's current signer-list epoch digest (`/v1/admin/signerlist/epoch-digest`).
+    pub membership_epoch_digest: [u8; 32],
+}
 
 /// The allowlist governance descriptor digest, exactly as the enclave re-derives it in
 /// `ecall_govern_trusted_mrenclaves` (trusted_mrenclaves_canonical.cpp):
-///   SHA-256(domain || op || mrenclave || escrow[20] || le64(epoch) || prev_allowlist_hash).
+///   SHA-256(domain || op || mrenclave || escrow[20] || le64(epoch) || prev_allowlist_hash ||
+///           governing_mrenclave || membership_epoch_digest).
 /// Pinned cross-language by the same golden vector the enclave's host test asserts.
 pub fn compute_trusted_mrenclave_descriptor_digest(
     op: u8,
@@ -44,6 +55,7 @@ pub fn compute_trusted_mrenclave_descriptor_digest(
     escrow: &[u8; 20],
     proposed_epoch: u64,
     prev_allowlist_hash: &[u8; 32],
+    gen: &GovContext,
 ) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -53,6 +65,8 @@ pub fn compute_trusted_mrenclave_descriptor_digest(
     h.update(escrow);
     h.update(proposed_epoch.to_le_bytes());
     h.update(prev_allowlist_hash);
+    h.update(gen.governing_mrenclave);
+    h.update(gen.membership_epoch_digest);
     h.finalize().into()
 }
 
@@ -629,16 +643,23 @@ mod tests {
     /// with Python hashlib. A drift on either side fail-closes every governance op.
     #[test]
     fn descriptor_digest_matches_the_enclave_golden_vectors() {
+        // Same inputs and values as the enclave's test_d1_gov_descriptor_frozen_vector,
+        // computed independently with Python hashlib.
+        let gen = GovContext {
+            governing_mrenclave: [0x44; 32],
+            membership_epoch_digest: [0x55; 32],
+        };
         let d_add = compute_trusted_mrenclave_descriptor_digest(
             OP_ADD,
             &[0x11; 32],
             &[0x33; 20],
             7,
             &[0x22; 32],
+            &gen,
         );
         assert_eq!(
             hex::encode(d_add),
-            "4f2feefb98d190fdb1a2e32018f2fc69a3a8ab02e01760196cfa2f948eb5b6ac"
+            "36914cc89ea15a3e6aeca5240e362aa0f06d174806f2b80eee6a1b8783d173f4"
         );
         let d_rm = compute_trusted_mrenclave_descriptor_digest(
             OP_REMOVE,
@@ -646,10 +667,11 @@ mod tests {
             &[0x33; 20],
             7,
             &[0x22; 32],
+            &gen,
         );
         assert_eq!(
             hex::encode(d_rm),
-            "e62e72be1d34384679bbd566da508fd2ddd75eb2a9a945300bac69bc797e9266"
+            "ee32d6eb9a10c0d2f610235a87b24bfae94714baa66887c6abe5ba8bc0f8e37d"
         );
     }
 }
