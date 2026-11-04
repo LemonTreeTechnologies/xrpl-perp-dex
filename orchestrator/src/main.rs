@@ -494,6 +494,48 @@ enum Command {
     /// GET /version; `--membership-epoch-digest` from GET /v1/admin/signerlist/epoch-digest. The
     /// descriptor is valid only in that generation: if any of them moves before the op is
     /// applied, the enclave refuses (-19) and you re-sign.
+    /// Sign a UNL policy update (freshness anchor + SPV quorum fraction) with the governance
+    /// key, producing the `descriptor_sigs_hex` that `/admin/unl-policy` must carry. The enclave
+    /// re-derives SHA-256("PERP_UNL_POLICY_GOV_DESCRIPTOR_v1" || escrow || le64(epoch) ||
+    /// prev_unl_hash || le64(pinned_ledger_seq) || le32(quorum_num) || le32(quorum_den) ||
+    /// governing_mrenclave || membership_epoch_digest) and verifies it against the BAKED key.
+    /// Read, on a node, right before signing: `--proposed-epoch` (= unl_epoch + 1) and
+    /// `--prev-unl-hash` (= digest) from GET /v1/admin/unl/status; `--governing-mrenclave` from
+    /// GET /version; `--membership-epoch-digest` from GET /v1/admin/signerlist/epoch-digest. The
+    /// host cannot change the anchor you sign: any other value is refused (-18).
+    SignUnlPolicyDescriptor {
+        /// The governance OpenSSH private key (ed25519). A FILE, never an argv value.
+        #[arg(long)]
+        key_file: PathBuf,
+        /// The cluster escrow r-address.
+        #[arg(long)]
+        escrow: String,
+        /// unl_epoch + 1, from unl/status.
+        #[arg(long)]
+        proposed_epoch: u64,
+        /// The current record digest, 32-byte hex, from unl/status.
+        #[arg(long)]
+        prev_unl_hash: String,
+        /// The freshness anchor to pin (a recently validated ledger).
+        #[arg(long)]
+        pinned_ledger_seq: u64,
+        /// SPV quorum fraction numerator (>= 80% with the denominator).
+        #[arg(long)]
+        quorum_num: u32,
+        /// SPV quorum fraction denominator.
+        #[arg(long)]
+        quorum_den: u32,
+        /// MRENCLAVE of the enclave that will verify this (its /version), 32-byte hex.
+        #[arg(long)]
+        governing_mrenclave: String,
+        /// That enclave's signer-list epoch digest, 32-byte hex.
+        #[arg(long)]
+        membership_epoch_digest: String,
+        /// TEST-ONLY override of the expected governance pub (hex), for a test measurement.
+        #[arg(long)]
+        expect_gov_pub: Option<String>,
+    },
+
     SignMrenclaveGovernDescriptor {
         /// The governance OpenSSH private key (ed25519). A FILE, never an argv value.
         #[arg(long)]
@@ -1162,6 +1204,79 @@ async fn main() -> Result<()> {
                 "/admin/membership-change request. For an M-of-N (S2) descriptor, concatenate"
             );
             println!("each operator's 64-byte signature in descriptor_sigs.");
+            return Ok(());
+        }
+        Some(Command::SignUnlPolicyDescriptor {
+            key_file,
+            escrow,
+            proposed_epoch,
+            prev_unl_hash,
+            pinned_ledger_seq,
+            quorum_num,
+            quorum_den,
+            governing_mrenclave,
+            membership_epoch_digest,
+            expect_gov_pub,
+        }) => {
+            let hex32 = |name: &str, h: &str| -> Result<[u8; 32]> {
+                let b = hex::decode(h.trim_start_matches("0x"))
+                    .with_context(|| format!("{name} must be hex"))?;
+                anyhow::ensure!(b.len() == 32, "{name} must be 32 bytes");
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                Ok(a)
+            };
+            anyhow::ensure!(
+                unl_policy::quorum_floor_ok(quorum_num, quorum_den),
+                "refusing to sign {quorum_num}/{quorum_den}: below the 80% floor"
+            );
+            let escrow_id = xrpl_signer::decode_xrpl_address(&escrow)
+                .context("--escrow must be a valid XRPL r-address")?;
+            let policy = unl_policy::UnlPolicyOp {
+                unl_epoch: proposed_epoch,
+                prev_unl_hash: hex32("--prev-unl-hash", &prev_unl_hash)?,
+                pinned_ledger_seq,
+                quorum_num,
+                quorum_den,
+            };
+            let gen = mrenclave_governance::GovContext {
+                governing_mrenclave: hex32("--governing-mrenclave", &governing_mrenclave)?,
+                membership_epoch_digest: hex32(
+                    "--membership-epoch-digest",
+                    &membership_epoch_digest,
+                )?,
+            };
+            let expect_pub = match expect_gov_pub.as_ref() {
+                None => sign_descriptor::BAKED_GOV_PUB,
+                Some(h) => hex32("--expect-gov-pub", h)?,
+            };
+            let key_pem = std::fs::read_to_string(&key_file)
+                .with_context(|| format!("cannot read governance key {}", key_file.display()))?;
+            let (digest, sig) = sign_descriptor::sign_unl_policy_descriptor(
+                &key_pem,
+                &escrow_id,
+                &policy,
+                &gen,
+                &expect_pub,
+            )?;
+            println!("escrow:                  {escrow}");
+            println!("proposed unl epoch:      {proposed_epoch}");
+            println!(
+                "prev unl hash:           {}",
+                hex::encode(policy.prev_unl_hash)
+            );
+            println!("freshness anchor:        {pinned_ledger_seq}");
+            println!("spv quorum:              {quorum_num}/{quorum_den}");
+            println!(
+                "governing mrenclave:     {}",
+                hex::encode(gen.governing_mrenclave)
+            );
+            println!(
+                "membership epoch digest: {}",
+                hex::encode(gen.membership_epoch_digest)
+            );
+            println!("descriptor_digest:   {}", hex::encode(digest));
+            println!("descriptor_sigs_hex: {}", hex::encode(sig));
             return Ok(());
         }
         Some(Command::SignMrenclaveGovernDescriptor {

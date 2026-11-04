@@ -111,6 +111,7 @@ impl LibP2PMembershipApplier {
         quorum_num: u32,
         quorum_den: u32,
         quorum_bundle_hex: &str,
+        descriptor_sigs_hex: &str,
     ) -> Result<(usize, usize, Vec<String>)> {
         let acks = self
             .broadcast_and_collect(MembershipApplyPayload::UnlPolicy {
@@ -121,6 +122,7 @@ impl LibP2PMembershipApplier {
                 quorum_num,
                 quorum_den,
                 quorum_bundle_hex: quorum_bundle_hex.to_string(),
+                descriptor_sigs_hex: descriptor_sigs_hex.to_string(),
             })
             .await?;
         let applied = acks.iter().filter(|a| a.ok).count();

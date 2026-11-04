@@ -47,6 +47,45 @@ pub fn unl_policy_message_hash(
     out
 }
 
+/// One UNL policy update, exactly the fields the enclave binds into the owner's descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnlPolicyOp {
+    pub unl_epoch: u64,
+    pub prev_unl_hash: [u8; 32],
+    pub pinned_ledger_seq: u64,
+    pub quorum_num: u32,
+    pub quorum_den: u32,
+}
+
+/// Domain of the OWNER's policy descriptor — must equal `kUnlPolicyGovDescriptorDomain`
+/// (sealed_pinned_unl_canonical.cpp, 33 bytes, no NUL).
+const UNL_POLICY_GOV_DESCRIPTOR_DOMAIN: &[u8; 33] = b"PERP_UNL_POLICY_GOV_DESCRIPTOR_v1";
+
+/// The owner's policy descriptor digest, exactly as the enclave re-derives it in
+/// `ecall_govern_unl_policy`: the policy fields plus the generation that verifies it.
+///   domain || escrow[20] || le_u64(epoch) || prev_unl_hash || le_u64(pinned_ledger_seq)
+///   || le_u32(quorum_num) || le_u32(quorum_den) || governing_mrenclave || membership_epoch_digest
+pub fn unl_policy_gov_descriptor_digest(
+    escrow: &[u8; 20],
+    unl_epoch: u64,
+    prev_unl_hash: &[u8; 32],
+    pinned_ledger_seq: u64,
+    quorum: (u32, u32),
+    gen: &crate::mrenclave_governance::GovContext,
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(UNL_POLICY_GOV_DESCRIPTOR_DOMAIN);
+    h.update(escrow);
+    h.update(unl_epoch.to_le_bytes());
+    h.update(prev_unl_hash);
+    h.update(pinned_ledger_seq.to_le_bytes());
+    h.update(quorum.0.to_le_bytes());
+    h.update(quorum.1.to_le_bytes());
+    h.update(gen.governing_mrenclave);
+    h.update(gen.membership_epoch_digest);
+    h.finalize().into()
+}
+
 /// The ≥80% floor, mirrored host-side so a leader refuses to even propose a weak threshold
 /// (the enclave enforces it independently — this is early, friendly failure, not the gate).
 pub fn quorum_floor_ok(quorum_num: u32, quorum_den: u32) -> bool {
@@ -431,8 +470,18 @@ pub async fn run_unl_policy_ceremony(
     quorum_num: u32,
     quorum_den: u32,
     cosign_quorum: usize,
+    descriptor_sigs: &[u8],
     applier: &crate::membership_apply::LibP2PMembershipApplier,
 ) -> Result<serde_json::Value> {
+    // The enclave refuses a policy update the owner did not sign (-17/-18); refusing here as
+    // well spares a collection round that cannot succeed.
+    if descriptor_sigs.is_empty() || descriptor_sigs.len() % 64 != 0 {
+        bail!(
+            "a UNL policy update needs the owner's governance descriptor \
+             (sign-unl-policy-descriptor); got {} byte(s)",
+            descriptor_sigs.len()
+        );
+    }
     if !quorum_floor_ok(quorum_num, quorum_den) {
         bail!("refusing to propose {quorum_num}/{quorum_den}: below the 80% floor");
     }
@@ -466,6 +515,7 @@ pub async fn run_unl_policy_ceremony(
             quorum_num,
             quorum_den,
             &hex::encode(&bundle),
+            &hex::encode(descriptor_sigs),
         )
         .await?;
     if let Some(msg) = apply_shortfall(applied, expected, &failures) {
@@ -488,6 +538,33 @@ pub async fn run_unl_policy_ceremony(
 
 #[cfg(test)]
 mod tests {
+
+    /// Same inputs and value as the enclave's test_pinned_unl_canonical golden vector,
+    /// computed independently with Python hashlib.
+    #[test]
+    fn owner_policy_descriptor_matches_the_enclave_golden_vector() {
+        let gen = crate::mrenclave_governance::GovContext {
+            governing_mrenclave: [0x44; 32],
+            membership_epoch_digest: [0x55; 32],
+        };
+        let d = super::unl_policy_gov_descriptor_digest(
+            &[0x33; 20],
+            7,
+            &[0x22; 32],
+            12345678,
+            (5, 6),
+            &gen,
+        );
+        assert_eq!(
+            hex::encode(d),
+            "221396a65ef4aa6b86a9e7992635ced50ef8cc6e6face60032bdb8befb084eeb"
+        );
+        // and it is not the signer-set policy message over the same fields
+        assert_ne!(
+            d,
+            super::unl_policy_message_hash(7, &[0x22; 32], 12345678, 5, 6)
+        );
+    }
 
     // ── #131 sweep Finding 2 — the cross-node UNL indicator ──
     //
