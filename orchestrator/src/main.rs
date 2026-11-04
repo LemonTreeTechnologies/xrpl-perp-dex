@@ -485,12 +485,15 @@ enum Command {
 
     /// Sign a trusted-MRENCLAVE allowlist operation with the governance key, producing the
     /// `descriptor_sigs_hex` that `/admin/mrenclave-govern` must carry. The enclave re-derives
-    /// SHA-256("PERP_MRENCLAVE_GOV_DESCRIPTOR_v1" || op || mrenclave || escrow || le64(epoch) ||
-    /// prev_allowlist_hash) and verifies it against the BAKED governance key; this tool computes
-    /// it identically (pinned cross-language) and refuses if the key is not the baked one. Read
-    /// `--proposed-epoch` (= allowlist_epoch + 1) and `--prev-allowlist-hash`
-    /// (= allowlist_digest) from GET /v1/admin/mrenclaves/status on a node right before signing:
-    /// if the head moves before the op is applied, the enclave refuses (-19) and you re-sign.
+    /// SHA-256("PERP_MRENCLAVE_GOV_DESCRIPTOR_v2" || op || mrenclave || escrow || le64(epoch) ||
+    /// prev_allowlist_hash || governing_mrenclave || membership_epoch_digest) and verifies it
+    /// against the BAKED governance key; this tool computes it identically (pinned
+    /// cross-language) and refuses if the key is not the baked one. Read, on a node, right before
+    /// signing: `--proposed-epoch` (= allowlist_epoch + 1) and `--prev-allowlist-hash`
+    /// (= allowlist_digest) from GET /v1/admin/mrenclaves/status; `--governing-mrenclave` from
+    /// GET /version; `--membership-epoch-digest` from GET /v1/admin/signerlist/epoch-digest. The
+    /// descriptor is valid only in that generation: if any of them moves before the op is
+    /// applied, the enclave refuses (-19) and you re-sign.
     SignMrenclaveGovernDescriptor {
         /// The governance OpenSSH private key (ed25519). A FILE, never an argv value.
         #[arg(long)]
@@ -510,6 +513,12 @@ enum Command {
         /// allowlist_digest (the current head), 32-byte hex, from mrenclaves/status.
         #[arg(long)]
         prev_allowlist_hash: String,
+        /// MRENCLAVE of the enclave that will verify this (its /version), 32-byte hex.
+        #[arg(long)]
+        governing_mrenclave: String,
+        /// That enclave's signer-list epoch digest (/v1/admin/signerlist/epoch-digest), 32-byte hex.
+        #[arg(long)]
+        membership_epoch_digest: String,
         /// TEST-ONLY override of the expected governance pub (hex), for a test measurement.
         #[arg(long)]
         expect_gov_pub: Option<String>,
@@ -1162,6 +1171,8 @@ async fn main() -> Result<()> {
             escrow,
             proposed_epoch,
             prev_allowlist_hash,
+            governing_mrenclave,
+            membership_epoch_digest,
             expect_gov_pub,
         }) => {
             let op_code = match op.to_ascii_lowercase().as_str() {
@@ -1179,6 +1190,13 @@ async fn main() -> Result<()> {
             };
             let mre = hex32("--mrenclave", &mrenclave)?;
             let prev = hex32("--prev-allowlist-hash", &prev_allowlist_hash)?;
+            let gen = mrenclave_governance::GovContext {
+                governing_mrenclave: hex32("--governing-mrenclave", &governing_mrenclave)?,
+                membership_epoch_digest: hex32(
+                    "--membership-epoch-digest",
+                    &membership_epoch_digest,
+                )?,
+            };
             let escrow_id = xrpl_signer::decode_xrpl_address(&escrow)
                 .context("--escrow must be a valid XRPL r-address")?;
             let expect_pub = match expect_gov_pub.as_ref() {
@@ -1187,15 +1205,34 @@ async fn main() -> Result<()> {
             };
             let key_pem = std::fs::read_to_string(&key_file)
                 .with_context(|| format!("cannot read governance key {}", key_file.display()))?;
+            let gov_op = mrenclave_governance::GovernanceOp {
+                op: op_code,
+                mrenclave: mre,
+                escrow: escrow_id,
+                proposed_epoch,
+                prev_allowlist_hash: prev,
+            };
             let (digest, sig) = sign_descriptor::sign_mrenclave_govern_descriptor(
                 &key_pem,
-                op_code,
-                &mre,
-                &escrow_id,
-                proposed_epoch,
-                &prev,
+                &gov_op,
+                &gen,
                 &expect_pub,
             )?;
+            // What is being authorized, printed in full before the signature is used: the owner
+            // reads these, never a bare digest.
+            println!("op:                      {}", op.to_ascii_lowercase());
+            println!("target mrenclave:        {}", hex::encode(mre));
+            println!("escrow:                  {escrow}");
+            println!("proposed allowlist epoch:{proposed_epoch}");
+            println!("prev allowlist hash:     {}", hex::encode(prev));
+            println!(
+                "governing mrenclave:     {}",
+                hex::encode(gen.governing_mrenclave)
+            );
+            println!(
+                "membership epoch digest: {}",
+                hex::encode(gen.membership_epoch_digest)
+            );
             println!("descriptor_digest:   {}", hex::encode(digest));
             println!("descriptor_sigs_hex: {}", hex::encode(sig));
             println!();

@@ -453,14 +453,10 @@ pub async fn corpus_admit_new_on_old(
             let derived = ed25519_dalek::SigningKey::from_bytes(&seed)
                 .verifying_key()
                 .to_bytes();
+            // The generation that will verify it: OLD, which holds this allowlist.
+            let gen = corpus_gov_context(old_base).await?;
             let (_digest, sig) = crate::sign_descriptor::sign_mrenclave_govern_descriptor(
-                &key_pem,
-                op.op,
-                &op.mrenclave,
-                &op.escrow,
-                op.proposed_epoch,
-                &op.prev_allowlist_hash,
-                &derived,
+                &key_pem, &op, &gen, &derived,
             )?;
             sig.to_vec()
         }
@@ -470,6 +466,40 @@ pub async fn corpus_admit_new_on_old(
         .govern_on_node(old_base, &op, &gov_bundle, &repro_bundle, &descriptor_sigs)
         .await
         .context("govern NEW's measurement onto OLD's allowlist")
+}
+
+/// The generation context of the enclave at `base`, read the way an operator reads it before
+/// signing: its measurement from /version and its signer-list epoch digest.
+async fn corpus_gov_context(base: &str) -> Result<crate::mrenclave_governance::GovContext> {
+    let http = client()?;
+    let hex32 = |v: &serde_json::Value, field: &str| -> Result<[u8; 32]> {
+        let h = v[field]
+            .as_str()
+            .with_context(|| format!("{field} missing"))?;
+        let b = hex::decode(h.trim_start_matches("0x")).with_context(|| format!("{field} hex"))?;
+        b.try_into()
+            .map_err(|_| anyhow::anyhow!("{field} must be 32 bytes"))
+    };
+    let version: serde_json::Value = http
+        .get(format!("{base}/version"))
+        .send()
+        .await
+        .context("GET /version")?
+        .json()
+        .await
+        .context("/version body")?;
+    let epoch: serde_json::Value = http
+        .get(format!("{base}/v1/admin/signerlist/epoch-digest"))
+        .send()
+        .await
+        .context("GET epoch-digest")?
+        .json()
+        .await
+        .context("epoch-digest body")?;
+    Ok(crate::mrenclave_governance::GovContext {
+        governing_mrenclave: hex32(&version, "mrenclave")?,
+        membership_epoch_digest: hex32(&epoch, "epoch_digest")?,
+    })
 }
 
 /// Run the real Path-A ceremony between two loopback SIM servers.

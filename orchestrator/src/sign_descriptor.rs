@@ -156,19 +156,17 @@ pub fn sign_descriptor(
 /// Same key, same wrong-key self-check, same raw-ed25519 shape as a membership descriptor.
 pub fn sign_mrenclave_govern_descriptor(
     key_pem: &str,
-    op: u8,
-    mrenclave: &[u8; 32],
-    escrow: &[u8; 20],
-    proposed_epoch: u64,
-    prev_allowlist_hash: &[u8; 32],
+    op: &crate::mrenclave_governance::GovernanceOp,
+    gen: &crate::mrenclave_governance::GovContext,
     expect_gov_pub: &[u8; 32],
 ) -> Result<([u8; 32], [u8; 64])> {
     let digest = crate::mrenclave_governance::compute_trusted_mrenclave_descriptor_digest(
-        op,
-        mrenclave,
-        escrow,
-        proposed_epoch,
-        prev_allowlist_hash,
+        op.op,
+        &op.mrenclave,
+        &op.escrow,
+        op.proposed_epoch,
+        &op.prev_allowlist_hash,
+        gen,
     );
     let sig = sign_raw_digest_with_gov_key(key_pem, &digest, expect_gov_pub)?;
     Ok((digest, sig))
@@ -200,6 +198,22 @@ fn sign_raw_digest_with_gov_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_op(op: u8) -> crate::mrenclave_governance::GovernanceOp {
+        crate::mrenclave_governance::GovernanceOp {
+            op,
+            mrenclave: [0x11; 32],
+            escrow: [0x33; 20],
+            proposed_epoch: 7,
+            prev_allowlist_hash: [0x22; 32],
+        }
+    }
+
+    const TEST_GEN: crate::mrenclave_governance::GovContext =
+        crate::mrenclave_governance::GovContext {
+            governing_mrenclave: [0x44; 32],
+            membership_epoch_digest: [0x55; 32],
+        };
 
     /// Build an UNENCRYPTED openssh-key-v1 blob from a seed, so the parser is exercised against
     /// the real wire format WITHOUT committing any private-key PEM to the repo.
@@ -339,16 +353,9 @@ mod tests {
         let seed = [0x42u8; 32];
         let pem = synth_openssh_key(&seed);
         let derived = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
-        let (digest, sig) = sign_mrenclave_govern_descriptor(
-            &pem,
-            1,
-            &[0x11; 32],
-            &[0x33; 20],
-            7,
-            &[0x22; 32],
-            &derived,
-        )
-        .expect("the expected key must sign");
+        let (digest, sig) =
+            sign_mrenclave_govern_descriptor(&pem, &test_op(1), &TEST_GEN, &derived)
+                .expect("the expected key must sign");
         assert_eq!(
             digest,
             crate::mrenclave_governance::compute_trusted_mrenclave_descriptor_digest(
@@ -356,7 +363,8 @@ mod tests {
                 &[0x11; 32],
                 &[0x33; 20],
                 7,
-                &[0x22; 32]
+                &[0x22; 32],
+                &TEST_GEN
             ),
             "the signed digest must be the enclave's digest"
         );
@@ -369,8 +377,31 @@ mod tests {
             &[0x33; 20],
             7,
             &[0x22; 32],
+            &TEST_GEN,
         );
         assert!(vk.verify(&other, &Signature::from_bytes(&sig)).is_err());
+        // D-1b: nor in another generation — another enclave version, or another signer-list
+        // epoch of the same version. This is the cross-generation replay the binding stops.
+        for gen in [
+            crate::mrenclave_governance::GovContext {
+                governing_mrenclave: [0x45; 32],
+                ..TEST_GEN
+            },
+            crate::mrenclave_governance::GovContext {
+                membership_epoch_digest: [0x56; 32],
+                ..TEST_GEN
+            },
+        ] {
+            let d = crate::mrenclave_governance::compute_trusted_mrenclave_descriptor_digest(
+                1,
+                &[0x11; 32],
+                &[0x33; 20],
+                7,
+                &[0x22; 32],
+                &gen,
+            );
+            assert!(vk.verify(&d, &Signature::from_bytes(&sig)).is_err());
+        }
     }
 
     /// A key that is not the expected (baked) governance key is refused before any
@@ -378,16 +409,8 @@ mod tests {
     #[test]
     fn mrenclave_govern_descriptor_refuses_a_non_governance_key() {
         let pem = synth_openssh_key(&[0x42u8; 32]);
-        let err = sign_mrenclave_govern_descriptor(
-            &pem,
-            1,
-            &[0x11; 32],
-            &[0x33; 20],
-            7,
-            &[0x22; 32],
-            &BAKED_GOV_PUB,
-        )
-        .expect_err("a non-governance key must be refused");
+        let err = sign_mrenclave_govern_descriptor(&pem, &test_op(1), &TEST_GEN, &BAKED_GOV_PUB)
+            .expect_err("a non-governance key must be refused");
         assert!(
             err.to_string().contains("NOT the expected governance key"),
             "{err}"
