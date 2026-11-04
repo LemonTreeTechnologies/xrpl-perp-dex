@@ -325,6 +325,25 @@ async fn system_status(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     let quorum = state.signers_config.as_ref().map(|c| c.quorum);
     let signer_count = state.signers_config.as_ref().map(|c| c.signers.len());
 
+    let unl_anchor = {
+        use crate::attested_clock::{anchor_gap, AnchorGap, UNL_PIN_WINDOW_LEDGERS};
+        let pinned = state
+            .attested_clock
+            .unl_pinned_ledger_seq
+            .load(Ordering::Relaxed);
+        let seq = state
+            .attested_clock
+            .attested_ledger_seq
+            .load(Ordering::Relaxed);
+        let (st, gap) = match anchor_gap(seq, pinned) {
+            AnchorGap::Unknown => ("unknown", 0),
+            AnchorGap::Fresh(g) => ("fresh", g),
+            AnchorGap::DueSoon(g) => ("due", g),
+            AnchorGap::Expired(g) => ("expired", g),
+        };
+        serde_json::json!({"pinned_ledger_seq": pinned, "gap_ledgers": gap, "state": st,
+                           "window_ledgers": UNL_PIN_WINDOW_LEDGERS})
+    };
     Json(serde_json::json!({
         "network": infer_network(&state.xrpl_url),
         "deposit_address": state.escrow_address,
@@ -355,6 +374,9 @@ async fn system_status(State(state): State<Arc<AppState>>) -> impl IntoResponse 
             "attested_ledger_seq": state.attested_clock.attested_ledger_seq.load(Ordering::Relaxed),
             // Ripple epoch, NAMED — a renderer that assumes Unix is 946684800 seconds wrong.
             "attested_close_time_ripple_epoch": state.attested_clock.attested_close_time.load(Ordering::Relaxed),
+            // The UNL freshness anchor against the attested ledger: "due" means re-pin now,
+            // "expired" means SPV deposits are refusing.
+            "unl_anchor": unl_anchor,
         },
         // The trust root both of the above rest on. `enabled: false` is not "healthy" —
         // it means the enclave's derived validator set is ageing with nothing refreshing
