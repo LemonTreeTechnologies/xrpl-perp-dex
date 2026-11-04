@@ -546,6 +546,10 @@ pub enum MembershipApplyPayload {
         quorum_num: u32,
         quorum_den: u32,
         quorum_bundle_hex: String,
+        /// The owner's governance descriptor over this policy. Default empty so an older
+        /// peer's relay still parses — and is then refused by the enclave.
+        #[serde(default)]
+        descriptor_sigs_hex: String,
     },
     /// β4 Thread A genesis (RESP-β4-threadA-impl.1 option 2): apply
     /// `ecall_bootstrap_from_quorum_attestation` locally — seal epoch 1 from the
@@ -3126,6 +3130,7 @@ impl P2PNode {
                 quorum_num,
                 quorum_den,
                 quorum_bundle_hex,
+                descriptor_sigs_hex,
             } => {
                 // The enclave re-derives the policy hash from these fields and re-verifies
                 // the quorum bundle against its OWN sealed SignerList, so nothing here is
@@ -3140,6 +3145,7 @@ impl P2PNode {
                     "quorum_num": quorum_num,
                     "quorum_den": quorum_den,
                     "quorum_bundle": quorum_bundle_hex,
+                    "descriptor_sigs": descriptor_sigs_hex,
                 });
                 match client.post(&url).json(&body).send().await {
                     Err(e) => Err(anyhow::anyhow!("apply.unl-policy: {e}")),
@@ -4987,9 +4993,11 @@ mod tests {
             quorum_num: 5,
             quorum_den: 6,
             quorum_bundle_hex: "cc".repeat(8),
+            descriptor_sigs_hex: "dd".repeat(64),
         };
         let json = serde_json::to_value(&p).expect("serialize");
         assert_eq!(json["op"], "unl_policy", "tag must stay `unl_policy`");
+        assert_eq!(json["descriptor_sigs_hex"], "dd".repeat(64));
         assert_eq!(json["pinned_ledger_seq"], 20_591_293);
         assert_eq!(json["quorum_num"], 5);
 

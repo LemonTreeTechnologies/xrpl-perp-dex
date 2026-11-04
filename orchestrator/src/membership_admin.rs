@@ -849,6 +849,10 @@ pub struct UnlPolicyRequest {
     pub quorum_den: u32,
     /// Endorsements required (2 on the 3-node cluster).
     pub cosign_quorum: usize,
+    /// The owner's governance descriptor over exactly this policy, from
+    /// `sign-unl-policy-descriptor`. Required: the enclave refuses an update without it.
+    #[serde(default)]
+    pub descriptor_sigs_hex: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -943,6 +947,20 @@ async fn handle_unl_policy(
         req.quorum_num,
         req.quorum_den,
         req.cosign_quorum,
+        &match hex::decode(req.descriptor_sigs_hex.trim_start_matches("0x")) {
+            Ok(b) => b,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(UnlPolicyResponse {
+                        status: "error".into(),
+                        message: format!("descriptor_sigs_hex is not hex: {e}"),
+                        enclave: serde_json::Value::Null,
+                    }),
+                )
+                    .into_response()
+            }
+        },
         &applier,
     )
     .await

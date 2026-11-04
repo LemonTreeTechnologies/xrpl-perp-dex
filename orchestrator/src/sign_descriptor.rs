@@ -172,6 +172,28 @@ pub fn sign_mrenclave_govern_descriptor(
     Ok((digest, sig))
 }
 
+/// Sign the OWNER's UNL policy descriptor (REQ unl-anchor-auto-advance, (A'+D)): the exact
+/// freshness anchor and quorum fraction, in the generation that will verify it. Same key and
+/// same refusal as every other governance signature.
+pub fn sign_unl_policy_descriptor(
+    key_pem: &str,
+    escrow: &[u8; 20],
+    policy: &crate::unl_policy::UnlPolicyOp,
+    gen: &crate::mrenclave_governance::GovContext,
+    expect_gov_pub: &[u8; 32],
+) -> Result<([u8; 32], [u8; 64])> {
+    let digest = crate::unl_policy::unl_policy_gov_descriptor_digest(
+        escrow,
+        policy.unl_epoch,
+        &policy.prev_unl_hash,
+        policy.pinned_ledger_seq,
+        (policy.quorum_num, policy.quorum_den),
+        gen,
+    );
+    let sig = sign_raw_digest_with_gov_key(key_pem, &digest, expect_gov_pub)?;
+    Ok((digest, sig))
+}
+
 /// The one place the governance key signs: derive it, REFUSE unless it is the expected baked
 /// key, then RAW ed25519 over the 32-byte digest (what `crypto_ed25519_check` verifies).
 fn sign_raw_digest_with_gov_key(
@@ -406,6 +428,41 @@ mod tests {
 
     /// A key that is not the expected (baked) governance key is refused before any
     /// signature is produced.
+    #[test]
+    fn unl_policy_descriptor_signature_verifies_and_binds_the_anchor() {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        let seed = [0x42u8; 32];
+        let pem = synth_openssh_key(&seed);
+        let derived = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        let policy = crate::unl_policy::UnlPolicyOp {
+            unl_epoch: 3,
+            prev_unl_hash: [0x22; 32],
+            pinned_ledger_seq: 22_056_907,
+            quorum_num: 5,
+            quorum_den: 6,
+        };
+        let (digest, sig) =
+            sign_unl_policy_descriptor(&pem, &[0x33; 20], &policy, &TEST_GEN, &derived)
+                .expect("the expected key must sign");
+        let vk = VerifyingKey::from_bytes(&derived).unwrap();
+        assert!(vk.verify(&digest, &Signature::from_bytes(&sig)).is_ok());
+        // A host that picks a different anchor gets a digest the signature does not cover.
+        let moved = crate::unl_policy::unl_policy_gov_descriptor_digest(
+            &[0x33; 20],
+            3,
+            &[0x22; 32],
+            22_056_999,
+            (5, 6),
+            &TEST_GEN,
+        );
+        assert!(vk.verify(&moved, &Signature::from_bytes(&sig)).is_err());
+        // And a non-governance key is refused before signing.
+        assert!(
+            sign_unl_policy_descriptor(&pem, &[0x33; 20], &policy, &TEST_GEN, &BAKED_GOV_PUB)
+                .is_err()
+        );
+    }
+
     #[test]
     fn mrenclave_govern_descriptor_refuses_a_non_governance_key() {
         let pem = synth_openssh_key(&[0x42u8; 32]);
