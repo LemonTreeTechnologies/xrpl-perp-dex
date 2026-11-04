@@ -746,17 +746,20 @@ fn count_files(dir: &str) -> usize {
 /// Sorted file names in a directory; empty when it cannot be read. Directories are skipped,
 /// so `.dcap-helper` does not count as sealed state.
 ///
-/// `*.new` files are skipped too: they are an enclave save IN FLIGHT (every part is written as
-/// `.new`, then all are renamed to `.sealed`), never sealed state. OLD keeps running and saving
-/// during the dry run, so a listing taken mid-save would otherwise report every in-flight part
-/// as "missing from NEW" and fail a sound migration.
+/// In-flight writes are skipped too, never sealed state. There are two layers of them: the
+/// chunked save writes every part as `<name>.new` and renames them all to `.sealed`, and the
+/// host's atomic file write (`ocall_save_to_file`, libapp/src/ocalls.cpp) writes `<name>.tmp`,
+/// fsyncs and renames — so `x.new.tmp` and `x.sealed.tmp` occur as well. OLD keeps running and
+/// saving during the dry run, so a listing taken mid-save would otherwise report an in-flight
+/// file as "missing from NEW" and fail a sound migration (node-1, 2026-11-04:
+/// `s0_perp_txhashes_10.new.tmp`).
 fn file_names(dir: &str) -> Vec<String> {
     let mut v: Vec<String> = match std::fs::read_dir(dir) {
         Ok(entries) => entries
             .flatten()
             .filter(|e| e.path().is_file())
             .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| !n.ends_with(".new"))
+            .filter(|n| !n.ends_with(".new") && !n.ends_with(".tmp"))
             .collect(),
         Err(_) => Vec::new(),
     };
@@ -1544,6 +1547,8 @@ mod tests {
             "s0_perp_meta.sealed",
             "s0_perp_users_0.new",
             "s0_perp_positions_7.new",
+            "s0_perp_txhashes_10.new.tmp",
+            "s0_perp_meta.sealed.tmp",
         ] {
             std::fs::write(dir.join(f), b"x").unwrap();
         }
