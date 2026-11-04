@@ -131,6 +131,41 @@ pub struct ClockHealth {
     /// Whether a driver is configured to run here at all. Without this, a node with the
     /// driver switched off is indistinguishable from one whose clock is stuck.
     pub driver_enabled: std::sync::atomic::AtomicBool,
+    /// The UNL freshness anchor this enclave holds, last read back (0 = not read yet).
+    pub unl_pinned_ledger_seq: AtomicU64,
+}
+
+/// Mirror of the enclave's `SEALED_PINNED_UNL_MAX_PIN_WINDOW`: an SPV proof more than this many
+/// ledgers above the anchor is refused (-81).
+pub const UNL_PIN_WINDOW_LEDGERS: u64 = 20_000;
+/// Warn this far into the window. Measured in LEDGERS, not hours, so a faster ledger rate
+/// cannot silently eat the margin (testnet measured ~3.47 s/ledger => the window is ~19 h).
+pub const UNL_PIN_DUE_LEDGERS: u64 = 15_000;
+
+/// How close the freshness anchor is to expiring, judged on the ledger gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorGap {
+    /// Not enough information (no attested ledger or no anchor read yet).
+    Unknown,
+    Fresh(u64),
+    /// Past UNL_PIN_DUE_LEDGERS: the owner should re-pin now.
+    DueSoon(u64),
+    /// Past the window: SPV deposits and withdrawal reconcile refuse (-81) until a re-pin.
+    Expired(u64),
+}
+
+pub fn anchor_gap(attested_ledger_seq: u64, pinned_ledger_seq: u64) -> AnchorGap {
+    if attested_ledger_seq == 0 || pinned_ledger_seq == 0 {
+        return AnchorGap::Unknown;
+    }
+    let gap = attested_ledger_seq.saturating_sub(pinned_ledger_seq);
+    if gap > UNL_PIN_WINDOW_LEDGERS {
+        AnchorGap::Expired(gap)
+    } else if gap > UNL_PIN_DUE_LEDGERS {
+        AnchorGap::DueSoon(gap)
+    } else {
+        AnchorGap::Fresh(gap)
+    }
 }
 
 /// Seconds between the Unix and Ripple epochs. Named, because getting it wrong is a
@@ -520,6 +555,33 @@ pub async fn run_attested_clock(
                             close_time_unix = ct + RIPPLE_EPOCH_OFFSET_SECS,
                             "attested clock advanced"
                         );
+                        // Every ~100 advances (a few minutes), compare the anchor to the
+                        // attested ledger and say so BEFORE deposits start refusing.
+                        if health.advances.load(Ordering::Relaxed) % 100 == 1 {
+                            let root = crate::unl_policy::enclave_root_from_v1(perp.base_url());
+                            if let Ok(rec) = crate::unl_policy::read_record(&root).await {
+                                health
+                                    .unl_pinned_ledger_seq
+                                    .store(rec.pinned_ledger_seq, Ordering::Relaxed);
+                                match anchor_gap(seq, rec.pinned_ledger_seq) {
+                                    AnchorGap::DueSoon(gap) => warn!(
+                                        metric = "unl_anchor_due",
+                                        gap,
+                                        window = UNL_PIN_WINDOW_LEDGERS,
+                                        "UNL freshness anchor is DUE: re-pin now (owner-signed); \
+                                         SPV deposits refuse once the gap passes the window"
+                                    ),
+                                    AnchorGap::Expired(gap) => error!(
+                                        metric = "unl_anchor_expired",
+                                        gap,
+                                        window = UNL_PIN_WINDOW_LEDGERS,
+                                        "UNL freshness anchor EXPIRED: SPV deposits and \
+                                         withdrawal reconcile refuse (-81) until a re-pin"
+                                    ),
+                                    _ => {}
+                                }
+                            }
+                        }
                     }
                 }
                 ClockOutcome::AlreadyAtOrAhead => { /* polled between closes; expected */ }
@@ -571,6 +633,31 @@ pub async fn run_attested_clock(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn anchor_gap_is_judged_in_ledgers() {
+        use super::{anchor_gap, AnchorGap};
+        assert_eq!(anchor_gap(0, 100), AnchorGap::Unknown);
+        assert_eq!(anchor_gap(100, 0), AnchorGap::Unknown);
+        assert_eq!(
+            anchor_gap(22_056_907 + 15_000, 22_056_907),
+            AnchorGap::Fresh(15_000)
+        );
+        assert_eq!(
+            anchor_gap(22_056_907 + 15_001, 22_056_907),
+            AnchorGap::DueSoon(15_001)
+        );
+        assert_eq!(
+            anchor_gap(22_056_907 + 20_000, 22_056_907),
+            AnchorGap::DueSoon(20_000)
+        );
+        assert_eq!(
+            anchor_gap(22_056_907 + 20_001, 22_056_907),
+            AnchorGap::Expired(20_001)
+        );
+        // an attested ledger below the anchor is not a gap
+        assert_eq!(anchor_gap(5, 10), AnchorGap::Fresh(0));
+    }
     #[test]
     fn batch_time_within_the_derived_window_is_accepted() {
         // a batch 5s behind our clock, equal, and 10s ahead (within the 30s skew tol) all pass.
