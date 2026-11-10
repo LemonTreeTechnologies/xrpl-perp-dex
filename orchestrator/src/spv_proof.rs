@@ -674,6 +674,156 @@ fn build_xdep_blob_framed(
     Ok(b)
 }
 
+/// Historical withdrawal finalize — the `XHWF` transport.
+///
+/// For a withdrawal Payment in a ledger T older than any validations we hold: a RECENT anchor
+/// ledger A with its validations, one LedgerHashes skip-list hop proven in A's state (the list
+/// holds the hash of `headers[0]`), then `headers` newest-first, each the parent of the one
+/// before it, ending at T, and T's transaction proof exactly as in `XDEP`. See
+/// `xrpl_spv_parse_historical_transport` / `xrpl_spv_verify_ancestor_chain` in the enclave.
+///
+/// Layout: 'XHWF' | ver(1) | 118 | anchor | val_count u16 | validations |
+///         leaf_len u16 | skip leaf | depth u8 | depth*512 |
+///         header_count u16 | header_count*118 |
+///         tx_len u32 | tx | meta_len u32 | meta | depth u8 | depth*512
+#[allow(clippy::too_many_arguments)]
+pub fn build_xhwf_blob(
+    anchor_header: &[u8; HEADER_LEN],
+    validations: &[Vec<u8>],
+    skip: &XspvProof,
+    headers: &[[u8; HEADER_LEN]],
+    tx_blob: &[u8],
+    meta: &[u8],
+    inner_root_to_leaf: &[[u8; 512]],
+) -> Result<Vec<u8>> {
+    let (val_count, vals) = build_validations_section(validations)?;
+    build_xhwf_blob_framed(
+        anchor_header,
+        val_count,
+        &vals,
+        skip,
+        headers,
+        tx_blob,
+        meta,
+        inner_root_to_leaf,
+    )
+}
+
+/// Framed-section form — see [`build_xspv_blob_framed`] for why it is private.
+#[allow(clippy::too_many_arguments)]
+fn build_xhwf_blob_framed(
+    anchor_header: &[u8; HEADER_LEN],
+    val_count: u16,
+    validations: &[u8],
+    skip: &XspvProof,
+    headers: &[[u8; HEADER_LEN]],
+    tx_blob: &[u8],
+    meta: &[u8],
+    inner_root_to_leaf: &[[u8; 512]],
+) -> Result<Vec<u8>> {
+    let leaf_len = u16::try_from(skip.leaf_data.len()).context("skip leaf too large for a u16")?;
+    let skip_depth =
+        u8::try_from(skip.inner_root_to_leaf.len()).context("skip path deeper than a u8")?;
+    if headers.is_empty() {
+        bail!("an XHWF chain needs at least the skip-hop header");
+    }
+    let header_count = u16::try_from(headers.len()).context("too many headers for a u16")?;
+    let tx_len = u32::try_from(tx_blob.len()).context("transaction too large for a u32 length")?;
+    let meta_len = u32::try_from(meta.len()).context("metadata too large for a u32 length")?;
+    let depth = u8::try_from(inner_root_to_leaf.len())
+        .context("inclusion path deeper than a u8 can express")?;
+
+    let mut b = Vec::new();
+    b.extend_from_slice(b"XHWF");
+    b.push(1); // version
+    push_be16(&mut b, HEADER_LEN as u16); // const 118, cannot narrow
+    b.extend_from_slice(anchor_header);
+    push_be16(&mut b, val_count);
+    b.extend_from_slice(validations);
+    push_be16(&mut b, leaf_len);
+    b.extend_from_slice(&skip.leaf_data);
+    b.push(skip_depth);
+    for node in &skip.inner_root_to_leaf {
+        b.extend_from_slice(node);
+    }
+    push_be16(&mut b, header_count);
+    for h in headers {
+        b.extend_from_slice(h);
+    }
+    b.extend_from_slice(&tx_len.to_be_bytes());
+    b.extend_from_slice(tx_blob);
+    b.extend_from_slice(&meta_len.to_be_bytes());
+    b.extend_from_slice(meta);
+    b.push(depth);
+    for node in inner_root_to_leaf {
+        b.extend_from_slice(node);
+    }
+    Ok(b)
+}
+
+/// LedgerHashes keylets (rippled Indexes.cpp, space 's'): the recent list, and the group list
+/// that holds flag ledger `seq` (one per 65536 ledgers).
+pub fn skip_keylet_recent() -> [u8; 32] {
+    sha512half(&[&[0x00, 0x73]])
+}
+
+pub fn skip_keylet_group(seq: u32) -> [u8; 32] {
+    sha512half(&[&[0x00, 0x73], &(seq >> 16).to_be_bytes()])
+}
+
+/// Number of ledgers a recent skip list spans, and the flag-ledger stride.
+pub const SKIP_SPAN: u32 = 256;
+
+/// Which ledger the anchor's skip list must name, and under which key — the same rule the
+/// enclave applies (`xrpl_spv_verify_ancestor_chain`), mirrored so a producer never ships a
+/// chain the enclave would pick a different key for. Within 256 of the anchor, the target
+/// itself through the recent list; otherwise the first flag ledger at or after it, through
+/// the recent list if that is within 256, else its group list.
+pub fn skip_hop_for(anchor_seq: u32, target_seq: u32) -> Result<(u32, [u8; 32])> {
+    if target_seq >= anchor_seq {
+        bail!("target {target_seq} is not older than the anchor {anchor_seq}");
+    }
+    if anchor_seq - target_seq <= SKIP_SPAN {
+        return Ok((target_seq, skip_keylet_recent()));
+    }
+    let flag = target_seq
+        .checked_add(SKIP_SPAN - 1)
+        .context("target sequence too large")?
+        / SKIP_SPAN
+        * SKIP_SPAN;
+    // flag < anchor: anchor - target > 256 and flag - target < 256.
+    if anchor_seq - flag <= SKIP_SPAN {
+        Ok((flag, skip_keylet_recent()))
+    } else {
+        Ok((flag, skip_keylet_group(flag)))
+    }
+}
+
+/// Producer-side check of the chain the enclave will walk: headers newest-first, each one the
+/// parent of the one before. Fails here, where the ledger numbers can be named, rather than as
+/// an anonymous refusal in the enclave.
+pub fn check_parent_chain(headers: &[[u8; HEADER_LEN]]) -> Result<()> {
+    for w in headers.windows(2) {
+        let (newer, cur) = (&w[0], &w[1]);
+        let ns = u32::from_be_bytes([newer[0], newer[1], newer[2], newer[3]]);
+        let cs = u32::from_be_bytes([cur[0], cur[1], cur[2], cur[3]]);
+        if ns == 0 || cs != ns - 1 {
+            bail!("header {cs} does not follow {ns}");
+        }
+        if ledger_hash(cur)[..] != newer[12..44] {
+            bail!("ledger {cs} is not the parent named by ledger {ns}");
+        }
+    }
+    Ok(())
+}
+
+/// Does a LedgerHashes leaf hold `hash` as one of its 32-byte entries? A producer-side
+/// sanity check only (the enclave parses the object properly); a raw aligned-free scan is
+/// enough to catch a wrong ledger before shipping.
+pub fn leaf_holds_hash(leaf: &[u8], hash: &[u8; 32]) -> bool {
+    leaf.windows(32).any(|w| w == hash)
+}
+
 /// Trusted-price — the clock transport (`XCLK`).
 ///
 /// The attested prefix and **nothing after it**: magic, version, the 118-byte header the

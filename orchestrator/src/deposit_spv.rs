@@ -75,6 +75,16 @@ impl ValidationBuffer {
         self.by_hash.get(ledger_hash)
     }
 
+    /// The most recently first-seen ledger holding at least `min` validations — the anchor a
+    /// historical proof starts from. Not the very newest entry: that one is usually still
+    /// collecting.
+    pub fn newest_with(&self, min: usize) -> Option<(String, Vec<Vec<u8>>)> {
+        self.order.iter().rev().find_map(|h| {
+            let v = self.by_hash.get(h)?;
+            (v.len() >= min).then(|| (h.clone(), v.clone()))
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.by_hash.len()
     }
@@ -109,6 +119,52 @@ pub fn build_deposit_proof(
     target_index: usize,
     validations: &[Vec<u8>],
 ) -> Result<DepositProof> {
+    let parts = tx_proof_parts(ledger_json, target_index)?;
+
+    // FRAMED, not concatenated — the same defect the clock driver shipped with. This
+    // path had never run, so nothing had ever refused it.
+    let blob = build_xdep_blob(
+        &parts.header,
+        validations,
+        &parts.tx_blob,
+        &parts.meta,
+        &parts.inner_root_to_leaf,
+    )
+    .context("assemble the XDEP blob")?;
+
+    // The sequence is read from the HEADER BYTES, not from the JSON. Those bytes are
+    // what the validators signed and what the enclave will re-derive its ledger hash
+    // from, so taking the number from anywhere else invites the two to disagree — and
+    // the JSON carries it at the result level in one mode and inside `ledger` in
+    // another, which is exactly the kind of difference that goes unnoticed.
+    let h = &parts.header;
+    let ledger_index = u32::from_be_bytes([h[0], h[1], h[2], h[3]]);
+
+    Ok(DepositProof {
+        blob,
+        tx_id: parts.tx_id,
+        ledger_index,
+    })
+}
+
+/// One transaction's inclusion in its ledger, before any transport framing: the ledger's
+/// header, the transaction and its metadata, and the tx-tree path. Shared by the XDEP
+/// (deposit / withdrawal finalize) and XHWF (historical finalize) producers.
+pub struct TxProofParts {
+    pub header: [u8; HEADER_LEN],
+    pub tx_blob: Vec<u8>,
+    pub meta: Vec<u8>,
+    pub inner_root_to_leaf: Vec<[u8; 512]>,
+    pub tx_id: [u8; 32],
+}
+
+/// Rebuild the ledger's transaction tree and read off the path to the transaction at
+/// `target_index`. `ledger_json` is the `ledger` RPC result with `transactions: true,
+/// expand: true, binary: true`.
+pub fn tx_proof_parts(
+    ledger_json: &serde_json::Value,
+    target_index: usize,
+) -> Result<TxProofParts> {
     let ledger = &ledger_json["ledger"];
 
     // The header comes from `ledger_data` when present, and only falls back to
@@ -175,28 +231,12 @@ pub fn build_deposit_proof(
         .inclusion_proof(&key)
         .context("read the inclusion path off the rebuilt map")?;
 
-    // FRAMED, not concatenated — the same defect the clock driver shipped with. This
-    // path had never run, so nothing had ever refused it.
-    let blob = build_xdep_blob(
-        &header,
-        validations,
-        tx_blob,
-        meta,
-        &proof.inner_root_to_leaf,
-    )
-    .context("assemble the XDEP blob")?;
-
-    // The sequence is read from the HEADER BYTES, not from the JSON. Those bytes are
-    // what the validators signed and what the enclave will re-derive its ledger hash
-    // from, so taking the number from anywhere else invites the two to disagree — and
-    // the JSON carries it at the result level in one mode and inside `ledger` in
-    // another, which is exactly the kind of difference that goes unnoticed.
-    let ledger_index = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-
-    Ok(DepositProof {
-        blob,
+    Ok(TxProofParts {
+        header,
+        tx_blob: tx_blob.clone(),
+        meta: meta.clone(),
+        inner_root_to_leaf: proof.inner_root_to_leaf,
         tx_id: key,
-        ledger_index,
     })
 }
 

@@ -111,6 +111,7 @@ pub fn spv_cause(rc: i64) -> Option<&'static str> {
         -20 => "a partial payment — delivered less than the Amount",
         -21 => "the transaction did not succeed in the ledger",
         -22 => "an IOU deposit while XRP-only",
+        -23 => "a ledger hash is not in the proven skip list / parent chain",
         -99 => "an internal SPV error",
         _ => return None,
     })
@@ -897,8 +898,8 @@ mod tests {
     /// Mirrors the enclave's `XRPL_SPV_ERR_*` values. Not contiguous — it runs 1..=22 and
     /// then jumps to 99 — which is exactly why the earlier `1..=19` loop looked complete
     /// and was not. The cross-repo gate asserts this list against the enclave's header.
-    const SPV_CAUSE_OFFSETS: [i64; 23] = [
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 99,
+    const SPV_CAUSE_OFFSETS: [i64; 24] = [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 99,
     ];
 
     #[test]
@@ -942,7 +943,7 @@ mod tests {
             "-299 is the farthest cause"
         );
         // the gaps are gaps, not causes
-        for gap in [23i64, 50, 98] {
+        for gap in [24i64, 50, 98] {
             assert_eq!(
                 spv_cause(SPV_HOST_RC_BASE - gap),
                 None,
