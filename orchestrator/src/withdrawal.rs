@@ -354,6 +354,10 @@ pub async fn process_withdrawal(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
+            undelivered: Vec::new(),
+            tx_json: Some(tx_json.clone()),
+            amount_fp8,
+            settled: false,
         };
     if let Some(j) = journal {
         j.record(mk_journal_entry(None));
@@ -374,10 +378,23 @@ pub async fn process_withdrawal(
         .context("failed to build HTTP client")?;
 
     let mut collected_signers: Vec<serde_json::Value> = Vec::new();
+    // Follower reserve: every signer that does NOT sign now (not asked once the quorum is in,
+    // refused, unreachable, or still owed an EARLIER withdrawal) is owed this request; the
+    // delivery loop sends it, per signer strictly in Sequence order, so every enclave reserves
+    // every withdrawal and their balances converge.
+    let mut undelivered: Vec<String> = Vec::new();
+    let earlier = journal.map(|j| j.snapshot()).unwrap_or_default();
 
     for signer in &signers_config.signers {
         if collected_signers.len() >= signers_config.quorum {
-            break;
+            undelivered.push(signer.name.clone());
+            continue;
+        }
+        if crate::withdrawal_reconcile::signer_owed_earlier(&earlier, &signer.name, sequence) {
+            info!(signer = %signer.name, sequence,
+                "signer still owed an earlier withdrawal — queued behind it (strict order)");
+            undelivered.push(signer.name.clone());
+            continue;
         }
         let account_id = match xrpl_signer::decode_xrpl_address(&signer.xrpl_address) {
             Ok(id) => id,
@@ -425,8 +442,14 @@ pub async fn process_withdrawal(
             }
             Err(e) => {
                 warn!(signer = %signer.name, "signing failed: {:#}", e);
+                undelivered.push(signer.name.clone());
             }
         }
+    }
+    if let Some(j) = journal {
+        let mut e = mk_journal_entry(None);
+        e.undelivered = undelivered.clone();
+        j.record(e);
     }
 
     if collected_signers.len() < signers_config.quorum {
@@ -471,7 +494,9 @@ pub async fn process_withdrawal(
             // Refresh the journal entry with the submitted hash (a lookup hint for the
             // reconcile loop; the reconcile key stays the Sequence slot + enclave content).
             if let Some(j) = journal {
-                j.record(mk_journal_entry(Some(xrpl_hash.clone())));
+                let mut e = mk_journal_entry(Some(xrpl_hash.clone()));
+                e.undelivered = undelivered.clone();
+                j.record(e);
             }
             Ok(WithdrawResult {
                 status: "success".into(),
@@ -493,6 +518,75 @@ pub async fn process_withdrawal(
                 ),
             })
         }
+    }
+}
+
+// ── Follower reserve: delivery to every signer ─────────────────────
+
+/// One delivery pass: for each signer, send the LOWEST-Sequence request it is still owed, and
+/// only that one — strict per-signer order, so its enclave never sees S2 before S1 (its
+/// monotonic high-water would refuse S1 forever). A failure stops that signer for this pass;
+/// the next pass retries the same request. A signer that answers holds the row: its enclave
+/// reserved it (or recognised it as the same payment) and its own reconcile settles it by
+/// proof. The signature itself is discarded — the Payment was submitted with the quorum.
+pub async fn deliver_owed_requests(
+    signers_config: &SignersConfig,
+    signing_tx: &mpsc::Sender<SigningRelay>,
+    journal: &crate::withdrawal_reconcile::JournalHandle,
+) {
+    let entries = journal.snapshot();
+    for signer in &signers_config.signers {
+        let Some(e) = crate::withdrawal_reconcile::next_owed(&entries, &signer.name) else {
+            continue;
+        };
+        let Some(tx_json) = e.tx_json.as_ref() else {
+            warn!(signer = %signer.name, sequence = e.sequence,
+                "owed request has no stored tx_json — cannot deliver (operator: re-inject it)");
+            continue;
+        };
+        let account_id = match xrpl_signer::decode_xrpl_address(&signer.xrpl_address) {
+            Ok(id) => id,
+            Err(err) => {
+                warn!(signer = %signer.name, "failed to decode address: {:#}", err);
+                continue;
+            }
+        };
+        match sign_via_p2p(
+            signing_tx,
+            signer,
+            tx_json,
+            &account_id,
+            30,
+            &e.user_id,
+            e.amount_fp8,
+        )
+        .await
+        {
+            Ok(_) => {
+                info!(signer = %signer.name, sequence = e.sequence,
+                    "owed withdrawal delivered — the signer's enclave now holds the row");
+                journal.delivered(&e.escrow, e.sequence, &signer.name);
+            }
+            Err(err) => {
+                warn!(signer = %signer.name, sequence = e.sequence,
+                    "owed withdrawal not delivered yet (retry next pass): {:#}", err);
+            }
+        }
+    }
+}
+
+/// The delivery loop. Runs on the node that holds the journal (the one that took the
+/// withdrawals); a no-op when nothing is owed.
+pub async fn run_delivery_loop(
+    signers_config: SignersConfig,
+    signing_tx: mpsc::Sender<SigningRelay>,
+    journal: crate::withdrawal_reconcile::JournalHandle,
+    interval_secs: u64,
+) {
+    let period = std::time::Duration::from_secs(interval_secs.max(1));
+    loop {
+        deliver_owed_requests(&signers_config, &signing_tx, &journal).await;
+        tokio::time::sleep(period).await;
     }
 }
 

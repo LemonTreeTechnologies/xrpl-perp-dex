@@ -58,6 +58,10 @@ pub struct ElectionState {
     // validator replay task can gate `batch.sequencer_id` against it
     // instead of trust-on-first-use on the first batch it observes.
     leader_tx: watch::Sender<Option<String>>,
+    // Follower reserve failover rule (auditor 2026-11-10): `Some(rx)` = this node may lead only
+    // while `*rx.borrow()` is true (its enclave holds every landed withdrawal). `None` = no gate.
+    caught_up: Option<watch::Receiver<bool>>,
+    held_back_logged: bool,
 }
 
 impl ElectionState {
@@ -94,7 +98,25 @@ impl ElectionState {
             inbound_rx,
             role_tx,
             leader_tx,
+            caught_up: None,
+            held_back_logged: false,
         }
+    }
+
+    /// Gate leadership on the withdrawal catch-up verdict. A priority-0 node that is not (yet)
+    /// caught up starts as a validator instead of claiming the role.
+    pub fn with_caught_up_gate(mut self, rx: watch::Receiver<bool>) -> Self {
+        self.caught_up = Some(rx);
+        if self.role == Role::Sequencer && !self.may_lead() {
+            warn!("not caught up on withdrawals — starting as validator until the enclave holds every landed one");
+            self.set_leader(None);
+            self.switch_role(Role::Validator);
+        }
+        self
+    }
+
+    fn may_lead(&self) -> bool {
+        self.caught_up.as_ref().map(|r| *r.borrow()).unwrap_or(true)
     }
 
     fn set_leader(&mut self, leader: Option<(String, u8)>) {
@@ -233,6 +255,15 @@ impl ElectionState {
     }
 
     fn check_timeout(&mut self) {
+        // A sequencer leads only while its enclave holds every landed withdrawal; if that stops
+        // being true it steps down until it has caught up.
+        if self.role == Role::Sequencer && !self.may_lead() {
+            warn!("sequencer is NOT caught up on withdrawals — stepping down");
+            self.set_leader(None);
+            self.switch_role(Role::Validator);
+            self.last_heartbeat = Instant::now();
+            return;
+        }
         // Startup grace: don't trigger failover for first heartbeat_timeout
         if self.startup_grace {
             if self.startup_time.elapsed() > self.config.heartbeat_timeout {
@@ -261,6 +292,16 @@ impl ElectionState {
     }
 
     fn promote(&mut self) {
+        if !self.may_lead() {
+            if !self.held_back_logged {
+                warn!(
+                    "would promote, but this node is not caught up on withdrawals — holding back"
+                );
+                self.held_back_logged = true;
+            }
+            return;
+        }
+        self.held_back_logged = false;
         info!(
             priority = self.config.our_priority,
             "promoting self to sequencer"
@@ -579,5 +620,89 @@ mod tests {
             ElectionMessage::Heartbeat { seq_num, .. } => assert_eq!(seq_num, 42),
             _ => panic!("wrong variant"),
         }
+    }
+
+    // ── Follower reserve: the failover caught-up gate ──────────────────────
+
+    fn gated(
+        priority: u8,
+        caught: bool,
+    ) -> (
+        ElectionState,
+        watch::Sender<bool>,
+        mpsc::Receiver<ElectionMessage>,
+    ) {
+        let (out_tx, out_rx) = mpsc::channel(10);
+        let (_in_tx, in_rx) = mpsc::channel(10);
+        let (role_tx, _role_rx) = watch::channel(Role::Validator);
+        let (leader_tx, _leader_rx) = watch::channel(None);
+        let config = ElectionConfig {
+            our_peer_id: format!("peer-{priority}"),
+            our_priority: priority,
+            heartbeat_interval: Duration::from_millis(50),
+            heartbeat_timeout: Duration::from_millis(100),
+        };
+        let (gate_tx, gate_rx) = watch::channel(caught);
+        let st = ElectionState::new(config, out_tx, in_rx, role_tx, leader_tx)
+            .with_caught_up_gate(gate_rx);
+        (st, gate_tx, out_rx)
+    }
+
+    #[tokio::test]
+    async fn priority_0_not_caught_up_starts_as_validator() {
+        let (st, _g, _o) = gated(0, false);
+        assert_eq!(
+            st.role,
+            Role::Validator,
+            "a node missing a landed withdrawal does not claim the role"
+        );
+        let (st, _g, _o) = gated(0, true);
+        assert_eq!(
+            st.role,
+            Role::Sequencer,
+            "caught up: priority 0 leads as before"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_behind_node_does_not_promote_until_caught_up() {
+        let (mut st, gate, _o) = gated(1, false);
+        st.promote();
+        assert_eq!(st.role, Role::Validator, "held back while behind");
+        gate.send(true).unwrap();
+        st.promote();
+        assert_eq!(
+            st.role,
+            Role::Sequencer,
+            "promotes once its enclave holds every landed withdrawal"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sequencer_that_falls_behind_steps_down() {
+        let (mut st, gate, _o) = gated(0, true);
+        st.startup_grace = false;
+        assert_eq!(st.role, Role::Sequencer);
+        gate.send(false).unwrap();
+        st.check_timeout();
+        assert_eq!(st.role, Role::Validator);
+        assert!(st.leader.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_gate_behaves_exactly_as_before() {
+        let (out_tx, _o) = mpsc::channel(10);
+        let (_in_tx, in_rx) = mpsc::channel(10);
+        let (role_tx, _r) = watch::channel(Role::Validator);
+        let (leader_tx, _l) = watch::channel(None);
+        let config = ElectionConfig {
+            our_peer_id: "p".into(),
+            our_priority: 1,
+            heartbeat_interval: Duration::from_millis(50),
+            heartbeat_timeout: Duration::from_millis(100),
+        };
+        let mut st = ElectionState::new(config, out_tx, in_rx, role_tx, leader_tx);
+        st.promote();
+        assert_eq!(st.role, Role::Sequencer);
     }
 }
