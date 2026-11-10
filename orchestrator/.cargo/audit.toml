@@ -53,4 +53,14 @@ ignore = [
     #      path (e.g. an auto-signer for operator requests, a sign-on-demand
     #      service) — that creates the mass-timing oracle this rationale says is absent.
     "RUSTSEC-2026-0387",
+    # libsqlite3-sys 0.30.1 — bundled C SQLite CVE (2026-11). NOT COMPILED into the
+    # orchestrator: sqlx is declared with features ["runtime-tokio", "postgres"] only;
+    # sqlx-sqlite sits in Cargo.lock's full graph but no enabled feature reaches it.
+    # Verified by ARTIFACT (same method as quinn-proto above), 2026-11-10:
+    # `cargo tree -i libsqlite3-sys -e normal,build` resolves to nothing while
+    # `-i sqlx-postgres` resolves (positive control), and target/debug/deps holds no
+    # *sqlite* artifact while it holds libsqlx_postgres*. The fixed 0.39 is unreachable
+    # under sqlx 0.8 (sqlx-sqlite =0.8.6 pins ^0.30.1). Revisit on the next sqlx bump,
+    # and REMOVE this ignore if sqlite is ever enabled.
+    "RUSTSEC-2026-0459",
 ]
