@@ -241,6 +241,17 @@ impl PerpClient {
         .await
     }
 
+    /// GAP B reconcile — finalize a withdrawal whose ledger is older than any validations this
+    /// node holds (XHWF: a recent anchor's quorum, its skip list, then parent links down to the
+    /// Payment's ledger). Same rc contract as `withdraw_finalize`; landed-only.
+    pub async fn withdraw_finalize_historical(&self, proof_blob: &[u8]) -> Result<Value> {
+        self.post(
+            "/perp/withdraw/finalize-historical",
+            serde_json::json!({ "proof_blob": hex::encode(proof_blob) }),
+        )
+        .await
+    }
+
     /// GAP B reconcile — roll back a reserved withdrawal whose Sequence slot was consumed
     /// by a DIFFERENT transaction (R-a, slot stolen; XDEP tx-inclusion of that other tx).
     /// Restores the held margin and drops the row; the per-escrow high-water STAYS, so the

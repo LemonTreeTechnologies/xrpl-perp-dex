@@ -69,6 +69,7 @@ mod vault_mm;
 mod withdraw_auth; // scope C — the account's own authorisation of a withdrawal
 mod withdrawal;
 mod withdrawal_catchup; // follower reserve — failover caught-up rule
+mod withdrawal_historical; // finalize a withdrawal whose ledger is older than the validation buffer
 mod withdrawal_reconcile; // GAP B — reserve→finalize/rollback journal + reconcile driver
 mod ws;
 mod xrpl_monitor;

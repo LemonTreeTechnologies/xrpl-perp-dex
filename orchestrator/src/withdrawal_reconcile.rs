@@ -482,7 +482,16 @@ pub async fn reconcile_one(
             entry.escrow, escrow_seq, entry.sequence
         )),
         Verdict::SlotConsumed => {
-            reconcile_consumed_slot(entry, perp, http, xrpl_http_url, buffer).await
+            reconcile_consumed_slot(
+                entry,
+                perp,
+                http,
+                xrpl_http_url,
+                buffer,
+                validated_idx,
+                rb_fetch,
+            )
+            .await
         }
         Verdict::Expired => reconcile_expired(entry, perp, rb_fetch).await,
     }
@@ -494,6 +503,8 @@ async fn reconcile_consumed_slot(
     http: &reqwest::Client,
     url: &str,
     buffer: &Arc<Mutex<ValidationBuffer>>,
+    validated_idx: u32,
+    rb_fetch: &SpvFetchConfig,
 ) -> ReconcileOutcome {
     let (tx_hash, ledger_index) =
         match find_validated_tx_at_sequence(http, url, &entry.escrow, entry.sequence).await {
@@ -532,15 +543,31 @@ async fn reconcile_consumed_slot(
     };
     // Lift the buffered validations out under the lock, then DROP the guard before any await
     // (std Mutex guard is not held across await).
-    let validations: Vec<Vec<u8>> = {
+    let validations: Option<Vec<Vec<u8>>> = {
         let guard = buffer.lock().unwrap_or_else(|p| p.into_inner());
-        match guard.get(&ledger_hash) {
-            Some(v) if !v.is_empty() => v.clone(),
-            _ => {
-                return ReconcileOutcome::Deferred(format!(
-                    "no buffered validations for ledger {ledger_hash} yet; retry while in window"
-                ))
-            }
+        guard.get(&ledger_hash).filter(|v| !v.is_empty()).cloned()
+    };
+    let validations = match validations {
+        Some(v) => v,
+        // Older than the buffer can ever hold: those validations are gone for good, so wait
+        // no longer — prove the ledger from a recent anchor instead.
+        None if is_beyond_buffer(validated_idx, ledger_index) => {
+            return reconcile_historical(
+                entry,
+                perp,
+                http,
+                url,
+                buffer,
+                &ledger,
+                target_index,
+                rb_fetch,
+            )
+            .await
+        }
+        None => {
+            return ReconcileOutcome::Deferred(format!(
+                "no buffered validations for ledger {ledger_hash} yet; retry while in window"
+            ))
         }
     };
     let proof = match build_deposit_proof(&ledger, target_index, &validations) {
@@ -587,6 +614,92 @@ async fn reconcile_consumed_slot(
                 // transient, retry.
                 None => ReconcileOutcome::Deferred(format!(
                     "finalize failed, no enclave rc (transport?): {msg}"
+                )),
+            }
+        }
+    }
+}
+
+/// Whether ledger `target` is too old for the validation buffer ever to hold its validations
+/// (it keeps the last `VALIDATION_BUFFER_LEDGERS` ledgers it saw).
+pub fn is_beyond_buffer(validated_idx: u32, target: u32) -> bool {
+    validated_idx.saturating_sub(target) > crate::deposit_spv::VALIDATION_BUFFER_LEDGERS as u32
+}
+
+/// Finalize a landed withdrawal whose ledger is older than any buffered validations (a node
+/// that was offline past the window; a row delivered by catch-up long after it landed). The
+/// proof is anchored at a recent ledger we do hold validations for. Landed-only: a DIFFERENT tx
+/// at the slot (-69) cannot be rolled back this way — the stolen-slot rollback needs that old
+/// ledger's own validations — so it is reported as an anomaly for an operator.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_historical(
+    entry: &PendingWithdrawal,
+    perp: &PerpClient,
+    http: &reqwest::Client,
+    history_url: &str,
+    buffer: &Arc<Mutex<ValidationBuffer>>,
+    target_ledger: &Value,
+    target_index: usize,
+    rb_fetch: &SpvFetchConfig,
+) -> ReconcileOutcome {
+    if !rb_fetch.prefer_getproofpath {
+        return ReconcileOutcome::Deferred(
+            "ledger is older than the validation buffer; finalizing it needs a patched proof node \
+             (PERP_WITHDRAWAL_RECONCILE_PROOF_URL)"
+                .into(),
+        );
+    }
+    let anchor = {
+        let guard = buffer.lock().unwrap_or_else(|p| p.into_inner());
+        guard.newest_with(rb_fetch.quorum)
+    };
+    let Some((anchor_hash, validations)) = anchor else {
+        return ReconcileOutcome::Deferred(
+            "no recent ledger with a full quorum buffered yet".into(),
+        );
+    };
+    let src = crate::withdrawal_historical::HistoricalSources {
+        history_url,
+        proof_url: &rb_fetch.http_url,
+    };
+    let blob = match crate::withdrawal_historical::build_historical_proof(
+        http,
+        &src,
+        &anchor_hash,
+        &validations,
+        target_ledger,
+        target_index,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => return ReconcileOutcome::Deferred(format!("XHWF proof build failed: {e:#}")),
+    };
+    match perp.withdraw_finalize_historical(&blob).await {
+        Ok(_) => {
+            info!(
+                escrow = %entry.escrow, sequence = entry.sequence, anchor = %anchor_hash,
+                "GAP B reconcile: withdrawal FINALIZED (historical proof)"
+            );
+            ReconcileOutcome::Finalized
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            match rc_from_error(&msg) {
+                Some(-69) => ReconcileOutcome::Anomaly(format!(
+                    "a DIFFERENT validated tx holds Sequence {} in an old ledger; the stolen-slot \
+                     rollback needs that ledger's own validations: {msg}",
+                    entry.sequence
+                )),
+                Some(rc) if rc_is_retryable(rc) => ReconcileOutcome::Deferred(format!(
+                    "historical finalize refused rc={rc} (retryable): {msg}"
+                )),
+                Some(rc) => ReconcileOutcome::Anomaly(format!(
+                    "historical finalize refused rc={rc}, not retryable: {msg}"
+                )),
+                None => ReconcileOutcome::Deferred(format!(
+                    "historical finalize failed, no enclave rc (transport, or an enclave without \
+                     the route?): {msg}"
                 )),
             }
         }
@@ -954,6 +1067,43 @@ pub async fn run_withdrawal_reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_path_starts_exactly_where_the_buffer_ends() {
+        let n = crate::deposit_spv::VALIDATION_BUFFER_LEDGERS as u32;
+        assert!(
+            !is_beyond_buffer(1000, 1000),
+            "the current ledger is in reach"
+        );
+        assert!(
+            !is_beyond_buffer(1000 + n, 1000),
+            "exactly the buffer's depth is still in reach"
+        );
+        assert!(
+            is_beyond_buffer(1000 + n + 1, 1000),
+            "one older can never be buffered"
+        );
+        assert!(
+            !is_beyond_buffer(5, 10),
+            "a target ahead of the read is not historical"
+        );
+    }
+
+    #[test]
+    fn the_anchor_is_the_newest_ledger_with_a_full_quorum() {
+        let mut b = ValidationBuffer::new();
+        for _ in 0..5 {
+            b.insert("A", vec![1]);
+        }
+        for _ in 0..5 {
+            b.insert("B", vec![2]);
+        }
+        b.insert("C", vec![3]); // newest, still collecting
+        let (h, v) = b.newest_with(5).expect("an anchor");
+        assert_eq!(h, "B", "newest with >= quorum, not the newest overall");
+        assert_eq!(v.len(), 5);
+        assert!(b.newest_with(6).is_none(), "no ledger reached 6");
+    }
 
     fn entry(sequence: u32, last_ledger_sequence: u32) -> PendingWithdrawal {
         PendingWithdrawal {
