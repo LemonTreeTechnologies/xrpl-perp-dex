@@ -385,6 +385,7 @@ async fn drive(
                 // No withdrawal claim: a SignerListSet spends nobody's balance.
                 withdrawal_user_id: None,
                 withdrawal_amount_fp8: None,
+                withdrawal_auth: None,
             })
             .await
             .is_err()
@@ -755,6 +756,7 @@ async fn drive_bootstrap_rotate(
                 // No withdrawal claim: a SignerListSet spends nobody's balance.
                 withdrawal_user_id: None,
                 withdrawal_amount_fp8: None,
+                withdrawal_auth: None,
             })
             .await
             .is_err()

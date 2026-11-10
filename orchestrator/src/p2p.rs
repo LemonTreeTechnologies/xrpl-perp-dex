@@ -280,6 +280,9 @@ pub enum SigningMessage {
         withdrawal_user_id: Option<String>,
         #[serde(default)]
         withdrawal_amount_fp8: Option<String>,
+        /// Scope C: the user's authorisation of this Payment, verbatim (see SigningRelay).
+        #[serde(default)]
+        withdrawal_auth: Option<crate::withdraw_auth::WithdrawAuth>,
     },
     Response {
         request_id: String,
@@ -707,6 +710,9 @@ pub struct SigningRelay {
     /// peer that cannot check must not sign. `None` for `SignerListSet`.
     pub withdrawal_user_id: Option<String>,
     pub withdrawal_amount_fp8: Option<String>,
+    /// Scope C: the user's own authorisation of this Payment, carried verbatim to the peer's
+    /// enclave, which verifies it and signs nothing without it. `None` for `SignerListSet`.
+    pub withdrawal_auth: Option<crate::withdraw_auth::WithdrawAuth>,
 }
 
 /// What a co-signer needs in order to CHECK a Payment instead of merely signing it:
@@ -718,6 +724,8 @@ pub struct WithdrawalClaim<'a> {
     pub user_id: &'a str,
     /// Raw FP8 integer as a decimal string, never "1.0" — see SigningMessage::Request.
     pub amount_fp8: &'a str,
+    /// The user's authorisation (scope C); the peer's enclave refuses a Payment without one.
+    pub auth: Option<&'a crate::withdraw_auth::WithdrawAuth>,
 }
 
 /// REQ-8 PRG-2 part 3/4: outbound Path A delegation collection request.
@@ -3304,10 +3312,21 @@ impl P2PNode {
                 let Some(WithdrawalClaim {
                     user_id: uid,
                     amount_fp8: amt,
+                    auth,
                 }) = claim
                 else {
                     return reject(
                         "Payment request carries no withdrawal claim (user_id + amount_fp8) —                          the enclave co-sign checks both against its own state and will not                          sign a payment it cannot verify"
+                            .to_string(),
+                    );
+                };
+                /* Scope C: nor without the USER's authorisation — the enclave verifies it against
+                 * the Payment and signs nothing without it, so a request lacking one is refused
+                 * here rather than forwarded to be refused there. */
+                let Some(auth) = auth else {
+                    return reject(
+                        "Payment request carries no user authorisation (user_pubkey, user_sig, \
+                         auth_nonce, max_ledger) — the enclave will not sign without it"
                             .to_string(),
                     );
                 };
@@ -3319,6 +3338,10 @@ impl P2PNode {
                         "user_id": uid,
                         "amount_fp8": amt,
                         "tx_blob": tx_blob_hex,
+                        "user_pubkey": auth.user_pubkey,
+                        "user_sig": auth.user_sig,
+                        "auth_nonce": auth.auth_nonce,
+                        "max_ledger": auth.max_ledger,
                     }),
                 )
             }
@@ -3498,7 +3521,7 @@ impl P2PNode {
                                 &relay.signer_account_id_hex,
                                 relay.quorum_bundle.as_deref(),
                                 match (relay.withdrawal_user_id.as_deref(), relay.withdrawal_amount_fp8.as_deref()) {
-                                    (Some(user_id), Some(amount_fp8)) => Some(WithdrawalClaim { user_id, amount_fp8 }),
+                                    (Some(user_id), Some(amount_fp8)) => Some(WithdrawalClaim { user_id, amount_fp8, auth: relay.withdrawal_auth.as_ref() }),
                                     _ => None,
                                 },
                             ).await;
@@ -3516,6 +3539,7 @@ impl P2PNode {
                         quorum_bundle: relay.quorum_bundle,
                         withdrawal_user_id: relay.withdrawal_user_id,
                         withdrawal_amount_fp8: relay.withdrawal_amount_fp8,
+                        withdrawal_auth: relay.withdrawal_auth,
                     };
                     match self.publish_signing(&msg) {
                         Ok(_) => {
@@ -4081,6 +4105,7 @@ impl P2PNode {
                                 quorum_bundle,
                                 withdrawal_user_id,
                                 withdrawal_amount_fp8,
+                                withdrawal_auth,
                             }) => {
                                 // Is this request addressed to our local signer?
                                 // Clone up-front so subsequent borrows can mutate
@@ -4142,7 +4167,7 @@ impl P2PNode {
                                     &signer_account_id_hex,
                                     quorum_bundle.as_deref(),
                                     match (withdrawal_user_id.as_deref(), withdrawal_amount_fp8.as_deref()) {
-                                        (Some(user_id), Some(amount_fp8)) => Some(WithdrawalClaim { user_id, amount_fp8 }),
+                                        (Some(user_id), Some(amount_fp8)) => Some(WithdrawalClaim { user_id, amount_fp8, auth: withdrawal_auth.as_ref() }),
                                         _ => None,
                                     },
                                 ).await;
@@ -6055,6 +6080,101 @@ mod tests {
     /// arriving without it is a rejection rather than a quiet fall back to signing blind.
     /// Asserts the enclave saw ZERO hits, so the refusal is genuinely local.
     #[tokio::test]
+    async fn wire_payment_without_user_authorisation_rejected_before_enclave() {
+        let (base_url, hits) = spawn_mock_enclave().await;
+        let mut signer = test_local_signer();
+        signer.enclave_url = base_url;
+        let payment = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": TEST_ESCROW,
+            "Destination": "rJGj4G5ekU9YS2HWzwXTVFQSWNewokACjm",
+            "Amount": "1000000",
+            "Fee": "60",
+            "Sequence": 1,
+            "SigningPubKey": ""
+        });
+        let resp = P2PNode::handle_signing_request(
+            &signer,
+            Some(TEST_ESCROW),
+            "wire-payment-no-auth",
+            &payment,
+            &signer_acct_id_hex(),
+            None,
+            // a claim, but NO user authorisation — a host that strips it gets nothing signed
+            Some(WithdrawalClaim {
+                user_id: "rUser",
+                amount_fp8: "100000000",
+                auth: None,
+            }),
+        )
+        .await;
+        match resp {
+            SigningMessage::Response {
+                error,
+                der_signature,
+                ..
+            } => {
+                assert!(
+                    der_signature.is_none(),
+                    "a Payment without the user's authorisation must not be signed"
+                );
+                let msg = error.unwrap_or_default();
+                assert!(
+                    msg.contains("user authorisation"),
+                    "rejection should name the missing authorisation, got: {msg}"
+                );
+            }
+            other => panic!("expected a Response, got {other:?}"),
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the enclave must not have been asked at all"
+        );
+    }
+
+    #[test]
+    fn signing_request_carries_the_authorisation_verbatim_on_the_wire() {
+        let auth = crate::withdraw_auth::WithdrawAuth {
+            user_pubkey: format!("ED{}", "11".repeat(32)),
+            user_sig: "22".repeat(64),
+            auth_nonce: "18446744073709551615".into(),
+            max_ledger: 4_000_000_000,
+        };
+        let req = SigningMessage::Request {
+            request_id: "a".into(),
+            requester_peer_id: "p".into(),
+            unsigned_tx: serde_json::json!({}),
+            signer_account_id_hex: "00".into(),
+            signer_xrpl_address: "r".into(),
+            quorum_bundle: None,
+            withdrawal_user_id: Some("rUser".into()),
+            withdrawal_amount_fp8: Some("1".into()),
+            withdrawal_auth: Some(auth.clone()),
+        };
+        let parsed: SigningMessage =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        match parsed {
+            SigningMessage::Request {
+                withdrawal_auth, ..
+            } => assert_eq!(
+                withdrawal_auth,
+                Some(auth),
+                "u64 nonce and u32 ledger survive exactly"
+            ),
+            other => panic!("{other:?}"),
+        }
+        // an older peer's message (no field) still parses, as None
+        let old = r#"{"type":"request","request_id":"a","requester_peer_id":"p","unsigned_tx":{},"signer_account_id_hex":"00","signer_xrpl_address":"r","quorum_bundle":null}"#;
+        if let Ok(SigningMessage::Request {
+            withdrawal_auth, ..
+        }) = serde_json::from_str::<SigningMessage>(old)
+        {
+            assert!(withdrawal_auth.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn wire_payment_without_withdrawal_claim_rejected_before_enclave() {
         let (base_url, hits) = spawn_mock_enclave().await;
         let mut signer = test_local_signer();
@@ -6165,6 +6285,7 @@ mod tests {
             quorum_bundle: Some(TEST_BUNDLE_HEX.to_string()),
             withdrawal_user_id: None,
             withdrawal_amount_fp8: None,
+            withdrawal_auth: None,
         };
         let wire = serde_json::to_string(&req).expect("serialize");
         let parsed: SigningMessage = serde_json::from_str(&wire).expect("deserialize");

@@ -31,6 +31,11 @@ pub struct WithdrawRequest {
     /// XRPL DestinationTag for the receiving account (required for exchanges)
     #[serde(default)]
     pub destination_tag: Option<u32>,
+    /// The account's own authorisation of exactly this withdrawal
+    /// (`docs/withdrawal-authorization-v1.md`): user_pubkey, user_sig, auth_nonce, max_ledger.
+    /// Every enclave that signs the Payment verifies it; without it none will.
+    #[serde(flatten, default)]
+    pub auth: Option<crate::withdraw_auth::WithdrawAuth>,
 }
 
 /// Withdrawal result.
@@ -88,6 +93,7 @@ async fn sign_with_enclave(
     tx_map: &serde_json::Map<String, serde_json::Value>,
     user_id: &str,
     amount_fp8: u64,
+    auth: &crate::withdraw_auth::WithdrawAuth,
 ) -> Result<(String, String)> {
     let mut blob = Vec::new();
     xrpl_mithril_codec::serializer::serialize_json_object(tx_map, &mut blob, true)
@@ -107,6 +113,10 @@ async fn sign_with_enclave(
             "user_id": user_id,
             "amount_fp8": amount_fp8.to_string(),
             "tx_blob": hex::encode(&blob),
+            "user_pubkey": auth.user_pubkey,
+            "user_sig": auth.user_sig,
+            "auth_nonce": auth.auth_nonce,
+            "max_ledger": auth.max_ledger,
         }))
         .timeout(std::time::Duration::from_secs(30))
         .send()
@@ -146,6 +156,7 @@ async fn sign_with_enclave(
 /// caller-computed hash is no longer sent on the wire — it would be
 /// trusted blindly by the receiver enclave and let any gossipsub peer
 /// demand signatures on arbitrary hashes.
+#[allow(clippy::too_many_arguments)]
 async fn sign_via_p2p(
     signing_tx: &mpsc::Sender<SigningRelay>,
     signer: &SignerConfig,
@@ -154,6 +165,7 @@ async fn sign_via_p2p(
     timeout_secs: u64,
     user_id: &str,
     amount_fp8: u64,
+    auth: &crate::withdraw_auth::WithdrawAuth,
 ) -> Result<(String, String)> {
     let request_id = format!("{:016x}", rand::random::<u64>());
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
@@ -172,6 +184,9 @@ async fn sign_via_p2p(
             // it checks both against its own state first.
             withdrawal_user_id: Some(user_id.to_string()),
             withdrawal_amount_fp8: Some(amount_fp8.to_string()),
+            // …and the user's own authorisation, verbatim: each peer's enclave verifies it
+            // against the Payment and will not sign without it.
+            withdrawal_auth: Some(auth.clone()),
         })
         .await
         .map_err(|_| anyhow::anyhow!("P2P signing channel closed"))?;
@@ -250,6 +265,22 @@ pub async fn process_withdrawal(
     let last_ledger_u32 = u32::try_from(last_ledger)
         .context("withdrawal LastLedgerSequence exceeds the XRPL 32-bit field")?;
 
+    // The user's authorisation bounds the Payment: its LastLedgerSequence may not exceed the
+    // user's max_ledger (each enclave refuses otherwise), and the amount is the exact drops the
+    // user signed. Refuse here, before anything is reserved, if it cannot be honoured.
+    let auth = req.auth.as_ref().context(
+        "withdrawal authorisation missing (user_pubkey, user_sig, auth_nonce, max_ledger)",
+    )?;
+    auth.validate_shape()?;
+    let last_ledger_u32 = last_ledger_u32.min(auth.max_ledger);
+    if u64::from(last_ledger_u32) < validated_ledger.saturating_add(2) {
+        anyhow::bail!(
+            "the withdrawal authorisation expires at ledger {} — too close to the current {} to land; sign a new one",
+            auth.max_ledger,
+            validated_ledger
+        );
+    }
+
     // Fee for multisig = base_fee * (1 + N_signers). Use generous fee.
     let fee = format!("{}", 12 * (1 + signers_config.quorum as u64));
     // Derive the drops ONCE and use the same number for the blob and for the co-sign
@@ -257,8 +288,10 @@ pub async fn process_withdrawal(
     // if it does not equal the claimed amount, so computing the two figures by separate
     // routes would turn a rounding difference into a refused withdrawal. One number, one
     // derivation — which is the same reason the claim travels as a raw integer.
-    let amount_drops = (req.amount.parse::<f64>().unwrap_or(0.0) * 1_000_000.0) as u64;
-    let amount_fp8 = amount_drops.saturating_mul(100);
+    let amount_drops = crate::withdraw_auth::xrp_to_drops(&req.amount)?;
+    let amount_fp8 = amount_drops
+        .checked_mul(100)
+        .context("withdrawal amount overflows fp8")?;
     let mut tx_json = serde_json::json!({
         "TransactionType": "Payment",
         "Account": escrow_address,
@@ -303,6 +336,7 @@ pub async fn process_withdrawal(
             &local.address,
             local_session_key,
             &hex::encode(&margin_blob),
+            auth,
         )
         .await;
 
@@ -358,6 +392,7 @@ pub async fn process_withdrawal(
             tx_json: Some(tx_json.clone()),
             amount_fp8,
             settled: false,
+            auth: Some(auth.clone()),
         };
     if let Some(j) = journal {
         j.record(mk_journal_entry(None));
@@ -417,10 +452,11 @@ pub async fn process_withdrawal(
                 30,
                 &req.user_id,
                 amount_fp8,
+                auth,
             )
             .await
         } else {
-            sign_with_enclave(&http, signer, tx_map, &req.user_id, amount_fp8).await
+            sign_with_enclave(&http, signer, tx_map, &req.user_id, amount_fp8, auth).await
         };
 
         match sign_result {
@@ -539,6 +575,11 @@ pub async fn deliver_owed_requests(
         let Some(e) = crate::withdrawal_reconcile::next_owed(&entries, &signer.name) else {
             continue;
         };
+        let Some(auth) = e.auth.as_ref() else {
+            warn!(signer = %signer.name, sequence = e.sequence,
+                "owed request has no stored user authorisation — cannot deliver");
+            continue;
+        };
         let Some(tx_json) = e.tx_json.as_ref() else {
             warn!(signer = %signer.name, sequence = e.sequence,
                 "owed request has no stored tx_json — cannot deliver (operator: re-inject it)");
@@ -559,6 +600,7 @@ pub async fn deliver_owed_requests(
             30,
             &e.user_id,
             e.amount_fp8,
+            auth,
         )
         .await
         {
@@ -646,5 +688,27 @@ async fn submit_multisigned(xrpl_url: &str, tx_json: &serde_json::Value) -> Resu
                 .as_str()
                 .unwrap_or("")
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn withdraw_request_reads_the_flattened_authorisation() {
+        let full: WithdrawRequest = serde_json::from_str(
+            r#"{"user_id":"rU","amount":"5","destination":"rD",
+            "user_pubkey":"02ab","user_sig":"30","auth_nonce":"3","max_ledger":99}"#,
+        )
+        .unwrap();
+        let a = full.auth.expect("all four fields present");
+        assert_eq!((a.auth_nonce.as_str(), a.max_ledger), ("3", 99));
+        let none: WithdrawRequest =
+            serde_json::from_str(r#"{"user_id":"rU","amount":"5","destination":"rD"}"#).unwrap();
+        assert!(
+            none.auth.is_none(),
+            "no authorisation = None, refused by the API with 400"
+        );
     }
 }
