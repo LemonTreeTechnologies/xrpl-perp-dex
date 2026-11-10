@@ -1586,6 +1586,26 @@ async fn withdraw(
     {
         return err(StatusCode::BAD_REQUEST, "invalid XRPL destination address").into_response();
     }
+    // The account's own authorisation of exactly this withdrawal is required: every enclave that
+    // signs the Payment verifies it (docs/withdrawal-authorization-v1.md).
+    match &req.auth {
+        None => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "withdrawal authorisation required: user_pubkey, user_sig, auth_nonce, max_ledger",
+            )
+            .into_response()
+        }
+        Some(a) => {
+            if let Err(e) = a.validate_shape() {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    &format!("invalid withdrawal authorisation: {e:#}"),
+                )
+                .into_response();
+            }
+        }
+    }
 
     let signers = match &state.signers_config {
         Some(cfg) => cfg.clone(),

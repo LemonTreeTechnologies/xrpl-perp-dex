@@ -1998,14 +1998,63 @@ pub async fn sign_request(seed: &str, method: &str, url: &str, body: Option<&str
 
 // ── withdraw (Bug 4) ───────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub async fn cli_withdraw(
     api_url: &str,
     seed: &str,
     amount: &str,
     destination: &str,
     destination_tag: Option<u32>,
+    escrow: &str,
+    xrpl_url: &str,
+    valid_ledgers: u32,
+    nonce_override: Option<u64>,
 ) -> Result<()> {
     let keypair = derive_keypair_from_seed(seed)?;
+
+    // The account's own authorisation (docs/withdrawal-authorization-v1.md): every enclave that
+    // signs the Payment verifies it. nonce = the cluster's last_withdraw_nonce + 1; max_ledger =
+    // the current validated ledger + a short window.
+    let nonce = match nonce_override {
+        Some(n) => n,
+        None => {
+            let (status, bal) = fetch_balance_json(api_url, &keypair).await?;
+            let last = bal["data"]["last_withdraw_nonce"]
+                .as_str()
+                .map(|s| s.to_string())
+                .or_else(|| bal["data"]["last_withdraw_nonce"].as_u64().map(|v| v.to_string()))
+                .with_context(|| format!(
+                    "the cluster did not report last_withdraw_nonce (HTTP {status}) — pass --nonce explicitly"
+                ))?;
+            last.parse::<u64>()
+                .context("last_withdraw_nonce is not a u64")?
+                .checked_add(1)
+                .context("nonce overflow")?
+        }
+    };
+    let validated = crate::unl_policy::own_validated_ledger(xrpl_url)
+        .await
+        .context("reading the validated ledger for max_ledger")?;
+    let max_ledger = u32::try_from(validated)
+        .ok()
+        .and_then(|v| v.checked_add(valid_ledgers))
+        .context("max_ledger overflows u32")?;
+    let drops = crate::withdraw_auth::xrp_to_drops(amount)?;
+    let escrow_id = crate::xrpl_signer::decode_xrpl_address(escrow).context("invalid --escrow")?;
+    let user_id = crate::xrpl_signer::decode_xrpl_address(&keypair.address)?;
+    let dest_id =
+        crate::xrpl_signer::decode_xrpl_address(destination).context("invalid --destination")?;
+    let msg = crate::withdraw_auth::message(
+        &escrow_id,
+        &user_id,
+        drops,
+        &dest_id,
+        destination_tag,
+        nonce,
+        max_ledger,
+    );
+    let auth_sig = keypair.sign_hash(&crate::withdraw_auth::digest(&msg))?;
+
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -2015,6 +2064,10 @@ pub async fn cli_withdraw(
         "user_id": keypair.address,
         "amount": amount,
         "destination": destination,
+        "user_pubkey": keypair.compressed_pubkey_hex,
+        "user_sig": hex::encode(&auth_sig),
+        "auth_nonce": nonce.to_string(),
+        "max_ledger": max_ledger,
     });
     if let Some(tag) = destination_tag {
         body["destination_tag"] = serde_json::json!(tag);
@@ -2038,6 +2091,8 @@ pub async fn cli_withdraw(
     if let Some(tag) = destination_tag {
         println!("Dest Tag:    {tag}");
     }
+    println!("Nonce:       {nonce}");
+    println!("Valid until: ledger {max_ledger}");
     println!("API:         {api_url}");
     println!();
 
@@ -2074,6 +2129,20 @@ pub async fn cli_withdraw(
 
 pub async fn cli_balance(api_url: &str, seed: &str) -> Result<()> {
     let keypair = derive_keypair_from_seed(seed)?;
+    let (status, body) = fetch_balance_json(api_url, &keypair).await?;
+    let pretty = serde_json::to_string_pretty(&body)?;
+    if status.is_success() {
+        println!("{pretty}");
+    } else {
+        println!("✗ HTTP {status}\n{pretty}");
+    }
+    Ok(())
+}
+
+async fn fetch_balance_json(
+    api_url: &str,
+    keypair: &XrplKeypair,
+) -> Result<(reqwest::StatusCode, serde_json::Value)> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -2105,15 +2174,7 @@ pub async fn cli_balance(api_url: &str, seed: &str) -> Result<()> {
 
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.context("invalid JSON response")?;
-    let pretty = serde_json::to_string_pretty(&body)?;
-
-    if status.is_success() {
-        println!("{pretty}");
-    } else {
-        println!("✗ HTTP {status}\n{pretty}");
-    }
-
-    Ok(())
+    Ok((status, body))
 }
 
 /// Fetches a previously-submitted XRPL transaction by hash via the
@@ -2404,6 +2465,45 @@ pub async fn signerlist_bootstrap_rotate(
 
 #[cfg(test)]
 mod tests {
+    /// Scope C end to end, Rust half: the published XRPL secp256k1 vector seed derives the
+    /// published address, and signs the withdrawal-authorisation message for that account. The
+    /// pubkey + DER signature printed here are pinned in the enclave's test_withdraw_auth.cpp,
+    /// which verifies them with libsecp256k1 and derives the same address — so the client's
+    /// signing and the enclave's verification are tested against EACH OTHER, not just a digest.
+    #[test]
+    fn withdraw_auth_signed_by_a_known_seed() {
+        let kp = derive_keypair_from_seed("snoPBrXtMeMyMHUVTgbuqAfg1SUTb").unwrap();
+        assert_eq!(
+            kp.address, "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+            "XRPL published vector"
+        );
+        let user = crate::xrpl_signer::decode_xrpl_address(&kp.address).unwrap();
+        let msg = crate::withdraw_auth::message(
+            &[0x11; 20],
+            &user,
+            5_000_000,
+            &[0x22; 20],
+            None,
+            1,
+            1000,
+        );
+        let d = crate::withdraw_auth::digest(&msg);
+        let sig = kp.sign_hash(&d).unwrap();
+        // RFC 6979: deterministic, so the exact bytes are pinned on both sides.
+        assert_eq!(
+            kp.compressed_pubkey_hex,
+            "0330e7fc9d56bb25d6893ba3f317ae5bcf33b3291bd63db32654a313222f7fd020"
+        );
+        assert_eq!(
+            hex::encode(d),
+            "a4c2fdc31fc03bfe1b7a28976d7e5b4eae1809765c3b865d89226e83d3967689"
+        );
+        assert_eq!(
+            hex::encode(&sig),
+            "304402205d53d458b0c38102e8d66ad1e43d7c0b4ce306b6deac566d62ed4cc4000a06b102205fec66580286af1ca7a4be16e27bc5d09a14701da8253426035a693a15d608de"
+        );
+    }
+
     use super::*;
 
     /// The messages must name the flags of the CALLER, not a hardcoded spelling.

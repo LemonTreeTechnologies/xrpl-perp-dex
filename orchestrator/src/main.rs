@@ -66,6 +66,7 @@ mod unl_refresh;
 mod upgrade_corpus;
 mod validator_manifests; // AC-BASE-2″ §6 — feed the enclave's measured-anchor validator root
 mod vault_mm;
+mod withdraw_auth; // scope C — the account's own authorisation of a withdrawal
 mod withdrawal;
 mod withdrawal_catchup; // follower reserve — failover caught-up rule
 mod withdrawal_reconcile; // GAP B — reserve→finalize/rollback journal + reconcile driver
@@ -186,9 +187,24 @@ enum Command {
         /// API server URL
         #[arg(long, default_value = "http://localhost:3000")]
         api: String,
-        /// XRPL secp256k1 seed (secret)
+        /// XRPL seed (secret). Prefer --seed-file: argv is visible to every local user.
         #[arg(long)]
-        seed: String,
+        seed: Option<String>,
+        /// File holding the XRPL seed (0600)
+        #[arg(long)]
+        seed_file: Option<std::path::PathBuf>,
+        /// The cluster escrow r-address (part of what the account authorises)
+        #[arg(long)]
+        escrow: String,
+        /// XRPL JSON-RPC URL, for the current validated ledger (max_ledger)
+        #[arg(long, default_value = "https://s.altnet.rippletest.net:51234")]
+        xrpl_url: String,
+        /// How many ledgers the authorisation stays valid (max_ledger = validated + this)
+        #[arg(long, default_value_t = 60)]
+        valid_ledgers: u32,
+        /// Override the nonce (default: the cluster's last_withdraw_nonce + 1)
+        #[arg(long)]
+        nonce: Option<u64>,
         /// Withdrawal amount (FP8 string, e.g. "1.00000000")
         #[arg(long)]
         amount: String,
@@ -214,9 +230,12 @@ enum Command {
         /// API server URL
         #[arg(long, default_value = "http://localhost:3000")]
         api: String,
-        /// XRPL secp256k1 seed (secret)
+        /// XRPL seed (secret). Prefer --seed-file: argv is visible to every local user.
         #[arg(long)]
-        seed: String,
+        seed: Option<String>,
+        /// File holding the XRPL seed (0600)
+        #[arg(long)]
+        seed_file: Option<std::path::PathBuf>,
     },
 
     /// Create a signers_config.json from multiple operator entry files.
@@ -989,14 +1008,35 @@ async fn main() -> Result<()> {
         Some(Command::Withdraw {
             api,
             seed,
+            seed_file,
             amount,
             destination,
             destination_tag,
+            escrow,
+            xrpl_url,
+            valid_ledgers,
+            nonce,
         }) => {
-            return cli_tools::cli_withdraw(&api, &seed, &amount, &destination, destination_tag)
-                .await;
+            let seed = cli_tools::resolve_seed(seed.as_deref(), seed_file.as_deref(), "seed")?;
+            return cli_tools::cli_withdraw(
+                &api,
+                &seed,
+                &amount,
+                &destination,
+                destination_tag,
+                &escrow,
+                &xrpl_url,
+                valid_ledgers,
+                nonce,
+            )
+            .await;
         }
-        Some(Command::Balance { api, seed }) => {
+        Some(Command::Balance {
+            api,
+            seed,
+            seed_file,
+        }) => {
+            let seed = cli_tools::resolve_seed(seed.as_deref(), seed_file.as_deref(), "seed")?;
             return cli_tools::cli_balance(&api, &seed).await;
         }
         Some(Command::PriceHealth { enclave_url }) => {

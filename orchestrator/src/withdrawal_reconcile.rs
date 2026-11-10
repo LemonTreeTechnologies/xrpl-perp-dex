@@ -83,6 +83,9 @@ pub struct PendingWithdrawal {
     /// owed the request: the entry stays for delivery only and is not reconciled again.
     #[serde(default)]
     pub settled: bool,
+    /// The user's authorisation, re-sent verbatim with an owed request (scope C).
+    #[serde(default)]
+    pub auth: Option<crate::withdraw_auth::WithdrawAuth>,
 }
 
 /// The durable journal: the set of in-flight reserved withdrawals for this node.

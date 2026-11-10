@@ -173,6 +173,7 @@ impl PerpClient {
         escrow_account_id: &str,
         session_key: &str,
         tx_blob: &str,
+        auth: &crate::withdraw_auth::WithdrawAuth,
     ) -> Result<Value> {
         self.post(
             "/perp/withdraw",
@@ -182,6 +183,10 @@ impl PerpClient {
                 "escrow_account_id": escrow_account_id,
                 "session_key": session_key,
                 "tx_blob": tx_blob,
+                "user_pubkey": auth.user_pubkey,
+                "user_sig": auth.user_sig,
+                "auth_nonce": auth.auth_nonce,
+                "max_ledger": auth.max_ledger,
             }),
         )
         .await
