@@ -24,13 +24,12 @@ pub struct DepositEvent {
     /// the enclave deposit ecall, which refuses a ledger below its monotonic
     /// watermark — a structural (buffer-size-independent) replay guard.
     pub ledger_index: u64,
-    /// #131 AC-R1 (option-A): true if this was a NATIVE XRP payment (drops), false if
-    /// an issued currency (RLUSD). The scanner routes XRP → `deposit_xrp` (credits
-    /// `xrp_balance`, an XRP liability matching the XRP escrow custody) and issued
-    /// currency → `deposit` (RLUSD margin). Previously ALL deposits went to the RLUSD
-    /// route, mis-crediting XRP payments as RLUSD margin — the per-asset custody/
-    /// liability mismatch the reserves ceremony surfaced.
-    pub is_xrp: bool,
+}
+
+/// Drops (1e-6 XRP) → an 8-decimal XRP string, integer arithmetic only: an `f64` loses
+/// whole drops above 2^53 (~9e9 XRP), and a money amount must not be rounded.
+fn drops_to_xrp_8dp(drops: u64) -> String {
+    format!("{}.{:06}00", drops / 1_000_000, drops % 1_000_000)
 }
 
 /// Monitors XRPL ledger for incoming deposits to an escrow account.
@@ -227,28 +226,32 @@ impl XrplMonitor {
                     &tx["Amount"]
                 };
 
-                // Handle both native XRP (drops string/number) and issued currency (object)
-                let value = if let Some(obj) = amount.as_object() {
-                    // Issued currency: {"value": "100.50", "currency": "...", "issuer": "..."}
-                    match obj.get("value").and_then(|v| v.as_str()) {
-                        Some(v) => v.to_string(),
-                        None => continue,
-                    }
-                } else if let Some(drops_str) = amount.as_str() {
-                    // Native XRP: amount in drops as string (1 XRP = 1,000,000 drops)
-                    let drops: u64 = match drops_str.parse() {
+                // The escrow takes native XRP only (asset model: the whole money path is XRP).
+                // An issued-currency Payment is never handed to the enclave as a deposit; it is
+                // logged so an operator can see and return it. The high-water already advanced.
+                if let Some(obj) = amount.as_object() {
+                    warn!(
+                        sender = tx["Account"].as_str().unwrap_or("?"),
+                        tx_hash = tx["hash"].as_str().unwrap_or("?"),
+                        currency = obj.get("currency").and_then(|v| v.as_str()).unwrap_or("?"),
+                        issuer = obj.get("issuer").and_then(|v| v.as_str()).unwrap_or("?"),
+                        value = obj.get("value").and_then(|v| v.as_str()).unwrap_or("?"),
+                        "issued-currency payment to escrow — not credited (native XRP only)"
+                    );
+                    continue;
+                }
+                // Native XRP in drops (string or number), converted with integer arithmetic only.
+                let drops: u64 = if let Some(drops_str) = amount.as_str() {
+                    match drops_str.parse() {
                         Ok(d) => d,
                         Err(_) => continue,
-                    };
-                    let xrp = drops as f64 / 1_000_000.0;
-                    format!("{xrp:.8}")
+                    }
                 } else if let Some(drops_num) = amount.as_u64() {
-                    // Native XRP: amount in drops as number
-                    let xrp = drops_num as f64 / 1_000_000.0;
-                    format!("{xrp:.8}")
+                    drops_num
                 } else {
                     continue;
                 };
+                let value = drops_to_xrp_8dp(drops);
 
                 // Parse amount directly as string to avoid f64 precision loss
                 // XRPL amounts are already decimal strings like "100.50"
@@ -299,18 +302,12 @@ impl XrplMonitor {
                 // is the fail-safe direction).
                 let deposit_ledger = tx["ledger_index"].as_u64().unwrap_or(0);
 
-                // #131 AC-R1 (option-A) asset routing: native XRP (drops) is a scalar;
-                // issued currency (RLUSD) is an object. Route XRP → xrp_balance so the
-                // liability's asset matches the XRP escrow custody.
-                let is_xrp = !amount.is_object();
-
                 deposits.push(DepositEvent {
                     sender,
                     amount: fp8_amount,
                     tx_hash: tx_hash[..64.min(tx_hash.len())].to_string(),
                     destination_tag,
                     ledger_index: deposit_ledger,
-                    is_xrp,
                 });
             }
 
@@ -421,7 +418,6 @@ mod tests {
         assert_eq!(deposits.len(), 2, "both page-2 deposits must be credited");
         assert_eq!(deposits[0].sender, "rAlice");
         assert_eq!(deposits[0].ledger_index, 100);
-        assert!(deposits[0].is_xrp);
         assert_eq!(deposits[0].amount, "1.00000000");
         assert_eq!(deposits[1].sender, "rBob");
         assert_eq!(deposits[1].ledger_index, 101);
@@ -485,6 +481,89 @@ mod tests {
         assert_eq!(deposits.len(), 1);
         assert_eq!(deposits[0].sender, "rAlice");
         assert_eq!(new_ledger, 100);
+    }
+
+    /// An issued-currency Payment to the escrow (any currency, any issuer).
+    fn iou_payment(
+        sender: &str,
+        currency: &str,
+        issuer: &str,
+        value: &str,
+        ledger: u64,
+        hash: &str,
+    ) -> Value {
+        let amt = json!({ "currency": currency, "issuer": issuer, "value": value });
+        json!({
+            "tx": {
+                "TransactionType": "Payment",
+                "Account": sender,
+                "Destination": ESCROW,
+                "Amount": amt,
+                "hash": hash,
+                "ledger_index": ledger,
+            },
+            "meta": { "TransactionResult": "tesSUCCESS", "delivered_amount": amt },
+        })
+    }
+
+    // The escrow takes native XRP only: a token payment is never yielded as a deposit, whatever
+    // it claims to be, and it does not stall the scan.
+    #[test]
+    fn issued_currency_payment_is_not_a_deposit_but_advances_high_water() {
+        let m = monitor();
+        let pages = vec![page(
+            vec![
+                iou_payment("rMallory", "USD", "rFakeIssuer", "1000000", 100, "H1"),
+                iou_payment(
+                    "rMallory",
+                    "524C555344000000000000000000000000000000",
+                    "rAnyone",
+                    "5",
+                    101,
+                    "H2",
+                ),
+                xrp_payment("rAlice", "1000000", 102, "H3"),
+            ],
+            None,
+        )];
+        let (deposits, new_ledger) = m.scan_pages(99, &pages);
+        assert_eq!(
+            deposits.len(),
+            1,
+            "only the native-XRP payment is a deposit"
+        );
+        assert_eq!(deposits[0].sender, "rAlice");
+        assert_eq!(
+            new_ledger, 102,
+            "the skipped token payments still advance the high-water"
+        );
+    }
+
+    // Drops → XRP is exact: no f64 on the way (f64 drops whole drops above 2^53).
+    #[test]
+    fn drops_convert_exactly() {
+        assert_eq!(drops_to_xrp_8dp(0), "0.00000000");
+        assert_eq!(drops_to_xrp_8dp(1), "0.00000100");
+        assert_eq!(drops_to_xrp_8dp(1_000_000), "1.00000000");
+        assert_eq!(drops_to_xrp_8dp(123_456_789), "123.45678900");
+        assert_eq!(
+            drops_to_xrp_8dp(9_007_199_254_740_993),
+            "9007199254.74099300"
+        );
+        assert_eq!(
+            drops_to_xrp_8dp(100_000_000_000_000_001),
+            "100000000000.00000100"
+        );
+        let m = monitor();
+        let pages = vec![page(
+            vec![xrp_payment("rWhale", "9007199254740993", 100, "H1")],
+            None,
+        )];
+        let (deposits, _) = m.scan_pages(99, &pages);
+        assert_eq!(
+            deposits[0].amount, "9007199254.74099300",
+            "the scan path uses it too"
+        );
     }
 
     // No pages fetched at all (page-0 RPC error) ⇒ no deposits, high-water unchanged.
