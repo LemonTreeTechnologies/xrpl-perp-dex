@@ -153,6 +153,22 @@ pub struct FailedNode {
     pub error: Option<String>,
 }
 
+/// True when nothing was applied and every NAMED node gave a definitive enclave refusal
+/// (a refused descriptor, or a no-op the enclave reports as unretryable). Then "retry" is the
+/// wrong advice: the same request is refused again. A node that merely did not answer is not
+/// a refusal, so any timeout keeps the outcome a retryable partial apply. The aggregate
+/// shortfall row (`<cluster>`) names no node and is ignored.
+fn is_refused_everywhere(results: &[NodeSealResult]) -> bool {
+    let named: Vec<&NodeSealResult> = results.iter().filter(|r| r.node != "<cluster>").collect();
+    !named.is_empty()
+        && named.iter().all(|r| {
+            !r.ok
+                && r.error.as_deref().is_some_and(|e| {
+                    e.contains("the enclave refused:") || e.contains("A RETRY CANNOT SUCCEED")
+                })
+        })
+}
+
 fn failed_seal_nodes(results: &[NodeSealResult]) -> Vec<FailedNode> {
     results
         .iter()
@@ -614,9 +630,12 @@ async fn drive_govern(
     .await?;
 
     let applied = outcome.node_results.iter().filter(|r| r.ok).count();
+    let refused = is_refused_everywhere(&outcome.node_results);
     Ok(MrenclaveGovernResponse {
         status: if outcome.all_applied() {
             "ok"
+        } else if refused {
+            "refused"
         } else {
             "partial_apply"
         }
@@ -633,6 +652,14 @@ async fn drive_govern(
                 outcome.op,
                 hex::encode(outcome.mrenclave),
                 applied
+            )
+        } else if refused {
+            format!(
+                "op {} on 0x{} REFUSED by the enclave on every node; nothing was applied. A retry \
+                 of the same request is refused again — read failed_nodes, re-read \
+                 mrenclaves/status, and re-sign.",
+                outcome.op,
+                hex::encode(outcome.mrenclave)
             )
         } else {
             format!(
@@ -1310,6 +1337,49 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].node, "node-2");
         assert_eq!(failed[0].error.as_deref(), Some("ERR_SEAL_REFUSED"));
+    }
+
+    /// Live 2026-11-10: a replayed descriptor was refused -19 on all 3 nodes, and the
+    /// response said "partial_apply … retry". A retry is refused again; say so.
+    #[test]
+    fn a_refusal_on_every_node_is_refused_not_retry() {
+        let refusal =
+            "apply: the enclave refused: the governance descriptor is not authorized (code=-19).";
+        let results = [
+            seal("node-1", false, Some(refusal)),
+            seal("node-2", false, Some(refusal)),
+            seal("node-3", false, Some(refusal)),
+            seal(
+                "<cluster>",
+                false,
+                Some("only 0 of 3 nodes acked within 45s; retry the change"),
+            ),
+        ];
+        assert!(is_refused_everywhere(&results));
+    }
+
+    #[test]
+    fn a_timeout_anywhere_keeps_it_a_retryable_partial_apply() {
+        let refusal = "apply: the enclave refused: (code=-19)";
+        let results = [
+            seal("node-1", false, Some(refusal)),
+            seal("node-2", false, None),
+            seal("node-3", false, Some("connection reset")),
+        ];
+        assert!(!is_refused_everywhere(&results));
+        assert!(!is_refused_everywhere(&[
+            seal("node-1", true, None),
+            seal("node-2", false, Some(refusal))
+        ]));
+        assert!(
+            !is_refused_everywhere(&[seal("<cluster>", false, Some(refusal))]),
+            "no named node, no verdict"
+        );
+        assert!(is_refused_everywhere(&[seal(
+            "node-1",
+            false,
+            Some("NO-OP … A RETRY CANNOT SUCCEED - it returns code=-3")
+        )]));
     }
 
     #[test]
