@@ -40,7 +40,7 @@ use tracing::{info, warn};
 /// validated transaction and build a proof, plus operator diagnostics. None of them is ever
 /// asserted to the enclave — every money figure the enclave uses it re-derives from the
 /// proof bytes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingWithdrawal {
     /// escrow r-address (the Payment's `Account`).
     pub escrow: String,
@@ -66,6 +66,23 @@ pub struct PendingWithdrawal {
     pub user_id: String,
     /// unix ms when the withdrawal was reserved — for staleness ordering and operator view.
     pub reserved_at_ms: u64,
+    /// Follower reserve (2026-11-10): EVERY signer reserves EVERY withdrawal, so all enclaves
+    /// hold the same balances. These are the
+    /// signers (by `SignerConfig::name`) still owed this co-sign request; the delivery loop
+    /// sends it to each, per signer strictly in Sequence order. Empty = every node has it.
+    #[serde(default)]
+    pub undelivered: Vec<String>,
+    /// The unsigned Payment (`tx_json`) and the fp8 claim, so the request can be re-sent
+    /// verbatim to a signer that missed it — before or after it landed (its signature is then
+    /// useless and harmless; what matters is that its enclave reserves and settles the row).
+    #[serde(default)]
+    pub tx_json: Option<serde_json::Value>,
+    #[serde(default)]
+    pub amount_fp8: u64,
+    /// This node's enclave settled the row (finalized / rolled back) but some signer is still
+    /// owed the request: the entry stays for delivery only and is not reconciled again.
+    #[serde(default)]
+    pub settled: bool,
 }
 
 /// The durable journal: the set of in-flight reserved withdrawals for this node.
@@ -658,22 +675,79 @@ impl JournalHandle {
         });
     }
 
-    /// Drop a now-reconciled entry and persist.
-    pub fn resolve(&self, escrow: &str, sequence: u32) {
-        self.with_journal(|j| {
-            if j.remove(escrow, sequence) {
-                if let Err(err) = j.save(&self.path) {
-                    warn!(error = %format!("{err:#}"),
-                        "withdrawal reconcile journal: persist after resolve failed");
-                }
-            }
-        });
-    }
-
     /// A snapshot of the in-flight entries to iterate without holding the lock across awaits.
     pub fn snapshot(&self) -> Vec<PendingWithdrawal> {
         self.with_journal(|j| j.entries.clone())
     }
+
+    /// This node's enclave settled the row. Drop the entry if every signer has the request;
+    /// otherwise keep it, marked settled, for the delivery loop only.
+    pub fn settle(&self, escrow: &str, sequence: u32) {
+        self.with_journal(|j| {
+            let keep = j
+                .entries
+                .iter_mut()
+                .find(|x| x.escrow == escrow && x.sequence == sequence)
+                .map(|e| {
+                    e.settled = true;
+                    !e.undelivered.is_empty()
+                })
+                .unwrap_or(false);
+            if !keep {
+                j.remove(escrow, sequence);
+            }
+            if let Err(err) = j.save(&self.path) {
+                warn!(error = %format!("{err:#}"),
+                    "withdrawal reconcile journal: persist after settle failed");
+            }
+        });
+    }
+
+    /// `signer` now holds the request at (escrow, sequence). Drops the entry once it is both
+    /// settled here and delivered everywhere.
+    pub fn delivered(&self, escrow: &str, sequence: u32, signer: &str) {
+        self.with_journal(|j| {
+            let mut drop = false;
+            if let Some(e) = j
+                .entries
+                .iter_mut()
+                .find(|x| x.escrow == escrow && x.sequence == sequence)
+            {
+                e.undelivered.retain(|s| s != signer);
+                drop = e.settled && e.undelivered.is_empty();
+            }
+            if drop {
+                j.remove(escrow, sequence);
+            }
+            if let Err(err) = j.save(&self.path) {
+                warn!(error = %format!("{err:#}"),
+                    "withdrawal reconcile journal: persist after delivery failed");
+            }
+        });
+    }
+}
+
+/// Strict per-signer order (auditor ruling 2026-11-10): a signer that has NOT yet received an
+/// earlier withdrawal must not be sent a later one, or its enclave's monotonic high-water
+/// would refuse the earlier one forever (-59). True when `signer` is owed some request at a
+/// Sequence other than `except_sequence`.
+pub fn signer_owed_earlier(
+    entries: &[PendingWithdrawal],
+    signer: &str,
+    except_sequence: u32,
+) -> bool {
+    entries
+        .iter()
+        .any(|e| e.sequence != except_sequence && e.undelivered.iter().any(|s| s == signer))
+}
+
+/// The next request owed to `signer`: the LOWEST Sequence it is still missing.
+pub fn next_owed(entries: &[PendingWithdrawal], signer: &str) -> Option<PendingWithdrawal> {
+    entries
+        .iter()
+        .filter(|e| e.undelivered.iter().any(|s| s == signer))
+        .min_by_key(|e| e.sequence)
+        .cloned()
 }
 
 /// Config for the background reconcile loop + boot sweep.
@@ -770,7 +844,27 @@ pub async fn reconcile_sweep(
     buffer: &Arc<Mutex<ValidationBuffer>>,
 ) -> SweepSummary {
     let mut summary = SweepSummary::default();
-    for row in journal.snapshot() {
+    let journal_rows = journal.snapshot();
+    // Follower reserve: this node's ENCLAVE is the arbiter of what it holds in flight. Rows it
+    // reserved as a CO-SIGNER were never written to this node's journal (only the node that
+    // took the request writes one), so they are settled from the enclave's own listing. An
+    // enclave that predates the listing returns None: journal-only, exactly as before.
+    let enclave_only: Vec<PendingWithdrawal> = match perp.list_pending_withdrawals().await {
+        Ok(Some(p)) => {
+            enclave_rows_missing_from_journal(&p.rows, &journal_rows, &cfg.rb_fetch.escrow_account)
+        }
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), "GAP B reconcile: enclave pending listing failed — journal rows only this pass");
+            Vec::new()
+        }
+    };
+    let todo = journal_rows
+        .into_iter()
+        .filter(|r| !r.settled)
+        .map(|r| (r, true))
+        .chain(enclave_only.into_iter().map(|r| (r, false)));
+    for (row, in_journal) in todo {
         let outcome =
             reconcile_one(&row, perp, http, &cfg.xrpl_http_url, buffer, &cfg.rb_fetch).await;
         match &outcome {
@@ -790,11 +884,39 @@ pub async fn reconcile_sweep(
                     "GAP B reconcile: ANOMALY (left in journal for an operator)");
             }
         }
-        if outcome.is_terminal() {
-            journal.resolve(&row.escrow, row.sequence);
+        if outcome.is_terminal() && in_journal {
+            // Settled HERE; kept only if some signer is still owed the request.
+            journal.settle(&row.escrow, row.sequence);
         }
     }
     summary
+}
+
+/// Enclave rows this node holds that its journal does not know (a co-signer's rows), as
+/// reconcile entries. Only S and L drive the reconcile; the rest is diagnostics, and the
+/// enclave re-derives every figure it acts on from the proof.
+pub fn enclave_rows_missing_from_journal(
+    rows: &[crate::perp_client::EnclavePendingRow],
+    journal: &[PendingWithdrawal],
+    escrow: &str,
+) -> Vec<PendingWithdrawal> {
+    rows.iter()
+        .filter(|r| {
+            !journal
+                .iter()
+                .any(|j| j.escrow == escrow && j.sequence == r.sequence && !j.settled)
+        })
+        .map(|r| PendingWithdrawal {
+            escrow: escrow.to_string(),
+            sequence: r.sequence,
+            last_ledger_sequence: r.last_ledger_sequence,
+            amount_drops: r.amount_drops,
+            destination: r.destination_hex.clone(),
+            destination_tag: r.destination_tag,
+            user_id: r.user_id.clone(),
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// The long-running reconcile loop: a boot sweep immediately, then one sweep per interval.
@@ -841,6 +963,7 @@ mod tests {
             submitted_hash: Some("ABCD".to_string()),
             user_id: "user-1".to_string(),
             reserved_at_ms: 1_700_000_000_000,
+            ..Default::default()
         }
     }
 
@@ -1038,5 +1161,130 @@ mod tests {
                 "unmapped rc {rc} must default to anomaly"
             );
         }
+    }
+
+    // ── Follower reserve: delivery bookkeeping ─────────────────────────────
+
+    fn owed(seq: u32, signers: &[&str], settled: bool) -> PendingWithdrawal {
+        PendingWithdrawal {
+            escrow: "rEsc".into(),
+            sequence: seq,
+            undelivered: signers.iter().map(|s| s.to_string()).collect(),
+            settled,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn strict_order_a_signer_owed_an_earlier_request_is_not_asked_a_later_one() {
+        let j = vec![owed(100, &["node-3"], false), owed(101, &[], false)];
+        assert!(
+            signer_owed_earlier(&j, "node-3", 102),
+            "node-3 still owes 100 — 102 must queue behind it"
+        );
+        assert!(!signer_owed_earlier(&j, "node-2", 102));
+        assert!(
+            !signer_owed_earlier(&j, "node-3", 100),
+            "its own entry is not 'earlier'"
+        );
+    }
+
+    #[test]
+    fn next_owed_is_the_lowest_sequence_for_that_signer() {
+        let j = vec![
+            owed(105, &["node-3"], false),
+            owed(101, &["node-3", "node-2"], true),
+            owed(103, &["node-2"], false),
+        ];
+        assert_eq!(next_owed(&j, "node-3").map(|e| e.sequence), Some(101));
+        assert_eq!(next_owed(&j, "node-2").map(|e| e.sequence), Some(101));
+        assert_eq!(next_owed(&j, "node-1"), None);
+    }
+
+    fn tmp_journal(name: &str) -> (JournalHandle, std::path::PathBuf) {
+        let p = std::env::temp_dir().join(format!("wd-journal-{name}-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        (JournalHandle::open(&p).unwrap(), p)
+    }
+
+    #[test]
+    fn settled_entry_is_kept_until_every_signer_has_it() {
+        let (j, p) = tmp_journal("settle");
+        j.record(owed(100, &["node-3"], false));
+        j.settle("rEsc", 100);
+        let s = j.snapshot();
+        assert_eq!(
+            s.len(),
+            1,
+            "settled here but node-3 is still owed it — kept"
+        );
+        assert!(s[0].settled);
+        j.delivered("rEsc", 100, "node-3");
+        assert!(
+            j.snapshot().is_empty(),
+            "settled AND delivered everywhere — dropped"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn delivered_before_settled_keeps_it_for_reconcile() {
+        let (j, p) = tmp_journal("deliver");
+        j.record(owed(100, &["node-3"], false));
+        j.delivered("rEsc", 100, "node-3");
+        let s = j.snapshot();
+        assert_eq!(
+            s.len(),
+            1,
+            "everyone has it but this node has not settled it yet"
+        );
+        assert!(s[0].undelivered.is_empty() && !s[0].settled);
+        j.settle("rEsc", 100);
+        assert!(j.snapshot().is_empty());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_fully_delivered_entry_settles_away_immediately() {
+        let (j, p) = tmp_journal("plain");
+        j.record(owed(100, &[], false));
+        j.settle("rEsc", 100);
+        assert!(
+            j.snapshot().is_empty(),
+            "nobody owed — settled = gone, as before"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn journal_with_the_old_shape_still_loads() {
+        let old = r#"{"entries":[{"escrow":"rEsc","sequence":7,"last_ledger_sequence":9,"amount_drops":1,
+            "destination":"rD","destination_tag":null,"submitted_hash":null,"user_id":"u","reserved_at_ms":0}]}"#;
+        let j: Journal = serde_json::from_str(old).unwrap();
+        assert_eq!(j.entries[0].sequence, 7);
+        assert!(
+            j.entries[0].undelivered.is_empty()
+                && !j.entries[0].settled
+                && j.entries[0].tx_json.is_none()
+        );
+    }
+
+    #[test]
+    fn enclave_rows_unknown_to_the_journal_are_reconciled_too() {
+        let row = |s: u32| crate::perp_client::EnclavePendingRow {
+            sequence: s,
+            last_ledger_sequence: s + 20,
+            amount_drops: 5,
+            destination_hex: "aa".into(),
+            destination_tag: None,
+            user_id: "u".into(),
+        };
+        let journal = vec![owed(100, &[], false), owed(101, &[], true)];
+        let got =
+            enclave_rows_missing_from_journal(&[row(100), row(101), row(102)], &journal, "rEsc");
+        let seqs: Vec<u32> = got.iter().map(|e| e.sequence).collect();
+        assert_eq!(seqs, vec![101, 102], "100 is reconciled from the journal; a settled journal entry or an unknown row comes from the enclave");
+        assert_eq!(got[1].last_ledger_sequence, 122);
+        assert_eq!(got[1].escrow, "rEsc");
     }
 }

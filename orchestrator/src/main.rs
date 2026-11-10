@@ -67,6 +67,7 @@ mod upgrade_corpus;
 mod validator_manifests; // AC-BASE-2″ §6 — feed the enclave's measured-anchor validator root
 mod vault_mm;
 mod withdrawal;
+mod withdrawal_catchup; // follower reserve — failover caught-up rule
 mod withdrawal_reconcile; // GAP B — reserve→finalize/rollback journal + reconcile driver
 mod ws;
 mod xrpl_monitor;
@@ -2585,6 +2586,27 @@ async fn main() -> Result<()> {
         role_tx,
         leader_tx,
     );
+    // Follower reserve failover rule (auditor 2026-11-10): with the withdrawal reconcile on,
+    // this node may lead only while its enclave holds every withdrawal that has landed.
+    // Starts NOT caught up (fail-closed) until the first check; lifted only for an enclave
+    // that predates the pending listing.
+    if withdrawal_journal.is_some() {
+        let (caught_tx, caught_rx) = tokio::sync::watch::channel(false);
+        let xrpl_http =
+            attested_clock::split_urls("XRPL_RPC_URL", &["https://s.altnet.rippletest.net:51234"])
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "https://s.altnet.rippletest.net:51234".to_string());
+        tokio::spawn(withdrawal_catchup::run_caught_up_check(
+            perp.clone(),
+            xrpl_http,
+            escrow_address.clone(),
+            caught_tx,
+            15,
+        ));
+        election_state = election_state.with_caught_up_gate(caught_rx);
+        info!("withdrawal catch-up gate ENABLED — leadership requires every landed withdrawal");
+    }
     let _election_handle = tokio::spawn(async move {
         election_state.run().await;
     });
@@ -3064,6 +3086,16 @@ async fn main() -> Result<()> {
             info!(
                 "withdrawal-reconcile ENABLED — reserve->finalize/rollback driver + boot sweep (per-node)"
             );
+        }
+        // Follower reserve: deliver every withdrawal to every signer, strictly in Sequence
+        // order per signer, so each enclave reserves (and later settles) it.
+        if let (Some(journal), Some(signers), Some(stx)) = (
+            withdrawal_journal.clone(),
+            app_state.signers_config.clone(),
+            app_state.signing_tx.clone(),
+        ) {
+            tokio::spawn(withdrawal::run_delivery_loop(signers, stx, journal, 10));
+            info!("withdrawal delivery ENABLED — every signer receives every withdrawal, in order");
         }
         // THE ONE WAY THE STALE-PIN BRICK RETURNS (audit 2026-10-06). The clock is
         // OFF-by-default and unl-refresh is ON-by-default, so the dangerous configuration is

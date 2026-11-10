@@ -407,6 +407,31 @@ impl PerpClient {
         self.get(&format!("/perp/balance?user_id={user_id}")).await
     }
 
+    /// Follower reserve: this node's enclave's in-flight withdrawal rows (all pages) and its
+    /// withdrawal high-water. `Ok(None)` when the enclave predates the route (404) — the
+    /// caller then falls back to the host journal alone, as before.
+    pub async fn list_pending_withdrawals(&self) -> Result<Option<EnclavePending>> {
+        let mut out = EnclavePending::default();
+        let mut offset: u32 = 0;
+        loop {
+            let url = format!("{}/perp/withdraw/pending?offset={offset}", self.base_url);
+            let resp = self.client.get(&url).send().await?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            let v: Value = resp.error_for_status()?.json().await?;
+            let page: EnclavePendingPage = serde_json::from_value(v["data"].clone())
+                .context("parsing /perp/withdraw/pending")?;
+            out.high_water = page.high_water;
+            let got = page.returned;
+            out.rows.extend(page.rows);
+            offset = offset.saturating_add(got);
+            if got == 0 || offset >= page.total {
+                return Ok(Some(out));
+            }
+        }
+    }
+
     // ── Position management ─────────────────────────────────────
 
     /// Open long/short position with margin check.
@@ -553,6 +578,33 @@ impl PerpClient {
             .await?;
         Ok(resp)
     }
+}
+
+/// One page of `GET /v1/perp/withdraw/pending` (the enclave's own rows; settlement is by proof).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct EnclavePendingPage {
+    pub total: u32,
+    #[serde(default)]
+    pub high_water: u32,
+    pub returned: u32,
+    pub rows: Vec<EnclavePendingRow>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct EnclavePendingRow {
+    pub sequence: u32,
+    pub last_ledger_sequence: u32,
+    pub amount_drops: u64,
+    pub destination_hex: String,
+    pub destination_tag: Option<u32>,
+    pub user_id: String,
+}
+
+/// Every in-flight row this node's enclave holds, plus its withdrawal high-water.
+#[derive(Debug, Clone, Default)]
+pub struct EnclavePending {
+    pub high_water: u32,
+    pub rows: Vec<EnclavePendingRow>,
 }
 
 #[cfg(test)]
