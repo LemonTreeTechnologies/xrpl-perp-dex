@@ -61,7 +61,8 @@ check "β16" "PerpMetaLegacyB16" "PERP_META_B16_LEN"
 check "β17" "PerpMetaLegacyB17" "PERP_META_B17_LEN"
 check "β18" "PerpMetaLegacyB18" "PERP_META_B18_LEN"
 check "gapb(β19)" "PerpMetaLegacyGapB" "PERP_META_B19_LEN"
-check "β20" "PerpMeta"    "PERP_META_B20_LEN"
+check "β20" "PerpMetaLegacyB20" "PERP_META_B20_LEN"
+check "β21" "PerpMeta"    "PERP_META_B21_LEN"
 
 
 # ── The CAPACITY limits, same reasoning one axis over ────────────────────────

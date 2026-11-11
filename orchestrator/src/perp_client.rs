@@ -517,27 +517,44 @@ impl PerpClient {
     }
 
     /// Force-close undercollateralized position.
-    pub async fn liquidate(&self, position_id: u64, close_price: &str) -> Result<Value> {
+    /// F-2: name the position; the enclave settles at its own signed mark (no host price).
+    pub async fn liquidate(&self, position_id: u64) -> Result<Value> {
         self.post(
             "/perp/liquidate",
-            serde_json::json!({
-                "position_id": position_id,
-                "close_price": close_price,
-            }),
+            serde_json::json!({ "position_id": position_id }),
         )
         .await
+    }
+
+    /// F-2/F-3: the enclave's own pricing state — mark, index, freshness, the fill band it
+    /// enforces and the funding clock. The fill pre-check uses THIS band, never a local copy.
+    pub async fn price_status(&self) -> Result<Value> {
+        self.get("/perp/price/status").await
     }
 
     // ── Funding ─────────────────────────────────────────────────
 
     /// Apply funding rate to all open positions.
-    pub async fn apply_funding(&self, funding_rate: &str, timestamp: u64) -> Result<Value> {
+    /// F-3: a trigger. The enclave decides whether an interval is due and the rate; the response
+    /// is `status: success` (applied, with `funding_rate` + `payments`) or `status: armed` (the
+    /// funding clock was started). Not due yet = an error carrying `rc=-121`.
+    pub async fn apply_funding(&self) -> Result<Value> {
+        self.post("/perp/funding/apply", serde_json::json!({}))
+            .await
+    }
+
+    /// F-3-R: a follower applies the leader's funding interval. The enclave re-bounds the rate by
+    /// its own clamp, checks `interval_start` against its own funding clock and due-ness on its own
+    /// attested time; payments use its own mark. `already_applied` is a no-op; rc -121 / -95 are
+    /// retryable; rc -122 / -123 / -124 are divergence alarms.
+    pub async fn apply_funding_replica(
+        &self,
+        interval_start: u64,
+        funding_rate: &str,
+    ) -> Result<Value> {
         self.post(
-            "/perp/funding/apply",
-            serde_json::json!({
-                "funding_rate": funding_rate,
-                "timestamp": timestamp,
-            }),
+            "/perp/funding/replica",
+            serde_json::json!({ "interval_start": interval_start, "funding_rate": funding_rate }),
         )
         .await
     }

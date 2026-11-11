@@ -147,6 +147,26 @@ pub struct OrderBook {
     /// same time-dependent state as the sequencer. Set under the book lock immediately
     /// before `submit_order` via `set_attested_ms`; 0 means "not fed" and matching pauses.
     attested_ms: u64,
+
+    /// F-2 (Q3): the fill band the ENCLAVE enforces, as an inclusive price range [lo, hi] in raw
+    /// FP8, set under the book lock before `submit_order` from the enclave's own mark and band
+    /// (`/v1/perp/price/status`). Matching never crosses a maker priced outside it, so the book
+    /// does not execute a fill the enclave would refuse. None = no mark yet (the enclave admits).
+    fill_band: Option<(i64, i64)>,
+}
+
+/// The inclusive [lo, hi] price range for ±`band_bp` basis points around `mark` (raw FP8), with
+/// the edges rounded INWARD so every price in it also passes the enclave's
+/// |price − mark|·10000 ≤ mark·band_bp test. None if mark ≤ 0 or band_bp < 0.
+pub fn fill_band_range(mark: i64, band_bp: i64) -> Option<(i64, i64)> {
+    if mark <= 0 || band_bp < 0 {
+        return None;
+    }
+    let m = mark as i128;
+    let d = m * band_bp as i128 / 10_000; // floor: |p − m| ≤ d  ⇔  |p − m|·10000 ≤ m·bp (integers)
+    let lo = (m - d).max(1);
+    let hi = m + d;
+    Some((lo as i64, i64::try_from(hi).unwrap_or(i64::MAX)))
 }
 
 impl OrderBook {
@@ -161,7 +181,13 @@ impl OrderBook {
             max_recent_trades: 1000,
             stp_rate: crate::rate_limit::RateLimiter::new(std::time::Duration::from_secs(60), 30),
             attested_ms: 0,
+            fill_band: None,
         }
+    }
+
+    /// F-2 (Q3): set the enclave's fill band for the next `submit_order` (see `fill_band`).
+    pub fn set_fill_band(&mut self, band: Option<(i64, i64)>) {
+        self.fill_band = band;
     }
 
     /// part-2 Q3: feed the enclave's ATTESTED close-time (unix ms) that the next
@@ -554,6 +580,7 @@ impl OrderBook {
         // current state and the amount that was cancelled.
         let mut stp_cancelled: Vec<(Order, i64)> = Vec::new();
 
+        let band = self.fill_band;
         let opposite_book = match taker.side {
             Side::Long => &mut self.asks,  // buyer matches against asks
             Side::Short => &mut self.bids, // seller matches against bids
@@ -569,6 +596,10 @@ impl OrderBook {
                     .take_while(|&ask_price| {
                         taker.order_type == OrderType::Market || ask_price <= taker.price.0
                     })
+                    // F-2: asks ascend, so the first one above the band ends the walk
+                    .take_while(|&ask_price| {
+                        band.is_none_or(|(lo, hi)| ask_price >= lo && ask_price <= hi)
+                    })
                     .collect()
             }
             Side::Short => {
@@ -579,6 +610,10 @@ impl OrderBook {
                     .copied()
                     .take_while(|&bid_price| {
                         taker.order_type == OrderType::Market || bid_price >= taker.price.0
+                    })
+                    // F-2: bids descend, so the first one below the band ends the walk
+                    .take_while(|&bid_price| {
+                        band.is_none_or(|(lo, hi)| bid_price >= lo && bid_price <= hi)
                     })
                     .collect()
             }
@@ -688,6 +723,131 @@ impl OrderBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-2 (Q3) parity: the range the book matches within must equal the set of prices the
+    /// enclave admits, |p − m|·10000 ≤ m·bp — checked exhaustively around both edges.
+    #[test]
+    fn fill_band_range_matches_the_enclave_test_exactly() {
+        let enclave_admits = |p: i64, m: i64, bp: i64| -> bool {
+            let d = (p as i128 - m as i128).abs();
+            d * 10_000 <= m as i128 * bp as i128
+        };
+        for &(m, bp) in &[
+            (100_00000000i64, 200i64),
+            (55_000_000, 200),
+            (1, 200),
+            (12_345_679, 137),
+            (99_999_999, 1),
+        ] {
+            let (lo, hi) = fill_band_range(m, bp).unwrap();
+            for p in [lo - 2, lo - 1, lo, lo + 1, hi - 1, hi, hi + 1, hi + 2] {
+                if p <= 0 {
+                    continue;
+                }
+                let in_book = p >= lo && p <= hi;
+                assert_eq!(
+                    in_book,
+                    enclave_admits(p, m, bp),
+                    "parity at p={p} m={m} bp={bp}"
+                );
+            }
+        }
+        assert_eq!(fill_band_range(0, 200), None);
+        assert_eq!(fill_band_range(-5, 200), None);
+        assert_eq!(fill_band_range(100, -1), None);
+    }
+
+    /// F-2 (Q3): a market buy walks asks only up to the band's upper edge, a market sell walks
+    /// bids only down to its lower edge; makers outside stay resting, untouched.
+    #[test]
+    fn matching_stops_at_the_enclave_fill_band_on_both_sides() {
+        let mut book = OrderBook::new("XRP-USD-PERP");
+        book.set_attested_ms(1_000);
+        // mark 1.00, ±200 bp → [0.98, 1.02]
+        book.set_fill_band(fill_band_range(100_000_000, 200));
+        for p in [1.01, 1.02, 1.03] {
+            book.submit_order(
+                "mm".into(),
+                Side::Short,
+                OrderType::Limit,
+                FP8::from_f64(p),
+                FP8::from_f64(1.0),
+                1,
+                TimeInForce::Gtc,
+                false,
+                None,
+            )
+            .unwrap();
+        }
+        for p in [0.99, 0.98, 0.97] {
+            book.submit_order(
+                "mm".into(),
+                Side::Long,
+                OrderType::Limit,
+                FP8::from_f64(p),
+                FP8::from_f64(1.0),
+                1,
+                TimeInForce::Gtc,
+                false,
+                None,
+            )
+            .unwrap();
+        }
+        let (_, buys, _) = book
+            .submit_order(
+                "t".into(),
+                Side::Long,
+                OrderType::Market,
+                FP8::ZERO,
+                FP8::from_f64(3.0),
+                1,
+                TimeInForce::Ioc,
+                false,
+                None,
+            )
+            .unwrap();
+        let bought: Vec<i64> = buys.iter().map(|t| t.price.0).collect();
+        assert_eq!(
+            bought,
+            vec![FP8::from_f64(1.01).0, FP8::from_f64(1.02).0],
+            "buy stops at 1.02; the 1.03 ask is out of band"
+        );
+        let (_, sells, _) = book
+            .submit_order(
+                "t".into(),
+                Side::Short,
+                OrderType::Market,
+                FP8::ZERO,
+                FP8::from_f64(3.0),
+                1,
+                TimeInForce::Ioc,
+                false,
+                None,
+            )
+            .unwrap();
+        let sold: Vec<i64> = sells.iter().map(|t| t.price.0).collect();
+        assert_eq!(
+            sold,
+            vec![FP8::from_f64(0.99).0, FP8::from_f64(0.98).0],
+            "sell stops at 0.98; the 0.97 bid is out of band"
+        );
+        // without a band (no mark yet) the same book walks everything that crosses
+        book.set_fill_band(None);
+        let (_, rest, _) = book
+            .submit_order(
+                "t".into(),
+                Side::Long,
+                OrderType::Market,
+                FP8::ZERO,
+                FP8::from_f64(1.0),
+                1,
+                TimeInForce::Ioc,
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(rest.len(), 1, "no band: the 1.03 ask fills");
+    }
 
     fn book() -> OrderBook {
         let mut ob = OrderBook::new("XRP-USD-PERP");
