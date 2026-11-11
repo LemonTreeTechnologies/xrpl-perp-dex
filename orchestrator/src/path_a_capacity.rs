@@ -110,10 +110,13 @@ pub mod limits {
     /// (`withdrawal_sequence_high_water` and `pending_withdrawal_count`). No longer current —
     /// the enclave froze it as `PerpMetaLegacyGapB` (200) and appended 8 more (below).
     pub const PERP_META_B19_LEN: u64 = 200;
-    /// β20 = GAP B + 8 — CURRENT. `pending_row_semantics` (u32) + an explicit u32 pad: the
-    /// rule the in-flight withdrawal rows were reserved under, read by a successor's import.
-    /// The enclave `static_assert(sizeof(PerpMeta) == 208)`; this mirror follows.
+    /// β20 = GAP B + 8. `pending_row_semantics` (u32) + an explicit u32 pad: the rule the
+    /// in-flight withdrawal rows were reserved under. No longer current — frozen by the enclave
+    /// as `PerpMetaLegacyB20` (208) when F-3 appended 24 more bytes (below).
     pub const PERP_META_B20_LEN: u64 = 208;
+    /// β21 = β20 + 24 — CURRENT. F-3: the funding clock + the interval's two fill-VWAP
+    /// accumulators. The enclave `static_assert(sizeof(PerpMeta) == 232)`; this mirror follows.
+    pub const PERP_META_B21_LEN: u64 = 232;
 }
 
 /// One limit check with the numbers behind the verdict.
@@ -220,10 +223,14 @@ pub enum MetaSchema {
     LegacyB18,
     /// == 200: the GAP B (β19) schema. Upgrades in place, zero-filling
     /// `pending_row_semantics` (only a successor's import reads it; the first save writes the
-    /// constant). Migratable — this is the OLD size for a GAP B → β20 migration.
+    /// constant) and the F-3 funding fields. Migratable.
     LegacyB19,
-    /// == 208: the β20 schema. Already current — nothing to upgrade.
-    AlreadyB20,
+    /// == 208: the β20 schema (live 1646a12a). Upgrades in place, zero-filling the F-3 funding
+    /// clock + fill accumulators (funding re-arms on the first trigger). Migratable — the OLD
+    /// size for a β20 → β21 migration.
+    LegacyB20,
+    /// == 232: the β21 schema. Already current — nothing to upgrade.
+    AlreadyB21,
     /// Any other length, an unreadable header, or a size that doesn't reconcile with the
     /// file. The current enclave load HARD-FAILS this (AC-CHUNK3-3) — so promoting a node
     /// in this state would strand it. STOP before the point of no return.
@@ -310,7 +317,8 @@ fn classify_perp_meta(payload_len: Option<u64>) -> MetaSchema {
         Some(limits::PERP_META_B17_LEN) => MetaSchema::LegacyB17,
         Some(limits::PERP_META_B18_LEN) => MetaSchema::LegacyB18,
         Some(limits::PERP_META_B19_LEN) => MetaSchema::LegacyB19,
-        Some(limits::PERP_META_B20_LEN) => MetaSchema::AlreadyB20,
+        Some(limits::PERP_META_B20_LEN) => MetaSchema::LegacyB20,
+        Some(limits::PERP_META_B21_LEN) => MetaSchema::AlreadyB21,
         _ => MetaSchema::Unknown,
     }
 }
@@ -479,7 +487,8 @@ pub fn render(report: &CapacityReport) -> String {
                 MetaSchema::LegacyB17 => "β17 (184B) → upgrades to β18 (192B): zero-fills save_seq, so the first β18 save writes 1 and stamps every sealed section; the torn-set check is disarmed until then because no section carries a stamp",
                 MetaSchema::LegacyB18 => "β18 (192B) → upgrades to GAP B (200B): zero-fills withdrawal_sequence_high_water + pending_withdrawal_count (the high-water starts at 0, correct for a cluster with no reserved withdrawals in flight)",
                 MetaSchema::LegacyB19 => "GAP B (200B) → upgrades to β20 (208B): zero-fills pending_row_semantics; the first save writes the current rule",
-                MetaSchema::AlreadyB20 => "β20 (208B) → already current schema (no-op)",
+                MetaSchema::LegacyB20 => "β20 (208B) → upgrades to β21 (232B): zero-fills the F-3 funding clock + fill accumulators; funding re-arms on the first trigger",
+                MetaSchema::AlreadyB21 => "β21 (232B) → already current schema (no-op)",
                 MetaSchema::Unknown => {
                     "UNKNOWN size → NON-migratable — current load HARD-FAILS (STOP)"
                 }
@@ -699,6 +708,7 @@ mod tests {
         assert_eq!(limits::PERP_META_B18_LEN, 192);
         assert_eq!(limits::PERP_META_B19_LEN, 200);
         assert_eq!(limits::PERP_META_B20_LEN, 208);
+        assert_eq!(limits::PERP_META_B21_LEN, 232);
         // Each bump appends whole u64 fields, so the sizes must be strictly increasing and
         // 8-aligned. A new entry that breaks either is a transcription error, not a schema.
         let all = [
@@ -714,6 +724,7 @@ mod tests {
             limits::PERP_META_B18_LEN,
             limits::PERP_META_B19_LEN,
             limits::PERP_META_B20_LEN,
+            limits::PERP_META_B21_LEN,
         ];
         for w in all.windows(2) {
             assert!(
@@ -772,14 +783,27 @@ mod tests {
     }
 
     #[test]
-    fn perp_meta_already_b20_is_the_no_op() {
+    fn perp_meta_already_b21_is_the_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        write_sealed_meta(d, "s0_perp_meta.sealed", limits::PERP_META_B21_LEN);
+        let r = assess_accounts_dir(d).unwrap();
+        assert!(r.ok(), "β21 meta must pass: {}", render(&r));
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB21);
+        assert!(render(&r).contains("no-op"));
+    }
+
+    /// The LIVE cluster's meta since 1646a12a (β20, 208B) is the OLD side of the F-3
+    /// migration: migratable, not current and not unknown.
+    #[test]
+    fn perp_meta_b20_is_migratable_to_b21() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         write_sealed_meta(d, "s0_perp_meta.sealed", limits::PERP_META_B20_LEN);
         let r = assess_accounts_dir(d).unwrap();
-        assert!(r.ok(), "β20 meta must pass: {}", render(&r));
-        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB20);
-        assert!(render(&r).contains("no-op"));
+        assert!(r.ok(), "β20 meta must be migratable: {}", render(&r));
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::LegacyB20);
+        assert!(render(&r).contains("upgrades to β21"));
     }
 
     /// The LIVE cluster's meta (GAP B, 200B) is the OLD side of the next migration: it must
@@ -831,15 +855,15 @@ mod tests {
         assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::LegacyB19);
     }
 
-    /// The current schema, stamped: plaintext 208 + 16 AAD = 224 payload → AlreadyB20.
+    /// The current schema, stamped: plaintext 232 + 16 AAD = 248 payload → AlreadyB21.
     #[test]
-    fn perp_meta_stamped_b20_current_is_the_no_op() {
+    fn perp_meta_stamped_b21_current_is_the_no_op() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
-        write_sealed_meta_aad(d, "s0_perp_meta.sealed", limits::PERP_META_B20_LEN, 16);
+        write_sealed_meta_aad(d, "s0_perp_meta.sealed", limits::PERP_META_B21_LEN, 16);
         let r = assess_accounts_dir(d).unwrap();
-        assert!(r.ok(), "a stamped β20 meta must pass: {}", render(&r));
-        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB20);
+        assert!(r.ok(), "a stamped β21 meta must pass: {}", render(&r));
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB21);
     }
 
     /// An implausibly large AAD (offsets that are not a real sealed header) must STOP.

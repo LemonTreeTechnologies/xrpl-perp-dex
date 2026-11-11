@@ -862,16 +862,11 @@ struct RunArgs {
 
 // ── Funding rate ────────────────────────────────────────────────
 
-const FUNDING_INTERVAL: Duration = Duration::from_secs(8 * 3600);
+/// F-3: how often to TRIGGER funding. The enclave decides whether an interval is due (on the
+/// attested clock) and the rate; a trigger inside the interval is refused (rc -121) and costs
+/// nothing. Frequent triggers only make a due interval land promptly and let an outage catch up.
+const FUNDING_TRIGGER_EVERY: Duration = Duration::from_secs(60);
 const STATE_SAVE_INTERVAL: Duration = Duration::from_secs(300);
-
-fn compute_funding_rate(mark_price: f64, index_price: f64) -> f64 {
-    if index_price <= 0.0 {
-        return 0.0;
-    }
-    let premium = (mark_price - index_price) / index_price;
-    premium.clamp(-0.0005, 0.0005)
-}
 
 // ── Liquidation scanning ────────────────────────────────────────
 
@@ -905,16 +900,22 @@ async fn run_liquidation_scan(
             };
             let user = pos["user_id"].as_str().unwrap_or("unknown");
 
-            match perp
-                .liquidate(pos_id, &float_to_fp8_string(current_price))
-                .await
-            {
+            // F-2: no price from here — the enclave settles at its own signed mark. The price
+            // reported below is the enclave's mark, read back for the event/record.
+            let settled = match perp.price_status().await {
+                Ok(st) => st["mark_price"]
+                    .as_str()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(current_price),
+                Err(_) => current_price,
+            };
+            match perp.liquidate(pos_id).await {
                 Ok(_) => {
                     info!(position_id = pos_id, user, "liquidated position");
                     let _ = ws_tx.send(WsEvent::Liquidation {
                         position_id: pos_id,
                         user_id: user.to_string(),
-                        price: float_to_fp8_string(current_price),
+                        price: float_to_fp8_string(settled),
                     });
                     // Nudge the user's client to re-fetch positions.
                     let _ = ws_tx.send(WsEvent::PositionChanged {
@@ -922,12 +923,12 @@ async fn run_liquidation_scan(
                         reason: "liquidation".into(),
                     });
                     if let Some(db) = db {
-                        db.insert_liquidation(pos_id, user, current_price).await;
+                        db.insert_liquidation(pos_id, user, settled).await;
                     }
                     let _ = events_tx.try_send(p2p::StateEvent::Liquidation {
                         position_id: pos_id,
                         user_id: user.to_string(),
-                        price: current_price,
+                        price: settled,
                     });
                 }
                 Err(e) => error!(position_id = pos_id, "liquidation failed: {:#}", e),
@@ -3438,50 +3439,66 @@ async fn main() -> Result<()> {
             last_liquidation_scan = Instant::now();
         }
 
-        // Funding rate (every 8 hours)
-        if last_funding_instant.elapsed() >= FUNDING_INTERVAL && current_price > 0.0 {
-            // Mark price = orderbook mid (or last trade), Index price = Binance
-            let mark = match app_state.engine.ticker().await {
-                (_, _, Some(mid)) => mid.to_f64(),
-                _ => current_price, // fallback to index if no orderbook
-            };
-            let rate = compute_funding_rate(mark, current_price);
-            let fp8_rate = float_to_fp8_string(rate);
-            match perp.apply_funding(&fp8_rate, now_ts).await {
+        // Funding (F-3): a trigger. The enclave decides whether an interval is due and the rate
+        // (VWAP of its accepted fills vs the signed index, clamped); nothing here computes one.
+        if last_funding_instant.elapsed() >= FUNDING_TRIGGER_EVERY {
+            match perp.apply_funding().await {
+                Ok(resp) if resp["status"].as_str() == Some("armed") => {
+                    info!("funding clock armed by the enclave (first trigger on this state; nothing applied)");
+                }
                 Ok(resp) => {
-                    info!(rate = %fp8_rate, "applied funding rate");
-                    let rate_raw = crate::types::FP8::from_f64(rate).raw();
-                    let mark_raw = app_state.mark_price.load(Ordering::Relaxed);
-                    let index_raw = crate::types::FP8::from_f64(current_price).raw();
+                    let rate_raw = resp["funding_rate"]
+                        .as_str()
+                        .and_then(|s| s.parse::<crate::types::FP8>().ok())
+                        .map(|fp| fp.raw())
+                        .unwrap_or(0);
+                    let (mark_raw, index_raw) = match perp.price_status().await {
+                        Ok(st) => (
+                            st["mark_price"]
+                                .as_str()
+                                .and_then(|s| s.parse::<crate::types::FP8>().ok())
+                                .map(|f| f.raw())
+                                .unwrap_or(0),
+                            st["index_price"]
+                                .as_str()
+                                .and_then(|s| s.parse::<crate::types::FP8>().ok())
+                                .map(|f| f.raw())
+                                .unwrap_or(0),
+                        ),
+                        Err(_) => (app_state.mark_price.load(Ordering::Relaxed), 0),
+                    };
+                    info!(rate = rate_raw, "funding applied by the enclave");
                     app_state.funding_rate.store(rate_raw, Ordering::Relaxed);
                     app_state.last_funding_time.store(now_ts, Ordering::Relaxed);
                     let mut funding_payments = Vec::new();
-                    if let Some(db) = &app_state.db {
-                        db.insert_funding_event(rate_raw, mark_raw, index_raw, now_ts)
-                            .await;
-                        if let Some(payments) = resp.get("payments").and_then(|v| v.as_array()) {
-                            for p in payments {
-                                let user_id = p["user_id"].as_str().unwrap_or("");
-                                let pos_id = p["position_id"].as_i64().unwrap_or(0);
-                                let side = p["side"].as_str().unwrap_or("");
-                                let payment = p["payment"]
-                                    .as_str()
-                                    .and_then(|s| s.parse::<crate::types::FP8>().ok())
-                                    .map(|fp| fp.raw())
-                                    .unwrap_or(0);
+                    if let Some(payments) = resp.get("payments").and_then(|v| v.as_array()) {
+                        for p in payments {
+                            let user_id = p["user_id"].as_str().unwrap_or("");
+                            let pos_id = p["position_id"].as_i64().unwrap_or(0);
+                            let side = p["side"].as_str().unwrap_or("");
+                            let payment = p["payment"]
+                                .as_str()
+                                .and_then(|s| s.parse::<crate::types::FP8>().ok())
+                                .map(|fp| fp.raw())
+                                .unwrap_or(0);
+                            if let Some(db) = &app_state.db {
                                 db.insert_funding_payment(
                                     user_id, pos_id, side, payment, rate_raw, mark_raw, now_ts,
                                 )
                                 .await;
-                                funding_payments.push(p2p::FundingPayment {
-                                    user_id: user_id.to_string(),
-                                    position_id: pos_id,
-                                    side: side.to_string(),
-                                    payment,
-                                });
                             }
-                            info!(count = payments.len(), "persisted funding payments");
+                            funding_payments.push(p2p::FundingPayment {
+                                user_id: user_id.to_string(),
+                                position_id: pos_id,
+                                side: side.to_string(),
+                                payment,
+                            });
                         }
+                        info!(count = payments.len(), "persisted funding payments");
+                    }
+                    if let Some(db) = &app_state.db {
+                        db.insert_funding_event(rate_raw, mark_raw, index_raw, now_ts)
+                            .await;
                     }
                     let _ = events_pub_tx.try_send(p2p::StateEvent::Funding {
                         rate_raw,
@@ -3491,7 +3508,14 @@ async fn main() -> Result<()> {
                         payments: funding_payments,
                     });
                 }
-                Err(e) => error!("funding application failed: {:#}", e),
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    if msg.contains("rc=-121") {
+                        tracing::debug!("funding not due yet (enclave)");
+                    } else {
+                        warn!("funding trigger refused: {msg}");
+                    }
+                }
             }
             last_funding_instant = Instant::now();
         }

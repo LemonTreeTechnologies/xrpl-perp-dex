@@ -230,6 +230,25 @@ impl TradingEngine {
             (ripple + 946_684_800) * 1_000
         };
 
+        // F-2 (Q3): the enclave's OWN mark and fill band, read before the lock (async). Matching
+        // then never crosses a maker outside it, so the book does not execute a fill the enclave
+        // would refuse. The enclave stays the authority; this only keeps the two in step. If the
+        // enclave cannot say, matching pauses (fail-safe), like the attested clock above.
+        let fill_band = {
+            let st = self.perp.price_status().await.map_err(|e| {
+                anyhow::anyhow!("matching paused: enclave price status unavailable ({e})")
+            })?;
+            let mark = st["mark_price"]
+                .as_str()
+                .and_then(|s| s.parse::<FP8>().ok())
+                .map(|f| f.raw())
+                .unwrap_or(0);
+            let band_bp = st["fill_band_bp"].as_i64().ok_or_else(|| {
+                anyhow::anyhow!("matching paused: enclave price status has no fill_band_bp")
+            })?;
+            crate::orderbook::fill_band_range(mark, band_bp)
+        };
+
         // Step 1: under the book lock — reserve-at-placement margin check (#114)
         // then match/rest. Both under the SAME lock so no order can slip in
         // between the check and the submit (no TOCTOU on the reservation).
@@ -238,6 +257,7 @@ impl TradingEngine {
             // part-2 Q3: hand the matcher the attested time under the SAME lock as the
             // submit, so the stamp cannot be raced by another order between set and use.
             book.set_attested_ms(attested_ms);
+            book.set_fill_band(fill_band);
             if let Some(avail) = avail {
                 // A limit order that finds no match returns Ok below WITHOUT ever
                 // reaching the enclave open_position gate (Step 2), so this is the
@@ -639,6 +659,15 @@ mod tests {
                 "/v1/perp/attested-clock/status",
                 get(|| async {
                     Json(json!({ "attested_close_time_ripple_epoch": 800_000_000u64 }))
+                }),
+            )
+            .route(
+                "/v1/perp/price/status",
+                get(|| async {
+                    Json(
+                        json!({ "mark_price": "0.55000000", "index_price": "0.55000000",
+                                 "mark_fresh": true, "fill_band_bp": 200 }),
+                    )
                 }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
