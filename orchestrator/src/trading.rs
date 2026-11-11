@@ -75,6 +75,10 @@ pub struct FailedFill {
     pub taker_error: Option<String>,
 }
 
+/// F-2 (Q3): the share of the enclave's fill band the book matches within (auditor: 90 %, the
+/// headroom must exceed the measured cross-node mark skew).
+const PRECHECK_BAND_PCT: i64 = 90;
+
 impl TradingEngine {
     pub fn new(market: &str, perp: PerpClient, peer_id: &str) -> Self {
         TradingEngine {
@@ -246,7 +250,10 @@ impl TradingEngine {
             let band_bp = st["fill_band_bp"].as_i64().ok_or_else(|| {
                 anyhow::anyhow!("matching paused: enclave price status has no fill_band_bp")
             })?;
-            crate::orderbook::fill_band_range(mark, band_bp)
+            // 90 % of the enclave's band: the follower enclaves replay these fills against their
+            // OWN marks, which can sit a little off the leader's, so a fill at the very edge here
+            // could be refused there. The headroom must stay above the measured cross-node skew.
+            crate::orderbook::fill_band_range(mark, band_bp * PRECHECK_BAND_PCT / 100)
         };
 
         // Step 1: under the book lock — reserve-at-placement margin check (#114)

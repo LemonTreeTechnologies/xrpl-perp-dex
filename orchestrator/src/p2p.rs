@@ -673,6 +673,11 @@ pub enum StateEvent {
         index_raw: i64,
         timestamp: u64,
         payments: Vec<FundingPayment>,
+        /// F-3-R: the funding interval the leader's enclave applied (attested XRPL-epoch seconds).
+        /// A follower's enclave applies the SAME interval only if it matches its own funding clock.
+        /// 0 from an older leader = nothing for a follower to apply.
+        #[serde(default)]
+        interval_start: u64,
     },
     Liquidation {
         position_id: u64,

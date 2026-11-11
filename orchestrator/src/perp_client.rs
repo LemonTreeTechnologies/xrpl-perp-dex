@@ -543,6 +543,22 @@ impl PerpClient {
             .await
     }
 
+    /// F-3-R: a follower applies the leader's funding interval. The enclave re-bounds the rate by
+    /// its own clamp, checks `interval_start` against its own funding clock and due-ness on its own
+    /// attested time; payments use its own mark. `already_applied` is a no-op; rc -121 / -95 are
+    /// retryable; rc -122 / -123 / -124 are divergence alarms.
+    pub async fn apply_funding_replica(
+        &self,
+        interval_start: u64,
+        funding_rate: &str,
+    ) -> Result<Value> {
+        self.post(
+            "/perp/funding/replica",
+            serde_json::json!({ "interval_start": interval_start, "funding_rate": funding_rate }),
+        )
+        .await
+    }
+
     // ── Shard identity ──────────────────────────────────────────
 
     /// Set shard_id on the enclave (called once at startup).

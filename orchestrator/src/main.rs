@@ -937,6 +937,117 @@ async fn run_liquidation_scan(
     }
 }
 
+/// F-3-R: drive a replicated funding interval / liquidation into THIS node's enclave, which
+/// re-checks it against its own state. Runs in the background so a retry never blocks the event
+/// stream. Retryable refusals (not due on our clock yet, our mark momentarily stale) are retried
+/// with a delay; a refusal that means the enclaves DISAGREE is logged as a divergence alarm.
+/// How a follower treats its enclave's refusal of a replicated event: retry later (not applicable
+/// YET — not due on our clock, or our mark momentarily stale) or alarm (the enclaves disagree).
+#[derive(Debug, PartialEq, Eq)]
+enum ReplicaRefusal {
+    Retry,
+    Divergence,
+}
+
+fn classify_replica_refusal(msg: &str, liquidation: bool) -> ReplicaRefusal {
+    let retryable = if liquidation {
+        msg.contains("rc=-95")
+    } else {
+        msg.contains("rc=-121") || msg.contains("rc=-95")
+    };
+    if retryable {
+        ReplicaRefusal::Retry
+    } else {
+        ReplicaRefusal::Divergence
+    }
+}
+
+fn replicate_into_enclave(perp: &PerpClient, event: &p2p::StateEvent) {
+    const RETRIES: u32 = 30;
+    const BACKOFF: Duration = Duration::from_secs(20);
+    match event {
+        p2p::StateEvent::Funding {
+            rate_raw,
+            interval_start,
+            ..
+        } if *interval_start > 0 => {
+            let (perp, start, rate) = (
+                perp.clone(),
+                *interval_start,
+                crate::types::FP8(*rate_raw).to_string(),
+            );
+            tokio::spawn(async move {
+                for attempt in 0..RETRIES {
+                    match perp.apply_funding_replica(start, &rate).await {
+                        Ok(r) => {
+                            info!(interval_start = start, rate = %rate, status = %r["status"],
+                                  "funding interval replicated into the local enclave");
+                            return;
+                        }
+                        Err(e) => {
+                            let msg = format!("{e:#}");
+                            if classify_replica_refusal(&msg, false) == ReplicaRefusal::Retry {
+                                tracing::debug!(
+                                    attempt,
+                                    interval_start = start,
+                                    "funding replica not yet applicable here; retrying"
+                                );
+                                tokio::time::sleep(BACKOFF).await;
+                                continue;
+                            }
+                            error!(interval_start = start, rate = %rate, metric = "funding_replica_divergence",
+                                   "DIVERGENCE: the local enclave refused the leader's funding interval: {msg}");
+                            return;
+                        }
+                    }
+                }
+                error!(
+                    interval_start = start,
+                    metric = "funding_replica_divergence",
+                    "DIVERGENCE: funding interval still not applicable here after retries"
+                );
+            });
+        }
+        p2p::StateEvent::Liquidation { position_id, .. } => {
+            let (perp, pos) = (perp.clone(), *position_id);
+            tokio::spawn(async move {
+                for attempt in 0..RETRIES {
+                    match perp.liquidate(pos).await {
+                        Ok(_) => {
+                            info!(
+                                position_id = pos,
+                                "liquidation replicated into the local enclave (re-checked at our mark)"
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            let msg = format!("{e:#}");
+                            if classify_replica_refusal(&msg, true) == ReplicaRefusal::Retry {
+                                tracing::debug!(
+                                    attempt,
+                                    position_id = pos,
+                                    "our mark is stale; retrying the replicated liquidation"
+                                );
+                                tokio::time::sleep(BACKOFF).await;
+                                continue;
+                            }
+                            error!(position_id = pos, metric = "liquidation_replica_divergence",
+                                   "DIVERGENCE: the local enclave refused the leader's liquidation: {msg}");
+                            return;
+                        }
+                    }
+                }
+                error!(
+                    position_id = pos,
+                    metric = "liquidation_replica_divergence",
+                    "DIVERGENCE: replicated liquidation still refused after retries (stale mark)"
+                );
+            });
+        }
+        _ => {}
+    }
+}
+
 // ── Main ────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -2418,10 +2529,13 @@ async fn main() -> Result<()> {
     // announcer holds its own clone, and unconfigured shards never needed it.
     drop(peer_quote_pub_tx);
 
-    // Validator: apply inbound state events to local PG
+    // Validator: apply inbound state events to the local ENCLAVE (F-3-R: funding and liquidation
+    // must reach every enclave, not only the leader's) and to local PG (history).
     let validator_events_db = db.clone();
+    let validator_perp = perp.clone();
     let _events_handle = tokio::spawn(async move {
         while let Some(event) = events_inbound_rx.recv().await {
+            replicate_into_enclave(&validator_perp, &event);
             let Some(ref db) = validator_events_db else {
                 continue;
             };
@@ -2442,6 +2556,7 @@ async fn main() -> Result<()> {
                     index_raw,
                     timestamp,
                     ref payments,
+                    ..
                 } => {
                     info!(rate = rate_raw, "replicated funding event");
                     db.insert_funding_event(rate_raw, mark_raw, index_raw, timestamp)
@@ -3506,6 +3621,7 @@ async fn main() -> Result<()> {
                         index_raw,
                         timestamp: now_ts,
                         payments: funding_payments,
+                        interval_start: resp["interval_start"].as_u64().unwrap_or(0),
                     });
                 }
                 Err(e) => {
@@ -3775,4 +3891,54 @@ async fn cli_upgrade_corpus_ceremony(
         upgrade_corpus::corpus_ceremony(old_url, new_url, mrenclave_new_hex, &signers).await?;
     println!("corpus: ceremony COMPLETE, nonce={nonce}");
     Ok(())
+}
+
+#[cfg(test)]
+mod replica_tests {
+    use super::*;
+
+    #[test]
+    fn replica_refusals_retry_only_when_not_yet_applicable() {
+        // funding: not due on our clock / our mark stale -> retry; anything else -> divergence alarm
+        assert_eq!(
+            classify_replica_refusal("funding replica refused (rc=-121)", false),
+            ReplicaRefusal::Retry
+        );
+        assert_eq!(
+            classify_replica_refusal("funding replica refused (rc=-95)", false),
+            ReplicaRefusal::Retry
+        );
+        for rc in ["-122", "-123", "-124", "-14", "-17"] {
+            assert_eq!(
+                classify_replica_refusal(&format!("funding replica refused (rc={rc})"), false),
+                ReplicaRefusal::Divergence,
+                "funding rc={rc}"
+            );
+        }
+        // liquidation: only a stale mark retries; "healthy at our mark" (-6) is a divergence alarm
+        assert_eq!(
+            classify_replica_refusal("Liquidation refused (rc=-95)", true),
+            ReplicaRefusal::Retry
+        );
+        assert_eq!(
+            classify_replica_refusal("Liquidation refused (rc=-6)", true),
+            ReplicaRefusal::Divergence
+        );
+        assert_eq!(
+            classify_replica_refusal("Liquidation refused (rc=-121)", true),
+            ReplicaRefusal::Divergence
+        );
+    }
+
+    #[test]
+    fn funding_event_from_an_older_leader_still_decodes() {
+        let old = r#"{"type":"funding","rate_raw":5,"mark_raw":1,"index_raw":1,"timestamp":9,"payments":[]}"#;
+        let ev: p2p::StateEvent = serde_json::from_str(old).expect("older leader's event decodes");
+        match ev {
+            p2p::StateEvent::Funding { interval_start, .. } => {
+                assert_eq!(interval_start, 0, "absent -> 0 = nothing to replicate")
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 }
