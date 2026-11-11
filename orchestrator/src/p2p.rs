@@ -3403,15 +3403,36 @@ impl P2PNode {
             }
         };
 
-        let body: serde_json::Value = match resp.json().await {
-            Ok(v) => v,
+        // Read the TEXT first: the enclave server reports a refusal as an HTTP error whose body
+        // is "Error <code>: <reason>\n{json}", which is not JSON. Decoding it as the success
+        // shape hid every refusal behind "error decoding response body".
+        let http_status = resp.status();
+        let text = match resp.text().await {
+            Ok(t) => t,
             Err(e) => {
                 return SigningMessage::Response {
                     request_id: request_id.to_string(),
                     signer_xrpl_address: local_signer.xrpl_address.clone(),
                     der_signature: None,
                     compressed_pubkey: None,
-                    error: Some(format!("enclave response parse: {e}")),
+                    error: Some(format!("enclave response read: {e}")),
+                };
+            }
+        };
+        let body: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) if http_status.is_success() => v,
+            _ => {
+                let excerpt: String = text.chars().take(300).collect();
+                return SigningMessage::Response {
+                    request_id: request_id.to_string(),
+                    signer_xrpl_address: local_signer.xrpl_address.clone(),
+                    der_signature: None,
+                    compressed_pubkey: None,
+                    error: Some(format!(
+                        "enclave HTTP {}: {}",
+                        http_status.as_u16(),
+                        excerpt.trim()
+                    )),
                 };
             }
         };
@@ -6136,6 +6157,79 @@ mod tests {
             0,
             "the enclave must not have been asked at all"
         );
+    }
+
+    /// A co-signer's refusal must reach the caller as its own text, not as "error decoding
+    /// response body". The enclave server answers a refusal with a non-JSON prefix
+    /// ("Error 409: Conflict\n{json}"); the already-handled one carries rc=-59, which the
+    /// delivery loop recognises — and nothing else does.
+    #[tokio::test]
+    async fn a_cosign_refusal_surfaces_its_text_and_the_already_handled_code() {
+        let app = Router::new().route(
+            "/v1/pool/sign/withdrawal-payment",
+            post(|| async {
+                (
+                    axum::http::StatusCode::CONFLICT,
+                    "Error 409: Conflict\n{\"message\":\"Co-sign refused: this Sequence is already handled here (rc=-59)\",\"status\":\"error\"}",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut signer = test_local_signer();
+        signer.enclave_url = format!("http://{addr}/v1");
+        let auth = crate::withdraw_auth::WithdrawAuth {
+            user_pubkey: format!("ED{}", "11".repeat(32)),
+            user_sig: "22".repeat(64),
+            auth_nonce: "1".into(),
+            max_ledger: 4_000_000_000,
+        };
+        let payment = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": TEST_ESCROW,
+            "Destination": "rJGj4G5ekU9YS2HWzwXTVFQSWNewokACjm",
+            "Amount": "1000000",
+            "Fee": "60",
+            "Sequence": 1,
+            "SigningPubKey": ""
+        });
+        let resp = P2PNode::handle_signing_request(
+            &signer,
+            Some(TEST_ESCROW),
+            "wire-payment-already-handled",
+            &payment,
+            &signer_acct_id_hex(),
+            None,
+            Some(WithdrawalClaim {
+                user_id: "rUser",
+                amount_fp8: "100000000",
+                auth: Some(&auth),
+            }),
+        )
+        .await;
+        match resp {
+            SigningMessage::Response {
+                error,
+                der_signature,
+                ..
+            } => {
+                assert!(der_signature.is_none());
+                let msg = error.unwrap_or_default();
+                assert!(msg.contains("HTTP 409"), "status must be named, got: {msg}");
+                assert!(
+                    !msg.contains("error decoding response body"),
+                    "the refusal must not be masked as a parse error: {msg}"
+                );
+                assert!(
+                    crate::withdrawal::is_already_handled_refusal(&msg),
+                    "the already-handled code must survive to the caller: {msg}"
+                );
+            }
+            other => panic!("expected a Response, got {other:?}"),
+        }
     }
 
     #[test]

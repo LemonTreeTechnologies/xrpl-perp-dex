@@ -419,16 +419,26 @@ pub async fn process_withdrawal(
     // every withdrawal and their balances converge.
     let mut undelivered: Vec<String> = Vec::new();
     let earlier = journal.map(|j| j.snapshot()).unwrap_or_default();
+    // THIS node's enclave already reserved the withdrawal when it took the request (the
+    // perp.withdraw call above), so it is never owed a delivery. Recording it as owed made
+    // the entry node re-deliver to its own enclave forever: the self-delivery can only be
+    // refused (the row exists or is settled), and strict per-signer order then wedged every
+    // later request owed to it.
+    let is_local = |s: &SignerConfig| is_local_signer(signers_config.local_signer.as_ref(), s);
 
     for signer in &signers_config.signers {
         if collected_signers.len() >= signers_config.quorum {
-            undelivered.push(signer.name.clone());
+            if !is_local(signer) {
+                undelivered.push(signer.name.clone());
+            }
             continue;
         }
         if crate::withdrawal_reconcile::signer_owed_earlier(&earlier, &signer.name, sequence) {
             info!(signer = %signer.name, sequence,
                 "signer still owed an earlier withdrawal — queued behind it (strict order)");
-            undelivered.push(signer.name.clone());
+            if !is_local(signer) {
+                undelivered.push(signer.name.clone());
+            }
             continue;
         }
         let account_id = match xrpl_signer::decode_xrpl_address(&signer.xrpl_address) {
@@ -478,7 +488,9 @@ pub async fn process_withdrawal(
             }
             Err(e) => {
                 warn!(signer = %signer.name, "signing failed: {:#}", e);
-                undelivered.push(signer.name.clone());
+                if !is_local(signer) {
+                    undelivered.push(signer.name.clone());
+                }
             }
         }
     }
@@ -559,6 +571,28 @@ pub async fn process_withdrawal(
 
 // ── Follower reserve: delivery to every signer ─────────────────────
 
+/// Is `s` THIS node's own signer? Matched on the XRPL address — the identity the enclave signs
+/// as — not on the display name, so a renamed entry cannot slip through or be mistaken.
+pub fn is_local_signer(local: Option<&SignerConfig>, s: &SignerConfig) -> bool {
+    local.is_some_and(|l| l.xrpl_address == s.xrpl_address)
+}
+
+/// A co-signer's refusal that means "this Sequence is already handled here" (its enclave's -59,
+/// surfaced by the co-sign route as `rc=-59`). Narrow on purpose: no other refusal marks a
+/// delivery done.
+pub fn is_already_handled_refusal(msg: &str) -> bool {
+    // Parse the whole number after each "rc=" — a substring test would also accept rc=-590.
+    msg.match_indices("rc=").any(|(i, _)| {
+        let tail = &msg[i + 3..];
+        let end = tail
+            .char_indices()
+            .find(|&(k, c)| !(c.is_ascii_digit() || (k == 0 && c == '-')))
+            .map(|(k, _)| k)
+            .unwrap_or(tail.len());
+        tail[..end].parse::<i64>() == Ok(-59)
+    })
+}
+
 /// One delivery pass: for each signer, send the LOWEST-Sequence request it is still owed, and
 /// only that one — strict per-signer order, so its enclave never sees S2 before S1 (its
 /// monotonic high-water would refuse S1 forever). A failure stops that signer for this pass;
@@ -610,8 +644,19 @@ pub async fn deliver_owed_requests(
                 journal.delivered(&e.escrow, e.sequence, &signer.name);
             }
             Err(err) => {
-                warn!(signer = %signer.name, sequence = e.sequence,
-                    "owed withdrawal not delivered yet (retry next pass): {:#}", err);
+                let msg = format!("{err:#}");
+                if is_already_handled_refusal(&msg) {
+                    // The signer's enclave holds this Sequence at or below its withdrawal
+                    // high-water: it already co-signed it (reserve = co-sign) or rolled it back.
+                    // Re-sending can only be refused again, so the delivery is done. This is
+                    // delivery BOOKKEEPING only — no signature is recorded or counted from it.
+                    info!(signer = %signer.name, sequence = e.sequence,
+                        "owed withdrawal already handled by the signer (rc -59) — marking delivered");
+                    journal.delivered(&e.escrow, e.sequence, &signer.name);
+                } else {
+                    warn!(signer = %signer.name, sequence = e.sequence,
+                        "owed withdrawal not delivered yet (retry next pass): {msg}");
+                }
             }
         }
     }
@@ -694,6 +739,67 @@ async fn submit_multisigned(xrpl_url: &str, tx_json: &serde_json::Value) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_entry_node_is_never_owed_its_own_delivery() {
+        let mk = |name: &str, addr: &str| {
+            let mut c: SignerConfig = serde_json::from_value(serde_json::json!({
+                "name": name, "enclave_url": "https://127.0.0.1:9089/v1",
+                "address": "0x0000000000000000000000000000000000000000",
+                "session_key": "00", "compressed_pubkey": "02", "xrpl_address": addr
+            }))
+            .expect("signer config");
+            c.name = name.into();
+            c
+        };
+        let n1 = mk("node-1", "rJScWJ3vfoV2BZTHYxKPdFUkFUq3nyQVx5");
+        let n3 = mk("node-3", "rGKHyMGiLocalAddressxxxxxxxxxxxxxx");
+        assert!(
+            is_local_signer(Some(&n3), &n3),
+            "the local signer is recognised"
+        );
+        assert!(
+            !is_local_signer(Some(&n3), &n1),
+            "another signer is not local"
+        );
+        assert!(
+            !is_local_signer(None, &n3),
+            "no local signer configured: nobody is local"
+        );
+        // identity is the XRPL address, not the display name
+        let renamed = mk("node-3-renamed", "rGKHyMGiLocalAddressxxxxxxxxxxxxxx");
+        assert!(
+            is_local_signer(Some(&n3), &renamed),
+            "a renamed entry with the same address is still local"
+        );
+        let same_name_other_addr = mk("node-3", "rJScWJ3vfoV2BZTHYxKPdFUkFUq3nyQVx5");
+        assert!(
+            !is_local_signer(Some(&n3), &same_name_other_addr),
+            "a name collision does not make it local"
+        );
+    }
+
+    #[test]
+    fn only_the_exact_already_handled_code_marks_a_delivery_done() {
+        assert!(is_already_handled_refusal(
+            "enclave HTTP 409: Co-sign refused: this Sequence is already handled here (rc=-59)"
+        ));
+        assert!(is_already_handled_refusal("rc=-59"));
+        for other in [
+            "rc=-590",
+            "rc=-5",
+            "rc=59",
+            "rc=-58)",
+            "Co-sign refused: this node will not vouch",
+            "rc=",
+            "rc=-",
+        ] {
+            assert!(
+                !is_already_handled_refusal(other),
+                "{other} must not count as delivered"
+            );
+        }
+    }
 
     #[test]
     fn withdraw_request_reads_the_flattened_authorisation() {
