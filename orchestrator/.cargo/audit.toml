@@ -17,6 +17,15 @@ ignore = [
     # hickory-proto 0.25 — O(n^2) name compression on message encoding. Fix is
     # hickory 0.26.1, blocked by libp2p 0.56's pin. Revisit on a libp2p bump.
     "RUSTSEC-2026-0119",
+    # hickory-proto 0.25 — four advisories published 2026-11 (record-count memory amplification;
+    # panics on SVCB/HTTPS quote and alpn values; zone-file lexer token panic). NOT COMPILED IN:
+    # hickory reaches Cargo.lock only through libp2p-dns / libp2p-mdns, whose features are off;
+    # `cargo tree -i hickory-proto --target all --all-features` prints nothing. Fix is hickory
+    # 0.26.2, blocked by libp2p 0.56's pin. Revisit on a libp2p bump or if DNS/mDNS is enabled.
+    "RUSTSEC-2026-0487",
+    "RUSTSEC-2026-0489",
+    "RUSTSEC-2026-0490",
+    "RUSTSEC-2026-0491",
     # rsa 0.9 Marvin timing side-channel — reached only via sqlx-mysql, which we do
     # NOT use (postgres only). Droppable by feature-gating sqlx off mysql (forward).
     "RUSTSEC-2023-0071",
