@@ -1138,14 +1138,58 @@ pub enum DkgStepMessage {
 
 // ── Network behaviour ───────────────────────────────────────────
 
-const ORDERS_TOPIC: &str = "perp-dex/orders";
-const ELECTION_TOPIC: &str = "perp-dex/election";
-const SIGNING_TOPIC: &str = "perp-dex/signing";
-const EVENTS_TOPIC: &str = "perp-dex/events";
-const PEER_QUOTE_TOPIC: &str = "perp-dex/path-a/peer-quote";
-const SHARE_V2_TOPIC: &str = "perp-dex/path-a/share-v2";
-const BOOTSTRAP_TOPIC: &str = "perp-dex/path-a/bootstrap";
-const DKG_STEP_TOPIC: &str = "perp-dex/cluster/dkg-step";
+// Topic SUFFIXES. Every gossip topic is namespaced by the cluster (its escrow r-address) via
+// [`cluster_topic`], so two clusters that share hosts (testnet + mainnet-sandbox on the same VMs, a
+// rehearsal cluster beside the live one) cannot exchange a single message even when mis-peered: the
+// separation is a property of the code, not of every operator's `--p2p-peers` list being right.
+const ORDERS_TOPIC: &str = "orders";
+const ELECTION_TOPIC: &str = "election";
+const SIGNING_TOPIC: &str = "signing";
+const EVENTS_TOPIC: &str = "events";
+const PEER_QUOTE_TOPIC: &str = "path-a/peer-quote";
+const SHARE_V2_TOPIC: &str = "path-a/share-v2";
+const BOOTSTRAP_TOPIC: &str = "path-a/bootstrap";
+const DKG_STEP_TOPIC: &str = "cluster/dkg-step";
+
+/// Every topic suffix this node subscribes to. One list, so a new topic can't be added without
+/// going through the namespace (the isolation test iterates it).
+const ALL_TOPIC_SUFFIXES: [&str; 8] = [
+    ORDERS_TOPIC,
+    ELECTION_TOPIC,
+    SIGNING_TOPIC,
+    EVENTS_TOPIC,
+    PEER_QUOTE_TOPIC,
+    SHARE_V2_TOPIC,
+    BOOTSTRAP_TOPIC,
+    DKG_STEP_TOPIC,
+];
+
+/// The full gossip topic name for `suffix` in cluster `cluster_ns`.
+pub fn cluster_topic(cluster_ns: &str, suffix: &str) -> String {
+    format!("perp-dex/{cluster_ns}/{suffix}")
+}
+
+/// Is a peer that identified with `theirs` a member of the cluster whose protocol is `ours`?
+/// Exact match: a different namespace, a pre-namespace build (`/perp-dex/0.1.0`), or anything
+/// else is another cluster.
+pub fn peer_in_cluster(ours: &str, theirs: &str) -> bool {
+    ours == theirs
+}
+
+/// The libp2p identify protocol string, carrying the cluster namespace so a peer from another
+/// cluster is recognised (and refused) at the PEER layer, not only by topic mismatch.
+pub fn cluster_identify_protocol(cluster_ns: &str) -> String {
+    format!("/perp-dex/0.1.0/{cluster_ns}")
+}
+
+/// The cluster namespace must be non-empty and made only of characters that cannot alter the
+/// topic/protocol structure (an XRPL r-address is base58: alphanumeric).
+fn validate_cluster_ns(cluster_ns: &str) -> Result<()> {
+    if cluster_ns.is_empty() || !cluster_ns.chars().all(|c| c.is_ascii_alphanumeric()) {
+        anyhow::bail!("invalid p2p cluster namespace {cluster_ns:?}: must be a non-empty alphanumeric id (the escrow r-address)");
+    }
+    Ok(())
+}
 
 #[derive(NetworkBehaviour)]
 struct PerpBehaviour {
@@ -1261,6 +1305,10 @@ pub struct P2PNode {
     /// requests. If `Some`, incoming requests from peers outside the set
     /// are dropped. If `None`, all peers are accepted (dev/test only).
     allowed_signing_peers: Option<HashSet<PeerId>>,
+    /// This cluster's identify protocol ([`cluster_identify_protocol`]). A peer that identifies
+    /// with anything else belongs to another cluster: it is never added as a gossip peer, it is
+    /// blacklisted in gossipsub, and its connection is closed.
+    identify_protocol: String,
     /// X-C1: replay guard for signing requests. Maps `request_id` →
     /// first-seen timestamp; entries older than the TTL are cleaned on
     /// insertion.
@@ -1315,11 +1363,25 @@ impl P2PNode {
     /// `keypair`:     persistent identity (use [`load_or_create_identity`])
     pub async fn new(
         listen_addr: &str,
+        cluster_ns: &str,
         keypair: Keypair,
         batch_tx: mpsc::Sender<(OrderBatch, Option<String>)>,
         election_inbound_tx: mpsc::Sender<ElectionMessage>,
         peer_count: Arc<std::sync::atomic::AtomicU32>,
     ) -> Result<Self> {
+        validate_cluster_ns(cluster_ns)?;
+        let identify_protocol = cluster_identify_protocol(cluster_ns);
+        // One line an operator can check after start: which cluster this node gossips in.
+        info!(
+            cluster = cluster_ns,
+            identify = %identify_protocol,
+            topics = ?ALL_TOPIC_SUFFIXES
+                .iter()
+                .map(|t| cluster_topic(cluster_ns, t))
+                .collect::<Vec<_>>(),
+            "p2p cluster namespace"
+        );
+        let identify_protocol_for_behaviour = identify_protocol.clone();
         let swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
@@ -1349,7 +1411,7 @@ impl P2PNode {
                 .expect("valid gossipsub behaviour");
 
                 let identify = identify::Behaviour::new(identify::Config::new(
-                    "/perp-dex/0.1.0".to_string(),
+                    identify_protocol_for_behaviour,
                     key.public(),
                 ));
 
@@ -1362,14 +1424,16 @@ impl P2PNode {
             .build();
 
         let peer_id = *swarm.local_peer_id();
-        let orders_topic = gossipsub::IdentTopic::new(ORDERS_TOPIC);
-        let election_topic = gossipsub::IdentTopic::new(ELECTION_TOPIC);
-        let signing_topic = gossipsub::IdentTopic::new(SIGNING_TOPIC);
-        let events_topic = gossipsub::IdentTopic::new(EVENTS_TOPIC);
-        let peer_quote_topic = gossipsub::IdentTopic::new(PEER_QUOTE_TOPIC);
-        let share_v2_topic = gossipsub::IdentTopic::new(SHARE_V2_TOPIC);
-        let bootstrap_topic = gossipsub::IdentTopic::new(BOOTSTRAP_TOPIC);
-        let dkg_step_topic = gossipsub::IdentTopic::new(DKG_STEP_TOPIC);
+        let orders_topic = gossipsub::IdentTopic::new(cluster_topic(cluster_ns, ORDERS_TOPIC));
+        let election_topic = gossipsub::IdentTopic::new(cluster_topic(cluster_ns, ELECTION_TOPIC));
+        let signing_topic = gossipsub::IdentTopic::new(cluster_topic(cluster_ns, SIGNING_TOPIC));
+        let events_topic = gossipsub::IdentTopic::new(cluster_topic(cluster_ns, EVENTS_TOPIC));
+        let peer_quote_topic =
+            gossipsub::IdentTopic::new(cluster_topic(cluster_ns, PEER_QUOTE_TOPIC));
+        let share_v2_topic = gossipsub::IdentTopic::new(cluster_topic(cluster_ns, SHARE_V2_TOPIC));
+        let bootstrap_topic =
+            gossipsub::IdentTopic::new(cluster_topic(cluster_ns, BOOTSTRAP_TOPIC));
+        let dkg_step_topic = gossipsub::IdentTopic::new(cluster_topic(cluster_ns, DKG_STEP_TOPIC));
 
         let mut node = P2PNode {
             swarm,
@@ -1427,6 +1491,7 @@ impl P2PNode {
             share_v2_rate: HashMap::new(),
             peer_id,
             peer_count,
+            identify_protocol,
         };
 
         // Subscribe to topics
@@ -4952,6 +5017,19 @@ impl P2PNode {
                     info,
                     ..
                 })) => {
+                    if !peer_in_cluster(&self.identify_protocol, &info.protocol_version) {
+                        warn!(
+                            peer = %peer_id,
+                            theirs = %info.protocol_version,
+                            ours = %self.identify_protocol,
+                            "refusing peer from another cluster (identify namespace mismatch)"
+                        );
+                        let gs = &mut self.swarm.behaviour_mut().gossipsub;
+                        gs.remove_explicit_peer(&peer_id);
+                        gs.blacklist_peer(&peer_id);
+                        let _ = self.swarm.disconnect_peer_id(peer_id);
+                        continue;
+                    }
                     info!(
                         peer = %peer_id,
                         protocol = %info.protocol_version,
@@ -6626,5 +6704,221 @@ mod tests {
         assert_eq!(canonical_session_key("0x5bb00f4c"), "5bb00f4c"); // strip
         assert_eq!(canonical_session_key("5bb00f4c"), "5bb00f4c"); // already bare
         assert_eq!(canonical_session_key(""), ""); // empty, no panic
+    }
+
+    // ── cluster isolation (topics + identify namespaced by escrow) ──────────────────────────
+
+    const NS_LIVE: &str = "rfYnJDSAeFuDCUTq2oYbckbJcz3gAJTNCd";
+    const NS_OTHER: &str = "rEHEARSALescrowXXXXXXXXXXXXXXXXXXX";
+
+    #[test]
+    fn cluster_topics_are_disjoint_across_clusters_on_every_topic() {
+        let live: HashSet<String> = ALL_TOPIC_SUFFIXES
+            .iter()
+            .map(|t| cluster_topic(NS_LIVE, t))
+            .collect();
+        let other: HashSet<String> = ALL_TOPIC_SUFFIXES
+            .iter()
+            .map(|t| cluster_topic(NS_OTHER, t))
+            .collect();
+        assert_eq!(
+            live.len(),
+            ALL_TOPIC_SUFFIXES.len(),
+            "topic names collide within a cluster"
+        );
+        assert!(
+            live.is_disjoint(&other),
+            "two clusters share a topic: {:?}",
+            live.intersection(&other).collect::<Vec<_>>()
+        );
+        // and no namespaced topic equals a pre-namespace (global) one
+        for t in ALL_TOPIC_SUFFIXES {
+            assert!(!live.contains(&format!("perp-dex/{t}")));
+        }
+        assert_eq!(
+            cluster_topic(NS_LIVE, ORDERS_TOPIC),
+            format!("perp-dex/{NS_LIVE}/orders")
+        );
+    }
+
+    #[test]
+    fn identify_namespace_is_exact_match_only() {
+        let ours = cluster_identify_protocol(NS_LIVE);
+        assert!(peer_in_cluster(&ours, &cluster_identify_protocol(NS_LIVE)));
+        assert!(!peer_in_cluster(
+            &ours,
+            &cluster_identify_protocol(NS_OTHER)
+        ));
+        assert!(
+            !peer_in_cluster(&ours, "/perp-dex/0.1.0"),
+            "a pre-namespace build must be refused"
+        );
+        assert!(!peer_in_cluster(&ours, &format!("{ours}x")));
+        assert!(!peer_in_cluster(&ours, ""));
+    }
+
+    #[test]
+    fn cluster_namespace_rejects_structure_characters() {
+        assert!(validate_cluster_ns(NS_LIVE).is_ok());
+        for bad in ["", "a/b", "a b", "../x", "r\u{0430}bc"] {
+            assert!(validate_cluster_ns(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    /// Layer 1 on its own (independent of the identify reject, which would mask it in the
+    /// two-node test): the node subscribes to EXACTLY the namespaced topics, every one of them.
+    #[tokio::test]
+    async fn node_subscribes_only_to_its_namespaced_topics() {
+        let (batch_tx, _b) = mpsc::channel(1);
+        let (el_tx, _e) = mpsc::channel(1);
+        let node = P2PNode::new(
+            &format!("/ip4/127.0.0.1/tcp/{}", free_tcp_port()),
+            NS_LIVE,
+            Keypair::generate_ed25519(),
+            batch_tx,
+            el_tx,
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        )
+        .await
+        .unwrap();
+        let subscribed: HashSet<gossipsub::TopicHash> =
+            node.swarm.behaviour().gossipsub.topics().cloned().collect();
+        let expected: HashSet<gossipsub::TopicHash> = ALL_TOPIC_SUFFIXES
+            .iter()
+            .map(|t| gossipsub::IdentTopic::new(cluster_topic(NS_LIVE, t)).hash())
+            .collect();
+        assert_eq!(subscribed, expected);
+    }
+
+    #[tokio::test]
+    async fn node_refuses_to_start_without_a_valid_namespace() {
+        let (batch_tx, _b) = mpsc::channel(1);
+        let (el_tx, _e) = mpsc::channel(1);
+        let r = P2PNode::new(
+            &format!("/ip4/127.0.0.1/tcp/{}", free_tcp_port()),
+            "",
+            Keypair::generate_ed25519(),
+            batch_tx,
+            el_tx,
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        )
+        .await;
+        assert!(r.is_err());
+    }
+
+    fn free_tcp_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    struct TestNode {
+        election_out: mpsc::Sender<ElectionMessage>,
+        election_in: mpsc::Receiver<ElectionMessage>,
+        peers: Arc<std::sync::atomic::AtomicU32>,
+        addr: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn spawn_test_node(ns: &str, dial: Option<&str>) -> TestNode {
+        let port = free_tcp_port();
+        let addr = format!("/ip4/127.0.0.1/tcp/{port}");
+        let (batch_tx, _batch_rx) = mpsc::channel(16);
+        let (election_in_tx, election_in) = mpsc::channel(64);
+        let peers = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut node = P2PNode::new(
+            &addr,
+            ns,
+            Keypair::generate_ed25519(),
+            batch_tx,
+            election_in_tx,
+            peers.clone(),
+        )
+        .await
+        .expect("node starts");
+        let (election_out, election_out_rx) = mpsc::channel(64);
+        node.set_election_publish_channel(election_out_rx);
+        if let Some(d) = dial {
+            node.dial(d).expect("dial");
+        }
+        // keep _batch_rx alive for the node's lifetime by moving it into the task
+        let task = tokio::spawn(async move {
+            let _keep = _batch_rx;
+            node.run().await;
+        });
+        TestNode {
+            election_out,
+            election_in,
+            peers,
+            addr,
+            task,
+        }
+    }
+
+    /// Publish heartbeats from `a` for `secs`, return whether `b` received any.
+    async fn b_hears_a(a: &TestNode, b: &mut TestNode, secs: u64) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        while tokio::time::Instant::now() < deadline {
+            let _ = a
+                .election_out
+                .send(ElectionMessage::Heartbeat {
+                    peer_id: "a".into(),
+                    priority: 1,
+                    seq_num: 7,
+                })
+                .await;
+            if let Ok(Some(_)) =
+                tokio::time::timeout(Duration::from_millis(300), b.election_in.recv()).await
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Positive control: two nodes of the SAME cluster connect and exchange gossip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_cluster_nodes_exchange_gossip() {
+        let a = spawn_test_node(NS_LIVE, None).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut b = spawn_test_node(NS_LIVE, Some(&a.addr)).await;
+        assert!(
+            b_hears_a(&a, &mut b, 15).await,
+            "same-cluster gossip did not flow"
+        );
+        assert!(b.peers.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+        a.task.abort();
+        b.task.abort();
+    }
+
+    /// The isolation property: a node of ANOTHER cluster that dials in (a mis-peered rehearsal)
+    /// receives nothing, and the identify check drops the connection on both sides.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn other_cluster_node_is_refused_and_hears_nothing() {
+        let a = spawn_test_node(NS_LIVE, None).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut b = spawn_test_node(NS_OTHER, Some(&a.addr)).await;
+        assert!(
+            !b_hears_a(&a, &mut b, 8).await,
+            "gossip crossed between clusters"
+        );
+        // identify-reject closed the connection: both sides back to zero peers
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let pa = a.peers.load(std::sync::atomic::Ordering::Relaxed);
+            let pb = b.peers.load(std::sync::atomic::Ordering::Relaxed);
+            if pa == 0 && pb == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cross-cluster connection not closed (a={pa}, b={pb})"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        a.task.abort();
+        b.task.abort();
     }
 }

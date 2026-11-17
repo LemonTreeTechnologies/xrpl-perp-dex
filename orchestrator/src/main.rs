@@ -1917,8 +1917,11 @@ async fn main() -> Result<()> {
         tokio::sync::mpsc::channel::<(p2p::OrderBatch, Option<String>)>(100);
     let (election_inbound_tx, election_inbound_rx) =
         tokio::sync::mpsc::channel::<election::ElectionMessage>(100);
+    // Gossip topics + identify are namespaced by THIS cluster's escrow, so a co-located cluster
+    // (rehearsal, mainnet-sandbox) can never exchange messages with this one, even if mis-peered.
     let mut p2p_node = p2p::P2PNode::new(
         &cli.p2p_listen,
+        &escrow_address,
         p2p_keypair,
         batch_tx,
         election_inbound_tx,
