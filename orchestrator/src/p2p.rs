@@ -5,7 +5,8 @@
 //! - Validators subscribe and replay deterministically
 //! - Any operator can request cross-signing via signing relay
 //!
-//! Topics: "perp-dex/orders", "perp-dex/election", "perp-dex/signing"
+//! Topics: "perp-dex/<escrow r-address>/<suffix>" for every suffix in `ALL_TOPIC_SUFFIXES`
+//! (orders, election, signing, events, path-a/*, cluster/dkg-step) — namespaced per cluster.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
