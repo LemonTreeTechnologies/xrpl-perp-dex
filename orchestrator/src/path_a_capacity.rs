@@ -39,7 +39,7 @@ pub mod limits {
     /// PATH_A_MANIFEST_MAX_FILES — one manifest entry per resealed file.
     pub const MANIFEST_MAX_FILES: u64 = 512;
     /// ENCLAVE_LIMITS_PERP_STATE_MAX_FILES_PER_SHARD.
-    pub const PERP_STATE_MAX_FILES_PER_SHARD: u64 = 200;
+    pub const PERP_STATE_MAX_FILES_PER_SHARD: u64 = 216;
     /// Export holds plaintexts + composite + payload at once ≈ 2.5–3× payload
     /// (X-β4.2-3: the heap axis fails at the PEAK, not the flat payload — the
     /// observed -99 was heap OOM before the buffer check).
@@ -118,9 +118,13 @@ pub mod limits {
     /// No longer current — frozen by the enclave as `PerpMetaLegacyB21` (232) when B22 appended
     /// 8 more bytes (below).
     pub const PERP_META_B21_LEN: u64 = 232;
-    /// β22 = β21 + 8 — CURRENT. `bad_debt` (i64): the insurance shortfall, booked explicitly.
-    /// The enclave `static_assert(sizeof(PerpMeta) == 240)`; this mirror follows.
+    /// β22 = β21 + 8. `bad_debt` (i64): the insurance shortfall, booked explicitly. No longer
+    /// current — frozen by the enclave as `PerpMetaLegacyB22` (240) when B23 appended 8 more
+    /// bytes (below).
     pub const PERP_META_B22_LEN: u64 = 240;
+    /// β23 = β22 + 8 — CURRENT. One u64 appended (`price_publisher_restrict_seq`).
+    /// The enclave `static_assert(sizeof(PerpMeta) == 248)`; this mirror follows.
+    pub const PERP_META_B23_LEN: u64 = 248;
 }
 
 /// One limit check with the numbers behind the verdict.
@@ -236,8 +240,11 @@ pub enum MetaSchema {
     /// == 232: the β21 schema (live ca1c32f7). Upgrades in place, zero-filling `bad_debt`.
     /// Migratable — the OLD size for a β21 → β22 migration.
     LegacyB21,
-    /// == 240: the β22 schema. Already current — nothing to upgrade.
-    AlreadyB22,
+    /// == 240: the β22 schema. Upgrades in place, zero-filling the appended trailing u64.
+    /// Migratable — the OLD size for a β22 → β23 migration.
+    LegacyB22,
+    /// == 248: the β23 schema. Already current — nothing to upgrade.
+    AlreadyB23,
     /// Any other length, an unreadable header, or a size that doesn't reconcile with the
     /// file. The current enclave load HARD-FAILS this (AC-CHUNK3-3) — so promoting a node
     /// in this state would strand it. STOP before the point of no return.
@@ -326,7 +333,8 @@ fn classify_perp_meta(payload_len: Option<u64>) -> MetaSchema {
         Some(limits::PERP_META_B19_LEN) => MetaSchema::LegacyB19,
         Some(limits::PERP_META_B20_LEN) => MetaSchema::LegacyB20,
         Some(limits::PERP_META_B21_LEN) => MetaSchema::LegacyB21,
-        Some(limits::PERP_META_B22_LEN) => MetaSchema::AlreadyB22,
+        Some(limits::PERP_META_B22_LEN) => MetaSchema::LegacyB22,
+        Some(limits::PERP_META_B23_LEN) => MetaSchema::AlreadyB23,
         _ => MetaSchema::Unknown,
     }
 }
@@ -497,7 +505,8 @@ pub fn render(report: &CapacityReport) -> String {
                 MetaSchema::LegacyB19 => "GAP B (200B) → upgrades to β20 (208B): zero-fills pending_row_semantics; the first save writes the current rule",
                 MetaSchema::LegacyB20 => "β20 (208B) → upgrades to β21 (232B): zero-fills the F-3 funding clock + fill accumulators; funding re-arms on the first trigger",
                 MetaSchema::LegacyB21 => "β21 (232B) → upgrades to β22 (240B): zero-fills bad_debt (no shortfall booked yet)",
-                MetaSchema::AlreadyB22 => "β22 (240B) → already current schema (no-op)",
+                MetaSchema::LegacyB22 => "β22 (240B) → upgrades to β23 (248B): zero-fills the appended trailing u64",
+                MetaSchema::AlreadyB23 => "β23 (248B) → already current schema (no-op)",
                 MetaSchema::Unknown => {
                     "UNKNOWN size → NON-migratable — current load HARD-FAILS (STOP)"
                 }
@@ -719,6 +728,7 @@ mod tests {
         assert_eq!(limits::PERP_META_B20_LEN, 208);
         assert_eq!(limits::PERP_META_B21_LEN, 232);
         assert_eq!(limits::PERP_META_B22_LEN, 240);
+        assert_eq!(limits::PERP_META_B23_LEN, 248);
         // Each bump appends whole u64 fields, so the sizes must be strictly increasing and
         // 8-aligned. A new entry that breaks either is a transcription error, not a schema.
         let all = [
@@ -736,6 +746,7 @@ mod tests {
             limits::PERP_META_B20_LEN,
             limits::PERP_META_B21_LEN,
             limits::PERP_META_B22_LEN,
+            limits::PERP_META_B23_LEN,
         ];
         for w in all.windows(2) {
             assert!(
@@ -794,14 +805,27 @@ mod tests {
     }
 
     #[test]
-    fn perp_meta_already_b22_is_the_no_op() {
+    fn perp_meta_already_b23_is_the_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        write_sealed_meta(d, "s0_perp_meta.sealed", limits::PERP_META_B23_LEN);
+        let r = assess_accounts_dir(d).unwrap();
+        assert!(r.ok(), "β23 meta must pass: {}", render(&r));
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB23);
+        assert!(render(&r).contains("no-op"));
+    }
+
+    /// The live β22 meta (240B) is the OLD side of the β23
+    /// migration: migratable, not current and not unknown.
+    #[test]
+    fn perp_meta_b22_is_migratable_to_b23() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         write_sealed_meta(d, "s0_perp_meta.sealed", limits::PERP_META_B22_LEN);
         let r = assess_accounts_dir(d).unwrap();
-        assert!(r.ok(), "β22 meta must pass: {}", render(&r));
-        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB22);
-        assert!(render(&r).contains("no-op"));
+        assert!(r.ok(), "β22 meta must be migratable: {}", render(&r));
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::LegacyB22);
+        assert!(render(&r).contains("upgrades to β23"));
     }
 
     /// The LIVE cluster's meta since ca1c32f7 (β21, 232B) is the OLD side of the β22
@@ -879,8 +903,9 @@ mod tests {
         assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::LegacyB19);
     }
 
-    /// The live schema, stamped: plaintext 232 + 16 AAD = 248 payload → LegacyB21 (248 is not
-    /// a schema).
+    /// The β21 schema, stamped: plaintext 232 + 16 AAD = 248 payload → LegacyB21. 248 is now
+    /// ALSO the β23 plaintext size, so this is the test that the classifier reads the plaintext
+    /// length and not the payload: reading the payload would call this a current β23 meta.
     #[test]
     fn perp_meta_stamped_b21_reads_plaintext() {
         let tmp = tempfile::tempdir().unwrap();
@@ -891,15 +916,26 @@ mod tests {
         assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::LegacyB21);
     }
 
-    /// The current schema, stamped: plaintext 240 + 16 AAD = 256 payload → AlreadyB22.
+    /// The live schema, stamped: plaintext 240 + 16 AAD = 256 payload → LegacyB22.
     #[test]
-    fn perp_meta_stamped_b22_current_is_the_no_op() {
+    fn perp_meta_stamped_b22_reads_plaintext() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         write_sealed_meta_aad(d, "s0_perp_meta.sealed", limits::PERP_META_B22_LEN, 16);
         let r = assess_accounts_dir(d).unwrap();
         assert!(r.ok(), "a stamped β22 meta must pass: {}", render(&r));
-        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB22);
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::LegacyB22);
+    }
+
+    /// The current schema, stamped: plaintext 248 + 16 AAD = 264 payload → AlreadyB23.
+    #[test]
+    fn perp_meta_stamped_b23_current_is_the_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        write_sealed_meta_aad(d, "s0_perp_meta.sealed", limits::PERP_META_B23_LEN, 16);
+        let r = assess_accounts_dir(d).unwrap();
+        assert!(r.ok(), "a stamped β23 meta must pass: {}", render(&r));
+        assert_eq!(r.perp_meta_findings[0].schema, MetaSchema::AlreadyB23);
     }
 
     /// An implausibly large AAD (offsets that are not a real sealed header) must STOP.
@@ -1013,11 +1049,12 @@ mod tests {
         // Reproduce the live failure shape: 179 files, ~10 MB. Even under the
         // NEW 16 MB buffer / 64 MB heap this must be caught — the file count
         // (179) is fine under 512, but per-shard perp count is the axis to
-        // watch. Here we push perp-per-shard OVER 200 to prove the STOP fires.
+        // watch. Here we push perp-per-shard one OVER the cap to prove the STOP fires.
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         write_file(d, "signer_list.sealed", 2256);
-        for i in 0..201 {
+        let over = limits::PERP_STATE_MAX_FILES_PER_SHARD + 1;
+        for i in 0..over {
             write_file(d, &format!("s0_perp_bindings_{i}.sealed"), 60560);
         }
         let r = assess_accounts_dir(d).unwrap();
@@ -1028,7 +1065,7 @@ mod tests {
             .find(|c| c.axis.contains("per shard"))
             .unwrap();
         assert!(!per_shard.ok);
-        assert_eq!(per_shard.usage, 201);
+        assert_eq!(per_shard.usage, over);
     }
 
     #[test]
