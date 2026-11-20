@@ -29,10 +29,11 @@ if [ ! -f "$HDR" ]; then
   exit 0
 fi
 
-# Extract `static_assert(sizeof(<TYPE>) == <N>, ...)` from the enclave header.
-enc_size() { grep -oP "static_assert\(sizeof\($1\) == \K[0-9]+" "$HDR" | head -1; }
+# Extract `static_assert(sizeof(<TYPE>) == <N>, ...)` from the enclave header. A type that is not
+# there yields "" (not an exit under set -e/pipefail), so check() can report it as MISSING.
+enc_size() { grep -oP "static_assert\(sizeof\($1\) == \K[0-9]+" "$HDR" | head -1 || true; }
 # Extract `<CONST>: u64 = <N>;` from the orch mirror.
-orch_size() { grep -oP "$1: u64 = \K[0-9]+" "$RS" | head -1; }
+orch_size() { grep -oP "$1: u64 = \K[0-9]+" "$RS" | head -1 || true; }
 
 fail=0
 checked=0
@@ -63,7 +64,8 @@ check "β18" "PerpMetaLegacyB18" "PERP_META_B18_LEN"
 check "gapb(β19)" "PerpMetaLegacyGapB" "PERP_META_B19_LEN"
 check "β20" "PerpMetaLegacyB20" "PERP_META_B20_LEN"
 check "β21" "PerpMetaLegacyB21" "PERP_META_B21_LEN"
-check "β22" "PerpMeta"    "PERP_META_B22_LEN"
+check "β22" "PerpMetaLegacyB22" "PERP_META_B22_LEN"
+check "β23" "PerpMeta"    "PERP_META_B23_LEN"
 
 
 # ── The CAPACITY limits, same reasoning one axis over ────────────────────────
