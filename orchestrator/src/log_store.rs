@@ -20,8 +20,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const REC_TAG: &[u8; 4] = b"PLR1";
-const CERT_TAG: &[u8; 4] = b"PLC1";
+const REC_MAGIC: &[u8; 4] = b"PLR1";
+const CERT_MAGIC: &[u8; 4] = b"PLC1";
 const REC_EXT: &str = "rec";
 const CERT_EXT: &str = "cert";
 const TMP_EXT: &str = "tmp";
@@ -90,7 +90,7 @@ pub fn encode_record(r: &LogRecord) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(
         REC_FIXED + r.batch.len() + r.quote_blob.len() + r.side_blobs.len() + r.sig_bundle.len(),
     );
-    out.extend_from_slice(REC_TAG);
+    out.extend_from_slice(REC_MAGIC);
     out.extend_from_slice(&r.seq.to_be_bytes());
     out.extend_from_slice(&r.chain_hash);
     out.extend_from_slice(&r.market_id.to_be_bytes());
@@ -152,7 +152,7 @@ pub fn decode_record(bytes: &[u8]) -> Result<LogRecord> {
         bytes.len()
     );
     let mut c = Cursor {
-        b: checked_body(bytes, REC_TAG)?,
+        b: checked_body(bytes, REC_MAGIC)?,
     };
     let seq = c.u64()?;
     let chain_hash: [u8; 32] = c.take(32)?.try_into().expect("32 bytes");
@@ -177,7 +177,7 @@ fn encode_cert(seq: u64, cert: &[u8]) -> Result<Vec<u8>> {
         cert.len()
     );
     let mut out = Vec::with_capacity(CERT_FIXED + cert.len());
-    out.extend_from_slice(CERT_TAG);
+    out.extend_from_slice(CERT_MAGIC);
     out.extend_from_slice(&seq.to_be_bytes());
     out.extend_from_slice(&len32(cert.len()));
     out.extend_from_slice(cert);
@@ -193,7 +193,7 @@ fn decode_cert(bytes: &[u8], want_seq: u64) -> Result<Vec<u8>> {
         bytes.len()
     );
     let mut c = Cursor {
-        b: checked_body(bytes, CERT_TAG)?,
+        b: checked_body(bytes, CERT_MAGIC)?,
     };
     let seq = c.u64()?;
     ensure!(

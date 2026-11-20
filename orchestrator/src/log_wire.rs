@@ -199,13 +199,13 @@ pub fn verify_fetched(a: &Announce, file: &[u8]) -> Result<LogRecord> {
 
 // ── Fetch request/response framing ─────────────────────────────────────
 
-const FETCH_TAG: &[u8; 4] = b"PLF1";
+const FETCH_MAGIC: &[u8; 4] = b"PLF1";
 pub const FETCH_REQ_LEN: usize = 4 + 8;
 const RESP_HAVE: u8 = 0;
 const RESP_NONE: u8 = 1;
 
 pub fn encode_fetch_request(seq: u64) -> Vec<u8> {
-    let mut v = FETCH_TAG.to_vec();
+    let mut v = FETCH_MAGIC.to_vec();
     v.extend_from_slice(&seq.to_be_bytes());
     v
 }
@@ -216,7 +216,7 @@ pub fn decode_fetch_request(b: &[u8]) -> Result<u64> {
         "fetch request is {} bytes",
         b.len()
     );
-    ensure!(&b[..4] == FETCH_TAG, "bad fetch request magic");
+    ensure!(&b[..4] == FETCH_MAGIC, "bad fetch request magic");
     Ok(u64::from_be_bytes(b[4..].try_into().expect("8 bytes")))
 }
 
