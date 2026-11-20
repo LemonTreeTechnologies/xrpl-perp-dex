@@ -7440,24 +7440,27 @@ mod tests {
             "A does not serve a non-member"
         );
 
-        // C's own announcement reaches B only relayed by A (a member): B must still drop it, because
-        // its signed author is not a member. A's announcement for another seq is the control that the
-        // relay path works at all.
-        let from_c = crate::log_wire::announce_for(9, &[6; 32], &file).unwrap();
-        let control = crate::log_wire::announce_for(10, &[6; 32], &file).unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        // D is a stranger connected to A only, so its announcement reaches B only relayed by A (a
+        // member): B must still drop it, because its signed author is not a member. (C is connected to
+        // B directly, so C cannot test this.) A's announcements are the control that the relay path
+        // works at all.
+        let kd = Keypair::generate_ed25519();
+        let id_ = kd.public().to_peer_id();
+        let dd = tempfile::tempdir().unwrap();
+        let d = spawn_log_node(&[&a.node.addr], vec![ia, id_], kd, dd.path()).await;
+        // Every publish has a fresh seq: gossipsub refuses to republish identical bytes,
+        // so a repeated message would be one attempt, not many.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         let mut saw_control = false;
-        while tokio::time::Instant::now() < deadline {
-            c.outbound
-                .send(crate::log_transport::LogOutbound::Publish(
-                    crate::log_transport::Outgoing::unchecked(from_c.clone()),
-                ))
-                .await
-                .unwrap();
-            if !saw_control {
-                a.outbound
+        let mut n = 0u64;
+        while tokio::time::Instant::now() < deadline && !saw_control {
+            n += 1;
+            let from_c = crate::log_wire::announce_for(1_000 + n, &[6; 32], &file).unwrap();
+            let control = crate::log_wire::announce_for(2_000 + n, &[6; 32], &file).unwrap();
+            for (node, g) in [(&d, from_c), (&a, control)] {
+                node.outbound
                     .send(crate::log_transport::LogOutbound::Publish(
-                        crate::log_transport::Outgoing::unchecked(control.clone()),
+                        crate::log_transport::Outgoing::unchecked(g),
                     ))
                     .await
                     .unwrap();
@@ -7465,10 +7468,26 @@ mod tests {
             while let Ok(Some(m)) =
                 tokio::time::timeout(Duration::from_millis(300), b.inbound.recv()).await
             {
-                assert_ne!(m.author, ic, "a non-member's announcement was delivered");
-                if matches!(m.msg, crate::log_wire::Parsed::Announce(x) if x.seq == 10) {
+                assert_ne!(m.author, id_, "a non-member's announcement was delivered");
+                if matches!(m.msg, crate::log_wire::Parsed::Announce(x) if x.seq > 2_000) {
                     saw_control = true;
                 }
+            }
+        }
+        // Keep D publishing a little longer after the control arrived: a delivered D message would
+        // land in this window too.
+        for k in 0..10u64 {
+            let g = crate::log_wire::announce_for(5_000 + k, &[6; 32], &file).unwrap();
+            d.outbound
+                .send(crate::log_transport::LogOutbound::Publish(
+                    crate::log_transport::Outgoing::unchecked(g),
+                ))
+                .await
+                .unwrap();
+            while let Ok(Some(m)) =
+                tokio::time::timeout(Duration::from_millis(200), b.inbound.recv()).await
+            {
+                assert_ne!(m.author, id_, "a non-member's announcement was delivered");
             }
         }
         assert!(saw_control, "control: a member's announcement still flows");
@@ -7476,6 +7495,7 @@ mod tests {
         a.node.task.abort();
         b.node.task.abort();
         c.node.task.abort();
+        d.node.task.abort();
     }
 
     /// The isolation property: a node of ANOTHER cluster that dials in (a mis-peered rehearsal)
