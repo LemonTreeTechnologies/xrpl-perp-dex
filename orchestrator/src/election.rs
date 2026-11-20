@@ -33,6 +33,23 @@ pub enum ElectionMessage {
     },
 }
 
+impl ElectionMessage {
+    /// The peer this message speaks for.
+    pub fn declared_peer_id(&self) -> &str {
+        match self {
+            ElectionMessage::Heartbeat { peer_id, .. }
+            | ElectionMessage::LeaderAnnounce { peer_id, .. } => peer_id,
+        }
+    }
+}
+
+/// An election message is accepted only from the peer it speaks for: `source` is the gossip author,
+/// set and verified by Signed + Strict gossipsub. A node only ever sends messages naming itself, so a
+/// message naming someone else (or carrying no author) is a forgery or a replay through another peer.
+pub fn origin_bound(msg: &ElectionMessage, source: Option<&str>) -> bool {
+    source == Some(msg.declared_peer_id())
+}
+
 pub struct ElectionConfig {
     pub our_peer_id: String,
     pub our_priority: u8,
@@ -334,6 +351,30 @@ impl ElectionState {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_election_message_must_come_from_the_peer_it_names() {
+        let hb = ElectionMessage::Heartbeat {
+            peer_id: "A".into(),
+            priority: 0,
+            seq_num: 1,
+        };
+        let la = ElectionMessage::LeaderAnnounce {
+            peer_id: "B".into(),
+            priority: 1,
+        };
+        assert!(origin_bound(&hb, Some("A")));
+        assert!(origin_bound(&la, Some("B")));
+        assert!(
+            !origin_bound(&hb, Some("B")),
+            "a heartbeat naming another peer"
+        );
+        assert!(
+            !origin_bound(&la, Some("A")),
+            "an announce naming another peer"
+        );
+        assert!(!origin_bound(&hb, None), "no author");
+    }
     use super::*;
 
     #[tokio::test]

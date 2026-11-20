@@ -20,6 +20,9 @@ mod frost_round; // FROST threshold-Schnorr signing round driver
 mod http_helpers;
 mod leader_gate; // O-H3 — validator leader-gate provenance decision (extracted + unit-tested)
 mod log_client; // client for the enclave's replicated-log routes
+mod log_store; // durable per-node store of replicated-log records
+mod log_transport; // replicated-log fetch protocol (bounded) and log channel types
+mod log_wire; // replicated-log transport framing, fetch checks, certificate assembly
 mod membership_admin;
 mod membership_apply;
 mod membership_canonical;
@@ -740,6 +743,12 @@ struct RunArgs {
     /// P2P peers to connect to (multiaddr, comma-separated)
     #[arg(long)]
     p2p_peers: Option<String>,
+
+    /// The cluster's member peers: comma-separated libp2p peer ids (each operator lists every member).
+    /// When set, election and signing messages are accepted only from members, by signed author and
+    /// relay. Required by the replicated-log transport.
+    #[arg(long)]
+    member_peers: Option<String>,
 
     /// Persistent libp2p identity key path. Auto-generated on first run so
     /// the operator's peer_id is stable across restarts (required for any
@@ -2703,6 +2712,14 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    // Member peers: parsed strictly — a malformed id stops startup rather than silently shrinking the set.
+    if let Some(m) = &cli.member_peers {
+        let members = p2p::parse_member_peers(m).context("--member-peers")?;
+        p2p_node.set_member_peers(members);
+    } else {
+        p2p_node.set_member_peers(Vec::new());
+    }
 
     // Connect to peers
     if let Some(peers_str) = &cli.p2p_peers {
