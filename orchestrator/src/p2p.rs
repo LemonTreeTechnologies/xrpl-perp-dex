@@ -1953,7 +1953,12 @@ impl P2PNode {
                     debug!("log publish: {e}");
                 }
             }
-            LogOutbound::Fetch { seq, peer, reply } => {
+            LogOutbound::Fetch {
+                kind,
+                seq,
+                peer,
+                reply,
+            } => {
                 if !self
                     .member_peers
                     .as_ref()
@@ -1966,7 +1971,7 @@ impl P2PNode {
                     .swarm
                     .behaviour_mut()
                     .log_fetch
-                    .send_request(&peer, seq);
+                    .send_request(&peer, (kind, seq));
                 self.log_fetches.insert(id, reply);
             }
         }
@@ -1974,7 +1979,10 @@ impl P2PNode {
 
     fn on_log_fetch_event(
         &mut self,
-        ev: request_response::Event<u64, crate::log_transport::FetchResponse>,
+        ev: request_response::Event<
+            (crate::log_wire::FetchKind, u64),
+            crate::log_transport::FetchResponse,
+        >,
     ) {
         use request_response::{Event, Message};
         match ev {
@@ -1992,10 +2000,10 @@ impl P2PNode {
                     .is_some_and(|m| m.contains(&peer));
                 let Some(dir) = self.log_store_dir.as_ref().filter(|_| member) else {
                     // Not served: dropping the channel fails the requester's attempt.
-                    warn!(peer = %peer, seq = request, "log fetch refused (transport off or not a member)");
+                    warn!(peer = %peer, seq = request.1, "log fetch refused (transport off or not a member)");
                     return;
                 };
-                let res = crate::log_transport::served_record(dir, request);
+                let res = crate::log_transport::served(dir, request.0, request.1);
                 let _ = self
                     .swarm
                     .behaviour_mut()
@@ -7296,7 +7304,12 @@ mod tests {
     ) -> anyhow::Result<crate::log_transport::FetchResponse> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         n.outbound
-            .send(crate::log_transport::LogOutbound::Fetch { seq, peer, reply })
+            .send(crate::log_transport::LogOutbound::Fetch {
+                kind: crate::log_wire::FetchKind::Record,
+                seq,
+                peer,
+                reply,
+            })
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(20), rx)

@@ -5,10 +5,10 @@
 //! Only member peers are served and only member peers' answers are used (the caller enforces both).
 #![allow(dead_code)]
 
-use crate::log_store::{Durable, MAX_REC_FILE};
+use crate::log_store::{Durable, MAX_CERT_FILE, MAX_REC_FILE};
 use crate::log_wire::{
     decode_fetch_request, encode_fetch_request, encode_fetch_response, fetch_response_body_len,
-    FETCH_REQ_LEN,
+    FetchKind, FETCH_REQ_LEN,
 };
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::StreamProtocol;
@@ -35,10 +35,14 @@ fn invalid(e: impl std::fmt::Display) -> io::Error {
 #[async_trait::async_trait]
 impl libp2p::request_response::Codec for LogFetchCodec {
     type Protocol = StreamProtocol;
-    type Request = u64;
+    type Request = (FetchKind, u64);
     type Response = FetchResponse;
 
-    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<u64>
+    async fn read_request<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<(FetchKind, u64)>
     where
         T: AsyncRead + Unpin + Send,
     {
@@ -67,11 +71,16 @@ impl libp2p::request_response::Codec for LogFetchCodec {
         Ok(Some(body))
     }
 
-    async fn write_request<T>(&mut self, _: &Self::Protocol, io: &mut T, seq: u64) -> io::Result<()>
+    async fn write_request<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        (kind, seq): (FetchKind, u64),
+    ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        io.write_all(&encode_fetch_request(seq)).await?;
+        io.write_all(&encode_fetch_request(kind, seq)).await?;
         io.close().await
     }
 
@@ -116,8 +125,9 @@ impl Outgoing {
 pub enum LogOutbound {
     /// Publish an announcement or an APPLIED share.
     Publish(Outgoing),
-    /// Ask one member peer for one record file.
+    /// Ask one member peer for one record file or certificate file.
     Fetch {
+        kind: FetchKind,
         seq: u64,
         peer: libp2p::PeerId,
         reply: oneshot::Sender<anyhow::Result<FetchResponse>>,
@@ -131,12 +141,16 @@ pub struct LogInbound {
     pub msg: crate::log_wire::Parsed,
 }
 
-/// The record file this node serves for `seq`, read bounded from the store directory (no shared lock
+/// The file this node serves for (`kind`, `seq`), read bounded from the store directory (no shared lock
 /// with the writer: files are only ever renamed into place whole).
-pub fn served_record(store_dir: &Path, seq: u64) -> FetchResponse {
-    let p = store_dir.join(format!("{seq:020}.rec"));
+pub fn served(store_dir: &Path, kind: FetchKind, seq: u64) -> FetchResponse {
+    let (ext, cap) = match kind {
+        FetchKind::Record => ("rec", MAX_REC_FILE),
+        FetchKind::Cert => ("cert", MAX_CERT_FILE),
+    };
+    let p = store_dir.join(format!("{seq:020}.{ext}"));
     match std::fs::metadata(&p) {
-        Ok(m) if m.len() > 0 && m.len() <= MAX_REC_FILE as u64 => std::fs::read(&p).ok(),
+        Ok(m) if m.len() > 0 && m.len() <= cap as u64 => std::fs::read(&p).ok(),
         _ => None,
     }
 }
@@ -155,9 +169,14 @@ mod tests {
     async fn requests_and_responses_round_trip() {
         let mut c = LogFetchCodec;
         let mut buf = Cursor::new(Vec::new());
-        c.write_request(&proto(), &mut buf, 77).await.unwrap();
+        c.write_request(&proto(), &mut buf, (FetchKind::Cert, 77))
+            .await
+            .unwrap();
         let mut r = Cursor::new(buf.into_inner());
-        assert_eq!(c.read_request(&proto(), &mut r).await.unwrap(), 77);
+        assert_eq!(
+            c.read_request(&proto(), &mut r).await.unwrap(),
+            (FetchKind::Cert, 77)
+        );
 
         for res in [None, Some(vec![1u8, 2, 3])] {
             let mut buf = Cursor::new(Vec::new());
@@ -182,7 +201,7 @@ mod tests {
         let mut short = Cursor::new(vec![0, 0, 0, 0, 9, 1, 2]);
         assert!(c.read_response(&proto(), &mut short).await.is_err());
         // A request of the wrong magic.
-        let mut bad = Cursor::new(b"XXXX\0\0\0\0\0\0\0\x01".to_vec());
+        let mut bad = Cursor::new(b"XXXX\0\0\0\0\0\0\0\0\x01".to_vec());
         assert_eq!(
             c.read_request(&proto(), &mut bad).await.unwrap_err().kind(),
             io::ErrorKind::InvalidData
@@ -201,20 +220,23 @@ mod tests {
     #[test]
     fn served_records_are_bounded_reads_of_whole_files() {
         let d = tempfile::tempdir().unwrap();
-        assert_eq!(served_record(d.path(), 1), None);
+        assert_eq!(served(d.path(), FetchKind::Record, 1), None);
         let p = d.path().join(format!("{:020}.rec", 1));
         std::fs::write(&p, b"abc").unwrap();
-        assert_eq!(served_record(d.path(), 1), Some(b"abc".to_vec()));
+        assert_eq!(
+            served(d.path(), FetchKind::Record, 1),
+            Some(b"abc".to_vec())
+        );
         std::fs::write(&p, b"").unwrap();
         assert_eq!(
-            served_record(d.path(), 1),
+            served(d.path(), FetchKind::Record, 1),
             None,
             "an empty file is not served"
         );
         let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
         f.set_len(MAX_REC_FILE as u64 + 1).unwrap();
         assert_eq!(
-            served_record(d.path(), 1),
+            served(d.path(), FetchKind::Record, 1),
             None,
             "an oversized file is not served"
         );
