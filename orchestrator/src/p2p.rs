@@ -1941,7 +1941,8 @@ impl P2PNode {
                 let g = out.gossip();
                 let topic = match g {
                     crate::log_wire::LogGossip::Announce { .. } => self.log_topic.clone(),
-                    crate::log_wire::LogGossip::Applied { .. } => self.log_cert_topic.clone(),
+                    crate::log_wire::LogGossip::Applied { .. }
+                    | crate::log_wire::LogGossip::View { .. } => self.log_cert_topic.clone(),
                 };
                 let data = match serde_json::to_vec(g) {
                     Ok(d) if d.len() <= crate::log_wire::MAX_GOSSIP_LEN => d,

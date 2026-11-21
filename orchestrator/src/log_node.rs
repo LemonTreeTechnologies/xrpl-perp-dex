@@ -9,8 +9,10 @@
 
 use crate::log_client::{ApplyInput, Head, LogClient, LogError, Probe};
 use crate::log_follower::{Alarm, Enclave, Follower, Net, Step};
+use crate::log_sync::{ServerInfo, SyncGate, SyncStatus, SyncVerdict};
 use crate::log_transport::{LogInbound, LogOutbound, Outgoing};
-use crate::log_wire::FetchKind;
+use crate::log_view::{ViewBook, ViewEvent};
+use crate::log_wire::{FetchKind, Parsed, ViewReport};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use libp2p::PeerId;
@@ -144,6 +146,9 @@ impl Enclave for EnclaveAdapter {
     async fn head(&self) -> Result<Head, LogError> {
         self.client.head().await
     }
+    async fn view(&self) -> Result<crate::log_client::View, LogError> {
+        self.client.view().await
+    }
     async fn apply(&self, input: &ApplyInput<'_>) -> Result<Vec<u8>, LogError> {
         self.client
             .apply(input, &self.account_id, &self.session_key)
@@ -217,6 +222,12 @@ pub struct LogStatus {
     /// This node's replicated state differs from the log it was given: its reads are not the cluster's.
     pub diverged: bool,
     pub last_step: String,
+    /// The leader must hold its next commit: member views disagree with no majority (C1).
+    pub view_hold: bool,
+    /// The last seq every member reported the same view for.
+    pub view_agreed_seq: Option<u64>,
+    /// This node's XRPL sync gate.
+    pub sync: SyncStatus,
     pub alarms_total: u64,
     pub recent_alarms: Vec<String>,
 }
@@ -240,11 +251,13 @@ impl LogHealth {
         self.update(|s| s.mode = mode);
     }
 
-    fn update(&self, f: impl FnOnce(&mut LogStatus)) {
+    pub(crate) fn update(&self, f: impl FnOnce(&mut LogStatus)) {
         f(&mut self.0.lock().unwrap_or_else(|e| e.into_inner()));
     }
 
-    fn record(&self, f: &Follower, step: &Step, head: Option<&Head>, alarms: Vec<Alarm>) {
+    /// Record the follower's state, the step just taken (if any), the head, and drain its alarms.
+    fn record(&self, f: &mut Follower, step: Option<&Step>, head: Option<&Head>, hold: bool) {
+        let alarms = f.take_alarms();
         self.update(|s| {
             if let Some(h) = head {
                 s.on = h.on;
@@ -253,7 +266,10 @@ impl LogHealth {
             s.stored_seq = f.store().last_seq();
             s.halted = f.halted();
             s.diverged = matches!(f.halted(), Some(c) if c == crate::log_client::rc::DIVERGED);
-            s.last_step = format!("{step:?}");
+            if let Some(step) = step {
+                s.last_step = format!("{step:?}");
+            }
+            s.view_hold = hold;
             for a in alarms {
                 s.alarms_total = s.alarms_total.saturating_add(1);
                 if s.recent_alarms.len() == RECENT_ALARMS {
@@ -267,27 +283,72 @@ impl LogHealth {
 
 // ── The loop ───────────────────────────────────────────────────────────
 
-/// Drive the follower: handle peer messages as they arrive, and step whenever the tick fires; after an
-/// applied step, step again at once (catching up), otherwise wait for the next tick.
+/// This node's own XRPL endpoint, for the sync gate.
+#[async_trait]
+pub trait XrplSource: Send + Sync {
+    async fn server_info(&self) -> Result<ServerInfo>;
+}
+
+pub struct XrplHttp {
+    pub http: reqwest::Client,
+    pub url: String,
+}
+
+#[async_trait]
+impl XrplSource for XrplHttp {
+    async fn server_info(&self) -> Result<ServerInfo> {
+        crate::log_sync::server_info(&self.http, &self.url).await
+    }
+}
+
+/// What the loop runs against.
+pub struct LoopParts<'a> {
+    pub enclave: &'a dyn Enclave,
+    pub net: &'a dyn Net,
+    pub xrpl: &'a dyn XrplSource,
+    pub health: &'a LogHealth,
+    /// This node's peer id (its own view reports are filed under it).
+    pub me: PeerId,
+    pub tick: Duration,
+}
+
+/// Act on the view compare's findings: a minority of one halts this node; the rest are alarms.
+fn on_view_events(f: &mut Follower, health: &LogHealth, events: Vec<ViewEvent>) {
+    for e in events {
+        match e {
+            ViewEvent::Agreed { seq } => health.update(|s| s.view_agreed_seq = Some(seq)),
+            ViewEvent::SelfOdd { seq } => f.halt_view_minority(seq),
+            ViewEvent::PeerOdd { seq, peer } => f.alarm(Alarm::ViewPeerOdd { seq, peer }),
+            ViewEvent::Split { seq } => f.alarm(Alarm::ViewSplit { seq }),
+            ViewEvent::Equivocation { seq, peer } => f.alarm(Alarm::ViewEquivocation { seq, peer }),
+        }
+    }
+}
+
+/// Drive the follower. Peer messages are handled as they arrive (view reports go to the view compare).
+/// On each tick: if this node's XRPL node is not in sync, wait; otherwise step, and after an applied
+/// entry report this node's view, then step again at once (catching up) until there is nothing to apply.
 pub async fn run_follower(
     mut f: Follower,
-    enclave: &dyn Enclave,
-    net: &dyn Net,
+    mut views: ViewBook,
+    mut gate: SyncGate,
     mut inbound: mpsc::Receiver<LogInbound>,
-    health: &LogHealth,
-    tick: Duration,
+    p: LoopParts<'_>,
 ) {
-    let mut ticker = tokio::time::interval(tick);
+    let mut ticker = tokio::time::interval(p.tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             m = inbound.recv() => match m {
+                Some(LogInbound { author, msg: Parsed::View(r) }) => {
+                    let anchor = f.store().last_seq().unwrap_or(0);
+                    let ev = views.add(author, r, anchor);
+                    on_view_events(&mut f, p.health, ev);
+                    p.health.record(&mut f, None, None, views.hold());
+                }
                 Some(m) => {
-                    f.on_inbound(enclave, m).await;
-                    let alarms = f.take_alarms();
-                    if !alarms.is_empty() {
-                        health.record(&f, &Step::Idle, None, alarms);
-                    }
+                    f.on_inbound(p.enclave, m).await;
+                    p.health.record(&mut f, None, None, views.hold());
                 }
                 None => {
                     tracing::error!("log inbound channel closed; the follower stops");
@@ -295,12 +356,39 @@ pub async fn run_follower(
                 }
             },
             _ = ticker.tick() => {
+                let verdict = match p.xrpl.server_info().await {
+                    Ok(si) => {
+                        let v = gate.evaluate(&si, Instant::now());
+                        let st = gate.status(&si, &v);
+                        p.health.update(|s| s.sync = st);
+                        v
+                    }
+                    Err(e) => {
+                        let v = SyncVerdict::Wait { reason: format!("server_info: {e:#}") };
+                        p.health.update(|s| s.sync.verdict = Some(v.clone()));
+                        v
+                    }
+                };
+                if verdict != SyncVerdict::InSync {
+                    let w = Step::Wait("this node's XRPL node is not in sync");
+                    p.health.record(&mut f, Some(&w), None, views.hold());
+                    continue;
+                }
                 loop {
-                    let step = f.step(enclave, net, Instant::now()).await;
-                    let head = enclave.head().await.ok();
-                    let alarms = f.take_alarms();
-                    health.record(&f, &step, head.as_ref(), alarms);
-                    if !matches!(step, Step::Applied { .. }) {
+                    let step = f.step(p.enclave, p.net, Instant::now()).await;
+                    if let Step::Applied { seq } = step {
+                        if let Ok(v) = p.enclave.view().await {
+                            if v.seq == seq {
+                                let r = ViewReport { seq, chain_hash: v.chain_hash, digest: v.digest };
+                                p.net.publish(Outgoing::view(&r)).await;
+                                let ev = views.add(p.me, r, seq);
+                                on_view_events(&mut f, p.health, ev);
+                            }
+                        }
+                    }
+                    let head = p.enclave.head().await.ok();
+                    p.health.record(&mut f, Some(&step), head.as_ref(), views.hold());
+                    if !matches!(step, Step::Applied { .. }) || f.halted().is_some() {
                         break;
                     }
                 }
@@ -522,6 +610,14 @@ mod tests {
                 on: true,
             })
         }
+        async fn view(&self) -> Result<crate::log_client::View, LogError> {
+            let seq = *self.seq.lock().unwrap();
+            Ok(crate::log_client::View {
+                seq,
+                chain_hash: [seq as u8; 32],
+                digest: [seq as u8; 32],
+            })
+        }
         async fn apply(&self, _: &ApplyInput<'_>) -> Result<Vec<u8>, LogError> {
             if self.code == 0 {
                 *self.seq.lock().unwrap() += 1;
@@ -545,8 +641,9 @@ mod tests {
         }
     }
 
-    /// Every peer serves records 1..=3.
-    struct Serves;
+    /// Every peer serves records 1..=3; publishes are recorded.
+    #[derive(Default)]
+    struct Serves(Mutex<Vec<crate::log_wire::LogGossip>>);
 
     #[async_trait]
     impl Net for Serves {
@@ -572,37 +669,119 @@ mod tests {
                 .unwrap(),
             ))
         }
-        async fn publish(&self, _: Outgoing) {}
+        async fn publish(&self, out: Outgoing) {
+            self.0.lock().unwrap().push(out.gossip().clone());
+        }
     }
 
-    async fn run_until(code: i64, tick: Duration, done: impl Fn(&LogStatus) -> bool) -> LogStatus {
+    struct FixedXrpl(ServerInfo);
+
+    #[async_trait]
+    impl XrplSource for FixedXrpl {
+        async fn server_info(&self) -> Result<ServerInfo> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn synced() -> ServerInfo {
+        ServerInfo {
+            server_state: "full".into(),
+            peers: 10,
+            validated_seq: 100,
+            validated_age_s: 1,
+        }
+    }
+
+    type Until = Box<dyn Fn(&LogStatus) -> bool>;
+
+    /// Run the loop; for each stage send its messages, then wait until its condition holds.
+    async fn run_stages(
+        code: i64,
+        tick: Duration,
+        xrpl: ServerInfo,
+        stages: Vec<(Vec<LogInbound>, Until)>,
+        me: PeerId,
+        members: Vec<PeerId>,
+    ) -> (LogStatus, Vec<crate::log_wire::LogGossip>) {
         let d = tempfile::tempdir().unwrap();
+        let others = other_members(&members, &me);
         let f = Follower::new(
             FollowerCfg::default(),
-            vec![PeerId::random()],
+            others,
             LogStore::open(d.path()).unwrap(),
         );
         let health = LogHealth::new("follow");
-        let (_tx, rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel(16);
         let e = OneApply {
             code,
             seq: Mutex::new(0),
         };
-        let run = run_follower(f, &e, &Serves, rx, &health, tick);
+        let net = Serves::default();
+        let x = FixedXrpl(xrpl);
+        let parts = LoopParts {
+            enclave: &e,
+            net: &net,
+            xrpl: &x,
+            health: &health,
+            me,
+            tick,
+        };
+        let run = run_follower(
+            f,
+            ViewBook::new(me, members, 16),
+            SyncGate::new(Default::default()),
+            rx,
+            parts,
+        );
         tokio::pin!(run);
-        let deadline = tokio::time::sleep(Duration::from_secs(5));
-        tokio::pin!(deadline);
-        loop {
-            tokio::select! {
-                _ = &mut run => panic!("the loop ended"),
-                _ = &mut deadline => panic!("never reached: {:?}", health.snapshot()),
-                _ = tokio::time::sleep(Duration::from_millis(5)) => {
-                    let s = health.snapshot();
-                    if done(&s) {
-                        return s;
+        for (send, until) in stages {
+            for m in send {
+                tx.send(m).await.unwrap();
+            }
+            let deadline = tokio::time::sleep(Duration::from_secs(5));
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    _ = &mut run => panic!("the loop ended"),
+                    _ = &mut deadline => panic!("never reached: {:?}", health.snapshot()),
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                        if until(&health.snapshot()) {
+                            break;
+                        }
                     }
                 }
             }
+        }
+        let published = net.0.lock().unwrap().clone();
+        (health.snapshot(), published)
+    }
+
+    async fn run_until(
+        code: i64,
+        tick: Duration,
+        done: impl Fn(&LogStatus) -> bool + 'static,
+    ) -> LogStatus {
+        let me = PeerId::random();
+        run_stages(
+            code,
+            tick,
+            synced(),
+            vec![(vec![], Box::new(done))],
+            me,
+            vec![me, PeerId::random()],
+        )
+        .await
+        .0
+    }
+
+    fn view_from(author: PeerId, seq: u64, d: u8) -> LogInbound {
+        LogInbound {
+            author,
+            msg: Parsed::View(ViewReport {
+                seq,
+                chain_hash: [seq as u8; 32],
+                digest: [d; 32],
+            }),
         }
     }
 
@@ -611,6 +790,152 @@ mod tests {
         // One tick (the first fires at once; the next is an hour away): catching up must not wait for ticks.
         let s = run_until(0, Duration::from_secs(3600), |s| s.stored_seq == Some(3)).await;
         assert_eq!((s.enclave_seq, s.halted, s.diverged), (3, None, false));
+    }
+
+    #[tokio::test]
+    async fn after_each_applied_seq_this_node_publishes_its_view() {
+        let me = PeerId::random();
+        let (_, published) = run_stages(
+            0,
+            Duration::from_secs(3600),
+            synced(),
+            vec![(vec![], Box::new(|s: &LogStatus| s.stored_seq == Some(3)))],
+            me,
+            vec![me, PeerId::random(), PeerId::random()],
+        )
+        .await;
+        let views: Vec<_> = published
+            .iter()
+            .filter_map(|g| match g {
+                crate::log_wire::LogGossip::View { seq, digest, .. } => {
+                    Some((*seq, digest.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            views,
+            (1..=3)
+                .map(|q| (q, hex::encode([q as u8; 32])))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_out_of_sync_xrpl_node_applies_nothing() {
+        let me = PeerId::random();
+        let behind = ServerInfo {
+            server_state: "tracking".into(),
+            ..synced()
+        };
+        let (s, _) = run_stages(
+            0,
+            Duration::from_millis(5),
+            behind,
+            vec![(
+                vec![],
+                Box::new(|s: &LogStatus| s.last_step.contains("not in sync")),
+            )],
+            me,
+            vec![me, PeerId::random()],
+        )
+        .await;
+        assert_eq!(s.stored_seq, None);
+        assert!(
+            matches!(&s.sync.verdict, Some(SyncVerdict::Wait { reason }) if reason.contains("tracking"))
+        );
+    }
+
+    #[tokio::test]
+    async fn this_node_in_the_view_minority_halts_as_diverged() {
+        let (me, a, b) = (PeerId::random(), PeerId::random(), PeerId::random());
+        // This node's view at seq 1 has digest [1; 32]; both peers report [9; 32].
+        let (s, _) = run_stages(
+            0,
+            Duration::from_secs(3600),
+            synced(),
+            vec![
+                (vec![], Box::new(|s: &LogStatus| s.stored_seq == Some(3))),
+                (
+                    vec![view_from(a, 1, 9), view_from(b, 1, 9)],
+                    Box::new(|s: &LogStatus| s.halted.is_some()),
+                ),
+            ],
+            me,
+            vec![me, a, b],
+        )
+        .await;
+        assert!(s.diverged);
+        assert!(
+            s.recent_alarms.iter().any(|a| a.contains("ViewMinority")),
+            "{:?}",
+            s.recent_alarms
+        );
+    }
+
+    #[tokio::test]
+    async fn an_odd_peer_is_an_alarm_and_this_node_continues() {
+        let (me, a, b) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let (s, _) = run_stages(
+            0,
+            Duration::from_secs(3600),
+            synced(),
+            vec![
+                (vec![], Box::new(|s: &LogStatus| s.stored_seq == Some(3))),
+                (
+                    vec![view_from(a, 1, 1), view_from(b, 1, 9)],
+                    Box::new(|s: &LogStatus| {
+                        s.recent_alarms.iter().any(|x| x.contains("ViewPeerOdd"))
+                    }),
+                ),
+            ],
+            me,
+            vec![me, a, b],
+        )
+        .await;
+        assert_eq!((s.halted, s.diverged, s.view_hold), (None, false, false));
+    }
+
+    #[tokio::test]
+    async fn every_member_agreeing_is_recorded() {
+        let (me, a, b) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let (s, _) = run_stages(
+            0,
+            Duration::from_secs(3600),
+            synced(),
+            vec![
+                (vec![], Box::new(|s: &LogStatus| s.stored_seq == Some(3))),
+                (
+                    vec![view_from(a, 2, 2), view_from(b, 2, 2)],
+                    Box::new(|s: &LogStatus| s.view_agreed_seq == Some(2)),
+                ),
+            ],
+            me,
+            vec![me, a, b],
+        )
+        .await;
+        assert!(s.recent_alarms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_disagreement_without_a_majority_sets_the_hold() {
+        let (me, a, b) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let (s, _) = run_stages(
+            0,
+            Duration::from_secs(3600),
+            synced(),
+            vec![
+                (vec![], Box::new(|s: &LogStatus| s.stored_seq == Some(3))),
+                (
+                    vec![view_from(a, 3, 7)],
+                    Box::new(|s: &LogStatus| s.view_hold),
+                ),
+            ],
+            me,
+            vec![me, a, b],
+        )
+        .await;
+        assert_eq!((s.halted, s.view_hold), (None, true));
     }
 
     #[tokio::test]
