@@ -111,6 +111,14 @@ pub fn classify_failure(status: u16, body: &str) -> LogError {
     }
 }
 
+/// What the enclave says about its log when asked at startup or by the watcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    /// The enclave build has no replicated log.
+    Absent,
+    Head(Head),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Head {
     pub seq: u64,
@@ -299,8 +307,23 @@ impl LogClient {
         })
     }
 
-    pub async fn head(&self) -> Result<Head, LogError> {
+    /// The head, or `Absent` when the enclave has no replicated log at all (a build before it): the
+    /// server's fallback for an unknown route is `200 {"status":"error","message":"Not found"}`.
+    pub async fn probe(&self) -> Result<Probe, LogError> {
         let v = self.get("/perp/log/head").await?;
+        if v.get("status").and_then(Value::as_str) == Some("error")
+            && v.get("message").and_then(Value::as_str) == Some("Not found")
+        {
+            return Ok(Probe::Absent);
+        }
+        Self::parse_head(v).map(Probe::Head)
+    }
+
+    pub async fn head(&self) -> Result<Head, LogError> {
+        Self::parse_head(self.get("/perp/log/head").await?)
+    }
+
+    fn parse_head(v: Value) -> Result<Head, LogError> {
         Self::shape(v, |v| {
             Ok(Head {
                 seq: u64f(v, "seq")?,
@@ -539,6 +562,33 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://{addr}/v1")
+    }
+
+    #[tokio::test]
+    async fn probe_tells_an_enclave_without_the_log_from_an_unreadable_one() {
+        let body = |v: Value| {
+            Router::new().route("/v1/perp/log/head", get(move || async move { Json(v) }))
+        };
+        let absent =
+            LogClient::new(&serve(body(json!({"status":"error","message":"Not found"}))).await)
+                .unwrap();
+        assert_eq!(absent.probe().await.unwrap(), Probe::Absent);
+        let on = LogClient::new(
+            &serve(body(json!({"status":"success","seq":0,"t_batch":0,
+            "chain_hash":"00".repeat(32),"fenced":false,"on":true})))
+            .await,
+        )
+        .unwrap();
+        assert!(matches!(on.probe().await.unwrap(), Probe::Head(h) if h.on));
+        // Any other error body is not "absent": the caller cannot tell the mode and must not guess.
+        for v in [
+            json!({"status":"error","message":"busy"}),
+            json!({"message":"Not found"}),
+            json!({"status":"success"}),
+        ] {
+            let c = LogClient::new(&serve(body(v.clone())).await).unwrap();
+            assert!(c.probe().await.is_err(), "{v} read as a mode");
+        }
     }
 
     #[tokio::test]

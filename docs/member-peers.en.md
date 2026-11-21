@@ -29,6 +29,21 @@ The list decides who may *speak* on these channels. It does not decide what a me
 and certificates are accepted only with member signatures verified inside the enclave against the sealed
 signer list. A wrong list on one node affects that node's connectivity, not the cluster's authority.
 
+## Replicated-log mode (`--log-store-dir`)
+
+When the enclave is in replicated-log mode, a node runs only with all three of: `--member-peers`,
+`--log-store-dir <dir>` (this node's durable log store) and a local signer from the signers config.
+
+- **At startup**, before any peer is dialled, the orchestrator asks the enclave whether it is in log mode.
+  In log mode with any of the three missing, it refuses to start and names what is missing. A log store
+  set without the rest is refused too, before genesis as well (an enclave build without the log
+  ignores the setting with a warning). If the enclave's answer cannot be read, startup
+  retries for about two minutes and then refuses; it never assumes "not in log mode".
+- **While running without the log**, the orchestrator keeps checking. When the enclave enters log mode,
+  the process stops (exit code 78), and the next start applies the rule above.
+- With all three set, the node follows the log. `/v1/system/status` reports it under `log`: mode,
+  enclave and stored position, `halted`, `diverged` and recent alarms.
+
 ## Operations
 
 - Adding or removing a member means updating the list on **every** node and restarting each orchestrator.

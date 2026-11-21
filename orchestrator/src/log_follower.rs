@@ -73,6 +73,9 @@ pub enum Alarm {
     BadShare { seq: u64, author: PeerId },
     /// The record applied but could not be stored.
     StoreFailed { seq: u64 },
+    /// The enclave head is at `seq` but the store holds only up to `stored` and cannot be repaired from
+    /// peers: this node is stuck (it applies nothing wrong, but it applies nothing).
+    StoreBehind { seq: u64, stored: Option<u64> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,7 +193,8 @@ impl Follower {
             | Alarm::Stale { seq, .. }
             | Alarm::CertConflict { seq }
             | Alarm::BadShare { seq, .. }
-            | Alarm::StoreFailed { seq } => *seq > floor,
+            | Alarm::StoreFailed { seq }
+            | Alarm::StoreBehind { seq, .. } => *seq > floor,
             Alarm::Halted { .. } => true,
         });
     }
@@ -389,10 +393,15 @@ impl Follower {
         if head.fenced {
             return self.halt(head.seq, crate::log_client::rc::FENCED);
         }
+        let stored = self.store.last_seq();
         if head.seq > 0
-            && self.store.last_seq().is_none_or(|l| l < head.seq)
+            && stored.is_none_or(|l| l < head.seq)
             && !self.repair_tail(net, &head).await
         {
+            self.raise(Alarm::StoreBehind {
+                seq: head.seq,
+                stored,
+            });
             return Step::Wait("the store is behind the enclave head");
         }
         let Some(n) = head.seq.checked_add(1) else {
@@ -1005,6 +1014,14 @@ mod tests {
             Step::Wait("the store is behind the enclave head")
         );
         assert_eq!(s.f.store().last_seq(), None);
+        s.f.step(&e, &net, Instant::now()).await;
+        assert_eq!(
+            s.f.take_alarms(),
+            vec![Alarm::StoreBehind {
+                seq: 1,
+                stored: None
+            }]
+        );
     }
 
     fn bundle(ks: &[u8], seq: u64) -> Vec<u8> {
@@ -1227,5 +1244,37 @@ mod tests {
             seq: 1,
             code: rc::DIVERGED
         }));
+    }
+
+    #[tokio::test]
+    async fn a_store_more_than_one_behind_cannot_be_repaired_and_alarms() {
+        let mut s = setup(FollowerCfg::default());
+        let a = s.peers[0];
+        s.f.store.put(&rec(1)).unwrap();
+        // Every peer has every record, yet a store at 1 cannot take 3 (it is append-only and contiguous).
+        let net = FakeNet::new(dir(&s))
+            .serve(FetchKind::Record, 2, a, file(2))
+            .serve(FetchKind::Record, 3, a, file(3))
+            .serve(FetchKind::Record, 4, a, file(4));
+        let e = FakeEnclave::ok();
+        *e.head.lock().unwrap() = Head {
+            seq: 3,
+            t_batch: 0,
+            chain_hash: [3; 32],
+            fenced: false,
+            on: true,
+        };
+        assert_eq!(
+            s.f.step(&e, &net, Instant::now()).await,
+            Step::Wait("the store is behind the enclave head")
+        );
+        assert!(e.applies.lock().unwrap().is_empty());
+        assert_eq!(
+            s.f.take_alarms(),
+            vec![Alarm::StoreBehind {
+                seq: 3,
+                stored: Some(1)
+            }]
+        );
     }
 }
