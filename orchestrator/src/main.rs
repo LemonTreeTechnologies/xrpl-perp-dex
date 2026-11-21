@@ -20,6 +20,7 @@ mod frost_round; // FROST threshold-Schnorr signing round driver
 mod http_helpers;
 mod leader_gate; // O-H3 — validator leader-gate provenance decision (extracted + unit-tested)
 mod log_client; // client for the enclave's replicated-log routes
+mod log_follower; // applies the replicated log in seq order; persists before APPLIED; alarms and halts
 mod log_store; // durable per-node store of replicated-log records
 mod log_transport; // replicated-log fetch protocol (bounded) and log channel types
 mod log_wire; // replicated-log transport framing, fetch checks, certificate assembly

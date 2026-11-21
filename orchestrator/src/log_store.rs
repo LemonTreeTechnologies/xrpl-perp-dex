@@ -186,7 +186,11 @@ fn encode_cert(seq: u64, cert: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn decode_cert(bytes: &[u8], want_seq: u64) -> Result<Vec<u8>> {
+/// Largest certificate file the store writes or reads.
+pub const MAX_CERT_FILE: usize = CERT_FIXED + MAX_CERT_LEN;
+
+/// Decode a certificate file (e.g. one fetched from a peer for catch-up). Strict, checksummed.
+pub fn decode_cert(bytes: &[u8], want_seq: u64) -> Result<Vec<u8>> {
     ensure!(
         bytes.len() <= CERT_FIXED + MAX_CERT_LEN,
         "certificate file is {} bytes",

@@ -117,6 +117,8 @@ pub struct Head {
     pub t_batch: u64,
     pub chain_hash: [u8; 32],
     pub fenced: bool,
+    /// Log mode: the enclave's log trust is seeded (before genesis the head reads seq 0 either way).
+    pub on: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +310,7 @@ impl LogClient {
                     .get("fenced")
                     .and_then(Value::as_bool)
                     .context("missing fenced")?,
+                on: v.get("on").and_then(Value::as_bool).context("missing on")?,
             })
         })
     }
@@ -341,6 +344,24 @@ impl LogClient {
         self.post(
             "/perp/log/begin",
             json!({"quote_blob": hex::encode(quote_blob), "market_id": market_id}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Do these APPLIED signatures for (seq, chain_hash) verify inside the enclave against the sealed
+    /// signer list — one share (`quorum` false) or a whole certificate (`quorum` true)? `Ok(())` = yes;
+    /// a refusal (`BAD_SIG`) = no.
+    pub async fn check_applied(
+        &self,
+        seq: u64,
+        chain_hash: &[u8; 32],
+        bundle: &[u8],
+        quorum: bool,
+    ) -> Result<(), LogError> {
+        self.post(
+            "/perp/log/check_applied",
+            json!({"seq": seq, "chain_hash": hex::encode(chain_hash), "bundle": hex::encode(bundle), "quorum": quorum}),
         )
         .await?;
         Ok(())
@@ -525,7 +546,7 @@ mod tests {
         let app = Router::new()
             .route(
                 "/v1/perp/log/head",
-                get(|| async { Json(json!({"status":"success","seq":3,"t_batch":9,"chain_hash":"ab".repeat(32),"fenced":false})) }),
+                get(|| async { Json(json!({"status":"success","seq":3,"t_batch":9,"chain_hash":"ab".repeat(32),"fenced":false,"on":true})) }),
             )
             .route(
                 "/v1/perp/log/view",
@@ -568,14 +589,31 @@ mod tests {
                     assert_eq!(b["market_id"], 0);
                     (StatusCode::CONFLICT, Json(json!({"status":"error","ret":-62})))
                 }),
+            )
+            .route(
+                "/v1/perp/log/check_applied",
+                post(|Json(b): Json<Value>| async move {
+                    assert_eq!((b["seq"].as_u64(), b["chain_hash"].as_str()), (Some(7), Some("ee".repeat(32).as_str())));
+                    assert_eq!(b["bundle"], "0102");
+                    if b["quorum"] == true {
+                        (StatusCode::OK, Json(json!({"status":"success"})))
+                    } else {
+                        (StatusCode::CONFLICT, Json(json!({"status":"error","ret":-67})))
+                    }
+                }),
             );
         let c = LogClient::new(&serve(app).await).unwrap();
         let h = c.head().await.unwrap();
         assert_eq!(
-            (h.seq, h.t_batch, h.chain_hash, h.fenced),
-            (3, 9, [0xab; 32], false)
+            (h.seq, h.t_batch, h.chain_hash, h.fenced, h.on),
+            (3, 9, [0xab; 32], false, true)
         );
         assert_eq!(c.view().await.unwrap().digest, [0xcd; 32]);
+        assert!(c.check_applied(7, &[0xee; 32], &[1, 2], true).await.is_ok());
+        assert!(matches!(
+            c.check_applied(7, &[0xee; 32], &[1, 2], false).await,
+            Err(LogError::Enclave(LogOutcome::Transient(-67)))
+        ));
         let b = c.book(2, 5).await.unwrap();
         assert_eq!(
             (b.total, b.last_order_id, b.orders[0].user_id.as_str()),
