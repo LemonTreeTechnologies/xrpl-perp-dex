@@ -39,6 +39,12 @@ pub enum LogGossip {
         chain_hash: String,
         share: String,
     },
+    /// "After applying `seq`, my replicated state hashes to `digest`" (the C1 cross-member compare).
+    View {
+        seq: u64,
+        chain_hash: String,
+        digest: String,
+    },
 }
 
 fn hex32(s: &str, what: &str) -> Result<[u8; 32]> {
@@ -65,10 +71,19 @@ pub struct Share {
     pub der: Vec<u8>,
 }
 
+/// A member's replicated view after one seq.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewReport {
+    pub seq: u64,
+    pub chain_hash: [u8; 32],
+    pub digest: [u8; 32],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
     Announce(Announce),
     Applied(Share),
+    View(ViewReport),
 }
 
 /// Parse one gossip message strictly (size first, unknown fields refused, every field checked).
@@ -111,6 +126,24 @@ pub fn parse_gossip(data: &[u8]) -> Result<Parsed> {
                 der,
             }))
         }
+        LogGossip::View {
+            seq,
+            chain_hash,
+            digest,
+        } => Ok(Parsed::View(ViewReport {
+            seq,
+            chain_hash: hex32(&chain_hash, "chain_hash")?,
+            digest: hex32(&digest, "digest")?,
+        })),
+    }
+}
+
+/// This node's view after one seq, as the enclave reported it.
+pub fn view(v: &ViewReport) -> LogGossip {
+    LogGossip::View {
+        seq: v.seq,
+        chain_hash: hex::encode(v.chain_hash),
+        digest: hex::encode(v.digest),
     }
 }
 
@@ -524,6 +557,26 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("bytes"));
+        let v = ViewReport {
+            seq: 9,
+            chain_hash: [1; 32],
+            digest: [2; 32],
+        };
+        let vb = serde_json::to_vec(&view(&v)).unwrap();
+        assert_eq!(parse_gossip(&vb).unwrap(), Parsed::View(v));
+        let short_digest = format!(
+            r#"{{"type":"view","seq":1,"chain_hash":"{h}","digest":"00"}}"#,
+            h = "00".repeat(32)
+        );
+        assert!(parse_gossip(short_digest.as_bytes())
+            .unwrap_err()
+            .to_string()
+            .contains("digest"));
+        let extra = format!(
+            r#"{{"type":"view","seq":1,"chain_hash":"{h}","digest":"{h}","x":1}}"#,
+            h = "00".repeat(32)
+        );
+        assert!(parse_gossip(extra.as_bytes()).is_err());
     }
 
     #[test]

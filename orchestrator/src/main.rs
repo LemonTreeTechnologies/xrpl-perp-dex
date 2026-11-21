@@ -23,7 +23,9 @@ mod log_client; // client for the enclave's replicated-log routes
 mod log_follower; // applies the replicated log in seq order; persists before APPLIED; alarms and halts
 mod log_node; // runs the log on a node: startup refusal, watcher, follower loop, status
 mod log_store; // durable per-node store of replicated-log records
+mod log_sync; // the XRPL sync gate: server_state, peers, validated-ledger age vs the measured close rate
 mod log_transport; // replicated-log fetch protocol (bounded) and log channel types
+mod log_view; // C1: member view reports compared after each seq; odd member, split, leader hold
 mod log_wire; // replicated-log transport framing, fetch checks, certificate assembly
 mod membership_admin;
 mod membership_apply;
@@ -2755,6 +2757,12 @@ async fn main() -> Result<()> {
                     .ok()
                     .and_then(|b| b.try_into().ok())
                     .context("the local signer's session key is not 32-byte hex")?;
+                // The view compare counts this node among the members, so it must be in the list.
+                anyhow::ensure!(
+                    members.contains(&p2p_node.peer_id),
+                    "--member-peers must list every member, this node ({}) included",
+                    p2p_node.peer_id
+                );
                 let store = log_store::LogStore::open(&dir).context("opening the log store")?;
                 let (in_tx, in_rx) = tokio::sync::mpsc::channel(256);
                 let (out_tx, out_rx) = tokio::sync::mpsc::channel(256);
@@ -2766,6 +2774,15 @@ async fn main() -> Result<()> {
                 );
                 log_health.set_mode("follow");
                 let health = log_health.clone();
+                let views = log_view::ViewBook::new(p2p_node.peer_id, members.clone(), 256);
+                let me = p2p_node.peer_id;
+                let xrpl = log_node::XrplHttp {
+                    http: reqwest::Client::builder()
+                        .timeout(Duration::from_secs(10))
+                        .build()
+                        .context("building the XRPL client")?,
+                    url: cli.xrpl_url.clone(),
+                };
                 tokio::spawn(async move {
                     let enclave = log_node::EnclaveAdapter {
                         client: log_client,
@@ -2776,15 +2793,16 @@ async fn main() -> Result<()> {
                         tx: out_tx,
                         fetch_timeout: Duration::from_secs(15),
                     };
-                    log_node::run_follower(
-                        follower,
-                        &enclave,
-                        &net,
-                        in_rx,
-                        &health,
-                        Duration::from_secs(1),
-                    )
-                    .await;
+                    let parts = log_node::LoopParts {
+                        enclave: &enclave,
+                        net: &net,
+                        xrpl: &xrpl,
+                        health: &health,
+                        me,
+                        tick: Duration::from_secs(1),
+                    };
+                    let gate = log_sync::SyncGate::new(log_sync::SyncCfg::default());
+                    log_node::run_follower(follower, views, gate, in_rx, parts).await;
                 });
                 info!("replicated log: follower running");
             }

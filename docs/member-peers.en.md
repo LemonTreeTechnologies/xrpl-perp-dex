@@ -42,7 +42,14 @@ When the enclave is in replicated-log mode, a node runs only with all three of: 
 - **While running without the log**, the orchestrator keeps checking. When the enclave enters log mode,
   the process stops (exit code 78), and the next start applies the rule above.
 - With all three set, the node follows the log. `/v1/system/status` reports it under `log`: mode,
-  enclave and stored position, `halted`, `diverged` and recent alarms.
+  enclave and stored position, `halted`, `diverged` and recent alarms. The list must include this node
+  itself, or the follower refuses to start.
+- **Sync gate.** The follower applies entries only while the node's XRPL endpoint (`--xrpl-url`) reports
+  `server_state` `full` or above, at least 3 peers, and a validated ledger younger than five measured close
+  intervals plus 5 s (the interval is clamped to 2–10 s). Otherwise it waits; `log.sync` shows why.
+- **View compare.** After each entry every member publishes its state digest. If two members agree and one
+  differs, the odd one is named: a peer in an alarm, this node by stopping (`diverged: true`). While views
+  disagree with no two agreeing, `log.view_hold` is true (the producing node will not commit on top of it).
 
 ## Operations
 

@@ -34,6 +34,8 @@ use std::time::{Duration, Instant};
 #[async_trait]
 pub trait Enclave: Send + Sync {
     async fn head(&self) -> Result<Head, LogError>;
+    /// This node's replicated view (seq, chain hash, state digest).
+    async fn view(&self) -> Result<crate::log_client::View, LogError>;
     /// Apply one batch; `Ok` is this node's APPLIED share (empty when it signs none).
     async fn apply(&self, input: &ApplyInput<'_>) -> Result<Vec<u8>, LogError>;
     async fn check_applied(
@@ -76,6 +78,14 @@ pub enum Alarm {
     /// The enclave head is at `seq` but the store holds only up to `stored` and cannot be repaired from
     /// peers: this node is stuck (it applies nothing wrong, but it applies nothing).
     StoreBehind { seq: u64, stored: Option<u64> },
+    /// C1: a majority of members agree on the view at `seq` and THIS node does not.
+    ViewMinority { seq: u64 },
+    /// C1: a majority agree at `seq` and `peer` does not.
+    ViewPeerOdd { seq: u64, peer: PeerId },
+    /// C1: no view at `seq` can reach a majority.
+    ViewSplit { seq: u64 },
+    /// C1: `peer` reported two different views for `seq`.
+    ViewEquivocation { seq: u64, peer: PeerId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +167,18 @@ impl Follower {
         seq > a.saturating_sub(self.cfg.window) && seq <= a.saturating_add(self.cfg.window)
     }
 
+    /// Raise an alarm from outside the follower (the view compare); deduplicated like the others.
+    pub fn alarm(&mut self, a: Alarm) {
+        self.raise(a);
+    }
+
+    /// The view compare put this node in the minority at `seq`: its state is not the cluster's. Stop
+    /// applying (sticky, as for an enclave DIVERGED) — the node re-syncs by operator action.
+    pub fn halt_view_minority(&mut self, seq: u64) {
+        self.raise(Alarm::ViewMinority { seq });
+        self.halt(seq, crate::log_client::rc::DIVERGED);
+    }
+
     fn raise(&mut self, a: Alarm) {
         if self.raised.insert(a.clone()) {
             tracing::error!(alarm = ?a, "replicated log alarm");
@@ -194,7 +216,11 @@ impl Follower {
             | Alarm::CertConflict { seq }
             | Alarm::BadShare { seq, .. }
             | Alarm::StoreFailed { seq }
-            | Alarm::StoreBehind { seq, .. } => *seq > floor,
+            | Alarm::StoreBehind { seq, .. }
+            | Alarm::ViewPeerOdd { seq, .. }
+            | Alarm::ViewSplit { seq }
+            | Alarm::ViewEquivocation { seq, .. } => *seq > floor,
+            Alarm::ViewMinority { .. } => true,
             Alarm::Halted { .. } => true,
         });
     }
@@ -207,6 +233,8 @@ impl Follower {
                     self.announced.insert(a.seq, (a, m.author));
                 }
             }
+            // View reports are compared by the loop (log_view), not here.
+            Parsed::View(_) => {}
             Parsed::Applied(s) => {
                 if !self.in_window(s.seq) {
                     return;
@@ -600,6 +628,14 @@ mod tests {
         async fn head(&self) -> Result<Head, LogError> {
             Ok(self.head.lock().unwrap().clone())
         }
+        async fn view(&self) -> Result<crate::log_client::View, LogError> {
+            let h = self.head.lock().unwrap().clone();
+            Ok(crate::log_client::View {
+                seq: h.seq,
+                chain_hash: h.chain_hash,
+                digest: [0; 32],
+            })
+        }
         async fn apply(&self, i: &ApplyInput<'_>) -> Result<Vec<u8>, LogError> {
             let next = self.head.lock().unwrap().seq + 1;
             self.applies
@@ -678,7 +714,9 @@ mod tests {
         }
         async fn publish(&self, out: Outgoing) {
             let seq = match out.gossip() {
-                LogGossip::Announce { seq, .. } | LogGossip::Applied { seq, .. } => *seq,
+                LogGossip::Announce { seq, .. }
+                | LogGossip::Applied { seq, .. }
+                | LogGossip::View { seq, .. } => *seq,
             };
             let on_disk = self.dir.join(format!("{seq:020}.rec")).exists();
             self.published
