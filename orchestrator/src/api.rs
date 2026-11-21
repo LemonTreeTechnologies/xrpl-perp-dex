@@ -129,6 +129,8 @@ pub struct AppState {
     /// Maintenance flag surfaced by `/v1/system/status` so frontends can show a banner
     /// without needing a redeploy. Toggled via `PERP_MAINTENANCE` env at startup.
     pub maintenance_mode: Arc<AtomicBool>,
+    /// The replicated log on this node: mode, position, halt/divergence, recent alarms.
+    pub log_health: Arc<crate::log_node::LogHealth>,
 }
 
 // ── Request/Response types ──────────────────────────────────────
@@ -381,6 +383,9 @@ async fn system_status(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         // The trust root both of the above rest on. `enabled: false` is not "healthy" —
         // it means the enclave's derived validator set is ageing with nothing refreshing
         // it, and a 5-of-6 floor spends its whole margin on ONE stale signing key.
+        // The replicated log. `diverged: true` means this node's state is not the cluster's: its reads
+        // must not be taken as the cluster's.
+        "log": state.log_health.snapshot(),
         "unl_refresh": {
             "enabled": state.unl_refresh.enabled.load(Ordering::Relaxed),
             "submissions": state.unl_refresh.submissions.load(Ordering::Relaxed),

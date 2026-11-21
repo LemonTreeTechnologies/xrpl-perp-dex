@@ -1846,6 +1846,11 @@ impl P2PNode {
         self.local_ecdh_pubkey = Some(pk_hex.to_lowercase());
     }
 
+    /// The local signer, if one is set (its session key is already canonical bare hex).
+    pub fn local_signer(&self) -> Option<&LocalSigner> {
+        self.local_signer.as_ref()
+    }
+
     /// Set local signer credentials for handling incoming signing requests.
     pub fn set_local_signer(&mut self, mut signer: LocalSigner) {
         // GEN-3-R1 (RESP-β4-B-genesis-impl): canonicalize session_key to bare hex
@@ -1881,7 +1886,6 @@ impl P2PNode {
     /// Turn on the replicated-log transport. Refused unless the member peers are configured: the log
     /// topics and the fetch protocol only ever talk to members, and an open log transport is never the
     /// default.
-    #[allow(dead_code)] // the caller is the log loop, in the next change
     pub fn enable_log_transport(
         &mut self,
         store_dir: std::path::PathBuf,

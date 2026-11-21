@@ -21,6 +21,7 @@ mod http_helpers;
 mod leader_gate; // O-H3 — validator leader-gate provenance decision (extracted + unit-tested)
 mod log_client; // client for the enclave's replicated-log routes
 mod log_follower; // applies the replicated log in seq order; persists before APPLIED; alarms and halts
+mod log_node; // runs the log on a node: startup refusal, watcher, follower loop, status
 mod log_store; // durable per-node store of replicated-log records
 mod log_transport; // replicated-log fetch protocol (bounded) and log channel types
 mod log_wire; // replicated-log transport framing, fetch checks, certificate assembly
@@ -750,6 +751,11 @@ struct RunArgs {
     /// relay. Required by the replicated-log transport.
     #[arg(long)]
     member_peers: Option<String>,
+
+    /// Directory of this node's replicated-log store. With --member-peers and a local signer it turns on
+    /// the log follower. An enclave in log mode refuses to run without all three.
+    #[arg(long)]
+    log_store_dir: Option<PathBuf>,
 
     /// Persistent libp2p identity key path. Auto-generated on first run so
     /// the operator's peer_id is stable across restarts (required for any
@@ -1858,6 +1864,7 @@ async fn main() -> Result<()> {
 
     let peer_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
+    let log_health = Arc::new(log_node::LogHealth::new("starting"));
     let maintenance_mode = Arc::new(std::sync::atomic::AtomicBool::new(matches!(
         std::env::var("PERP_MAINTENANCE").ok().as_deref(),
         Some("1") | Some("true") | Some("yes")
@@ -1911,6 +1918,7 @@ async fn main() -> Result<()> {
         unl_refresh: unl_health.clone(),
         reserves_figures: Some(reserves_figures_cache.clone()),
         maintenance_mode: maintenance_mode.clone(),
+        log_health: log_health.clone(),
     });
 
     // Start API server
@@ -2715,11 +2723,83 @@ async fn main() -> Result<()> {
     });
 
     // Member peers: parsed strictly — a malformed id stops startup rather than silently shrinking the set.
-    if let Some(m) = &cli.member_peers {
-        let members = p2p::parse_member_peers(m).context("--member-peers")?;
-        p2p_node.set_member_peers(members);
-    } else {
-        p2p_node.set_member_peers(Vec::new());
+    let members = match &cli.member_peers {
+        Some(m) => p2p::parse_member_peers(m).context("--member-peers")?,
+        None => Vec::new(),
+    };
+    p2p_node.set_member_peers(members.clone());
+
+    // The replicated log: decided BEFORE any peer is dialled. An enclave in log mode with this node
+    // missing member peers, the log store or a local signer is a refusal to start (election and signing
+    // are open to any peer without member peers).
+    {
+        use crate::log_node::{LogConfig, Setup};
+        let log_client = log_client::LogClient::new(&cli.enclave_url)?;
+        let signer = p2p_node
+            .local_signer()
+            .map(|s| (s.address.clone(), s.session_key.clone()));
+        let cfg = LogConfig {
+            member_peers: !members.is_empty(),
+            store_dir: cli.log_store_dir.is_some(),
+            signer: signer.is_some(),
+        };
+        let probe = log_node::probe_at_startup(&log_client, 60, Duration::from_secs(2)).await?;
+        match log_node::startup_decision(&probe, &cfg)? {
+            Setup::Follow => {
+                let dir = cli
+                    .log_store_dir
+                    .clone()
+                    .expect("checked by startup_decision");
+                let (account_id, key_hex) = signer.expect("checked by startup_decision");
+                let session_key: [u8; 32] = hex::decode(&key_hex)
+                    .ok()
+                    .and_then(|b| b.try_into().ok())
+                    .context("the local signer's session key is not 32-byte hex")?;
+                let store = log_store::LogStore::open(&dir).context("opening the log store")?;
+                let (in_tx, in_rx) = tokio::sync::mpsc::channel(256);
+                let (out_tx, out_rx) = tokio::sync::mpsc::channel(256);
+                p2p_node.enable_log_transport(dir, in_tx, out_rx)?;
+                let follower = log_follower::Follower::new(
+                    log_follower::FollowerCfg::default(),
+                    log_node::other_members(&members, &p2p_node.peer_id),
+                    store,
+                );
+                log_health.set_mode("follow");
+                let health = log_health.clone();
+                tokio::spawn(async move {
+                    let enclave = log_node::EnclaveAdapter {
+                        client: log_client,
+                        account_id,
+                        session_key,
+                    };
+                    let net = log_node::NetAdapter {
+                        tx: out_tx,
+                        fetch_timeout: Duration::from_secs(15),
+                    };
+                    log_node::run_follower(
+                        follower,
+                        &enclave,
+                        &net,
+                        in_rx,
+                        &health,
+                        Duration::from_secs(1),
+                    )
+                    .await;
+                });
+                info!("replicated log: follower running");
+            }
+            Setup::Legacy => {
+                log_health.set_mode("legacy");
+                tokio::spawn(async move {
+                    log_node::watch_for_log_mode(&log_client, Duration::from_secs(5)).await;
+                    error!(
+                        "the enclave entered replicated-log mode but this node is not configured for it \
+                         (--member-peers, --log-store-dir, local signer); stopping"
+                    );
+                    std::process::exit(78);
+                });
+            }
+        }
     }
 
     // Connect to peers
