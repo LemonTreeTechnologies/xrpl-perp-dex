@@ -200,24 +200,44 @@ pub fn verify_fetched(a: &Announce, file: &[u8]) -> Result<LogRecord> {
 // ── Fetch request/response framing ─────────────────────────────────────
 
 const FETCH_MAGIC: &[u8; 4] = b"PLF1";
-pub const FETCH_REQ_LEN: usize = 4 + 8;
+/// magic 4 | kind 1 | seq 8.
+pub const FETCH_REQ_LEN: usize = 4 + 1 + 8;
+
+/// What a fetch asks for: the record file, or the stored quorum certificate file (catch-up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FetchKind {
+    Record,
+    Cert,
+}
 const RESP_HAVE: u8 = 0;
 const RESP_NONE: u8 = 1;
 
-pub fn encode_fetch_request(seq: u64) -> Vec<u8> {
+pub fn encode_fetch_request(kind: FetchKind, seq: u64) -> Vec<u8> {
     let mut v = FETCH_MAGIC.to_vec();
+    v.push(match kind {
+        FetchKind::Record => 0,
+        FetchKind::Cert => 1,
+    });
     v.extend_from_slice(&seq.to_be_bytes());
     v
 }
 
-pub fn decode_fetch_request(b: &[u8]) -> Result<u64> {
+pub fn decode_fetch_request(b: &[u8]) -> Result<(FetchKind, u64)> {
     ensure!(
         b.len() == FETCH_REQ_LEN,
         "fetch request is {} bytes",
         b.len()
     );
     ensure!(&b[..4] == FETCH_MAGIC, "bad fetch request magic");
-    Ok(u64::from_be_bytes(b[4..].try_into().expect("8 bytes")))
+    let kind = match b[4] {
+        0 => FetchKind::Record,
+        1 => FetchKind::Cert,
+        k => anyhow::bail!("unknown fetch kind {k}"),
+    };
+    Ok((
+        kind,
+        u64::from_be_bytes(b[5..].try_into().expect("8 bytes")),
+    ))
 }
 
 /// Response: a 5-byte header (status, u32 length) then the record file; "not present" carries length 0.
@@ -577,9 +597,18 @@ mod tests {
 
     #[test]
     fn fetch_framing_is_exact_and_bounded() {
-        assert_eq!(decode_fetch_request(&encode_fetch_request(42)).unwrap(), 42);
+        for k in [FetchKind::Record, FetchKind::Cert] {
+            assert_eq!(
+                decode_fetch_request(&encode_fetch_request(k, 42)).unwrap(),
+                (k, 42)
+            );
+        }
         assert!(decode_fetch_request(b"PLF1\0\0\0").is_err());
-        assert!(decode_fetch_request(b"XXXX\0\0\0\0\0\0\0\x01").is_err());
+        assert!(decode_fetch_request(b"XXXX\0\0\0\0\0\0\0\0\x01").is_err());
+        assert!(decode_fetch_request(b"PLF1\x02\0\0\0\0\0\0\0\x01")
+            .unwrap_err()
+            .to_string()
+            .contains("kind"));
         let r = encode_fetch_response(Some(b"abc")).unwrap();
         let head: [u8; 5] = r[..5].try_into().unwrap();
         assert_eq!(fetch_response_body_len(&head).unwrap(), Some(3));
