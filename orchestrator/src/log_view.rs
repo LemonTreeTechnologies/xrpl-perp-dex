@@ -10,12 +10,12 @@
 //!   2/3 chain to extend right now); this clears when the missing report arrives.
 //!
 //! This is a host rule over what members say; binding the view into the quorum certificate is the
-//! stronger form (a mainnet gate). A member that lies here can cause a hold or name itself odd — a
-//! liveness effect, never a change to what the log accepts.
+//! stronger form, planned as a following step. A member that lies here can cause a hold or name itself
+//! odd — a liveness effect, never a change to what the log accepts.
 
 use crate::log_wire::ViewReport;
 use libp2p::PeerId;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 type Value = ([u8; 32], [u8; 32]);
 
@@ -38,8 +38,11 @@ pub struct ViewBook {
     members: Vec<PeerId>,
     window: u64,
     by_seq: BTreeMap<u64, HashMap<PeerId, Value>>,
-    /// Seqs already decided (agreed / odd named / split), so each is reported once.
+    /// Seqs already decided (agreed / split, or every member reported), so each is reported once.
     decided: BTreeMap<u64, ()>,
+    /// Members already named odd per seq: with stragglers still missing a majority can name an odd
+    /// member before the seq is decided, and later reports must not name it again.
+    named: BTreeMap<u64, HashSet<PeerId>>,
 }
 
 impl ViewBook {
@@ -51,6 +54,7 @@ impl ViewBook {
             window,
             by_seq: BTreeMap::new(),
             decided: BTreeMap::new(),
+            named: BTreeMap::new(),
         }
     }
 
@@ -100,9 +104,14 @@ impl ViewBook {
         }
         let missing = self.members.len().saturating_sub(slot.len());
         let maj = self.majority();
+        let all_equal = groups.len() == 1;
         if let Some((_, winners)) = groups.iter().find(|(_, ps)| ps.len() >= maj) {
             let mut ev = vec![];
+            let named = self.named.entry(seq).or_default();
             for p in slot.keys().filter(|p| !winners.contains(p)) {
+                if !named.insert(*p) {
+                    continue;
+                }
                 ev.push(if *p == self.me {
                     ViewEvent::SelfOdd { seq }
                 } else {
@@ -111,7 +120,7 @@ impl ViewBook {
             }
             if missing == 0 {
                 self.decided.insert(seq, ());
-                if ev.is_empty() {
+                if all_equal {
                     ev.push(ViewEvent::Agreed { seq });
                 }
             }
@@ -142,6 +151,7 @@ impl ViewBook {
         let floor = anchor.saturating_sub(self.window);
         self.by_seq.retain(|&s, _| s > floor);
         self.decided.retain(|&s, _| s > floor);
+        self.named.retain(|&s, _| s > floor);
     }
 }
 
@@ -263,5 +273,25 @@ mod tests {
         k.add(me, v(40, 1), 40);
         assert!(!k.by_seq.contains_key(&1));
         assert!(!k.hold(), "a hold on a seq far behind is gone with it");
+    }
+
+    #[test]
+    fn with_stragglers_an_odd_member_is_named_once_and_the_seq_is_not_called_agreed() {
+        let ps: Vec<PeerId> = (0..5).map(|_| PeerId::random()).collect();
+        let mut k = ViewBook::new(ps[0], ps.clone(), 16);
+        // Majority of 5 is 3: three agree, one differs, one still missing.
+        for p in &ps[..3] {
+            assert!(k.add(*p, v(1, 7), 1).is_empty());
+        }
+        assert_eq!(
+            k.add(ps[3], v(1, 9), 1),
+            vec![ViewEvent::PeerOdd {
+                seq: 1,
+                peer: ps[3]
+            }]
+        );
+        // The last report agrees: ps[3] is not named again, and the seq is not "agreed".
+        assert!(k.add(ps[4], v(1, 7), 1).is_empty());
+        assert!(k.add(ps[4], v(1, 7), 1).is_empty());
     }
 }
