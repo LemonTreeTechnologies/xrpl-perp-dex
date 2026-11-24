@@ -64,16 +64,7 @@ impl ShardRouter {
             // config. Operators must alert on `audit.shard_id_unsupported
             // = true` in journalctl for multi-shard deployments. Single-
             // shard deploys are unaffected.
-            if let Err(e) = client.set_shard_id(entry.shard_id).await {
-                tracing::warn!(
-                    target: "audit",
-                    shard_id_unsupported = true,
-                    shard_id = entry.shard_id,
-                    url = %entry.enclave_url,
-                    "set_shard_id not supported by enclave (running as shard 0): {:#}",
-                    e
-                );
-            }
+            apply_shard_id(&client, entry.shard_id, &entry.enclave_url).await?;
             info!(shard_id = entry.shard_id, url = %entry.enclave_url, "shard registered");
             if let Some(gid) = &entry.frost_group_id {
                 info!(shard_id = entry.shard_id, group_id = %gid, "Path A announcer armed");
@@ -104,19 +95,8 @@ impl ShardRouter {
         // single-shard deploy the warning is informational (an older
         // enclave silently runs as shard 0 anyway, which is the correct
         // value for a 1-shard cluster).
-        match client.set_shard_id(shard_id).await {
-            Ok(_) => info!(shard_id, url = %enclave_url, "single-shard router"),
-            Err(e) => {
-                tracing::warn!(
-                    target: "audit",
-                    shard_id_unsupported = true,
-                    shard_id,
-                    url = %enclave_url,
-                    "set_shard_id not supported by enclave (running as shard 0): {:#}",
-                    e
-                );
-            }
-        }
+        apply_shard_id(&client, shard_id, enclave_url).await?;
+        info!(shard_id, url = %enclave_url, "single-shard router");
 
         let mut shards = HashMap::new();
         shards.insert(shard_id, client);
@@ -174,5 +154,95 @@ impl ShardRouter {
         self.shards
             .get(&0)
             .unwrap_or_else(|| self.shards.values().next().expect("no shards configured"))
+    }
+}
+
+/// Tell the enclave which shard it is. An enclave that does not take it runs as shard 0. For shard 0 that is
+/// the configured value, so it is only reported. For any other shard it would run this shard's traffic under
+/// shard 0's identity, so the node refuses to start instead. The enclave's answer must name the shard asked
+/// for. (It echoes the request; reading the value back from the enclave needs an enclave route.)
+async fn apply_shard_id(client: &PerpClient, shard_id: u32, url: &str) -> Result<()> {
+    let outcome = match client.set_shard_id(shard_id).await {
+        Ok(v) if v["shard_id"].as_u64() == Some(u64::from(shard_id)) => Ok(()),
+        Ok(v) => Err(anyhow::anyhow!(
+            "the enclave answered for another shard: {v}"
+        )),
+        Err(e) => Err(e),
+    };
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(e) if shard_id == 0 => {
+            tracing::warn!(
+                target: "audit",
+                shard_id_unsupported = true,
+                shard_id,
+                url = %url,
+                "set_shard_id not taken by the enclave (it runs as shard 0, the configured value): {:#}",
+                e
+            );
+            Ok(())
+        }
+        Err(e) => anyhow::bail!(
+            "the enclave at {url} did not take shard_id {shard_id} ({e:#}); it would run as shard 0, so \
+             refusing to start"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod shard_id_tests {
+    use super::*;
+    use axum::routing::post;
+
+    /// A fake enclave whose /v1/perp/shard/set answers with `answer` (None = the route is absent: 404).
+    async fn enclave(answer: Option<serde_json::Value>) -> String {
+        let app = match answer {
+            Some(v) => axum::Router::new().route(
+                "/v1/perp/shard/set",
+                post(move || {
+                    let v = v.clone();
+                    async move { axum::Json(v) }
+                }),
+            ),
+            None => axum::Router::new(),
+        };
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        format!("http://{a}/v1")
+    }
+
+    #[tokio::test]
+    async fn an_enclave_without_the_route_is_fine_for_shard_0_and_refused_for_any_other() {
+        let url = enclave(None).await;
+        assert!(ShardRouter::single(&url, 0).await.is_ok());
+        let e = ShardRouter::single(&url, 1)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            e.contains("did not take shard_id 1") && e.contains("refusing to start"),
+            "{e}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_answer_must_name_the_shard_asked_for() {
+        let ok = enclave(Some(
+            serde_json::json!({"status": "success", "shard_id": 3}),
+        ))
+        .await;
+        assert!(ShardRouter::single(&ok, 3).await.is_ok());
+        let other = enclave(Some(
+            serde_json::json!({"status": "success", "shard_id": 0}),
+        ))
+        .await;
+        let e = ShardRouter::single(&other, 3)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("another shard"), "{e}");
     }
 }
