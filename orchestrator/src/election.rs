@@ -2,6 +2,10 @@
 //!
 //! - Sequencer broadcasts heartbeat every 5s via gossipsub
 //! - If heartbeat missed 3x (15s), highest-priority live operator takes over
+//! - Takeover is STAGGERED by priority: a node waits `heartbeat_timeout + priority × takeover_stagger`,
+//!   so nodes of different priority do not time out together and both promote. This is a LIVENESS
+//!   measure only: it makes a dual leader rare, not impossible (a lost announce, a slow node). Single-
+//!   leader safety needs terms + majority vote; money safety comes from the signer (log-mode E5).
 //! - Priority is static from config (0 = highest)
 //! - Old sequencer returning does not reclaim leadership
 
@@ -55,6 +59,27 @@ pub struct ElectionConfig {
     pub our_priority: u8,
     pub heartbeat_interval: Duration,
     pub heartbeat_timeout: Duration,
+    /// Extra wait per priority step before taking over (see module doc). Zero disables the stagger.
+    pub takeover_stagger: Duration,
+}
+
+/// The production heartbeat period, takeover timeout and stagger (main.rs builds its config from
+/// these). The stagger is at least one heartbeat period, so a higher-priority node that took over
+/// has had a full heartbeat to announce itself before the next seat's timer fires.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+pub const TAKEOVER_STAGGER: Duration = Duration::from_secs(5);
+
+impl ElectionConfig {
+    /// How long this node waits without a leader heartbeat before it takes over:
+    /// `heartbeat_timeout + our_priority × takeover_stagger`, saturating. `our_priority` is this
+    /// node's own configured seat, never a value from a message.
+    pub fn takeover_timeout(&self) -> Duration {
+        self.heartbeat_timeout.saturating_add(
+            self.takeover_stagger
+                .saturating_mul(u32::from(self.our_priority)),
+        )
+    }
 }
 
 // ── State machine ──────────────────────────────────────────────
@@ -283,7 +308,7 @@ impl ElectionState {
         }
         // Startup grace: don't trigger failover for first heartbeat_timeout
         if self.startup_grace {
-            if self.startup_time.elapsed() > self.config.heartbeat_timeout {
+            if self.startup_time.elapsed() > self.config.takeover_timeout() {
                 self.startup_grace = false;
                 // If nobody claimed leadership during grace, take over
                 if self.leader.is_none() {
@@ -298,10 +323,10 @@ impl ElectionState {
             debug!(
                 ?elapsed,
                 leader = ?self.leader,
-                timeout = ?self.config.heartbeat_timeout,
+                timeout = ?self.config.takeover_timeout(),
                 "validator heartbeat tick"
             );
-            if elapsed > self.config.heartbeat_timeout {
+            if elapsed > self.config.takeover_timeout() {
                 warn!(?elapsed, "leader heartbeat timeout — attempting takeover");
                 self.promote();
             }
@@ -388,6 +413,7 @@ mod tests {
             our_priority: 0,
             heartbeat_interval: Duration::from_secs(5),
             heartbeat_timeout: Duration::from_secs(15),
+            takeover_stagger: Duration::ZERO,
         };
 
         let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
@@ -408,6 +434,7 @@ mod tests {
             our_priority: 1,
             heartbeat_interval: Duration::from_secs(5),
             heartbeat_timeout: Duration::from_secs(15),
+            takeover_stagger: Duration::ZERO,
         };
 
         let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
@@ -426,6 +453,7 @@ mod tests {
             our_priority: 1,
             heartbeat_interval: Duration::from_secs(5),
             heartbeat_timeout: Duration::from_secs(15),
+            takeover_stagger: Duration::ZERO,
         };
 
         let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
@@ -452,6 +480,7 @@ mod tests {
             our_priority: 0,
             heartbeat_interval: Duration::from_secs(5),
             heartbeat_timeout: Duration::from_secs(15),
+            takeover_stagger: Duration::ZERO,
         };
 
         let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
@@ -479,6 +508,7 @@ mod tests {
             our_priority: 1,
             heartbeat_interval: Duration::from_secs(5),
             heartbeat_timeout: Duration::from_secs(15),
+            takeover_stagger: Duration::ZERO,
         };
 
         let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
@@ -507,6 +537,7 @@ mod tests {
             our_priority: 1,
             heartbeat_interval: Duration::from_secs(5),
             heartbeat_timeout: Duration::from_secs(15),
+            takeover_stagger: Duration::ZERO,
         };
 
         let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
@@ -539,6 +570,7 @@ mod tests {
             our_priority: 1,
             heartbeat_interval: Duration::from_secs(5),
             heartbeat_timeout: Duration::from_millis(50), // short for test
+            takeover_stagger: Duration::ZERO,
         };
 
         let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
@@ -570,6 +602,7 @@ mod tests {
             our_priority: 1,
             heartbeat_interval: Duration::from_secs(5),
             heartbeat_timeout: Duration::from_secs(15),
+            takeover_stagger: Duration::ZERO,
         };
 
         let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
@@ -597,6 +630,7 @@ mod tests {
             our_priority: 1,
             heartbeat_interval: Duration::from_secs(5),
             heartbeat_timeout: Duration::from_secs(15),
+            takeover_stagger: Duration::ZERO,
         };
 
         let (leader_tx, _leader_rx) = watch::channel::<Option<String>>(None);
@@ -628,6 +662,7 @@ mod tests {
             our_priority: 1,
             heartbeat_interval: Duration::from_secs(5),
             heartbeat_timeout: Duration::from_secs(15),
+            takeover_stagger: Duration::ZERO,
         };
 
         let mut state = ElectionState::new(config, out_tx, in_rx, role_tx, leader_tx);
@@ -682,6 +717,7 @@ mod tests {
             our_priority: priority,
             heartbeat_interval: Duration::from_millis(50),
             heartbeat_timeout: Duration::from_millis(100),
+            takeover_stagger: Duration::ZERO,
         };
         let (gate_tx, gate_rx) = watch::channel(caught);
         let st = ElectionState::new(config, out_tx, in_rx, role_tx, leader_tx)
@@ -741,9 +777,109 @@ mod tests {
             our_priority: 1,
             heartbeat_interval: Duration::from_millis(50),
             heartbeat_timeout: Duration::from_millis(100),
+            takeover_stagger: Duration::ZERO,
         };
         let mut st = ElectionState::new(config, out_tx, in_rx, role_tx, leader_tx);
         st.promote();
         assert_eq!(st.role, Role::Sequencer);
+    }
+
+    // ── takeover stagger ──
+
+    fn staggered(priority: u8, timeout_ms: u64, stagger_ms: u64) -> ElectionState {
+        let (out_tx, _o) = mpsc::channel(10);
+        let (_in_tx, in_rx) = mpsc::channel(10);
+        let (role_tx, _r) = watch::channel(Role::Validator);
+        let (leader_tx, _l) = watch::channel(None);
+        let config = ElectionConfig {
+            our_peer_id: format!("peer-{priority}"),
+            our_priority: priority,
+            heartbeat_interval: Duration::from_millis(50),
+            heartbeat_timeout: Duration::from_millis(timeout_ms),
+            takeover_stagger: Duration::from_millis(stagger_ms),
+        };
+        ElectionState::new(config, out_tx, in_rx, role_tx, leader_tx)
+    }
+
+    #[test]
+    fn the_takeover_timeout_grows_by_one_stagger_per_priority_step_and_saturates() {
+        let c = |p: u8, stagger: Duration| ElectionConfig {
+            our_peer_id: "x".into(),
+            our_priority: p,
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            heartbeat_timeout: HEARTBEAT_TIMEOUT,
+            takeover_stagger: stagger,
+        };
+        assert_eq!(
+            c(0, TAKEOVER_STAGGER).takeover_timeout(),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            c(1, TAKEOVER_STAGGER).takeover_timeout(),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            c(2, TAKEOVER_STAGGER).takeover_timeout(),
+            Duration::from_secs(25)
+        );
+        assert_eq!(c(255, Duration::MAX).takeover_timeout(), Duration::MAX);
+    }
+
+    #[test]
+    fn the_production_stagger_is_at_least_one_heartbeat() {
+        assert!(
+            TAKEOVER_STAGGER >= HEARTBEAT_INTERVAL,
+            "a priority-0 takeover must have a heartbeat to announce before priority 1 fires"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lower_priority_validator_waits_its_stagger_before_taking_over() {
+        // priority 1: timeout 50 ms + 1 × 400 ms = 450 ms
+        let mut st = staggered(1, 50, 400);
+        st.startup_grace = false;
+        st.leader = Some(("peer-0".into(), 0));
+        st.last_heartbeat = Instant::now() - Duration::from_millis(200);
+        st.check_timeout();
+        assert_eq!(
+            st.role,
+            Role::Validator,
+            "past the plain timeout but inside its stagger: priority 1 must not take over yet"
+        );
+        st.last_heartbeat = Instant::now() - Duration::from_millis(600);
+        st.check_timeout();
+        assert_eq!(
+            st.role,
+            Role::Sequencer,
+            "past its staggered timeout: takes over"
+        );
+    }
+
+    #[tokio::test]
+    async fn priority_0_is_not_delayed_by_the_stagger() {
+        let mut st = staggered(0, 50, 400);
+        st.startup_grace = false;
+        st.role = Role::Validator;
+        st.leader = Some(("peer-1".into(), 1));
+        st.last_heartbeat = Instant::now() - Duration::from_millis(200);
+        st.check_timeout();
+        assert_eq!(st.role, Role::Sequencer);
+    }
+
+    #[tokio::test]
+    async fn the_startup_grace_is_staggered_too() {
+        // priority 2: 50 ms + 2 × 400 ms = 850 ms
+        let mut st = staggered(2, 50, 400);
+        st.startup_time = Instant::now() - Duration::from_millis(300);
+        st.check_timeout();
+        assert_eq!(st.role, Role::Validator, "inside its staggered grace");
+        assert!(st.startup_grace);
+        st.startup_time = Instant::now() - Duration::from_millis(1000);
+        st.check_timeout();
+        assert_eq!(
+            st.role,
+            Role::Sequencer,
+            "nobody led during its grace: takes over"
+        );
     }
 }
