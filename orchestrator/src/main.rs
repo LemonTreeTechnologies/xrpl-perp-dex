@@ -2898,8 +2898,10 @@ async fn main() -> Result<()> {
     let election_config = election::ElectionConfig {
         our_peer_id: p2p_node.peer_id.to_string(),
         our_priority: cli.priority,
-        heartbeat_interval: Duration::from_secs(5),
-        heartbeat_timeout: Duration::from_secs(15),
+        heartbeat_interval: election::HEARTBEAT_INTERVAL,
+        heartbeat_timeout: election::HEARTBEAT_TIMEOUT,
+        // Priority 0 takes over at 15 s, priority 1 at 20 s, priority 2 at 25 s (liveness only).
+        takeover_stagger: election::TAKEOVER_STAGGER,
     };
     let mut election_state = election::ElectionState::new(
         election_config,
