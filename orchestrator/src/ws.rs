@@ -195,14 +195,34 @@ pub async fn ws_handler(
         )
             .into_response();
     }
-    let rx = state.ws_tx.subscribe();
-    ws.on_upgrade(move |socket| client_loop(socket, rx))
+    upgrade(ws, state.log_health.clone(), state.ws_tx.subscribe())
+}
+
+/// The stream carries trading data (book, trades, fills, order updates), so it is gated like the trading
+/// routes: no new stream while this node's replicated state is not the cluster's (diverged or fenced),
+/// and an open stream is closed (1013, try again later) instead of sending its next event.
+fn upgrade(
+    ws: WebSocketUpgrade,
+    health: Arc<crate::log_node::LogHealth>,
+    rx: broadcast::Receiver<WsEvent>,
+) -> axum::response::Response {
+    if health.refuses_trading() {
+        return (StatusCode::SERVICE_UNAVAILABLE, STATE_NOT_THE_CLUSTERS).into_response();
+    }
+    ws.on_upgrade(move |socket| client_loop(socket, rx, health))
         .into_response()
 }
 
+const STATE_NOT_THE_CLUSTERS: &str =
+    "this node's replicated state is not the cluster's (diverged or fenced); use another node";
+
 /// Per-client loop: read from broadcast, filter by subscribed channels,
 /// write JSON to socket.
-async fn client_loop(mut socket: WebSocket, mut rx: broadcast::Receiver<WsEvent>) {
+async fn client_loop(
+    mut socket: WebSocket,
+    mut rx: broadcast::Receiver<WsEvent>,
+    health: Arc<crate::log_node::LogHealth>,
+) {
     info!("WebSocket client connected");
     let mut channels: HashSet<String> = default_channels();
 
@@ -213,6 +233,15 @@ async fn client_loop(mut socket: WebSocket, mut rx: broadcast::Receiver<WsEvent>
                     Ok(event) => {
                         if !event.matches(&channels) {
                             continue;
+                        }
+                        if health.refuses_trading() {
+                            let _ = socket
+                                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                                    code: 1013,
+                                    reason: STATE_NOT_THE_CLUSTERS.into(),
+                                })))
+                                .await;
+                            break;
                         }
                         let json = match serde_json::to_string(&event) {
                             Ok(j) => j,
@@ -446,5 +475,66 @@ mod tests {
             serde_json::from_str::<ControlFrame>(txt).unwrap(),
             ControlFrame::Ping
         );
+    }
+
+    mod state_gate {
+        use super::*;
+        use crate::log_node::LogHealth;
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as C;
+
+        async fn serve(health: Arc<LogHealth>, tx: broadcast::Sender<WsEvent>) -> String {
+            let app = axum::Router::new().route(
+                "/ws",
+                axum::routing::get(move |ws: WebSocketUpgrade| {
+                    let (h, rx) = (health.clone(), tx.subscribe());
+                    async move { upgrade(ws, h, rx) }
+                }),
+            );
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+            format!("ws://{a}/ws")
+        }
+
+        fn trade(id: u64) -> WsEvent {
+            WsEvent::Trade {
+                trade_id: id,
+                price: "1".into(),
+                size: "1".into(),
+                taker_side: "long".into(),
+                maker_user_id: "rA".into(),
+                taker_user_id: "rB".into(),
+                timestamp_ms: 1,
+            }
+        }
+
+        #[tokio::test]
+        async fn an_open_stream_closes_when_the_node_diverges_and_a_new_one_is_refused() {
+            let health = Arc::new(LogHealth::new("follow"));
+            let (tx, _keep) = broadcast::channel(16);
+            let url = serve(health.clone(), tx.clone()).await;
+            let (mut c, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+            // Wait until the server side has subscribed, then a healthy node streams.
+            while tx.receiver_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+            tx.send(trade(1)).unwrap();
+            let m = c.next().await.unwrap().unwrap();
+            assert!(m.to_text().unwrap().contains("\"trade_id\":1"), "{m:?}");
+
+            health.update(|s| {
+                s.halted = Some(crate::log_client::rc::DIVERGED);
+                s.diverged = true;
+            });
+            tx.send(trade(2)).unwrap();
+            match c.next().await.unwrap().unwrap() {
+                C::Close(Some(f)) => assert_eq!(u16::from(f.code), 1013),
+                other => panic!("the diverged node sent {other:?} instead of closing"),
+            }
+
+            let e = tokio_tungstenite::connect_async(&url).await.unwrap_err();
+            assert!(e.to_string().contains("503"), "{e}");
+        }
     }
 }
