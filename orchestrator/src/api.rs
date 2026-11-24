@@ -131,6 +131,8 @@ pub struct AppState {
     pub maintenance_mode: Arc<AtomicBool>,
     /// The replicated log on this node: mode, position, halt/divergence, recent alarms.
     pub log_health: Arc<crate::log_node::LogHealth>,
+    /// The enclave-backed subsystems this node is configured to run, and whether each is running.
+    pub subsystems: Arc<crate::subsystems::Subsystems>,
 }
 
 // ── Request/Response types ──────────────────────────────────────
@@ -386,6 +388,7 @@ async fn system_status(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         // The replicated log. `diverged: true` means this node's state is not the cluster's: its reads
         // must not be taken as the cluster's.
         "log": state.log_health.snapshot(),
+        "subsystems": state.subsystems.snapshot(),
         "unl_refresh": {
             "enabled": state.unl_refresh.enabled.load(Ordering::Relaxed),
             "submissions": state.unl_refresh.submissions.load(Ordering::Relaxed),
