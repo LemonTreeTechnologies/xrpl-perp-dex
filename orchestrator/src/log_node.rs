@@ -165,12 +165,13 @@ impl Enclave for EnclaveAdapter {
     async fn check_applied(
         &self,
         seq: u64,
+        term: u64,
         chain_hash: &[u8; 32],
         bundle: &[u8],
         quorum: bool,
     ) -> Result<(), LogError> {
         self.client
-            .check_applied(seq, chain_hash, bundle, quorum)
+            .check_applied(seq, term, chain_hash, bundle, quorum)
             .await
     }
 }
@@ -438,6 +439,7 @@ mod tests {
             seq: 0,
             t_batch: 0,
             chain_hash: [0; 32],
+            term: 0,
             fenced: false,
             on,
         })
@@ -676,6 +678,7 @@ mod tests {
                 seq,
                 t_batch: 0,
                 chain_hash: [seq as u8; 32],
+                term: 0,
                 fenced: false,
                 on: true,
             })
@@ -700,6 +703,7 @@ mod tests {
         }
         async fn check_applied(
             &self,
+            _: u64,
             _: u64,
             _: &[u8; 32],
             _: &[u8],

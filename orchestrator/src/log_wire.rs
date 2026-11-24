@@ -33,9 +33,10 @@ pub enum LogGossip {
         record_len: u32,
         record_sha256: String,
     },
-    /// One member's APPLIED signature entry for (seq, chain_hash).
+    /// One member's APPLIED signature entry for (seq, term, chain_hash).
     Applied {
         seq: u64,
+        term: u64,
         chain_hash: String,
         share: String,
     },
@@ -66,6 +67,7 @@ pub struct Announce {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Share {
     pub seq: u64,
+    pub term: u64,
     pub chain_hash: [u8; 32],
     pub pubkey: [u8; 33],
     pub der: Vec<u8>,
@@ -114,6 +116,7 @@ pub fn parse_gossip(data: &[u8]) -> Result<Parsed> {
         }
         LogGossip::Applied {
             seq,
+            term,
             chain_hash,
             share,
         } => {
@@ -121,6 +124,7 @@ pub fn parse_gossip(data: &[u8]) -> Result<Parsed> {
             let (pubkey, der) = parse_sig_entry(&raw)?;
             Ok(Parsed::Applied(Share {
                 seq,
+                term,
                 chain_hash: hex32(&chain_hash, "chain_hash")?,
                 pubkey,
                 der,
@@ -161,8 +165,12 @@ pub fn announce(d: &Durable) -> LogGossip {
 /// This node's APPLIED share for a durably stored record. `entry` is the enclave's signature entry.
 pub fn applied(d: &Durable, entry: &[u8]) -> Result<LogGossip> {
     parse_sig_entry(entry)?;
+    let term = d
+        .term()
+        .context("the stored batch has no header term: no APPLIED share")?;
     Ok(LogGossip::Applied {
         seq: d.seq(),
+        term,
         chain_hash: hex::encode(d.chain_hash()),
         share: hex::encode(entry),
     })
@@ -465,7 +473,11 @@ mod tests {
             seq,
             chain_hash: [7; 32],
             market_id: 0,
-            batch: vec![1, 2, 3],
+            batch: {
+                let mut b = vec![0u8; 108];
+                b[100..108].copy_from_slice(&9u64.to_be_bytes());
+                b
+            },
             quote_blob: vec![4; 10],
             side_blobs: vec![],
             sig_bundle: entry(1, 70),
@@ -508,6 +520,7 @@ mod tests {
         );
         let share = serde_json::to_vec(&LogGossip::Applied {
             seq: 5,
+            term: 2,
             chain_hash: hex::encode([7; 32]),
             share: hex::encode(entry(3, 70)),
         })
@@ -602,11 +615,40 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!((sh.seq, sh.chain_hash, sh.pubkey[1]), (5, [7; 32], 3));
+        assert_eq!(
+            (sh.seq, sh.term, sh.chain_hash, sh.pubkey[1]),
+            (5, 9, [7; 32], 3)
+        );
         assert!(
             applied(&proof, &entry(3, 7)).is_err(),
             "a malformed entry is not published"
         );
+        // D11.2: a share is over seq ‖ term ‖ chain hash; a stored body too short to carry the header's term
+        // gets no share at all (never a guessed term).
+        let mut short = rec(6);
+        short.batch = vec![1, 2, 3];
+        let p = s.put(&short).unwrap();
+        assert_eq!(p.term(), None);
+        assert!(
+            applied(&p, &entry(3, 70)).is_err(),
+            "no term → no APPLIED share"
+        );
+    }
+
+    #[test]
+    fn the_batch_term_is_read_big_endian_at_byte_100() {
+        let mut b = vec![0u8; 108];
+        b[100..108].copy_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
+        assert_eq!(
+            crate::log_store::batch_term(&b),
+            Some(0x0102_0304_0506_0708)
+        );
+        assert_eq!(
+            crate::log_store::batch_term(&b[..107]),
+            None,
+            "one byte short"
+        );
+        assert_eq!(crate::log_store::batch_term(&[]), None);
     }
 
     #[test]
@@ -621,7 +663,7 @@ mod tests {
         assert_eq!(verify_fetched(&a, &file).unwrap(), rec(5));
         // A different, internally valid record of the same length: only the hash tells them apart.
         let mut other = rec(5);
-        other.batch = vec![9, 9, 9];
+        other.batch[0] = 9;
         let other_file = encode_record(&other).unwrap();
         assert_eq!(other_file.len(), file.len());
         assert!(verify_fetched(&a, &other_file)
@@ -701,6 +743,7 @@ mod tests {
     fn share(seq: u64, signer: u8, chain: u8) -> Share {
         Share {
             seq,
+            term: 0,
             chain_hash: [chain; 32],
             pubkey: [signer; 33],
             der: vec![0x30; 70],
