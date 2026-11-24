@@ -173,13 +173,6 @@ pub fn router(state: Arc<AdminState>) -> Router {
     Router::new()
         .route("/admin/path-a/share-export", post(handle_share_export))
         .with_state(state)
-        // FROST signing-round probe. Stateless (the caller names the enclave,
-        // the signer set and the group key), so it is merged rather than
-        // sharing AdminState.
-        .merge(Router::new().route(
-            "/admin/frost/round",
-            post(crate::frost_round::handle_frost_round),
-        ))
         // #131 Safe governance: order the owner signatures and submit the self-call.
         // Stateless like the FROST probe; configuration comes from the same env the
         // publisher reads, so there is no second place to hold the gas key.
@@ -402,16 +395,14 @@ mod admin_surface_tests {
         );
     }
 
-    /// EVERY route on the listener is covered, not just the Safe ones — share-export and the
-    /// FROST round driver are on the same app, and they were the two that worried me most when
-    /// I found the listener had no auth layer at all.
+    /// EVERY route on the listener is covered, not just the Safe ones — share-export is on the same
+    /// app, and it worried me most when I found the listener had no auth layer at all.
     #[tokio::test]
-    async fn the_layer_covers_share_export_and_the_frost_round_too() {
+    async fn the_layer_covers_share_export_too() {
         let base = serve(vec!["rOperatorOne".to_string()]).await;
         let c = reqwest::Client::new();
         for route in [
             "/admin/path-a/share-export",
-            "/admin/frost/round",
             "/admin/safe/exec",
             "/admin/safe/derive-step",
             "/admin/safe/attest-projection",
