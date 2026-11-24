@@ -27,6 +27,8 @@ pub struct LogConfig {
     pub member_peers: bool,
     pub store_dir: bool,
     pub signer: bool,
+    /// --vault-mm or --vault-dn: the vault places orders from the node itself, outside the log.
+    pub vault: bool,
 }
 
 impl LogConfig {
@@ -63,6 +65,12 @@ pub enum Setup {
 pub fn startup_decision(p: &Probe, c: &LogConfig) -> Result<Setup> {
     match p {
         Probe::Head(h) if h.on => {
+            if c.vault {
+                bail!(
+                    "the enclave is in replicated-log mode; refusing to start with --vault-mm/--vault-dn \
+                     (the vault places orders from this node, outside the log)"
+                )
+            }
             if c.complete() {
                 Ok(Setup::Follow)
             } else {
@@ -232,6 +240,12 @@ pub struct LogStatus {
     pub recent_alarms: Vec<String>,
 }
 
+impl LogStatus {
+    fn state_is_not_the_clusters(&self) -> bool {
+        self.diverged || self.halted.is_some()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct LogHealth(Mutex<LogStatus>);
 
@@ -245,6 +259,19 @@ impl LogHealth {
 
     pub fn snapshot(&self) -> LogStatus {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Whether this node must refuse trading reads and writes: its replicated state is known not to be
+    /// the cluster's. That is any halt — the follower latches a halt only for a code it can no longer follow
+    /// past (diverged, fenced, a prologue failure, a refusal while fenced), after which the state stays
+    /// frozen and falls further behind. A transient refusal (gap, stale, not yet) never latches a halt: the
+    /// follower keeps fetching and catches up. Any halt, not a list of codes, so a new halt code cannot
+    /// leave this open.
+    pub fn refuses_trading(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state_is_not_the_clusters()
     }
 
     pub fn set_mode(&self, mode: &'static str) {
@@ -420,7 +447,45 @@ mod tests {
         member_peers: true,
         store_dir: true,
         signer: true,
+        vault: false,
     };
+
+    #[test]
+    fn log_mode_refuses_to_start_with_the_vault_flags() {
+        let vault = LogConfig { vault: true, ..ALL };
+        let e = startup_decision(&head(true), &vault)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--vault-mm/--vault-dn"), "{e}");
+        // Before genesis the vault still runs (legacy trading), with or without the log configured.
+        assert_eq!(
+            startup_decision(&head(false), &vault).unwrap(),
+            Setup::Follow
+        );
+        assert_eq!(
+            startup_decision(&Probe::Absent, &vault).unwrap(),
+            Setup::Legacy
+        );
+    }
+
+    #[test]
+    fn every_halt_refuses_trading_and_a_following_node_does_not() {
+        use crate::log_client::{rc, LogOutcome};
+        assert!(!LogHealth::new("follow").refuses_trading());
+        // Every code the follower halts on (the Halted class), each on its own. (A transient such as STALE
+        // never latches a halt: log_follower's stale tests assert halted() stays None.)
+        for code in [
+            rc::DIVERGED,
+            rc::FENCED,
+            rc::PROLOGUE_FAILED,
+            rc::ERR_FENCED,
+        ] {
+            assert!(matches!(LogOutcome::from_rc(code), LogOutcome::Halted(_)));
+            let h = LogHealth::new("follow");
+            h.update(|s| s.halted = Some(code));
+            assert!(h.refuses_trading(), "halted on {code} must refuse");
+        }
+    }
 
     #[test]
     fn log_mode_refuses_to_start_unless_every_piece_is_configured() {
@@ -452,6 +517,7 @@ mod tests {
                     member_peers: false,
                     store_dir: false,
                     signer: false,
+                    vault: false,
                 },
                 "--member-peers",
             ),
@@ -471,6 +537,7 @@ mod tests {
             member_peers: false,
             store_dir: false,
             signer: true,
+            vault: false,
         };
         assert_eq!(
             startup_decision(&head(false), &bare).unwrap(),
@@ -481,6 +548,7 @@ mod tests {
             member_peers: true,
             store_dir: false,
             signer: true,
+            vault: false,
         };
         assert_eq!(
             startup_decision(&head(false), &members_only).unwrap(),
@@ -490,6 +558,7 @@ mod tests {
             member_peers: false,
             store_dir: true,
             signer: true,
+            vault: false,
         };
         assert!(startup_decision(&head(false), &partial)
             .unwrap_err()
@@ -503,6 +572,7 @@ mod tests {
             member_peers: false,
             store_dir: false,
             signer: false,
+            vault: false,
         };
         assert_eq!(
             startup_decision(&Probe::Absent, &bare).unwrap(),

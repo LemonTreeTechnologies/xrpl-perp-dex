@@ -2788,6 +2788,7 @@ async fn main() -> Result<()> {
             member_peers: !members.is_empty(),
             store_dir: cli.log_store_dir.is_some(),
             signer: signer.is_some(),
+            vault: cli.vault_mm || cli.vault_dn,
         };
         let probe = log_node::probe_at_startup(&log_client, 60, Duration::from_secs(2)).await?;
         match log_node::startup_decision(&probe, &cfg)? {
