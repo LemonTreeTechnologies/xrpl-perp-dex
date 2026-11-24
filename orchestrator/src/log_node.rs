@@ -242,7 +242,7 @@ pub struct LogStatus {
 
 impl LogStatus {
     fn state_is_not_the_clusters(&self) -> bool {
-        self.diverged || self.halted == Some(crate::log_client::rc::FENCED)
+        self.diverged || self.halted.is_some()
     }
 }
 
@@ -262,7 +262,11 @@ impl LogHealth {
     }
 
     /// Whether this node must refuse trading reads and writes: its replicated state is known not to be
-    /// the cluster's — it diverged from the log, or its enclave is fenced.
+    /// the cluster's. That is any halt — the follower latches a halt only for a code it can no longer follow
+    /// past (diverged, fenced, a prologue failure, a refusal while fenced), after which the state stays
+    /// frozen and falls further behind. A transient refusal (gap, stale, not yet) never latches a halt: the
+    /// follower keeps fetching and catches up. Any halt, not a list of codes, so a new halt code cannot
+    /// leave this open.
     pub fn refuses_trading(&self) -> bool {
         self.0
             .lock()
@@ -465,21 +469,22 @@ mod tests {
     }
 
     #[test]
-    fn a_diverged_or_fenced_node_refuses_trading_and_a_healthy_one_does_not() {
-        let h = LogHealth::new("follow");
-        assert!(!h.refuses_trading());
-        h.update(|s| s.halted = Some(crate::log_client::rc::STALE));
-        assert!(
-            !h.refuses_trading(),
-            "a transient halt is not a wrong state"
-        );
-        h.update(|s| s.halted = Some(crate::log_client::rc::FENCED));
-        assert!(h.refuses_trading());
-        h.update(|s| {
-            s.halted = Some(crate::log_client::rc::DIVERGED);
-            s.diverged = true;
-        });
-        assert!(h.refuses_trading());
+    fn every_halt_refuses_trading_and_a_following_node_does_not() {
+        use crate::log_client::{rc, LogOutcome};
+        assert!(!LogHealth::new("follow").refuses_trading());
+        // Every code the follower halts on (the Halted class), each on its own. (A transient such as STALE
+        // never latches a halt: log_follower's stale tests assert halted() stays None.)
+        for code in [
+            rc::DIVERGED,
+            rc::FENCED,
+            rc::PROLOGUE_FAILED,
+            rc::ERR_FENCED,
+        ] {
+            assert!(matches!(LogOutcome::from_rc(code), LogOutcome::Halted(_)));
+            let h = LogHealth::new("follow");
+            h.update(|s| s.halted = Some(code));
+            assert!(h.refuses_trading(), "halted on {code} must refuse");
+        }
     }
 
     #[test]

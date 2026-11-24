@@ -910,6 +910,8 @@ mod tests {
         assert!(s.f.take_alarms().is_empty());
         s.f.step(&e, &net, t0 + Duration::from_secs(30)).await;
         assert_eq!(s.f.take_alarms(), vec![Alarm::Stale { seq: 1, secs: 30 }]);
+        // Transient: the node keeps following (and so keeps serving reads), however long it waits.
+        assert_eq!(s.f.halted(), None);
     }
 
     #[tokio::test]
