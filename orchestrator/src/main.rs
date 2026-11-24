@@ -16,7 +16,6 @@ mod db;
 mod deposit_spv; // #131 P3 — assemble SPV deposit proofs for the enclave
 mod dkg_coordinate;
 mod election;
-mod frost_round; // FROST threshold-Schnorr signing round driver
 mod http_helpers;
 mod leader_gate; // O-H3 — validator leader-gate provenance decision (extracted + unit-tested)
 mod log_client; // client for the enclave's replicated-log routes
