@@ -64,6 +64,7 @@ mod singleton;
 mod spv_proof; // AC-BASE-2″ P2-d — XRPL SPV proof builder/fetcher
 #[cfg(test)]
 mod spv_proof_vector; // the live reserves-path vectors, mirrored from the enclave suite
+mod subsystems;
 mod trading;
 mod tx_shamap; // #131 P3 — rebuild a ledger's tx SHAMap + read inclusion paths off it
 #[cfg(test)]
@@ -1678,6 +1679,13 @@ async fn main() -> Result<()> {
             "the local enclave answers; continuing startup"
         );
     }
+    // Which enclave-backed subsystems this node runs; each startup site below records its outcome, and a
+    // watcher alarms on any configured one that is not running.
+    let subsystems = Arc::new(subsystems::Subsystems::default());
+    tokio::spawn(subsystems::watch(
+        subsystems.clone(),
+        Duration::from_secs(60),
+    ));
     let shard_router = match &cli.shards_config {
         Some(path) => shard_router::ShardRouter::from_config(path).await?,
         None => shard_router::ShardRouter::single(&cli.enclave_url, 0).await?,
@@ -1910,6 +1918,7 @@ async fn main() -> Result<()> {
         };
 
     let app_state = Arc::new(AppState {
+        subsystems: subsystems.clone(),
         engine,
         perp: PerpClient::new(&cli.enclave_url)?,
         ws_tx: ws_tx.clone(),
@@ -2027,8 +2036,10 @@ async fn main() -> Result<()> {
         Ok(pk) => {
             info!(ecdh_pubkey = %pk, "fetched local ECDH identity for Path A");
             p2p_node.set_local_ecdh_pubkey(pk);
+            subsystems.running("path-a-recipient-filter");
         }
         Err(e) => {
+            subsystems.disabled("path-a-recipient-filter", format!("{e:#}"));
             warn!(
                 "Path A: failed to fetch local ECDH pubkey ({:#}) — \
                  recipient filter disabled, share-v2 import will still \
@@ -2134,7 +2145,7 @@ async fn main() -> Result<()> {
             .to_string();
         let epoch_client = http_helpers::loopback_http_client(Duration::from_secs(30))?;
         let epoch_src = membership_http::HttpEpochDigestSource::new(epoch_client, epoch_admin_base);
-        let _announcer = tokio::spawn(async move {
+        let announcer = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(PEER_QUOTE_INTERVAL_SECS));
             loop {
                 tick.tick().await;
@@ -2187,6 +2198,7 @@ async fn main() -> Result<()> {
                 info!(shard_id, group_id = %group_id, "queued peer-quote announce");
             }
         });
+        subsystems.running_task(&format!("announcer/shard-{shard_id}"), announcer);
     }
 
     // THE OPERATOR ROSTER AUTHORITY, built ONCE and shared by every admin listener below
@@ -2269,6 +2281,7 @@ async fn main() -> Result<()> {
             {
                 Ok(pk) => pk,
                 Err(e) => {
+                    subsystems.disabled("dkg-coordinator", format!("{e:#}"));
                     warn!("DKG coordinator: failed to fetch local ECDH pubkey ({e}); coordinator disabled");
                     String::new()
                 }
@@ -2299,9 +2312,12 @@ async fn main() -> Result<()> {
 
                 // Always spawn the follower handler.
                 let follower_state = coord_state.clone();
-                tokio::spawn(async move {
-                    dkg_coordinate::run_follower(follower_state, dkg_step_in_rx).await;
-                });
+                subsystems.running_task(
+                    "dkg-coordinator",
+                    tokio::spawn(async move {
+                        dkg_coordinate::run_follower(follower_state, dkg_step_in_rx).await;
+                    }),
+                );
 
                 // Leader admin listener (operator opts in).
                 if let Some(addr) = cli.dkg_admin_listen.clone() {
@@ -2340,6 +2356,7 @@ async fn main() -> Result<()> {
             {
                 Ok(pk) => pk.to_lowercase(),
                 Err(e) => {
+                    subsystems.disabled("join-brain", format!("{e:#}"));
                     warn!("join-brain: fetch local ECDH pubkey failed ({e}); join-brain disabled");
                     String::new()
                 }
@@ -2375,14 +2392,26 @@ async fn main() -> Result<()> {
                         my_account_id_hex: hex::encode(my_aid),
                         publish_tx: bootstrap_pub_tx,
                     };
-                    tokio::spawn(async move {
-                        bootstrap_join::run_join_brain(brain, bootstrap_in_rx).await;
-                    });
+                    subsystems.running_task(
+                        "join-brain",
+                        tokio::spawn(async move {
+                            bootstrap_join::run_join_brain(brain, bootstrap_in_rx).await;
+                        }),
+                    );
                     info!(shard_id = group.shard_id, "β3.2c join-brain spawned");
                 }
-                _ => warn!(
-                    "join-brain disabled: escrow/local r-address decode failed or ECDH pubkey unavailable"
-                ),
+                _ => {
+                    // An ECDH failure was recorded above with its cause; otherwise an address did not decode.
+                    if !join_ecdh.is_empty() {
+                        subsystems.disabled(
+                            "join-brain",
+                            "the escrow or local r-address does not decode",
+                        );
+                    }
+                    warn!(
+                        "join-brain disabled: escrow/local r-address decode failed or ECDH pubkey unavailable"
+                    )
+                }
             }
         }
     }
