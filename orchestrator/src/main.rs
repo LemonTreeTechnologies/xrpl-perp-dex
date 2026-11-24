@@ -16,6 +16,7 @@ mod db;
 mod deposit_spv; // #131 P3 — assemble SPV deposit proofs for the enclave
 mod dkg_coordinate;
 mod election;
+mod enclave_ready;
 mod http_helpers;
 mod leader_gate; // O-H3 — validator leader-gate provenance decision (extracted + unit-tested)
 mod log_client; // client for the enclave's replicated-log routes
@@ -1662,6 +1663,21 @@ async fn main() -> Result<()> {
     };
 
     // Initialize shard router — sets shard_id on each enclave at startup
+    // The first enclave read of the server is below (the shard id); every one-shot startup read after it
+    // turns its feature off on failure. Wait until the enclave answers so a joint enclave+orchestrator
+    // start cannot leave those features off; refuse to start if it never answers.
+    {
+        let at = enclave_ready::await_enclave(
+            &enclave_ready::HttpEnclave::new(&cli.enclave_url)?,
+            90,
+            Duration::from_secs(2),
+        )
+        .await?;
+        info!(
+            attempt = at,
+            "the local enclave answers; continuing startup"
+        );
+    }
     let shard_router = match &cli.shards_config {
         Some(path) => shard_router::ShardRouter::from_config(path).await?,
         None => shard_router::ShardRouter::single(&cli.enclave_url, 0).await?,
