@@ -4,7 +4,6 @@ build/
 *.o
 *.so
 *.signed.so
-!enclave.signed.so
 
 # SGX
 enclave.token

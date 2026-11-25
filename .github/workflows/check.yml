@@ -83,3 +83,11 @@ jobs:
       # the mistake that left the gate above at exit 127 and never once executed.
       - name: logged errors print their chain
         run: scripts/ci_log_error_chain.py
+
+      # This repo tracked its own enclave.signed.so from 2026-04-12, seven months stale,
+      # behind an explicit .gitignore exception — while the enclave repo removed its copy
+      # and gated the class (F-9). Deploying a committed binary rolls back every fix since
+      # the commit that produced it; the deploy flow takes the freshly built artefact.
+      # The script checks from the repo root itself, whatever this job's directory is.
+      - name: no committed enclave binary
+        run: scripts/ci_no_committed_enclave_binary.py
