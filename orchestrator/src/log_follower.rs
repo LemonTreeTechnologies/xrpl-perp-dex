@@ -41,6 +41,7 @@ pub trait Enclave: Send + Sync {
     async fn check_applied(
         &self,
         seq: u64,
+        term: u64,
         chain_hash: &[u8; 32],
         bundle: &[u8],
         quorum: bool,
@@ -241,7 +242,7 @@ impl Follower {
                 }
                 let one = crate::quorum_bundle::build(&[(s.pubkey.to_vec(), s.der.clone())]);
                 if enclave
-                    .check_applied(s.seq, &s.chain_hash, &one, false)
+                    .check_applied(s.seq, s.term, &s.chain_hash, &one, false)
                     .await
                     .is_err()
                 {
@@ -258,11 +259,11 @@ impl Follower {
 
     /// Add a verified share; store the certificate once it verifies at quorum.
     async fn collect(&mut self, enclave: &dyn Enclave, s: Share) {
-        let (seq, chain) = (s.seq, s.chain_hash);
+        let (seq, term, chain) = (s.seq, s.term, s.chain_hash);
         match self.collector.add(s, self.anchor()) {
             ShareOutcome::Ready(bundle) => {
                 if enclave
-                    .check_applied(seq, &chain, &bundle, true)
+                    .check_applied(seq, term, &chain, &bundle, true)
                     .await
                     .is_err()
                 {
@@ -312,6 +313,7 @@ impl Follower {
         enclave: &dyn Enclave,
         net: &dyn Net,
         seq: u64,
+        term: u64,
         chain: &[u8; 32],
     ) -> Option<Vec<u8>> {
         if let Some(c) = self.pending_certs.get(&seq) {
@@ -329,7 +331,11 @@ impl Follower {
             let Ok(cert) = decode_cert(&file, seq) else {
                 continue;
             };
-            if enclave.check_applied(seq, chain, &cert, true).await.is_ok() {
+            if enclave
+                .check_applied(seq, term, chain, &cert, true)
+                .await
+                .is_ok()
+            {
                 return Some(cert);
             }
         }
@@ -373,13 +379,18 @@ impl Follower {
         };
         net.publish(Outgoing::announce(&durable)).await;
         if !share.is_empty() {
-            match (Outgoing::applied(&durable, &share), parse_sig_entry(&share)) {
-                (Ok(out), Ok((pubkey, der))) => {
+            match (
+                Outgoing::applied(&durable, &share),
+                parse_sig_entry(&share),
+                durable.term(),
+            ) {
+                (Ok(out), Ok((pubkey, der)), Some(term)) => {
                     net.publish(out).await;
                     self.collect(
                         enclave,
                         Share {
                             seq,
+                            term,
                             chain_hash: rec.chain_hash,
                             pubkey,
                             der,
@@ -462,7 +473,10 @@ impl Follower {
             if matches!(outcome, Err(LogError::Enclave(LogOutcome::Transient(c))) if c == crate::log_client::rc::STALE)
                 && cert.is_none()
             {
-                cert = self.find_cert(enclave, net, n, &rec.chain_hash).await;
+                // A certificate is over seq ‖ term ‖ chain hash; the term is the batch header's.
+                if let Some(term) = crate::log_store::batch_term(&rec.batch) {
+                    cert = self.find_cert(enclave, net, n, term, &rec.chain_hash).await;
+                }
                 if cert.is_some() {
                     outcome = self.apply(enclave, &rec, cert.as_deref()).await;
                 }
@@ -556,12 +570,23 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
+    /// A batch-shaped body: the enclave's header length (108), a seq marker, the term 7 at byte 100.
+    const TERM: u64 = 7;
+    fn batch(seq: u64) -> Vec<u8> {
+        let mut b = vec![0u8; 108];
+        b[0] = 1;
+        b[1] = 2;
+        b[2] = seq as u8;
+        b[100..108].copy_from_slice(&TERM.to_be_bytes());
+        b
+    }
+
     fn rec(seq: u64) -> LogRecord {
         LogRecord {
             seq,
             chain_hash: [seq as u8; 32],
             market_id: 0,
-            batch: vec![1, 2, seq as u8],
+            batch: batch(seq),
             quote_blob: vec![9; 40],
             side_blobs: vec![],
             sig_bundle: vec![7; 72],
@@ -584,6 +609,7 @@ mod tests {
         let (pubkey, der) = parse_sig_entry(&share_entry(k)).unwrap();
         Share {
             seq,
+            term: TERM,
             chain_hash: [seq as u8; 32],
             pubkey,
             der,
@@ -600,6 +626,8 @@ mod tests {
         good: Mutex<HashSet<Vec<u8>>>,
         applies: Mutex<Vec<(u64, Vec<u8>)>>,
         checks: Mutex<usize>,
+        /// The term of every check_applied call (D11.2: it must be the batch header's).
+        terms: Mutex<Vec<u64>>,
     }
 
     impl FakeEnclave {
@@ -609,6 +637,7 @@ mod tests {
                     seq: 0,
                     t_batch: 0,
                     chain_hash: [0; 32],
+                    term: 0,
                     fenced: false,
                     on: true,
                 }),
@@ -616,6 +645,7 @@ mod tests {
                 good: Mutex::new(HashSet::new()),
                 applies: Mutex::new(vec![]),
                 checks: Mutex::new(0),
+                terms: Mutex::new(vec![]),
             }
         }
         fn ok() -> Self {
@@ -655,11 +685,13 @@ mod tests {
         async fn check_applied(
             &self,
             _: u64,
+            term: u64,
             _: &[u8; 32],
             b: &[u8],
             _: bool,
         ) -> Result<(), LogError> {
             *self.checks.lock().unwrap() += 1;
+            self.terms.lock().unwrap().push(term);
             if self.good.lock().unwrap().contains(b) {
                 Ok(())
             } else {
@@ -771,7 +803,14 @@ mod tests {
         // Per seq: an announcement, then this node's APPLIED share; each only once the record was on disk.
         assert_eq!(p.len(), 4);
         assert!(matches!(p[0].0, LogGossip::Announce { seq: 1, .. }));
-        assert!(matches!(p[1].0, LogGossip::Applied { seq: 1, .. }));
+        assert!(matches!(
+            p[1].0,
+            LogGossip::Applied {
+                seq: 1,
+                term: TERM,
+                ..
+            }
+        ));
         assert!(
             p.iter().all(|(_, on_disk)| *on_disk),
             "published before the record was durable"
@@ -943,6 +982,11 @@ mod tests {
             s.f.step(&e, &net, Instant::now()).await,
             Step::Applied { seq: 1 }
         );
+        assert!(
+            !e.terms.lock().unwrap().is_empty()
+                && e.terms.lock().unwrap().iter().all(|t| *t == TERM),
+            "the certificate is checked under the batch header's term"
+        );
         // Applied with the certificate that verified, never with the one that did not.
         let applies = e.applies.lock().unwrap();
         assert_eq!(applies.last().unwrap().1, cert);
@@ -1024,6 +1068,7 @@ mod tests {
             seq: 1,
             t_batch: 0,
             chain_hash: [1; 32],
+            term: 0,
             fenced: false,
             on: true,
         };
@@ -1046,6 +1091,7 @@ mod tests {
             seq: 1,
             t_batch: 0,
             chain_hash: [9; 32],
+            term: 0,
             fenced: false,
             on: true,
         };
@@ -1156,6 +1202,10 @@ mod tests {
         assert_eq!(
             s.f.store().get_cert(1).unwrap(),
             Some(bundle(&[0xa1, 0xb1], 1))
+        );
+        assert!(
+            e.terms.lock().unwrap().iter().all(|t| *t == TERM),
+            "each peer share and the assembled certificate are checked under the share's term"
         );
 
         let (mut s, e) = applied_one(false).await;
@@ -1301,6 +1351,7 @@ mod tests {
             seq: 3,
             t_batch: 0,
             chain_hash: [3; 32],
+            term: 0,
             fenced: false,
             on: true,
         };

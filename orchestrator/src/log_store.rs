@@ -28,6 +28,19 @@ const TMP_EXT: &str = "tmp";
 
 /// Per-field caps. They bound what one record may allocate; the enclave validates the contents.
 pub const MAX_BATCH_LEN: usize = 64 * 1024;
+
+/// Where the enclave's batch header carries the leader's term (D11.2): u64 big-endian at byte 100.
+const BATCH_TERM_AT: usize = 100;
+
+/// The term in a batch header, or `None` when the bytes are too short to hold one. The enclave checks
+/// the term; the host only carries it (APPLIED shares and certificates are over seq ‖ term ‖ chain hash).
+pub fn batch_term(batch: &[u8]) -> Option<u64> {
+    let b: [u8; 8] = batch
+        .get(BATCH_TERM_AT..BATCH_TERM_AT + 8)?
+        .try_into()
+        .ok()?;
+    Some(u64::from_be_bytes(b))
+}
 pub const MAX_QUOTE_BLOB_LEN: usize = 64 * 1024;
 pub const MAX_SIDE_BLOBS_LEN: usize = 2 * 1024 * 1024;
 pub const MAX_SIG_BUNDLE_LEN: usize = 16 * 1024;
@@ -224,6 +237,8 @@ pub enum Stored {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Durable {
     seq: u64,
+    /// The batch header's term (`None` for bytes too short to be a batch; such a record gets no share).
+    term: Option<u64>,
     chain_hash: [u8; 32],
     file_len: usize,
     file_sha256: [u8; 32],
@@ -236,6 +251,9 @@ impl Durable {
     }
     pub fn chain_hash(&self) -> &[u8; 32] {
         &self.chain_hash
+    }
+    pub fn term(&self) -> Option<u64> {
+        self.term
     }
     pub fn file_len(&self) -> usize {
         self.file_len
@@ -360,6 +378,7 @@ impl LogStore {
         let bytes = encode_record(r)?;
         let proof = |stored| Durable {
             seq: r.seq,
+            term: batch_term(&r.batch),
             chain_hash: r.chain_hash,
             file_len: bytes.len(),
             file_sha256: Sha256::digest(&bytes).into(),
