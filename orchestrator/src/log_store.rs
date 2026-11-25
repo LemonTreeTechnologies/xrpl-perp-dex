@@ -21,7 +21,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const REC_MAGIC: &[u8; 4] = b"PLR1";
-const CERT_MAGIC: &[u8; 4] = b"PLC1";
+/// PLC2: the certificate carries the view digest its shares sign (10d (a)); PLC1 files are refused.
+const CERT_MAGIC: &[u8; 4] = b"PLC2";
 const REC_EXT: &str = "rec";
 const CERT_EXT: &str = "cert";
 const TMP_EXT: &str = "tmp";
@@ -50,8 +51,17 @@ const REC_FIXED: usize = 4 + 8 + 32 + 4 + 16 + 32;
 /// Largest record file the store will read.
 pub const MAX_REC_FILE: usize =
     REC_FIXED + MAX_BATCH_LEN + MAX_QUOTE_BLOB_LEN + MAX_SIDE_BLOBS_LEN + MAX_SIG_BUNDLE_LEN;
-/// Fixed part of a certificate file: magic 4 | seq 8 | length 4 | sha 32.
-const CERT_FIXED: usize = 4 + 8 + 4 + 32;
+/// Fixed part of a certificate file: magic 4 | seq 8 | view 32 | length 4 | sha 32.
+const CERT_FIXED: usize = 4 + 8 + 32 + 4 + 32;
+
+/// A quorum certificate: the post-batch view digest its APPLIED shares sign, and the signature bundle.
+/// The enclave verifies the bundle over seq ‖ term ‖ chain hash ‖ view; a node catching up with it then
+/// compares its own view with `view`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cert {
+    pub view: [u8; 32],
+    pub bundle: Vec<u8>,
+}
 
 /// One applied batch, as this node received and applied it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,17 +193,18 @@ pub fn decode_record(bytes: &[u8]) -> Result<LogRecord> {
     Ok(r)
 }
 
-fn encode_cert(seq: u64, cert: &[u8]) -> Result<Vec<u8>> {
+fn encode_cert(seq: u64, cert: &Cert) -> Result<Vec<u8>> {
     ensure!(
-        cert.len() <= MAX_CERT_LEN,
+        cert.bundle.len() <= MAX_CERT_LEN,
         "certificate is {} bytes",
-        cert.len()
+        cert.bundle.len()
     );
-    let mut out = Vec::with_capacity(CERT_FIXED + cert.len());
+    let mut out = Vec::with_capacity(CERT_FIXED + cert.bundle.len());
     out.extend_from_slice(CERT_MAGIC);
     out.extend_from_slice(&seq.to_be_bytes());
-    out.extend_from_slice(&len32(cert.len()));
-    out.extend_from_slice(cert);
+    out.extend_from_slice(&cert.view);
+    out.extend_from_slice(&len32(cert.bundle.len()));
+    out.extend_from_slice(&cert.bundle);
     let sha = Sha256::digest(&out);
     out.extend_from_slice(&sha);
     Ok(out)
@@ -203,7 +214,7 @@ fn encode_cert(seq: u64, cert: &[u8]) -> Result<Vec<u8>> {
 pub const MAX_CERT_FILE: usize = CERT_FIXED + MAX_CERT_LEN;
 
 /// Decode a certificate file (e.g. one fetched from a peer for catch-up). Strict, checksummed.
-pub fn decode_cert(bytes: &[u8], want_seq: u64) -> Result<Vec<u8>> {
+pub fn decode_cert(bytes: &[u8], want_seq: u64) -> Result<Cert> {
     ensure!(
         bytes.len() <= CERT_FIXED + MAX_CERT_LEN,
         "certificate file is {} bytes",
@@ -217,9 +228,10 @@ pub fn decode_cert(bytes: &[u8], want_seq: u64) -> Result<Vec<u8>> {
         seq == want_seq,
         "certificate file holds seq {seq}, expected {want_seq}"
     );
-    let cert = c.blob(MAX_CERT_LEN, "certificate")?;
+    let view: [u8; 32] = c.take(32)?.try_into().expect("32 bytes");
+    let bundle = c.blob(MAX_CERT_LEN, "certificate")?;
     ensure!(c.b.is_empty(), "{} trailing bytes", c.b.len());
-    Ok(cert)
+    Ok(Cert { view, bundle })
 }
 
 /// What a `put` did.
@@ -418,7 +430,7 @@ impl LogStore {
 
     /// Store the quorum certificate for a stored record. Write-once: the first certificate is kept
     /// (any valid one finalises the batch); returns whether this call wrote it.
-    pub fn put_cert(&mut self, seq: u64, cert: &[u8]) -> Result<bool> {
+    pub fn put_cert(&mut self, seq: u64, cert: &Cert) -> Result<bool> {
         ensure!(
             self.first.is_some_and(|f| seq >= f) && self.last.is_some_and(|l| seq <= l),
             "no stored record at seq {seq} for a certificate"
@@ -432,7 +444,7 @@ impl LogStore {
         Ok(true)
     }
 
-    pub fn get_cert(&self, seq: u64) -> Result<Option<Vec<u8>>> {
+    pub fn get_cert(&self, seq: u64) -> Result<Option<Cert>> {
         let Some(bytes) = Self::read_bounded(&self.path(seq, CERT_EXT), CERT_FIXED + MAX_CERT_LEN)?
         else {
             return Ok(None);
@@ -527,7 +539,14 @@ mod tests {
             .to_string()
             .contains("checksum"));
         // A well-formed certificate file is not a record: the magic differs, the checksum is valid.
-        let cert = encode_cert(1, &good[..10]).unwrap();
+        let cert = encode_cert(
+            1,
+            &Cert {
+                view: [3; 32],
+                bundle: good[..10].to_vec(),
+            },
+        )
+        .unwrap();
         assert!(decode_record(&cert)
             .unwrap_err()
             .to_string()
@@ -605,24 +624,58 @@ mod tests {
 
     #[test]
     fn certificates_are_write_once_and_only_for_stored_records() {
+        let c = |v: u8, b: &[u8]| Cert {
+            view: [v; 32],
+            bundle: b.to_vec(),
+        };
         let d = tempfile::tempdir().unwrap();
         let mut s = LogStore::open(d.path()).unwrap();
-        assert!(s.put_cert(1, &[1]).is_err(), "no record yet");
+        assert!(s.put_cert(1, &c(1, &[1])).is_err(), "no record yet");
         s.put(&rec(1)).unwrap();
-        assert!(s.put_cert(2, &[1]).is_err(), "past the last record");
-        assert!(s.put_cert(1, &[0xaa; 10]).unwrap());
+        assert!(s.put_cert(2, &c(1, &[1])).is_err(), "past the last record");
+        assert!(s.put_cert(1, &c(0x5a, &[0xaa; 10])).unwrap());
         assert!(
-            !s.put_cert(1, &[0xbb; 10]).unwrap(),
+            !s.put_cert(1, &c(0x5b, &[0xbb; 10])).unwrap(),
             "the first certificate is kept"
         );
         let s = LogStore::open(d.path()).unwrap();
-        assert_eq!(s.get_cert(1).unwrap().unwrap(), vec![0xaa; 10]);
+        assert_eq!(
+            s.get_cert(1).unwrap().unwrap(),
+            c(0x5a, &[0xaa; 10]),
+            "the view digest round-trips with the bundle"
+        );
         assert!(s.get_cert(2).unwrap().is_none());
         let p = d.path().join(format!("{:020}.cert", 1));
-        fs::write(&p, encode_cert(5, &[1]).unwrap()).unwrap();
+        fs::write(&p, encode_cert(5, &c(1, &[1])).unwrap()).unwrap();
         assert!(
             s.get_cert(1).is_err(),
             "a certificate file for another seq is refused"
         );
+    }
+
+    #[test]
+    fn a_certificate_file_without_a_view_is_refused() {
+        // The PLC1 layout (magic | seq | length | bundle | sha): no view digest. Valid checksum.
+        let mut old = b"PLC1".to_vec();
+        old.extend_from_slice(&1u64.to_be_bytes());
+        old.extend_from_slice(&3u32.to_be_bytes());
+        old.extend_from_slice(&[1, 2, 3]);
+        let sha = Sha256::digest(&old);
+        old.extend_from_slice(&sha);
+        assert!(decode_cert(&old, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("magic"));
+        // The view is exactly 32 bytes at offset 12: a body one byte short of it is truncated.
+        let good = encode_cert(
+            1,
+            &Cert {
+                view: [7; 32],
+                bundle: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(good.len(), CERT_FIXED);
+        assert_eq!(&good[12..44], &[7u8; 32]);
     }
 }

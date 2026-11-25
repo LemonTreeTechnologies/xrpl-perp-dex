@@ -18,8 +18,8 @@
 //! enclave accepts. The collection window is anchored to this node's OWN last stored seq.
 #![allow(dead_code)]
 
-use crate::log_client::{ApplyInput, Head, LogError, LogOutcome};
-use crate::log_store::{decode_cert, decode_record, LogRecord, LogStore};
+use crate::log_client::{Applied, ApplyInput, Head, LogError, LogOutcome};
+use crate::log_store::{decode_cert, decode_record, Cert, LogRecord, LogStore};
 use crate::log_transport::{LogInbound, Outgoing};
 use crate::log_wire::{
     parse_sig_entry, verify_fetched, Announce, CertCollector, FetchKind, FetchPlan, Parsed, Share,
@@ -36,13 +36,14 @@ pub trait Enclave: Send + Sync {
     async fn head(&self) -> Result<Head, LogError>;
     /// This node's replicated view (seq, chain hash, state digest).
     async fn view(&self) -> Result<crate::log_client::View, LogError>;
-    /// Apply one batch; `Ok` is this node's APPLIED share (empty when it signs none).
-    async fn apply(&self, input: &ApplyInput<'_>) -> Result<Vec<u8>, LogError>;
+    /// Apply one batch: this node's APPLIED share (empty when it signs none) and post-batch view.
+    async fn apply(&self, input: &ApplyInput<'_>) -> Result<Applied, LogError>;
     async fn check_applied(
         &self,
         seq: u64,
         term: u64,
         chain_hash: &[u8; 32],
+        view: &[u8; 32],
         bundle: &[u8],
         quorum: bool,
     ) -> Result<(), LogError>;
@@ -72,6 +73,9 @@ pub enum Alarm {
     Halted { seq: u64, code: i64 },
     /// APPLIED shares for two different chain hashes at one seq.
     CertConflict { seq: u64 },
+    /// APPLIED shares for one batch over two different post-batch views: members disagree on the state
+    /// after the same batch (10d (a)). The view that reaches the quorum is certified; the other is not.
+    CertViewConflict { seq: u64 },
     /// A peer's APPLIED share did not verify in the enclave.
     BadShare { seq: u64, author: PeerId },
     /// The record applied but could not be stored.
@@ -132,7 +136,7 @@ pub struct Follower {
     collector: CertCollector,
     announced: BTreeMap<u64, (Announce, PeerId)>,
     /// Quorum certificates verified in the enclave for seqs this node has not stored yet.
-    pending_certs: BTreeMap<u64, Vec<u8>>,
+    pending_certs: BTreeMap<u64, Cert>,
     stale_since: Option<(u64, Instant)>,
     raised: HashSet<Alarm>,
     alarms: Vec<Alarm>,
@@ -215,6 +219,7 @@ impl Follower {
             | Alarm::BadRecord { seq, .. }
             | Alarm::Stale { seq, .. }
             | Alarm::CertConflict { seq }
+            | Alarm::CertViewConflict { seq }
             | Alarm::BadShare { seq, .. }
             | Alarm::StoreFailed { seq }
             | Alarm::StoreBehind { seq, .. }
@@ -242,7 +247,7 @@ impl Follower {
                 }
                 let one = crate::quorum_bundle::build(&[(s.pubkey.to_vec(), s.der.clone())]);
                 if enclave
-                    .check_applied(s.seq, s.term, &s.chain_hash, &one, false)
+                    .check_applied(s.seq, s.term, &s.chain_hash, &s.view, &one, false)
                     .await
                     .is_err()
                 {
@@ -259,11 +264,11 @@ impl Follower {
 
     /// Add a verified share; store the certificate once it verifies at quorum.
     async fn collect(&mut self, enclave: &dyn Enclave, s: Share) {
-        let (seq, term, chain) = (s.seq, s.term, s.chain_hash);
+        let (seq, term, chain, view) = (s.seq, s.term, s.chain_hash, s.view);
         match self.collector.add(s, self.anchor()) {
             ShareOutcome::Ready(bundle) => {
                 if enclave
-                    .check_applied(seq, term, &chain, &bundle, true)
+                    .check_applied(seq, term, &chain, &view, &bundle, true)
                     .await
                     .is_err()
                 {
@@ -273,17 +278,19 @@ impl Follower {
                     );
                     return;
                 }
+                let cert = Cert { view, bundle };
                 if self.store.last_seq().is_some_and(|l| seq <= l)
                     && self.store.first_seq().is_some_and(|f| seq >= f)
                 {
-                    if let Err(e) = self.store.put_cert(seq, &bundle) {
+                    if let Err(e) = self.store.put_cert(seq, &cert) {
                         tracing::error!(seq, "storing a certificate: {e:#}");
                     }
                 } else {
-                    self.pending_certs.insert(seq, bundle);
+                    self.pending_certs.insert(seq, cert);
                 }
             }
             ShareOutcome::Conflict { seq } => self.raise(Alarm::CertConflict { seq }),
+            ShareOutcome::ViewConflict { seq } => self.raise(Alarm::CertViewConflict { seq }),
             ShareOutcome::Pending | ShareOutcome::Duplicate | ShareOutcome::OutOfWindow => {}
         }
     }
@@ -306,8 +313,8 @@ impl Follower {
         Ok(r)
     }
 
-    /// A quorum certificate for `seq` (signing `chain`), from what this node holds or from a peer — only
-    /// one the enclave verifies at quorum.
+    /// A quorum certificate for `seq` (signing `chain` and the view it carries), from what this node holds
+    /// or from a peer — only one the enclave verifies at quorum.
     async fn find_cert(
         &mut self,
         enclave: &dyn Enclave,
@@ -315,7 +322,7 @@ impl Follower {
         seq: u64,
         term: u64,
         chain: &[u8; 32],
-    ) -> Option<Vec<u8>> {
+    ) -> Option<Cert> {
         if let Some(c) = self.pending_certs.get(&seq) {
             return Some(c.clone());
         }
@@ -332,7 +339,7 @@ impl Follower {
                 continue;
             };
             if enclave
-                .check_applied(seq, term, chain, &cert, true)
+                .check_applied(seq, term, chain, &cert.view, &cert.bundle, true)
                 .await
                 .is_ok()
             {
@@ -365,7 +372,7 @@ impl Follower {
         enclave: &dyn Enclave,
         net: &dyn Net,
         rec: LogRecord,
-        share: Vec<u8>,
+        out: Applied,
     ) -> Step {
         let seq = rec.seq;
         // Durable FIRST: only the proof `put` returns can be announced or signed for.
@@ -378,20 +385,21 @@ impl Follower {
             }
         };
         net.publish(Outgoing::announce(&durable)).await;
-        if !share.is_empty() {
+        if let (false, Some(view)) = (out.share.is_empty(), out.view) {
             match (
-                Outgoing::applied(&durable, &share),
-                parse_sig_entry(&share),
+                Outgoing::applied(&durable, &view, &out.share),
+                parse_sig_entry(&out.share),
                 durable.term(),
             ) {
-                (Ok(out), Ok((pubkey, der)), Some(term)) => {
-                    net.publish(out).await;
+                (Ok(msg), Ok((pubkey, der)), Some(term)) => {
+                    net.publish(msg).await;
                     self.collect(
                         enclave,
                         Share {
                             seq,
                             term,
                             chain_hash: rec.chain_hash,
+                            view,
                             pubkey,
                             der,
                         },
@@ -455,7 +463,7 @@ impl Follower {
         let mut any_copy = false;
         let mut only_bad_sig = true;
         let mut last_code = 0i64;
-        let mut cert: Option<Vec<u8>> = self.pending_certs.get(&n).cloned();
+        let mut cert: Option<Cert> = self.pending_certs.get(&n).cloned();
         while let Some(p) = plan.next_peer() {
             let Ok(Some(body)) = net.fetch(FetchKind::Record, n, p).await else {
                 continue;
@@ -469,20 +477,20 @@ impl Follower {
                     continue;
                 }
             };
-            let mut outcome = self.apply(enclave, &rec, cert.as_deref()).await;
+            let mut outcome = self.apply(enclave, &rec, cert.as_ref()).await;
             if matches!(outcome, Err(LogError::Enclave(LogOutcome::Transient(c))) if c == crate::log_client::rc::STALE)
                 && cert.is_none()
             {
-                // A certificate is over seq ‖ term ‖ chain hash; the term is the batch header's.
+                // A certificate is over seq ‖ term ‖ chain hash ‖ view; the term is the batch header's.
                 if let Some(term) = crate::log_store::batch_term(&rec.batch) {
                     cert = self.find_cert(enclave, net, n, term, &rec.chain_hash).await;
                 }
                 if cert.is_some() {
-                    outcome = self.apply(enclave, &rec, cert.as_deref()).await;
+                    outcome = self.apply(enclave, &rec, cert.as_ref()).await;
                 }
             }
             match outcome {
-                Ok(share) => return self.finish_applied(enclave, net, rec, share).await,
+                Ok(applied) => return self.finish_applied(enclave, net, rec, applied).await,
                 Err(LogError::Enclave(o)) => match o {
                     LogOutcome::Ok | LogOutcome::AlreadyApplied => {
                         return Step::Wait("the head moved")
@@ -544,8 +552,8 @@ impl Follower {
         &self,
         enclave: &dyn Enclave,
         rec: &LogRecord,
-        cert: Option<&[u8]>,
-    ) -> Result<Vec<u8>, LogError> {
+        cert: Option<&Cert>,
+    ) -> Result<Applied, LogError> {
         enclave
             .apply(&ApplyInput {
                 batch: &rec.batch,
@@ -553,7 +561,8 @@ impl Follower {
                 market_id: rec.market_id,
                 side_blobs: &rec.side_blobs,
                 sig_bundle: &rec.sig_bundle,
-                cert_bundle: cert.unwrap_or(&[]),
+                cert_bundle: cert.map_or(&[][..], |c| &c.bundle),
+                cert_view: cert.map(|c| &c.view),
             })
             .await
     }
@@ -605,12 +614,16 @@ mod tests {
         v
     }
 
+    /// The post-batch view every fake enclave reports (10d (a)).
+    const VIEW: [u8; 32] = [0x5e; 32];
+
     fn share(seq: u64, k: u8) -> Share {
         let (pubkey, der) = parse_sig_entry(&share_entry(k)).unwrap();
         Share {
             seq,
             term: TERM,
             chain_hash: [seq as u8; 32],
+            view: VIEW,
             pubkey,
             der,
         }
@@ -625,9 +638,15 @@ mod tests {
         /// Bundles `check_applied` accepts (any `quorum`).
         good: Mutex<HashSet<Vec<u8>>>,
         applies: Mutex<Vec<(u64, Vec<u8>)>>,
+        /// The certificate view handed to each apply (10d (a)).
+        cert_views: Mutex<Vec<Option<[u8; 32]>>>,
+        /// What apply reports as this node's view (`None`: the enclave could not compute it).
+        own_view: Mutex<Option<[u8; 32]>>,
         checks: Mutex<usize>,
         /// The term of every check_applied call (D11.2: it must be the batch header's).
         terms: Mutex<Vec<u64>>,
+        /// The view of every check_applied call (10d (a): the share's or the certificate's).
+        views: Mutex<Vec<[u8; 32]>>,
     }
 
     impl FakeEnclave {
@@ -644,8 +663,11 @@ mod tests {
                 rule,
                 good: Mutex::new(HashSet::new()),
                 applies: Mutex::new(vec![]),
+                cert_views: Mutex::new(vec![]),
+                own_view: Mutex::new(Some(VIEW)),
                 checks: Mutex::new(0),
                 terms: Mutex::new(vec![]),
+                views: Mutex::new(vec![]),
             }
         }
         fn ok() -> Self {
@@ -666,18 +688,22 @@ mod tests {
                 digest: [0; 32],
             })
         }
-        async fn apply(&self, i: &ApplyInput<'_>) -> Result<Vec<u8>, LogError> {
+        async fn apply(&self, i: &ApplyInput<'_>) -> Result<Applied, LogError> {
             let next = self.head.lock().unwrap().seq + 1;
             self.applies
                 .lock()
                 .unwrap()
                 .push((next, i.cert_bundle.to_vec()));
+            self.cert_views.lock().unwrap().push(i.cert_view.copied());
             match (self.rule)(next, i) {
                 Ok(s) => {
                     let mut h = self.head.lock().unwrap();
                     h.seq = next;
                     h.chain_hash = [next as u8; 32];
-                    Ok(s)
+                    Ok(Applied {
+                        share: s,
+                        view: *self.own_view.lock().unwrap(),
+                    })
                 }
                 Err(c) => Err(LogError::Enclave(LogOutcome::from_rc(c))),
             }
@@ -687,11 +713,13 @@ mod tests {
             _: u64,
             term: u64,
             _: &[u8; 32],
+            view: &[u8; 32],
             b: &[u8],
             _: bool,
         ) -> Result<(), LogError> {
             *self.checks.lock().unwrap() += 1;
             self.terms.lock().unwrap().push(term);
+            self.views.lock().unwrap().push(*view);
             if self.good.lock().unwrap().contains(b) {
                 Ok(())
             } else {
@@ -804,18 +832,70 @@ mod tests {
         assert_eq!(p.len(), 4);
         assert!(matches!(p[0].0, LogGossip::Announce { seq: 1, .. }));
         assert!(matches!(
-            p[1].0,
+            &p[1].0,
             LogGossip::Applied {
                 seq: 1,
                 term: TERM,
+                view,
                 ..
-            }
+            } if *view == hex::encode(VIEW)
         ));
         assert!(
             p.iter().all(|(_, on_disk)| *on_disk),
             "published before the record was durable"
         );
         assert!(s.f.take_alarms().is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_its_own_view_a_node_publishes_no_applied_share() {
+        let mut s = setup(FollowerCfg::default());
+        let net = FakeNet::new(dir(&s)).serve(FetchKind::Record, 1, s.peers[0], file(1));
+        let e = FakeEnclave::ok();
+        *e.own_view.lock().unwrap() = None;
+        assert_eq!(
+            s.f.step(&e, &net, Instant::now()).await,
+            Step::Applied { seq: 1 }
+        );
+        let p = net.published.lock().unwrap();
+        assert!(matches!(p[0].0, LogGossip::Announce { seq: 1, .. }));
+        assert!(
+            !p.iter()
+                .any(|(g, _)| matches!(g, LogGossip::Applied { .. })),
+            "a share is over a view: no view, no share"
+        );
+    }
+
+    #[tokio::test]
+    async fn shares_over_another_view_raise_an_alarm_and_the_agreeing_quorum_still_certifies() {
+        let (mut s, e) = applied_one(true).await;
+        let (a, b) = (s.peers[0], s.peers[1]);
+        let mut odd = share(1, 0xa1);
+        odd.view = [0xbd; 32];
+        // the odd share verifies on its own (its member did sign that view), so it reaches the collector
+        e.good.lock().unwrap().insert(bundle(&[0xa1], 1));
+        s.f.on_inbound(
+            &e,
+            LogInbound {
+                author: a,
+                msg: Parsed::Applied(odd),
+            },
+        )
+        .await;
+        s.f.on_inbound(
+            &e,
+            LogInbound {
+                author: b,
+                msg: Parsed::Applied(share(1, 0xb1)),
+            },
+        )
+        .await;
+        assert_eq!(s.f.take_alarms(), vec![Alarm::CertViewConflict { seq: 1 }]);
+        assert_eq!(
+            s.f.store().get_cert(1).unwrap(),
+            None::<Cert>,
+            "two members over two views are no quorum"
+        );
     }
 
     #[tokio::test]
@@ -959,11 +1039,20 @@ mod tests {
         let (a, b) = (s.peers[0], s.peers[1]);
         let cert = vec![0xc1; 40];
         let bogus = vec![0xc2; 40];
+        // The certificate's view: what the quorum signed, not this node's own (VIEW).
+        const CV: [u8; 32] = [0xc7; 32];
         let cert_file = |c: &[u8]| {
             let d = tempfile::tempdir().unwrap();
             let mut st = LogStore::open(d.path()).unwrap();
             st.put(&rec(1)).unwrap();
-            st.put_cert(1, c).unwrap();
+            st.put_cert(
+                1,
+                &Cert {
+                    view: CV,
+                    bundle: c.to_vec(),
+                },
+            )
+            .unwrap();
             std::fs::read(d.path().join(format!("{:020}.cert", 1))).unwrap()
         };
         let net = FakeNet::new(dir(&s))
@@ -986,6 +1075,15 @@ mod tests {
             !e.terms.lock().unwrap().is_empty()
                 && e.terms.lock().unwrap().iter().all(|t| *t == TERM),
             "the certificate is checked under the batch header's term"
+        );
+        assert!(
+            e.views.lock().unwrap().iter().all(|v| *v == CV),
+            "a fetched certificate is checked over the view it carries"
+        );
+        assert_eq!(
+            e.cert_views.lock().unwrap().last().copied().flatten(),
+            Some(CV),
+            "the catch-up apply gets the certificate's view beside its bundle"
         );
         // Applied with the certificate that verified, never with the one that did not.
         let applies = e.applies.lock().unwrap();
@@ -1164,7 +1262,7 @@ mod tests {
         )
         .await;
         // Had the rejected share counted, these two would have made a certificate.
-        assert_eq!(s.f.store().get_cert(1).unwrap(), None);
+        assert_eq!(s.f.store().get_cert(1).unwrap(), None::<Cert>);
         s.f.on_inbound(
             &e,
             LogInbound {
@@ -1174,7 +1272,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            s.f.store().get_cert(1).unwrap(),
+            s.f.store().get_cert(1).unwrap().map(|c| c.bundle),
             Some(bundle(&[0xb1, 0xa1], 1))
         );
     }
@@ -1200,12 +1298,21 @@ mod tests {
         )
         .await;
         assert_eq!(
-            s.f.store().get_cert(1).unwrap(),
+            s.f.store().get_cert(1).unwrap().map(|c| c.bundle),
             Some(bundle(&[0xa1, 0xb1], 1))
         );
         assert!(
             e.terms.lock().unwrap().iter().all(|t| *t == TERM),
             "each peer share and the assembled certificate are checked under the share's term"
+        );
+        assert!(
+            e.views.lock().unwrap().iter().all(|v| *v == VIEW),
+            "… and over the view the shares carry"
+        );
+        assert_eq!(
+            s.f.store().get_cert(1).unwrap().map(|c| c.view),
+            Some(VIEW),
+            "the stored certificate keeps the view it certifies"
         );
 
         let (mut s, e) = applied_one(false).await;
@@ -1226,7 +1333,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(s.f.store().get_cert(1).unwrap(), None);
+        assert_eq!(s.f.store().get_cert(1).unwrap(), None::<Cert>);
     }
 
     #[tokio::test]
@@ -1314,7 +1421,13 @@ mod tests {
             if let Parsed::Announce(a) = announce(q) {
                 s.f.announced.insert(q, (a, p));
             }
-            s.f.pending_certs.insert(q, vec![q as u8]);
+            s.f.pending_certs.insert(
+                q,
+                Cert {
+                    view: VIEW,
+                    bundle: vec![q as u8],
+                },
+            );
             s.f.raise(Alarm::NonMemberSig { seq: q });
         }
         s.f.raise(Alarm::Halted {
