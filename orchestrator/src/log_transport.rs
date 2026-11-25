@@ -108,8 +108,8 @@ impl Outgoing {
     pub fn announce(d: &Durable) -> Self {
         Self(crate::log_wire::announce(d))
     }
-    pub fn applied(d: &Durable, entry: &[u8]) -> anyhow::Result<Self> {
-        Ok(Self(crate::log_wire::applied(d, entry)?))
+    pub fn applied(d: &Durable, view: &[u8; 32], entry: &[u8]) -> anyhow::Result<Self> {
+        Ok(Self(crate::log_wire::applied(d, view, entry)?))
     }
     /// A view report (read from the enclave; it announces no record and signs nothing).
     pub fn view(v: &crate::log_wire::ViewReport) -> Self {

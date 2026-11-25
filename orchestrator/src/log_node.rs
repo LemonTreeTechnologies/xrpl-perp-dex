@@ -157,7 +157,7 @@ impl Enclave for EnclaveAdapter {
     async fn view(&self) -> Result<crate::log_client::View, LogError> {
         self.client.view().await
     }
-    async fn apply(&self, input: &ApplyInput<'_>) -> Result<Vec<u8>, LogError> {
+    async fn apply(&self, input: &ApplyInput<'_>) -> Result<crate::log_client::Applied, LogError> {
         self.client
             .apply(input, &self.account_id, &self.session_key)
             .await
@@ -167,11 +167,12 @@ impl Enclave for EnclaveAdapter {
         seq: u64,
         term: u64,
         chain_hash: &[u8; 32],
+        view: &[u8; 32],
         bundle: &[u8],
         quorum: bool,
     ) -> Result<(), LogError> {
         self.client
-            .check_applied(seq, term, chain_hash, bundle, quorum)
+            .check_applied(seq, term, chain_hash, view, bundle, quorum)
             .await
     }
 }
@@ -691,10 +692,13 @@ mod tests {
                 digest: [seq as u8; 32],
             })
         }
-        async fn apply(&self, _: &ApplyInput<'_>) -> Result<Vec<u8>, LogError> {
+        async fn apply(&self, _: &ApplyInput<'_>) -> Result<crate::log_client::Applied, LogError> {
             if self.code == 0 {
                 *self.seq.lock().unwrap() += 1;
-                Ok(vec![])
+                Ok(crate::log_client::Applied {
+                    share: vec![],
+                    view: None,
+                })
             } else {
                 Err(LogError::Enclave(crate::log_client::LogOutcome::from_rc(
                     self.code,
@@ -705,6 +709,7 @@ mod tests {
             &self,
             _: u64,
             _: u64,
+            _: &[u8; 32],
             _: &[u8; 32],
             _: &[u8],
             _: bool,

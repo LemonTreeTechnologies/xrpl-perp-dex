@@ -148,6 +148,18 @@ pub struct Committed {
     pub sig: Vec<u8>,
     /// This node's APPLIED share for the batch.
     pub cert: Vec<u8>,
+    /// This node's post-batch view digest: the share is signed over it.
+    pub view: [u8; 32],
+}
+
+/// What one apply returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Applied {
+    /// This node's APPLIED share; empty when the apply signs none (a catch-up, or unsignable).
+    pub share: Vec<u8>,
+    /// This node's post-batch view digest; `None` when the enclave could not compute it (then there
+    /// is no share either).
+    pub view: Option<[u8; 32]>,
 }
 
 /// One live order of the enclave book (the binding hash stays inside the enclave).
@@ -254,6 +266,8 @@ pub struct ApplyInput<'a> {
     pub side_blobs: &'a [u8],
     pub sig_bundle: &'a [u8],
     pub cert_bundle: &'a [u8],
+    /// The view digest `cert_bundle` signs; required exactly when a certificate is passed.
+    pub cert_view: Option<&'a [u8; 32]>,
 }
 
 #[derive(Clone)]
@@ -385,7 +399,7 @@ impl LogClient {
         Ok(())
     }
 
-    /// Do these APPLIED signatures for (seq, term, chain_hash) verify inside the enclave against the sealed
+    /// Do these APPLIED signatures for (seq, term, chain_hash, view) verify inside the enclave against the sealed
     /// signer list — one share (`quorum` false) or a whole certificate (`quorum` true)? `Ok(())` = yes;
     /// a refusal (`BAD_SIG`) = no.
     pub async fn check_applied(
@@ -393,12 +407,13 @@ impl LogClient {
         seq: u64,
         term: u64,
         chain_hash: &[u8; 32],
+        view: &[u8; 32],
         bundle: &[u8],
         quorum: bool,
     ) -> Result<(), LogError> {
         self.post(
             "/perp/log/check_applied",
-            json!({"seq": seq, "term": term, "chain_hash": hex::encode(chain_hash), "bundle": hex::encode(bundle), "quorum": quorum}),
+            json!({"seq": seq, "term": term, "chain_hash": hex::encode(chain_hash), "view": hex::encode(view), "bundle": hex::encode(bundle), "quorum": quorum}),
         )
         .await?;
         Ok(())
@@ -429,17 +444,18 @@ impl LogClient {
                 batch: hexv(v, "batch")?,
                 sig: hexv(v, "sig")?,
                 cert: hexv(v, "cert")?,
+                view: hex32(v, "view")?,
             })
         })
     }
 
-    /// Apply one batch. `Ok(cert)` is this node's APPLIED share (empty when the apply signs none).
+    /// Apply one batch: this node's APPLIED share (empty when the apply signs none) and its view.
     pub async fn apply(
         &self,
         input: &ApplyInput<'_>,
         account_id: &str,
         session_key: &[u8; 32],
-    ) -> Result<Vec<u8>, LogError> {
+    ) -> Result<Applied, LogError> {
         let v = self
             .post(
                 "/perp/log/apply",
@@ -450,12 +466,21 @@ impl LogClient {
                     "side_blobs": hex::encode(input.side_blobs),
                     "sig_bundle": hex::encode(input.sig_bundle),
                     "cert_bundle": hex::encode(input.cert_bundle),
+                    "cert_view": input.cert_view.map(hex::encode).unwrap_or_default(),
                     "account_id": account_id,
                     "session_key": hex::encode(session_key),
                 }),
             )
             .await?;
-        Self::shape(v, |v| hexv(v, "cert"))
+        Self::shape(v, |v| {
+            let share = hexv(v, "cert")?;
+            // The enclave reports zeros when it could not compute its view; no view → no share.
+            let view = Some(hex32(v, "view")?).filter(|d| *d != [0u8; 32]);
+            Ok(Applied {
+                share: if view.is_some() { share } else { Vec::new() },
+                view,
+            })
+        })
     }
 }
 
@@ -642,17 +667,29 @@ mod tests {
                 "/v1/perp/log/commit",
                 post(|Json(b): Json<Value>| async move {
                     assert_eq!(b["session_key"], "11".repeat(32));
-                    Json(json!({"status":"success","batch":"aa","sig":"bb","cert":"cc"}))
+                    Json(json!({"status":"success","batch":"aa","sig":"bb","cert":"cc","view":"dd".repeat(32)}))
                 }),
             )
             .route(
                 "/v1/perp/log/apply",
                 post(|Json(b): Json<Value>| async move {
-                    for k in ["batch", "quote_blob", "side_blobs", "sig_bundle", "cert_bundle", "account_id", "session_key"] {
+                    for k in ["batch", "quote_blob", "side_blobs", "sig_bundle", "cert_bundle", "cert_view", "account_id", "session_key"] {
                         assert!(b.get(k).and_then(Value::as_str).is_some(), "apply body carries {k}");
                     }
-                    assert_eq!(b["market_id"], 0);
-                    (StatusCode::CONFLICT, Json(json!({"status":"error","ret":-62})))
+                    match b["market_id"].as_u64() {
+                        // a catch-up: the certificate goes with the view it signs
+                        Some(1) => {
+                            assert_eq!(b["cert_bundle"], "0405");
+                            assert_eq!(b["cert_view"], "9a".repeat(32));
+                            (StatusCode::OK, Json(json!({"status":"success","cert":"","view":"77".repeat(32)})))
+                        }
+                        // the enclave could not compute its view: zeros, and then no share is used
+                        Some(2) => (StatusCode::OK, Json(json!({"status":"success","cert":"cc","view":"00".repeat(32)}))),
+                        _ => {
+                            assert_eq!(b["cert_view"], "", "no certificate, no view");
+                            (StatusCode::CONFLICT, Json(json!({"status":"error","ret":-62})))
+                        }
+                    }
                 }),
             )
             .route(
@@ -660,6 +697,7 @@ mod tests {
                 post(|Json(b): Json<Value>| async move {
                     assert_eq!((b["seq"].as_u64(), b["chain_hash"].as_str()), (Some(7), Some("ee".repeat(32).as_str())));
                     assert_eq!(b["term"].as_u64(), Some(5));
+                    assert_eq!(b["view"], "9b".repeat(32));
                     assert_eq!(b["bundle"], "0102");
                     if b["quorum"] == true {
                         (StatusCode::OK, Json(json!({"status":"success"})))
@@ -676,11 +714,12 @@ mod tests {
         );
         assert_eq!(c.view().await.unwrap().digest, [0xcd; 32]);
         assert!(c
-            .check_applied(7, 5, &[0xee; 32], &[1, 2], true)
+            .check_applied(7, 5, &[0xee; 32], &[0x9b; 32], &[1, 2], true)
             .await
             .is_ok());
         assert!(matches!(
-            c.check_applied(7, 5, &[0xee; 32], &[1, 2], false).await,
+            c.check_applied(7, 5, &[0xee; 32], &[0x9b; 32], &[1, 2], false)
+                .await,
             Err(LogError::Enclave(LogOutcome::Transient(-67)))
         ));
         let b = c.book(2, 5).await.unwrap();
@@ -699,21 +738,42 @@ mod tests {
         let k = [0x11u8; 32];
         let cm = c.commit("0x11", &k).await.unwrap();
         assert_eq!(
-            (cm.batch, cm.sig, cm.cert),
-            (vec![0xaa], vec![0xbb], vec![0xcc])
+            (cm.batch, cm.sig, cm.cert, cm.view),
+            (vec![0xaa], vec![0xbb], vec![0xcc], [0xdd; 32])
         );
-        let input = ApplyInput {
+        let mut input = ApplyInput {
             batch: &[1],
             quote_blob: &[2],
             market_id: 0,
             side_blobs: &[],
             sig_bundle: &[3],
             cert_bundle: &[],
+            cert_view: None,
         };
         assert!(matches!(
             c.apply(&input, "0x11", &k).await,
             Err(LogError::Enclave(LogOutcome::Halted(-62)))
         ));
+        let cv = [0x9a; 32];
+        input.market_id = 1;
+        input.cert_bundle = &[4, 5];
+        input.cert_view = Some(&cv);
+        assert_eq!(
+            c.apply(&input, "0x11", &k).await.unwrap(),
+            Applied {
+                share: vec![],
+                view: Some([0x77; 32])
+            }
+        );
+        input.market_id = 2;
+        assert_eq!(
+            c.apply(&input, "0x11", &k).await.unwrap(),
+            Applied {
+                share: vec![],
+                view: None
+            },
+            "no view → no share, even if the enclave returned one"
+        );
     }
 
     #[tokio::test]

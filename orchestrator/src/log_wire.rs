@@ -6,8 +6,10 @@
 //! - A fetched body is checked against the announced length and hash BEFORE it is decoded, stored or
 //!   given to the enclave; a mismatch means "try another peer", never "use it".
 //! - Fetching is bounded: a fixed number of attempts over distinct peers.
-//! - APPLIED shares are collected per (seq, chain hash) and assembled into the enclave's quorum bundle;
-//!   a share for a different chain hash at the same seq is reported, never mixed in.
+//! - APPLIED shares are collected per (seq, chain hash, view digest) and assembled into the enclave's
+//!   quorum bundle; a share for a different chain hash at the same seq is reported and never mixed in;
+//!   a share for a different view at the same (seq, chain hash) is reported and kept apart, so one
+//!   diverged member cannot keep the others from certifying.
 #![allow(dead_code)]
 
 use crate::log_store::{decode_record, Durable, LogRecord, MAX_REC_FILE};
@@ -33,11 +35,13 @@ pub enum LogGossip {
         record_len: u32,
         record_sha256: String,
     },
-    /// One member's APPLIED signature entry for (seq, term, chain_hash).
+    /// One member's APPLIED signature entry for (seq, term, chain_hash, view): `view` is the member's own
+    /// post-batch state digest.
     Applied {
         seq: u64,
         term: u64,
         chain_hash: String,
+        view: String,
         share: String,
     },
     /// "After applying `seq`, my replicated state hashes to `digest`" (the C1 cross-member compare).
@@ -69,6 +73,7 @@ pub struct Share {
     pub seq: u64,
     pub term: u64,
     pub chain_hash: [u8; 32],
+    pub view: [u8; 32],
     pub pubkey: [u8; 33],
     pub der: Vec<u8>,
 }
@@ -118,6 +123,7 @@ pub fn parse_gossip(data: &[u8]) -> Result<Parsed> {
             seq,
             term,
             chain_hash,
+            view,
             share,
         } => {
             let raw = hex::decode(&share).context("share is not hex")?;
@@ -126,6 +132,7 @@ pub fn parse_gossip(data: &[u8]) -> Result<Parsed> {
                 seq,
                 term,
                 chain_hash: hex32(&chain_hash, "chain_hash")?,
+                view: hex32(&view, "view")?,
                 pubkey,
                 der,
             }))
@@ -162,8 +169,9 @@ pub fn announce(d: &Durable) -> LogGossip {
     }
 }
 
-/// This node's APPLIED share for a durably stored record. `entry` is the enclave's signature entry.
-pub fn applied(d: &Durable, entry: &[u8]) -> Result<LogGossip> {
+/// This node's APPLIED share for a durably stored record. `entry` is the enclave's signature entry and
+/// `view` the post-batch view digest the enclave signed it over.
+pub fn applied(d: &Durable, view: &[u8; 32], entry: &[u8]) -> Result<LogGossip> {
     parse_sig_entry(entry)?;
     let term = d
         .term()
@@ -172,6 +180,7 @@ pub fn applied(d: &Durable, entry: &[u8]) -> Result<LogGossip> {
         seq: d.seq(),
         term,
         chain_hash: hex::encode(d.chain_hash()),
+        view: hex::encode(view),
         share: hex::encode(entry),
     })
 }
@@ -375,6 +384,10 @@ pub enum ShareOutcome {
     /// A share for another chain hash at a seq whose chain hash is already known: two different
     /// batches at one seq. Not mixed in; the caller raises the alarm.
     Conflict { seq: u64 },
+    /// A share for the known chain hash but another view than shares already held: members disagree on
+    /// the state after the same batch. Recorded in its own group (never mixed with another view's);
+    /// the caller raises the alarm.
+    ViewConflict { seq: u64 },
     /// Outside the window the collector keeps (too old or too far ahead).
     OutOfWindow,
 }
@@ -382,8 +395,9 @@ pub enum ShareOutcome {
 /// Collects APPLIED shares per seq. Bounded: only seqs within `window` of THIS node's own position in the
 /// log (the caller's `anchor`, e.g. its last stored seq) are kept — never of the largest seq a peer
 /// claimed, which one forged share could push out of reach — and a seq holds fewer than `min_shares` shares before it completes and is dropped.
-/// Shares gathered so far for one seq: the chain hash they sign, and (pubkey, DER) per signer.
-type Pending = ([u8; 32], Vec<([u8; 33], Vec<u8>)>);
+/// Shares gathered so far for one seq: the chain hash they sign, and per view digest the (pubkey, DER)
+/// of each signer. A signer is in at most one group per seq.
+type Pending = ([u8; 32], BTreeMap<[u8; 32], Vec<([u8; 33], Vec<u8>)>>);
 
 #[derive(Debug)]
 pub struct CertCollector {
@@ -417,18 +431,23 @@ impl CertCollector {
         let entry = self
             .by_seq
             .entry(s.seq)
-            .or_insert_with(|| (s.chain_hash, Vec::new()));
+            .or_insert_with(|| (s.chain_hash, BTreeMap::new()));
         if entry.0 != s.chain_hash {
             return ShareOutcome::Conflict { seq: s.seq };
         }
-        if entry.1.iter().any(|(pk, _)| *pk == s.pubkey) {
+        if entry
+            .1
+            .values()
+            .any(|g| g.iter().any(|(pk, _)| *pk == s.pubkey))
+        {
             return ShareOutcome::Duplicate;
         }
-        entry.1.push((s.pubkey, s.der));
-        let ready = entry.1.len() >= self.min_shares;
+        let other_view = entry.1.keys().any(|v| *v != s.view);
+        let group = entry.1.entry(s.view).or_default();
+        group.push((s.pubkey, s.der));
+        let ready = group.len() >= self.min_shares;
         let bundle = ready.then(|| {
-            let pairs: Vec<(Vec<u8>, Vec<u8>)> = entry
-                .1
+            let pairs: Vec<(Vec<u8>, Vec<u8>)> = group
                 .iter()
                 .map(|(pk, d)| (pk.to_vec(), d.clone()))
                 .collect();
@@ -440,6 +459,7 @@ impl CertCollector {
                 self.done.insert(s.seq);
                 ShareOutcome::Ready(b)
             }
+            None if other_view => ShareOutcome::ViewConflict { seq: s.seq },
             None => ShareOutcome::Pending,
         }
     }
@@ -522,12 +542,27 @@ mod tests {
             seq: 5,
             term: 2,
             chain_hash: hex::encode([7; 32]),
+            view: hex::encode([6; 32]),
             share: hex::encode(entry(3, 70)),
         })
         .unwrap();
         assert!(
-            matches!(parse_gossip(&share).unwrap(), Parsed::Applied(s) if s.seq == 5 && s.pubkey[1] == 3)
+            matches!(parse_gossip(&share).unwrap(), Parsed::Applied(s) if s.seq == 5 && s.pubkey[1] == 3 && s.view == [6; 32])
         );
+        // 10d (a): a share without its view, or with a short one, is not a share.
+        let no_view = format!(
+            r#"{{"type":"applied","seq":5,"term":2,"chain_hash":"{h}","share":"{e}"}}"#,
+            h = hex::encode([7; 32]),
+            e = hex::encode(entry(3, 70))
+        );
+        assert!(parse_gossip(no_view.as_bytes()).is_err(), "no view");
+        let short_view = format!(
+            r#"{{"type":"applied","seq":5,"term":2,"chain_hash":"{h}","view":"{v}","share":"{e}"}}"#,
+            h = hex::encode([7; 32]),
+            v = hex::encode([6; 31]),
+            e = hex::encode(entry(3, 70))
+        );
+        assert!(parse_gossip(short_view.as_bytes()).is_err(), "31-byte view");
         let zero = format!(
             r#"{{"type":"announce","seq":1,"chain_hash":"{h}","record_len":0,"record_sha256":"{h}"}}"#,
             h = "00".repeat(32)
@@ -609,18 +644,18 @@ mod tests {
             announce(&proof),
             "re-storing proves the same file"
         );
-        let Parsed::Applied(sh) =
-            parse_gossip(&serde_json::to_vec(&applied(&proof, &entry(3, 70)).unwrap()).unwrap())
-                .unwrap()
-        else {
+        let Parsed::Applied(sh) = parse_gossip(
+            &serde_json::to_vec(&applied(&proof, &[0x5e; 32], &entry(3, 70)).unwrap()).unwrap(),
+        )
+        .unwrap() else {
             panic!()
         };
         assert_eq!(
-            (sh.seq, sh.term, sh.chain_hash, sh.pubkey[1]),
-            (5, 9, [7; 32], 3)
+            (sh.seq, sh.term, sh.chain_hash, sh.view, sh.pubkey[1]),
+            (5, 9, [7; 32], [0x5e; 32], 3)
         );
         assert!(
-            applied(&proof, &entry(3, 7)).is_err(),
+            applied(&proof, &[0x5e; 32], &entry(3, 7)).is_err(),
             "a malformed entry is not published"
         );
         // D11.2: a share is over seq ‖ term ‖ chain hash; a stored body too short to carry the header's term
@@ -630,7 +665,7 @@ mod tests {
         let p = s.put(&short).unwrap();
         assert_eq!(p.term(), None);
         assert!(
-            applied(&p, &entry(3, 70)).is_err(),
+            applied(&p, &[0x5e; 32], &entry(3, 70)).is_err(),
             "no term → no APPLIED share"
         );
     }
@@ -741,10 +776,14 @@ mod tests {
     }
 
     fn share(seq: u64, signer: u8, chain: u8) -> Share {
+        share_v(seq, signer, chain, 0x11)
+    }
+    fn share_v(seq: u64, signer: u8, chain: u8, view: u8) -> Share {
         Share {
             seq,
             term: 0,
             chain_hash: [chain; 32],
+            view: [view; 32],
             pubkey: [signer; 33],
             der: vec![0x30; 70],
         }
@@ -785,6 +824,41 @@ mod tests {
                 (vec![2; 33], vec![0x30; 70]),
                 (vec![3; 33], vec![0x30; 70]),
             ]))
+        );
+    }
+
+    #[test]
+    fn shares_over_different_views_never_mix_and_one_odd_member_does_not_block() {
+        let b = |a: u8, c: u8| {
+            crate::quorum_bundle::build(&[
+                (vec![a; 33], vec![0x30; 70]),
+                (vec![c; 33], vec![0x30; 70]),
+            ])
+        };
+        // The odd member's share arrives FIRST; the two that agree still certify their view.
+        let mut c = CertCollector::new(2, 16);
+        assert_eq!(c.add(share_v(4, 9, 7, 0xbd), 1), ShareOutcome::Pending);
+        assert_eq!(
+            c.add(share_v(4, 2, 7, 0x11), 1),
+            ShareOutcome::ViewConflict { seq: 4 },
+            "a second view at one (seq, chain) is reported"
+        );
+        assert_eq!(
+            c.add(share_v(4, 3, 7, 0x11), 1),
+            ShareOutcome::Ready(b(2, 3))
+        );
+        // Two signers of two different views are not a quorum of either.
+        let mut d = CertCollector::new(2, 16);
+        assert_eq!(d.add(share_v(5, 2, 7, 0xaa), 1), ShareOutcome::Pending);
+        assert_eq!(
+            d.add(share_v(5, 3, 7, 0xbb), 1),
+            ShareOutcome::ViewConflict { seq: 5 }
+        );
+        // A signer cannot vote for both views.
+        assert_eq!(d.add(share_v(5, 2, 7, 0xbb), 1), ShareOutcome::Duplicate);
+        assert_eq!(
+            d.add(share_v(5, 4, 7, 0xbb), 1),
+            ShareOutcome::Ready(b(3, 4))
         );
     }
 
