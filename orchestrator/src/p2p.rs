@@ -5,7 +5,8 @@
 //! - Validators subscribe and replay deterministically
 //! - Any operator can request cross-signing via signing relay
 //!
-//! Topics: "perp-dex/orders", "perp-dex/election", "perp-dex/signing"
+//! Topics: "perp-dex/<escrow r-address>/<suffix>" for every suffix in `ALL_TOPIC_SUFFIXES`
+//! (orders, election, signing, events, path-a/*, cluster/dkg-step) — namespaced per cluster.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -20,13 +21,13 @@ use libp2p::{
     futures::StreamExt,
     gossipsub, identify,
     identity::Keypair,
-    noise,
+    noise, request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::election::ElectionMessage;
 use crate::pool_path_a_client::ShareEnvelopeV2;
@@ -1138,19 +1139,95 @@ pub enum DkgStepMessage {
 
 // ── Network behaviour ───────────────────────────────────────────
 
-const ORDERS_TOPIC: &str = "perp-dex/orders";
-const ELECTION_TOPIC: &str = "perp-dex/election";
-const SIGNING_TOPIC: &str = "perp-dex/signing";
-const EVENTS_TOPIC: &str = "perp-dex/events";
-const PEER_QUOTE_TOPIC: &str = "perp-dex/path-a/peer-quote";
-const SHARE_V2_TOPIC: &str = "perp-dex/path-a/share-v2";
-const BOOTSTRAP_TOPIC: &str = "perp-dex/path-a/bootstrap";
-const DKG_STEP_TOPIC: &str = "perp-dex/cluster/dkg-step";
+// Topic SUFFIXES. Every gossip topic is namespaced by the cluster (its escrow r-address) via
+// [`cluster_topic`], so two clusters that share hosts (testnet + mainnet-sandbox on the same VMs, a
+// rehearsal cluster beside the live one) cannot exchange a single message even when mis-peered: the
+// separation is a property of the code, not of every operator's `--p2p-peers` list being right.
+const ORDERS_TOPIC: &str = "orders";
+const ELECTION_TOPIC: &str = "election";
+const SIGNING_TOPIC: &str = "signing";
+const EVENTS_TOPIC: &str = "events";
+const PEER_QUOTE_TOPIC: &str = "path-a/peer-quote";
+const SHARE_V2_TOPIC: &str = "path-a/share-v2";
+const BOOTSTRAP_TOPIC: &str = "path-a/bootstrap";
+const DKG_STEP_TOPIC: &str = "cluster/dkg-step";
+/// Replicated log: record announcements (headers only; bodies move by request-response).
+const LOG_TOPIC: &str = "log";
+/// Replicated log: APPLIED signature shares.
+const LOG_CERT_TOPIC: &str = "log-cert";
+
+/// One log fetch may take at most this long before it counts as a failed attempt.
+const LOG_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Concurrent log fetch streams per connection.
+const LOG_FETCH_MAX_STREAMS: usize = 16;
+
+/// Every topic suffix this node subscribes to. One list, so a new topic can't be added without
+/// going through the namespace (the isolation test iterates it).
+const ALL_TOPIC_SUFFIXES: [&str; 10] = [
+    ORDERS_TOPIC,
+    ELECTION_TOPIC,
+    SIGNING_TOPIC,
+    EVENTS_TOPIC,
+    PEER_QUOTE_TOPIC,
+    SHARE_V2_TOPIC,
+    BOOTSTRAP_TOPIC,
+    DKG_STEP_TOPIC,
+    LOG_TOPIC,
+    LOG_CERT_TOPIC,
+];
+
+/// A message is from a member only if its signed AUTHOR is a member — gossipsub forwards messages on
+/// its own, so a member relaying an outsider's message must not admit it — and the relay is one too.
+pub fn member_allowed(members: &HashSet<PeerId>, relay: &PeerId, author: Option<&PeerId>) -> bool {
+    members.contains(relay) && author.is_some_and(|a| members.contains(a))
+}
+
+/// Parse `--member-peers`: comma-separated libp2p peer ids. Any malformed id is an error, never skipped.
+pub fn parse_member_peers(s: &str) -> Result<Vec<PeerId>> {
+    let mut out = Vec::new();
+    for p in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let id: PeerId = p
+            .parse()
+            .map_err(|e| anyhow::anyhow!("bad member peer id {p:?}: {e}"))?;
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// The full gossip topic name for `suffix` in cluster `cluster_ns`.
+pub fn cluster_topic(cluster_ns: &str, suffix: &str) -> String {
+    format!("perp-dex/{cluster_ns}/{suffix}")
+}
+
+/// Is a peer that identified with `theirs` a member of the cluster whose protocol is `ours`?
+/// Exact match: a different namespace, a pre-namespace build (`/perp-dex/0.1.0`), or anything
+/// else is another cluster.
+pub fn peer_in_cluster(ours: &str, theirs: &str) -> bool {
+    ours == theirs
+}
+
+/// The libp2p identify protocol string, carrying the cluster namespace so a peer from another
+/// cluster is recognised (and refused) at the PEER layer, not only by topic mismatch.
+pub fn cluster_identify_protocol(cluster_ns: &str) -> String {
+    format!("/perp-dex/0.1.0/{cluster_ns}")
+}
+
+/// The cluster namespace must be non-empty and made only of characters that cannot alter the
+/// topic/protocol structure (an XRPL r-address is base58: alphanumeric).
+fn validate_cluster_ns(cluster_ns: &str) -> Result<()> {
+    if cluster_ns.is_empty() || !cluster_ns.chars().all(|c| c.is_ascii_alphanumeric()) {
+        anyhow::bail!("invalid p2p cluster namespace {cluster_ns:?}: must be a non-empty alphanumeric id (the escrow r-address)");
+    }
+    Ok(())
+}
 
 #[derive(NetworkBehaviour)]
 struct PerpBehaviour {
     gossipsub: gossipsub::Behaviour,
     identify: identify::Behaviour,
+    log_fetch: request_response::Behaviour<crate::log_transport::LogFetchCodec>,
 }
 
 // ── P2P Node ────────────────────────────────────────────────────
@@ -1260,7 +1337,23 @@ pub struct P2PNode {
     /// X-C1: optional allowlist of peers that may publish signing
     /// requests. If `Some`, incoming requests from peers outside the set
     /// are dropped. If `None`, all peers are accepted (dev/test only).
-    allowed_signing_peers: Option<HashSet<PeerId>>,
+    member_peers: Option<HashSet<PeerId>>,
+    /// Replicated log transport, off until [`P2PNode::enable_log_transport`]: the store directory
+    /// served to member peers, where inbound log messages go, what to publish/fetch, and the fetches
+    /// in flight.
+    log_store_dir: Option<std::path::PathBuf>,
+    log_inbound_tx: Option<mpsc::Sender<crate::log_transport::LogInbound>>,
+    log_outbound_rx: Option<mpsc::Receiver<crate::log_transport::LogOutbound>>,
+    log_fetches: HashMap<
+        request_response::OutboundRequestId,
+        tokio::sync::oneshot::Sender<anyhow::Result<crate::log_transport::FetchResponse>>,
+    >,
+    log_topic: gossipsub::IdentTopic,
+    log_cert_topic: gossipsub::IdentTopic,
+    /// This cluster's identify protocol ([`cluster_identify_protocol`]). A peer that identifies
+    /// with anything else belongs to another cluster: it is never added as a gossip peer, it is
+    /// blacklisted in gossipsub, and its connection is closed.
+    identify_protocol: String,
     /// X-C1: replay guard for signing requests. Maps `request_id` →
     /// first-seen timestamp; entries older than the TTL are cleaned on
     /// insertion.
@@ -1315,11 +1408,26 @@ impl P2PNode {
     /// `keypair`:     persistent identity (use [`load_or_create_identity`])
     pub async fn new(
         listen_addr: &str,
+        cluster_ns: &str,
         keypair: Keypair,
         batch_tx: mpsc::Sender<(OrderBatch, Option<String>)>,
         election_inbound_tx: mpsc::Sender<ElectionMessage>,
         peer_count: Arc<std::sync::atomic::AtomicU32>,
     ) -> Result<Self> {
+        validate_cluster_ns(cluster_ns)?;
+        let identify_protocol = cluster_identify_protocol(cluster_ns);
+        // One line an operator can check after start: which cluster this node gossips in.
+        info!(
+            cluster = cluster_ns,
+            identify = %identify_protocol,
+            topics = ?ALL_TOPIC_SUFFIXES
+                .iter()
+                .map(|t| cluster_topic(cluster_ns, t))
+                .collect::<Vec<_>>(),
+            "p2p cluster namespace"
+        );
+        let identify_protocol_for_behaviour = identify_protocol.clone();
+        let log_fetch_protocol = crate::log_transport::fetch_protocol(cluster_ns)?;
         let swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
@@ -1349,27 +1457,41 @@ impl P2PNode {
                 .expect("valid gossipsub behaviour");
 
                 let identify = identify::Behaviour::new(identify::Config::new(
-                    "/perp-dex/0.1.0".to_string(),
+                    identify_protocol_for_behaviour,
                     key.public(),
                 ));
+
+                // Log fetch: bounded per request (the codec), per peer (concurrent streams) and in time.
+                let log_fetch = request_response::Behaviour::with_codec(
+                    crate::log_transport::LogFetchCodec,
+                    [(log_fetch_protocol, request_response::ProtocolSupport::Full)],
+                    request_response::Config::default()
+                        .with_request_timeout(LOG_FETCH_TIMEOUT)
+                        .with_max_concurrent_streams(LOG_FETCH_MAX_STREAMS),
+                );
 
                 PerpBehaviour {
                     gossipsub,
                     identify,
+                    log_fetch,
                 }
             })?
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
 
         let peer_id = *swarm.local_peer_id();
-        let orders_topic = gossipsub::IdentTopic::new(ORDERS_TOPIC);
-        let election_topic = gossipsub::IdentTopic::new(ELECTION_TOPIC);
-        let signing_topic = gossipsub::IdentTopic::new(SIGNING_TOPIC);
-        let events_topic = gossipsub::IdentTopic::new(EVENTS_TOPIC);
-        let peer_quote_topic = gossipsub::IdentTopic::new(PEER_QUOTE_TOPIC);
-        let share_v2_topic = gossipsub::IdentTopic::new(SHARE_V2_TOPIC);
-        let bootstrap_topic = gossipsub::IdentTopic::new(BOOTSTRAP_TOPIC);
-        let dkg_step_topic = gossipsub::IdentTopic::new(DKG_STEP_TOPIC);
+        let orders_topic = gossipsub::IdentTopic::new(cluster_topic(cluster_ns, ORDERS_TOPIC));
+        let election_topic = gossipsub::IdentTopic::new(cluster_topic(cluster_ns, ELECTION_TOPIC));
+        let signing_topic = gossipsub::IdentTopic::new(cluster_topic(cluster_ns, SIGNING_TOPIC));
+        let events_topic = gossipsub::IdentTopic::new(cluster_topic(cluster_ns, EVENTS_TOPIC));
+        let peer_quote_topic =
+            gossipsub::IdentTopic::new(cluster_topic(cluster_ns, PEER_QUOTE_TOPIC));
+        let share_v2_topic = gossipsub::IdentTopic::new(cluster_topic(cluster_ns, SHARE_V2_TOPIC));
+        let bootstrap_topic =
+            gossipsub::IdentTopic::new(cluster_topic(cluster_ns, BOOTSTRAP_TOPIC));
+        let dkg_step_topic = gossipsub::IdentTopic::new(cluster_topic(cluster_ns, DKG_STEP_TOPIC));
+        let log_topic = gossipsub::IdentTopic::new(cluster_topic(cluster_ns, LOG_TOPIC));
+        let log_cert_topic = gossipsub::IdentTopic::new(cluster_topic(cluster_ns, LOG_CERT_TOPIC));
 
         let mut node = P2PNode {
             swarm,
@@ -1418,7 +1540,13 @@ impl P2PNode {
             local_signer: None,
             reserves_baseline_config: None,
             escrow_xrpl_address: None,
-            allowed_signing_peers: None,
+            member_peers: None,
+            log_store_dir: None,
+            log_inbound_tx: None,
+            log_outbound_rx: None,
+            log_fetches: HashMap::new(),
+            log_topic,
+            log_cert_topic,
             recent_signing_requests: HashMap::new(),
             signing_request_rate: HashMap::new(),
             recent_dkg_step_keys: HashMap::new(),
@@ -1427,6 +1555,7 @@ impl P2PNode {
             share_v2_rate: HashMap::new(),
             peer_id,
             peer_count,
+            identify_protocol,
         };
 
         // Subscribe to topics
@@ -1470,6 +1599,13 @@ impl P2PNode {
             .gossipsub
             .subscribe(&node.dkg_step_topic)
             .context("failed to subscribe to dkg-step topic")?;
+        for t in [&node.log_topic, &node.log_cert_topic] {
+            node.swarm
+                .behaviour_mut()
+                .gossipsub
+                .subscribe(t)
+                .context("failed to subscribe to a log topic")?;
+        }
 
         // Listen
         let addr: Multiaddr = listen_addr.parse().context("invalid listen address")?;
@@ -1710,6 +1846,11 @@ impl P2PNode {
         self.local_ecdh_pubkey = Some(pk_hex.to_lowercase());
     }
 
+    /// The local signer, if one is set (its session key is already canonical bare hex).
+    pub fn local_signer(&self) -> Option<&LocalSigner> {
+        self.local_signer.as_ref()
+    }
+
     /// Set local signer credentials for handling incoming signing requests.
     pub fn set_local_signer(&mut self, mut signer: LocalSigner) {
         // GEN-3-R1 (RESP-β4-B-genesis-impl): canonicalize session_key to bare hex
@@ -1742,47 +1883,182 @@ impl P2PNode {
         self.reserves_baseline_config = Some(cfg);
     }
 
-    /// X-C1: set the peer allowlist for signing requests. Any peer not
-    /// in the set has its signing requests dropped. Pass an empty vec to
-    /// disable the allowlist (dev/test only — logs a warning).
+    /// Turn on the replicated-log transport. Refused unless the member peers are configured: the log
+    /// topics and the fetch protocol only ever talk to members, and an open log transport is never the
+    /// default.
+    pub fn enable_log_transport(
+        &mut self,
+        store_dir: std::path::PathBuf,
+        inbound: mpsc::Sender<crate::log_transport::LogInbound>,
+        outbound: mpsc::Receiver<crate::log_transport::LogOutbound>,
+    ) -> Result<()> {
+        // `set_member_peers` stores an empty list as `None`, so "configured" means non-empty.
+        anyhow::ensure!(
+            self.member_peers.is_some(),
+            "the log transport needs --member-peers"
+        );
+        self.log_store_dir = Some(store_dir);
+        self.log_inbound_tx = Some(inbound);
+        self.log_outbound_rx = Some(outbound);
+        Ok(())
+    }
+
+    fn log_member(&self, relay: &PeerId, author: Option<&PeerId>) -> bool {
+        self.member_peers
+            .as_ref()
+            .is_some_and(|m| member_allowed(m, relay, author))
+    }
+
+    /// A message on a log topic: dropped unless the transport is on and it comes from a member (author
+    /// and relay); parsed strictly; handed to the log loop with its author.
+    async fn on_log_gossip(&mut self, relay: &PeerId, message: &gossipsub::Message) {
+        let Some(tx) = self.log_inbound_tx.clone() else {
+            return;
+        };
+        if !self.log_member(relay, message.source.as_ref()) {
+            warn!(relay = %relay, "dropping log message from outside the member peers");
+            return;
+        }
+        let Some(author) = message.source else { return };
+        match crate::log_wire::parse_gossip(&message.data) {
+            Ok(msg) => {
+                if tx
+                    .send(crate::log_transport::LogInbound { author, msg })
+                    .await
+                    .is_err()
+                {
+                    warn!("log loop is gone; dropping log message");
+                }
+            }
+            Err(e) => warn!(author = %author, "invalid log message: {:#}", e),
+        }
+    }
+
+    fn on_log_outbound(&mut self, out: crate::log_transport::LogOutbound) {
+        use crate::log_transport::LogOutbound;
+        match out {
+            LogOutbound::Publish(out) => {
+                let g = out.gossip();
+                let topic = match g {
+                    crate::log_wire::LogGossip::Announce { .. } => self.log_topic.clone(),
+                    crate::log_wire::LogGossip::Applied { .. }
+                    | crate::log_wire::LogGossip::View { .. } => self.log_cert_topic.clone(),
+                };
+                let data = match serde_json::to_vec(g) {
+                    Ok(d) if d.len() <= crate::log_wire::MAX_GOSSIP_LEN => d,
+                    Ok(d) => {
+                        return error!(
+                            len = d.len(),
+                            "log message over the gossip cap; not published"
+                        )
+                    }
+                    Err(e) => return error!("serialising a log message: {e}"),
+                };
+                if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(topic, data) {
+                    debug!("log publish: {e}");
+                }
+            }
+            LogOutbound::Fetch {
+                kind,
+                seq,
+                peer,
+                reply,
+            } => {
+                if !self
+                    .member_peers
+                    .as_ref()
+                    .is_some_and(|m| m.contains(&peer))
+                {
+                    let _ = reply.send(Err(anyhow::anyhow!("{peer} is not a member peer")));
+                    return;
+                }
+                let id = self
+                    .swarm
+                    .behaviour_mut()
+                    .log_fetch
+                    .send_request(&peer, (kind, seq));
+                self.log_fetches.insert(id, reply);
+            }
+        }
+    }
+
+    fn on_log_fetch_event(
+        &mut self,
+        ev: request_response::Event<
+            (crate::log_wire::FetchKind, u64),
+            crate::log_transport::FetchResponse,
+        >,
+    ) {
+        use request_response::{Event, Message};
+        match ev {
+            Event::Message {
+                peer,
+                message:
+                    Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let member = self
+                    .member_peers
+                    .as_ref()
+                    .is_some_and(|m| m.contains(&peer));
+                let Some(dir) = self.log_store_dir.as_ref().filter(|_| member) else {
+                    // Not served: dropping the channel fails the requester's attempt.
+                    warn!(peer = %peer, seq = request.1, "log fetch refused (transport off or not a member)");
+                    return;
+                };
+                let res = crate::log_transport::served(dir, request.0, request.1);
+                let _ = self
+                    .swarm
+                    .behaviour_mut()
+                    .log_fetch
+                    .send_response(channel, res);
+            }
+            Event::Message {
+                message:
+                    Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self.log_fetches.remove(&request_id) {
+                    let _ = tx.send(Ok(response));
+                }
+            }
+            Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            } => {
+                if let Some(tx) = self.log_fetches.remove(&request_id) {
+                    let _ = tx.send(Err(anyhow::anyhow!(
+                        "log fetch from {peer} failed: {error}"
+                    )));
+                }
+            }
+            Event::InboundFailure { peer, error, .. } => {
+                debug!(peer = %peer, "log fetch inbound: {error}")
+            }
+            Event::ResponseSent { .. } => {}
+        }
+    }
+
+    /// The cluster's member peers (operator config). When set, election and signing messages are
+    /// accepted only when BOTH their signed author and the peer that relayed them are members; the log
+    /// topics require it. An empty list leaves the topics open (legacy, logs a warning).
     ///
-    /// **Not wired into `main.rs` (perp RESP-5 §C1 acknowledged):** the
-    /// REQ-5 §1 row X-C1 claim that "peer allowlist + replay guard +
-    /// per-peer rate limit all live on the dispatch path" was partially
-    /// false at HEAD because this method had no caller. The four
-    /// load-bearing defenses against the published X-C1 attack —
-    /// (1) hash re-derivation from the unsigned tx, (2) per-tx-type
-    /// policy with source-account binding, (3) replay guard,
-    /// (4) per-peer rate limit — remain in place and are sufficient
-    /// against the published PoC.
-    ///
-    /// Wiring the allowlist requires plumbing libp2p peer IDs through
-    /// operator config (no deterministic mapping from `xrpl_address` to
-    /// peer_id — they are independent identities). Two paths to wire:
-    /// (a) extend `SignerEntry` schema with `libp2p_peer_id`, populated
-    /// during `node-bootstrap` and discoverable via on-chain `Domain`
-    /// or a new XRPL field; (b) collect peer_ids from authenticated
-    /// peer-quote announcements over time and union them into the
-    /// allowlist. Both are non-trivial. Tracked as separate work item.
-    ///
-    /// `#[allow(dead_code)]` is intentional and explicit (not the
-    /// previously-misleading "feature pending" attribute): the function
-    /// is preserved as the wiring entry point for the future allowlist
-    /// implementation. The `#[allow]` documents the choice rather than
-    /// hiding it.
-    #[allow(dead_code)]
-    pub fn set_allowed_signing_peers(&mut self, peers: Vec<PeerId>) {
+    /// This is a transport control (who may speak), not authority: what a message may DO is decided by
+    /// the enclave's member signatures at the sealed signer-list quorum.
+    pub fn set_member_peers(&mut self, peers: Vec<PeerId>) {
         if peers.is_empty() {
-            warn!(
-                "P2P signing relay: empty allowlist — accepting signing requests from any peer (dev/test)"
-            );
-            self.allowed_signing_peers = None;
+            warn!("P2P: no member peers configured — election and signing accept any peer");
+            self.member_peers = None;
         } else {
-            info!(
-                count = peers.len(),
-                "P2P signing relay: signing peer allowlist configured"
-            );
-            self.allowed_signing_peers = Some(peers.into_iter().collect());
+            info!(count = peers.len(), "P2P: member peer allowlist configured");
+            self.member_peers = Some(peers.into_iter().collect());
         }
     }
 
@@ -3481,6 +3757,7 @@ impl P2PNode {
         let mut share_v2_rx = self.share_v2_publish_rx.take();
         let mut bootstrap_rx = self.bootstrap_publish_rx.take();
         let mut dkg_step_rx = self.dkg_step_publish_rx.take();
+        let mut log_outbound_rx = self.log_outbound_rx.take();
 
         let orders_topic_hash = self.orders_topic.hash();
         let election_topic_hash = self.election_topic.hash();
@@ -3490,6 +3767,8 @@ impl P2PNode {
         let share_v2_topic_hash = self.share_v2_topic.hash();
         let bootstrap_topic_hash = self.bootstrap_topic.hash();
         let dkg_step_topic_hash = self.dkg_step_topic.hash();
+        let log_topic_hash = self.log_topic.hash();
+        let log_cert_topic_hash = self.log_cert_topic.hash();
 
         let mut signing_cleanup = tokio::time::interval(Duration::from_secs(5));
 
@@ -4075,6 +4354,16 @@ impl P2PNode {
                     self.pending_spv_baseline_apply.retain(|_, tx| !tx.is_closed());
                 }
 
+                // Replicated log: publish a header/share, or start a bounded fetch from a member.
+                Some(out) = async {
+                    match &mut log_outbound_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<crate::log_transport::LogOutbound>>().await,
+                    }
+                } => {
+                    self.on_log_outbound(out);
+                }
+
                 // Handle swarm events
                 event = self.swarm.select_next_some() => {
             match event {
@@ -4085,6 +4374,10 @@ impl P2PNode {
                         ..
                     },
                 )) => {
+                    if message.topic == log_topic_hash || message.topic == log_cert_topic_hash {
+                        self.on_log_gossip(&propagation_source, &message).await;
+                        continue;
+                    }
                     if message.topic == orders_topic_hash {
                         match serde_json::from_slice::<OrderBatch>(&message.data) {
                             Ok(batch) => {
@@ -4112,6 +4405,26 @@ impl P2PNode {
                     } else if message.topic == election_topic_hash {
                         match serde_json::from_slice::<ElectionMessage>(&message.data) {
                             Ok(msg) => {
+                                let author = message.source.map(|p| p.to_string());
+                                if let Some(ref members) = self.member_peers {
+                                    if !member_allowed(members, &propagation_source, message.source.as_ref()) {
+                                        warn!(
+                                            relay = %propagation_source,
+                                            author = author.as_deref().unwrap_or("<unsigned>"),
+                                            "dropping election message from outside the member peers"
+                                        );
+                                        continue;
+                                    }
+                                }
+                                if !crate::election::origin_bound(&msg, author.as_deref()) {
+                                    warn!(
+                                        relay = %propagation_source,
+                                        author = author.as_deref().unwrap_or("<unsigned>"),
+                                        declared = msg.declared_peer_id(),
+                                        "dropping election message not sent by the peer it names"
+                                    );
+                                    continue;
+                                }
                                 if let Err(e) = self.election_inbound_tx.send(msg).await {
                                     error!("failed to forward election msg: {:#}", e);
                                 }
@@ -4150,8 +4463,8 @@ impl P2PNode {
                                 // is the authenticated libp2p peer_id of the
                                 // node that forwarded this to us, not the
                                 // self-reported `requester_peer_id` field.
-                                if let Some(ref allow) = self.allowed_signing_peers {
-                                    if !allow.contains(&propagation_source) {
+                                if let Some(ref allow) = self.member_peers {
+                                    if !member_allowed(allow, &propagation_source, message.source.as_ref()) {
                                         warn!(
                                             req_id = %request_id,
                                             from = %propagation_source,
@@ -4290,8 +4603,8 @@ impl P2PNode {
                                 // X-C1: peer allowlist + per-peer rate
                                 // limit + replay guard, mirroring the
                                 // existing XRPL signing path.
-                                if let Some(ref allow) = self.allowed_signing_peers {
-                                    if !allow.contains(&propagation_source) {
+                                if let Some(ref allow) = self.member_peers {
+                                    if !member_allowed(allow, &propagation_source, message.source.as_ref()) {
                                         warn!(
                                             req_id = %request_id,
                                             from = %propagation_source,
@@ -4374,8 +4687,8 @@ impl P2PNode {
 
                                 // X-C1: peer allowlist + rate limit + replay
                                 // guard, mirroring the existing signing paths.
-                                if let Some(ref allow) = self.allowed_signing_peers {
-                                    if !allow.contains(&propagation_source) {
+                                if let Some(ref allow) = self.member_peers {
+                                    if !member_allowed(allow, &propagation_source, message.source.as_ref()) {
                                         warn!(
                                             req_id = %request_id,
                                             from = %propagation_source,
@@ -4479,8 +4792,8 @@ impl P2PNode {
                                 let Some(local) = local_opt else {
                                     continue;
                                 };
-                                if let Some(ref allow) = self.allowed_signing_peers {
-                                    if !allow.contains(&propagation_source) {
+                                if let Some(ref allow) = self.member_peers {
+                                    if !member_allowed(allow, &propagation_source, message.source.as_ref()) {
                                         warn!(
                                             req_id = %request_id,
                                             from = %propagation_source,
@@ -4543,8 +4856,8 @@ impl P2PNode {
                                 let cfg_opt = self.reserves_baseline_config.clone();
                                 let local_opt = self.local_signer.clone();
                                 let (Some(cfg), Some(local)) = (cfg_opt, local_opt) else { continue; };
-                                if let Some(ref allow) = self.allowed_signing_peers {
-                                    if !allow.contains(&propagation_source) {
+                                if let Some(ref allow) = self.member_peers {
+                                    if !member_allowed(allow, &propagation_source, message.source.as_ref()) {
                                         warn!(req_id = %request_id, from = %propagation_source,
                                               "X-C1: #131 unl-policy request from peer outside allowlist — dropped");
                                         continue;
@@ -4582,8 +4895,8 @@ impl P2PNode {
                                 // Read-only, but still an inbound message that makes this
                                 // node do work, so it carries the same X-C1 guards as its
                                 // signing siblings rather than a weaker set.
-                                if let Some(ref allow) = self.allowed_signing_peers {
-                                    if !allow.contains(&propagation_source) {
+                                if let Some(ref allow) = self.member_peers {
+                                    if !member_allowed(allow, &propagation_source, message.source.as_ref()) {
                                         warn!(req_id = %request_id, from = %propagation_source,
                                               "X-C1: unl-status request from peer outside allowlist — dropped");
                                         continue;
@@ -4634,8 +4947,8 @@ impl P2PNode {
                                 let Some(local) = local_opt else {
                                     continue;
                                 };
-                                if let Some(ref allow) = self.allowed_signing_peers {
-                                    if !allow.contains(&propagation_source) {
+                                if let Some(ref allow) = self.member_peers {
+                                    if !member_allowed(allow, &propagation_source, message.source.as_ref()) {
                                         warn!(
                                             req_id = %request_id,
                                             from = %propagation_source,
@@ -4684,8 +4997,8 @@ impl P2PNode {
 
                                 // X-C1: peer allowlist + rate limit + replay
                                 // guard, mirroring the signing paths.
-                                if let Some(ref allow) = self.allowed_signing_peers {
-                                    if !allow.contains(&propagation_source) {
+                                if let Some(ref allow) = self.member_peers {
+                                    if !member_allowed(allow, &propagation_source, message.source.as_ref()) {
                                         warn!(
                                             req_id = %request_id,
                                             from = %propagation_source,
@@ -4745,8 +5058,8 @@ impl P2PNode {
 
                                 // X-C1: peer allowlist + rate limit + replay guard,
                                 // mirroring the membership-apply path.
-                                if let Some(ref allow) = self.allowed_signing_peers {
-                                    if !allow.contains(&propagation_source) {
+                                if let Some(ref allow) = self.member_peers {
+                                    if !member_allowed(allow, &propagation_source, message.source.as_ref()) {
                                         warn!(
                                             req_id = %request_id,
                                             from = %propagation_source,
@@ -4947,11 +5260,27 @@ impl P2PNode {
                         }
                     }
                 }
+                SwarmEvent::Behaviour(PerpBehaviourEvent::LogFetch(ev)) => {
+                    self.on_log_fetch_event(ev);
+                }
                 SwarmEvent::Behaviour(PerpBehaviourEvent::Identify(identify::Event::Received {
                     peer_id,
                     info,
                     ..
                 })) => {
+                    if !peer_in_cluster(&self.identify_protocol, &info.protocol_version) {
+                        warn!(
+                            peer = %peer_id,
+                            theirs = %info.protocol_version,
+                            ours = %self.identify_protocol,
+                            "refusing peer from another cluster (identify namespace mismatch)"
+                        );
+                        let gs = &mut self.swarm.behaviour_mut().gossipsub;
+                        gs.remove_explicit_peer(&peer_id);
+                        gs.blacklist_peer(&peer_id);
+                        let _ = self.swarm.disconnect_peer_id(peer_id);
+                        continue;
+                    }
                     info!(
                         peer = %peer_id,
                         protocol = %info.protocol_version,
@@ -4987,6 +5316,42 @@ impl P2PNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_member_message_needs_a_member_author_and_a_member_relay() {
+        let (a, b, x) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let m: HashSet<PeerId> = [a, b].into_iter().collect();
+        assert!(member_allowed(&m, &a, Some(&a)), "a member's own message");
+        assert!(
+            member_allowed(&m, &a, Some(&b)),
+            "a member's message relayed by a member"
+        );
+        assert!(
+            !member_allowed(&m, &a, Some(&x)),
+            "an outsider's message relayed by a member"
+        );
+        assert!(
+            !member_allowed(&m, &x, Some(&a)),
+            "a member's message relayed by an outsider"
+        );
+        assert!(!member_allowed(&m, &a, None), "no signed author");
+    }
+
+    #[test]
+    fn member_peers_parse_strictly() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let got = parse_member_peers(&format!(" {a}, {b},,{a} ")).unwrap();
+        assert_eq!(
+            got,
+            vec![a, b],
+            "trimmed, empty items skipped, duplicates once"
+        );
+        assert!(
+            parse_member_peers(&format!("{a},not-a-peer")).is_err(),
+            "one bad id fails the whole list"
+        );
+        assert!(parse_member_peers("").unwrap().is_empty());
+    }
 
     /// #131 §6: the UNL-policy apply crosses gossipsub, so a wrong serde tag would make
     /// every peer silently DROP it — the driver would report "applied on 1 node" forever
@@ -6626,5 +6991,557 @@ mod tests {
         assert_eq!(canonical_session_key("0x5bb00f4c"), "5bb00f4c"); // strip
         assert_eq!(canonical_session_key("5bb00f4c"), "5bb00f4c"); // already bare
         assert_eq!(canonical_session_key(""), ""); // empty, no panic
+    }
+
+    // ── cluster isolation (topics + identify namespaced by escrow) ──────────────────────────
+
+    const NS_LIVE: &str = "rfYnJDSAeFuDCUTq2oYbckbJcz3gAJTNCd";
+    const NS_OTHER: &str = "rEHEARSALescrowXXXXXXXXXXXXXXXXXXX";
+
+    #[test]
+    fn cluster_topics_are_disjoint_across_clusters_on_every_topic() {
+        let live: HashSet<String> = ALL_TOPIC_SUFFIXES
+            .iter()
+            .map(|t| cluster_topic(NS_LIVE, t))
+            .collect();
+        let other: HashSet<String> = ALL_TOPIC_SUFFIXES
+            .iter()
+            .map(|t| cluster_topic(NS_OTHER, t))
+            .collect();
+        assert_eq!(
+            live.len(),
+            ALL_TOPIC_SUFFIXES.len(),
+            "topic names collide within a cluster"
+        );
+        assert!(
+            live.is_disjoint(&other),
+            "two clusters share a topic: {:?}",
+            live.intersection(&other).collect::<Vec<_>>()
+        );
+        // and no namespaced topic equals a pre-namespace (global) one
+        for t in ALL_TOPIC_SUFFIXES {
+            assert!(!live.contains(&format!("perp-dex/{t}")));
+        }
+        assert_eq!(
+            cluster_topic(NS_LIVE, ORDERS_TOPIC),
+            format!("perp-dex/{NS_LIVE}/orders")
+        );
+    }
+
+    #[test]
+    fn identify_namespace_is_exact_match_only() {
+        let ours = cluster_identify_protocol(NS_LIVE);
+        assert!(peer_in_cluster(&ours, &cluster_identify_protocol(NS_LIVE)));
+        assert!(!peer_in_cluster(
+            &ours,
+            &cluster_identify_protocol(NS_OTHER)
+        ));
+        assert!(
+            !peer_in_cluster(&ours, "/perp-dex/0.1.0"),
+            "a pre-namespace build must be refused"
+        );
+        assert!(!peer_in_cluster(&ours, &format!("{ours}x")));
+        assert!(!peer_in_cluster(&ours, ""));
+    }
+
+    #[test]
+    fn cluster_namespace_rejects_structure_characters() {
+        assert!(validate_cluster_ns(NS_LIVE).is_ok());
+        for bad in ["", "a/b", "a b", "../x", "r\u{0430}bc"] {
+            assert!(validate_cluster_ns(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    /// Layer 1 on its own (independent of the identify reject, which would mask it in the
+    /// two-node test): the node subscribes to EXACTLY the namespaced topics, every one of them.
+    #[tokio::test]
+    async fn node_subscribes_only_to_its_namespaced_topics() {
+        let (batch_tx, _b) = mpsc::channel(1);
+        let (el_tx, _e) = mpsc::channel(1);
+        let node = P2PNode::new(
+            &format!("/ip4/127.0.0.1/tcp/{}", free_tcp_port()),
+            NS_LIVE,
+            Keypair::generate_ed25519(),
+            batch_tx,
+            el_tx,
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        )
+        .await
+        .unwrap();
+        let subscribed: HashSet<gossipsub::TopicHash> =
+            node.swarm.behaviour().gossipsub.topics().cloned().collect();
+        let expected: HashSet<gossipsub::TopicHash> = ALL_TOPIC_SUFFIXES
+            .iter()
+            .map(|t| gossipsub::IdentTopic::new(cluster_topic(NS_LIVE, t)).hash())
+            .collect();
+        assert_eq!(subscribed, expected);
+    }
+
+    #[tokio::test]
+    async fn node_refuses_to_start_without_a_valid_namespace() {
+        let (batch_tx, _b) = mpsc::channel(1);
+        let (el_tx, _e) = mpsc::channel(1);
+        let r = P2PNode::new(
+            &format!("/ip4/127.0.0.1/tcp/{}", free_tcp_port()),
+            "",
+            Keypair::generate_ed25519(),
+            batch_tx,
+            el_tx,
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        )
+        .await;
+        assert!(r.is_err());
+    }
+
+    fn free_tcp_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    struct TestNode {
+        election_out: mpsc::Sender<ElectionMessage>,
+        election_in: mpsc::Receiver<ElectionMessage>,
+        peers: Arc<std::sync::atomic::AtomicU32>,
+        addr: String,
+        peer_id: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn spawn_test_node(ns: &str, dial: Option<&str>) -> TestNode {
+        spawn_test_node_with(ns, dial, None).await
+    }
+
+    async fn spawn_test_node_with(
+        ns: &str,
+        dial: Option<&str>,
+        members: Option<Vec<PeerId>>,
+    ) -> TestNode {
+        let port = free_tcp_port();
+        let addr = format!("/ip4/127.0.0.1/tcp/{port}");
+        let (batch_tx, _batch_rx) = mpsc::channel(16);
+        let (election_in_tx, election_in) = mpsc::channel(64);
+        let peers = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut node = P2PNode::new(
+            &addr,
+            ns,
+            Keypair::generate_ed25519(),
+            batch_tx,
+            election_in_tx,
+            peers.clone(),
+        )
+        .await
+        .expect("node starts");
+        let (election_out, election_out_rx) = mpsc::channel(64);
+        node.set_election_publish_channel(election_out_rx);
+        if let Some(m) = members {
+            node.set_member_peers(m);
+        }
+        if let Some(d) = dial {
+            node.dial(d).expect("dial");
+        }
+        let peer_id = node.peer_id.to_string();
+        // keep _batch_rx alive for the node's lifetime by moving it into the task
+        let task = tokio::spawn(async move {
+            let _keep = _batch_rx;
+            node.run().await;
+        });
+        TestNode {
+            election_out,
+            election_in,
+            peers,
+            addr,
+            peer_id,
+            task,
+        }
+    }
+
+    /// Publish heartbeats from `a` for `secs`, return whether `b` received any.
+    async fn b_hears_a(a: &TestNode, b: &mut TestNode, secs: u64) -> bool {
+        let me = a.peer_id.clone();
+        b_hears_a_as(a, b, secs, &me).await
+    }
+
+    static HB_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    /// Same, with the heartbeat naming `declared` as its sender.
+    async fn b_hears_a_as(a: &TestNode, b: &mut TestNode, secs: u64, declared: &str) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        while tokio::time::Instant::now() < deadline {
+            let _ = a
+                .election_out
+                .send(ElectionMessage::Heartbeat {
+                    peer_id: declared.to_string(),
+                    priority: 1,
+                    // Unique per send: gossipsub refuses to republish an identical message, so a fixed
+                    // value would make every heartbeat after the first silently go nowhere.
+                    seq_num: HB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                })
+                .await;
+            if let Ok(Some(_)) =
+                tokio::time::timeout(Duration::from_millis(300), b.election_in.recv()).await
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Positive control: two nodes of the SAME cluster connect and exchange gossip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_cluster_nodes_exchange_gossip() {
+        let a = spawn_test_node(NS_LIVE, None).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut b = spawn_test_node(NS_LIVE, Some(&a.addr)).await;
+        assert!(
+            b_hears_a(&a, &mut b, 15).await,
+            "same-cluster gossip did not flow"
+        );
+        assert!(b.peers.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+        a.task.abort();
+        b.task.abort();
+    }
+
+    /// Election origin binding on a real swarm: a heartbeat whose declared sender is not its signed
+    /// author never reaches the election state machine, while the honest one from the same node does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_election_message_naming_another_peer_is_dropped_on_the_wire() {
+        let a = spawn_test_node(NS_LIVE, None).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut b = spawn_test_node(NS_LIVE, Some(&a.addr)).await;
+        assert!(
+            b_hears_a(&a, &mut b, 15).await,
+            "control: honest heartbeats flow"
+        );
+        let victim = b.peer_id.clone();
+        assert!(
+            !b_hears_a_as(&a, &mut b, 6, &victim).await,
+            "a heartbeat claiming to be another peer was delivered"
+        );
+        a.task.abort();
+        b.task.abort();
+    }
+
+    /// The member allowlist on a real swarm: a node that does not list the sender as a member drops its
+    /// election messages; listing it lets them through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn election_messages_from_a_non_member_are_dropped_on_the_wire() {
+        let a = spawn_test_node(NS_LIVE, None).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let a_id: PeerId = a.peer_id.parse().unwrap();
+        let mut member = spawn_test_node_with(NS_LIVE, Some(&a.addr), Some(vec![a_id])).await;
+        assert!(
+            b_hears_a(&a, &mut member, 15).await,
+            "control: a listed member is heard"
+        );
+        let mut stranger =
+            spawn_test_node_with(NS_LIVE, Some(&a.addr), Some(vec![PeerId::random()])).await;
+        assert!(
+            !b_hears_a(&a, &mut stranger, 8).await,
+            "a non-member's election message was delivered"
+        );
+        a.task.abort();
+        member.task.abort();
+        stranger.task.abort();
+    }
+
+    struct LogTestNode {
+        node: TestNode,
+        inbound: mpsc::Receiver<crate::log_transport::LogInbound>,
+        outbound: mpsc::Sender<crate::log_transport::LogOutbound>,
+    }
+
+    async fn spawn_log_node(
+        dial: &[&str],
+        members: Vec<PeerId>,
+        keypair: Keypair,
+        dir: &std::path::Path,
+    ) -> LogTestNode {
+        let (batch_tx, _batch_rx) = mpsc::channel(64);
+        let (election_in_tx, election_in) = mpsc::channel(64);
+        let peers = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let addr = format!("/ip4/127.0.0.1/tcp/{}", free_tcp_port());
+        let mut node = P2PNode::new(
+            &addr,
+            NS_LIVE,
+            keypair,
+            batch_tx,
+            election_in_tx,
+            peers.clone(),
+        )
+        .await
+        .expect("node starts");
+        let (in_tx, inbound) = mpsc::channel(64);
+        let (outbound, out_rx) = mpsc::channel(64);
+        node.set_member_peers(members);
+        node.enable_log_transport(dir.to_path_buf(), in_tx, out_rx)
+            .expect("log transport on");
+        let (election_out, election_out_rx) = mpsc::channel(64);
+        node.set_election_publish_channel(election_out_rx);
+        for d in dial {
+            node.dial(d).expect("dial");
+        }
+        let peer_id = node.peer_id.to_string();
+        let task = tokio::spawn(async move {
+            let _keep = _batch_rx;
+            node.run().await;
+        });
+        LogTestNode {
+            node: TestNode {
+                election_out,
+                election_in,
+                peers,
+                addr,
+                peer_id,
+                task,
+            },
+            inbound,
+            outbound,
+        }
+    }
+
+    async fn fetch(
+        n: &LogTestNode,
+        seq: u64,
+        peer: PeerId,
+    ) -> anyhow::Result<crate::log_transport::FetchResponse> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        n.outbound
+            .send(crate::log_transport::LogOutbound::Fetch {
+                kind: crate::log_wire::FetchKind::Record,
+                seq,
+                peer,
+                reply,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), rx)
+            .await
+            .expect("fetch answered")
+            .unwrap()
+    }
+
+    fn test_record(seq: u64) -> crate::log_store::LogRecord {
+        crate::log_store::LogRecord {
+            seq,
+            chain_hash: [5; 32],
+            market_id: 0,
+            batch: vec![1; 100],
+            quote_blob: vec![2; 50],
+            // Larger than one gossip message may be: only the fetch path can carry it.
+            side_blobs: vec![3; 100 * 1024],
+            sig_bundle: vec![4; 70],
+        }
+    }
+
+    #[test]
+    fn the_log_transport_is_refused_without_member_peers() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (batch_tx, _b) = mpsc::channel(1);
+            let (e_tx, _e) = mpsc::channel(1);
+            let addr = format!("/ip4/127.0.0.1/tcp/{}", free_tcp_port());
+            let mut node = P2PNode::new(
+                &addr,
+                NS_LIVE,
+                Keypair::generate_ed25519(),
+                batch_tx,
+                e_tx,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+            let d = tempfile::tempdir().unwrap();
+            let (i, _ir) = mpsc::channel(1);
+            let (_o, or) = mpsc::channel(1);
+            assert!(
+                node.enable_log_transport(d.path().to_path_buf(), i, or)
+                    .is_err(),
+                "no member set"
+            );
+            node.set_member_peers(Vec::new());
+            let (i, _ir) = mpsc::channel(1);
+            let (_o, or) = mpsc::channel(1);
+            assert!(
+                node.enable_log_transport(d.path().to_path_buf(), i, or)
+                    .is_err(),
+                "empty member set"
+            );
+        });
+    }
+
+    /// End to end on real swarms: A stores a record larger than any gossip message, announces it; B
+    /// receives the header, fetches the body from A, and it verifies against the header. A node A does
+    /// not list as a member gets nothing — neither the record nor its fetch answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_member_fetches_an_announced_record_and_a_stranger_does_not() {
+        let (ka, kb, kc) = (
+            Keypair::generate_ed25519(),
+            Keypair::generate_ed25519(),
+            Keypair::generate_ed25519(),
+        );
+        let (ia, ib, ic) = (
+            ka.public().to_peer_id(),
+            kb.public().to_peer_id(),
+            kc.public().to_peer_id(),
+        );
+        let (da, db, dc) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let mut store = crate::log_store::LogStore::open(da.path()).unwrap();
+        let rec = test_record(1);
+        let durable = store.put(&rec).unwrap();
+        // C holds the same record, so a refusal to fetch from C can only be B's own member rule.
+        crate::log_store::LogStore::open(dc.path())
+            .unwrap()
+            .put(&rec)
+            .unwrap();
+        let file = std::fs::read(da.path().join(format!("{:020}.rec", 1))).unwrap();
+        assert!(
+            file.len() > 65536,
+            "the record must exceed the gossip limit for this test to mean anything"
+        );
+
+        let a = spawn_log_node(&[], vec![ia, ib], ka, da.path()).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut b = spawn_log_node(&[&a.node.addr], vec![ia, ib], kb, db.path()).await;
+        // C lists A and B (so it may ask A, and would serve B), but neither A nor B lists C. C is
+        // connected to both, so every refusal below is a member rule, not a missing connection.
+        let c = spawn_log_node(
+            &[&a.node.addr, &b.node.addr],
+            vec![ia, ib, ic],
+            kc,
+            dc.path(),
+        )
+        .await;
+
+        // A announces until B hears it (mesh formation takes a moment).
+        let announce = crate::log_transport::Outgoing::announce(&durable);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let heard = loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "B never heard the announcement"
+            );
+            a.outbound
+                .send(crate::log_transport::LogOutbound::Publish(announce.clone()))
+                .await
+                .unwrap();
+            if let Ok(Some(m)) =
+                tokio::time::timeout(Duration::from_millis(500), b.inbound.recv()).await
+            {
+                break m;
+            }
+        };
+        assert_eq!(heard.author, ia);
+        let crate::log_wire::Parsed::Announce(ann) = heard.msg else {
+            panic!("not an announcement")
+        };
+
+        let body = fetch(&b, 1, ia).await.unwrap().expect("A has record 1");
+        assert_eq!(crate::log_wire::verify_fetched(&ann, &body).unwrap(), rec);
+        assert_eq!(
+            fetch(&b, 2, ia).await.unwrap(),
+            None,
+            "A does not have record 2"
+        );
+        assert!(
+            fetch(&b, 1, ic).await.is_err(),
+            "B does not fetch from a non-member"
+        );
+        assert!(
+            fetch(&c, 1, ia).await.is_err(),
+            "A does not serve a non-member"
+        );
+
+        // D is a stranger connected to A only, so its announcement reaches B only relayed by A (a
+        // member): B must still drop it, because its signed author is not a member. (C is connected to
+        // B directly, so C cannot test this.) A's announcements are the control that the relay path
+        // works at all.
+        let kd = Keypair::generate_ed25519();
+        let id_ = kd.public().to_peer_id();
+        let dd = tempfile::tempdir().unwrap();
+        let d = spawn_log_node(&[&a.node.addr], vec![ia, id_], kd, dd.path()).await;
+        // Every publish has a fresh seq: gossipsub refuses to republish identical bytes,
+        // so a repeated message would be one attempt, not many.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut saw_control = false;
+        let mut n = 0u64;
+        while tokio::time::Instant::now() < deadline && !saw_control {
+            n += 1;
+            let from_c = crate::log_wire::announce_for(1_000 + n, &[6; 32], &file).unwrap();
+            let control = crate::log_wire::announce_for(2_000 + n, &[6; 32], &file).unwrap();
+            for (node, g) in [(&d, from_c), (&a, control)] {
+                node.outbound
+                    .send(crate::log_transport::LogOutbound::Publish(
+                        crate::log_transport::Outgoing::unchecked(g),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            while let Ok(Some(m)) =
+                tokio::time::timeout(Duration::from_millis(300), b.inbound.recv()).await
+            {
+                assert_ne!(m.author, id_, "a non-member's announcement was delivered");
+                if matches!(m.msg, crate::log_wire::Parsed::Announce(x) if x.seq > 2_000) {
+                    saw_control = true;
+                }
+            }
+        }
+        // Keep D publishing a little longer after the control arrived: a delivered D message would
+        // land in this window too.
+        for k in 0..10u64 {
+            let g = crate::log_wire::announce_for(5_000 + k, &[6; 32], &file).unwrap();
+            d.outbound
+                .send(crate::log_transport::LogOutbound::Publish(
+                    crate::log_transport::Outgoing::unchecked(g),
+                ))
+                .await
+                .unwrap();
+            while let Ok(Some(m)) =
+                tokio::time::timeout(Duration::from_millis(200), b.inbound.recv()).await
+            {
+                assert_ne!(m.author, id_, "a non-member's announcement was delivered");
+            }
+        }
+        assert!(saw_control, "control: a member's announcement still flows");
+
+        a.node.task.abort();
+        b.node.task.abort();
+        c.node.task.abort();
+        d.node.task.abort();
+    }
+
+    /// The isolation property: a node of ANOTHER cluster that dials in (a mis-peered rehearsal)
+    /// receives nothing, and the identify check drops the connection on both sides.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn other_cluster_node_is_refused_and_hears_nothing() {
+        let a = spawn_test_node(NS_LIVE, None).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut b = spawn_test_node(NS_OTHER, Some(&a.addr)).await;
+        assert!(
+            !b_hears_a(&a, &mut b, 8).await,
+            "gossip crossed between clusters"
+        );
+        // identify-reject closed the connection: both sides back to zero peers
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let pa = a.peers.load(std::sync::atomic::Ordering::Relaxed);
+            let pb = b.peers.load(std::sync::atomic::Ordering::Relaxed);
+            if pa == 0 && pb == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cross-cluster connection not closed (a={pa}, b={pb})"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        a.task.abort();
+        b.task.abort();
     }
 }

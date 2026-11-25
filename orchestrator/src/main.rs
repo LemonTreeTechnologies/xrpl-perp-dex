@@ -16,9 +16,17 @@ mod db;
 mod deposit_spv; // #131 P3 — assemble SPV deposit proofs for the enclave
 mod dkg_coordinate;
 mod election;
-mod frost_round; // FROST threshold-Schnorr signing round driver
+mod enclave_ready;
 mod http_helpers;
 mod leader_gate; // O-H3 — validator leader-gate provenance decision (extracted + unit-tested)
+mod log_client; // client for the enclave's replicated-log routes
+mod log_follower; // applies the replicated log in seq order; persists before APPLIED; alarms and halts
+mod log_node; // runs the log on a node: startup refusal, watcher, follower loop, status
+mod log_store; // durable per-node store of replicated-log records
+mod log_sync; // the XRPL sync gate: server_state, peers, validated-ledger age vs the measured close rate
+mod log_transport; // replicated-log fetch protocol (bounded) and log channel types
+mod log_view; // C1: member view reports compared after each seq; odd member, split, leader hold
+mod log_wire; // replicated-log transport framing, fetch checks, certificate assembly
 mod membership_admin;
 mod membership_apply;
 mod membership_canonical;
@@ -56,6 +64,7 @@ mod singleton;
 mod spv_proof; // AC-BASE-2″ P2-d — XRPL SPV proof builder/fetcher
 #[cfg(test)]
 mod spv_proof_vector; // the live reserves-path vectors, mirrored from the enclave suite
+mod subsystems;
 mod trading;
 mod tx_shamap; // #131 P3 — rebuild a ledger's tx SHAMap + read inclusion paths off it
 #[cfg(test)]
@@ -739,6 +748,17 @@ struct RunArgs {
     /// P2P peers to connect to (multiaddr, comma-separated)
     #[arg(long)]
     p2p_peers: Option<String>,
+
+    /// The cluster's member peers: comma-separated libp2p peer ids (each operator lists every member).
+    /// When set, election and signing messages are accepted only from members, by signed author and
+    /// relay. Required by the replicated-log transport.
+    #[arg(long)]
+    member_peers: Option<String>,
+
+    /// Directory of this node's replicated-log store. With --member-peers and a local signer it turns on
+    /// the log follower. An enclave in log mode refuses to run without all three.
+    #[arg(long)]
+    log_store_dir: Option<PathBuf>,
 
     /// Persistent libp2p identity key path. Auto-generated on first run so
     /// the operator's peer_id is stable across restarts (required for any
@@ -1644,6 +1664,28 @@ async fn main() -> Result<()> {
     };
 
     // Initialize shard router — sets shard_id on each enclave at startup
+    // The first enclave read of the server is below (the shard id); every one-shot startup read after it
+    // turns its feature off on failure. Wait until the enclave answers so a joint enclave+orchestrator
+    // start cannot leave those features off; refuse to start if it never answers.
+    {
+        let at = enclave_ready::await_enclave(
+            &enclave_ready::HttpEnclave::new(&cli.enclave_url)?,
+            90,
+            Duration::from_secs(2),
+        )
+        .await?;
+        info!(
+            attempt = at,
+            "the local enclave answers; continuing startup"
+        );
+    }
+    // Which enclave-backed subsystems this node runs; each startup site below records its outcome, and a
+    // watcher alarms on any configured one that is not running.
+    let subsystems = Arc::new(subsystems::Subsystems::default());
+    tokio::spawn(subsystems::watch(
+        subsystems.clone(),
+        Duration::from_secs(60),
+    ));
     let shard_router = match &cli.shards_config {
         Some(path) => shard_router::ShardRouter::from_config(path).await?,
         None => shard_router::ShardRouter::single(&cli.enclave_url, 0).await?,
@@ -1847,6 +1889,7 @@ async fn main() -> Result<()> {
 
     let peer_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
+    let log_health = Arc::new(log_node::LogHealth::new("starting"));
     let maintenance_mode = Arc::new(std::sync::atomic::AtomicBool::new(matches!(
         std::env::var("PERP_MAINTENANCE").ok().as_deref(),
         Some("1") | Some("true") | Some("yes")
@@ -1875,6 +1918,7 @@ async fn main() -> Result<()> {
         };
 
     let app_state = Arc::new(AppState {
+        subsystems: subsystems.clone(),
         engine,
         perp: PerpClient::new(&cli.enclave_url)?,
         ws_tx: ws_tx.clone(),
@@ -1900,6 +1944,7 @@ async fn main() -> Result<()> {
         unl_refresh: unl_health.clone(),
         reserves_figures: Some(reserves_figures_cache.clone()),
         maintenance_mode: maintenance_mode.clone(),
+        log_health: log_health.clone(),
     });
 
     // Start API server
@@ -1917,8 +1962,11 @@ async fn main() -> Result<()> {
         tokio::sync::mpsc::channel::<(p2p::OrderBatch, Option<String>)>(100);
     let (election_inbound_tx, election_inbound_rx) =
         tokio::sync::mpsc::channel::<election::ElectionMessage>(100);
+    // Gossip topics + identify are namespaced by THIS cluster's escrow, so a co-located cluster
+    // (rehearsal, mainnet-sandbox) can never exchange messages with this one, even if mis-peered.
     let mut p2p_node = p2p::P2PNode::new(
         &cli.p2p_listen,
+        &escrow_address,
         p2p_keypair,
         batch_tx,
         election_inbound_tx,
@@ -1988,8 +2036,10 @@ async fn main() -> Result<()> {
         Ok(pk) => {
             info!(ecdh_pubkey = %pk, "fetched local ECDH identity for Path A");
             p2p_node.set_local_ecdh_pubkey(pk);
+            subsystems.running("path-a-recipient-filter");
         }
         Err(e) => {
+            subsystems.disabled("path-a-recipient-filter", format!("{e:#}"));
             warn!(
                 "Path A: failed to fetch local ECDH pubkey ({:#}) — \
                  recipient filter disabled, share-v2 import will still \
@@ -2095,7 +2145,7 @@ async fn main() -> Result<()> {
             .to_string();
         let epoch_client = http_helpers::loopback_http_client(Duration::from_secs(30))?;
         let epoch_src = membership_http::HttpEpochDigestSource::new(epoch_client, epoch_admin_base);
-        let _announcer = tokio::spawn(async move {
+        let announcer = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(PEER_QUOTE_INTERVAL_SECS));
             loop {
                 tick.tick().await;
@@ -2148,6 +2198,7 @@ async fn main() -> Result<()> {
                 info!(shard_id, group_id = %group_id, "queued peer-quote announce");
             }
         });
+        subsystems.running_task(&format!("announcer/shard-{shard_id}"), announcer);
     }
 
     // THE OPERATOR ROSTER AUTHORITY, built ONCE and shared by every admin listener below
@@ -2230,6 +2281,7 @@ async fn main() -> Result<()> {
             {
                 Ok(pk) => pk,
                 Err(e) => {
+                    subsystems.disabled("dkg-coordinator", format!("{e:#}"));
                     warn!("DKG coordinator: failed to fetch local ECDH pubkey ({e}); coordinator disabled");
                     String::new()
                 }
@@ -2260,9 +2312,12 @@ async fn main() -> Result<()> {
 
                 // Always spawn the follower handler.
                 let follower_state = coord_state.clone();
-                tokio::spawn(async move {
-                    dkg_coordinate::run_follower(follower_state, dkg_step_in_rx).await;
-                });
+                subsystems.running_task(
+                    "dkg-coordinator",
+                    tokio::spawn(async move {
+                        dkg_coordinate::run_follower(follower_state, dkg_step_in_rx).await;
+                    }),
+                );
 
                 // Leader admin listener (operator opts in).
                 if let Some(addr) = cli.dkg_admin_listen.clone() {
@@ -2301,6 +2356,7 @@ async fn main() -> Result<()> {
             {
                 Ok(pk) => pk.to_lowercase(),
                 Err(e) => {
+                    subsystems.disabled("join-brain", format!("{e:#}"));
                     warn!("join-brain: fetch local ECDH pubkey failed ({e}); join-brain disabled");
                     String::new()
                 }
@@ -2336,14 +2392,26 @@ async fn main() -> Result<()> {
                         my_account_id_hex: hex::encode(my_aid),
                         publish_tx: bootstrap_pub_tx,
                     };
-                    tokio::spawn(async move {
-                        bootstrap_join::run_join_brain(brain, bootstrap_in_rx).await;
-                    });
+                    subsystems.running_task(
+                        "join-brain",
+                        tokio::spawn(async move {
+                            bootstrap_join::run_join_brain(brain, bootstrap_in_rx).await;
+                        }),
+                    );
                     info!(shard_id = group.shard_id, "β3.2c join-brain spawned");
                 }
-                _ => warn!(
-                    "join-brain disabled: escrow/local r-address decode failed or ECDH pubkey unavailable"
-                ),
+                _ => {
+                    // An ECDH failure was recorded above with its cause; otherwise an address did not decode.
+                    if !join_ecdh.is_empty() {
+                        subsystems.disabled(
+                            "join-brain",
+                            "the escrow or local r-address does not decode",
+                        );
+                    }
+                    warn!(
+                        "join-brain disabled: escrow/local r-address decode failed or ECDH pubkey unavailable"
+                    )
+                }
             }
         }
     }
@@ -2700,6 +2768,103 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Member peers: parsed strictly — a malformed id stops startup rather than silently shrinking the set.
+    let members = match &cli.member_peers {
+        Some(m) => p2p::parse_member_peers(m).context("--member-peers")?,
+        None => Vec::new(),
+    };
+    p2p_node.set_member_peers(members.clone());
+
+    // The replicated log: decided BEFORE any peer is dialled. An enclave in log mode with this node
+    // missing member peers, the log store or a local signer is a refusal to start (election and signing
+    // are open to any peer without member peers).
+    {
+        use crate::log_node::{LogConfig, Setup};
+        let log_client = log_client::LogClient::new(&cli.enclave_url)?;
+        let signer = p2p_node
+            .local_signer()
+            .map(|s| (s.address.clone(), s.session_key.clone()));
+        let cfg = LogConfig {
+            member_peers: !members.is_empty(),
+            store_dir: cli.log_store_dir.is_some(),
+            signer: signer.is_some(),
+            vault: cli.vault_mm || cli.vault_dn,
+        };
+        let probe = log_node::probe_at_startup(&log_client, 60, Duration::from_secs(2)).await?;
+        match log_node::startup_decision(&probe, &cfg)? {
+            Setup::Follow => {
+                let dir = cli
+                    .log_store_dir
+                    .clone()
+                    .expect("checked by startup_decision");
+                let (account_id, key_hex) = signer.expect("checked by startup_decision");
+                let session_key: [u8; 32] = hex::decode(&key_hex)
+                    .ok()
+                    .and_then(|b| b.try_into().ok())
+                    .context("the local signer's session key is not 32-byte hex")?;
+                // The view compare counts this node among the members, so it must be in the list.
+                anyhow::ensure!(
+                    members.contains(&p2p_node.peer_id),
+                    "--member-peers must list every member, this node ({}) included",
+                    p2p_node.peer_id
+                );
+                let store = log_store::LogStore::open(&dir).context("opening the log store")?;
+                let (in_tx, in_rx) = tokio::sync::mpsc::channel(256);
+                let (out_tx, out_rx) = tokio::sync::mpsc::channel(256);
+                p2p_node.enable_log_transport(dir, in_tx, out_rx)?;
+                let follower = log_follower::Follower::new(
+                    log_follower::FollowerCfg::default(),
+                    log_node::other_members(&members, &p2p_node.peer_id),
+                    store,
+                );
+                log_health.set_mode("follow");
+                let health = log_health.clone();
+                let views = log_view::ViewBook::new(p2p_node.peer_id, members.clone(), 256);
+                let me = p2p_node.peer_id;
+                let xrpl = log_node::XrplHttp {
+                    http: reqwest::Client::builder()
+                        .timeout(Duration::from_secs(10))
+                        .build()
+                        .context("building the XRPL client")?,
+                    url: cli.xrpl_url.clone(),
+                };
+                tokio::spawn(async move {
+                    let enclave = log_node::EnclaveAdapter {
+                        client: log_client,
+                        account_id,
+                        session_key,
+                    };
+                    let net = log_node::NetAdapter {
+                        tx: out_tx,
+                        fetch_timeout: Duration::from_secs(15),
+                    };
+                    let parts = log_node::LoopParts {
+                        enclave: &enclave,
+                        net: &net,
+                        xrpl: &xrpl,
+                        health: &health,
+                        me,
+                        tick: Duration::from_secs(1),
+                    };
+                    let gate = log_sync::SyncGate::new(log_sync::SyncCfg::default());
+                    log_node::run_follower(follower, views, gate, in_rx, parts).await;
+                });
+                info!("replicated log: follower running");
+            }
+            Setup::Legacy => {
+                log_health.set_mode("legacy");
+                tokio::spawn(async move {
+                    log_node::watch_for_log_mode(&log_client, Duration::from_secs(5)).await;
+                    error!(
+                        "the enclave entered replicated-log mode but this node is not configured for it \
+                         (--member-peers, --log-store-dir, local signer); stopping"
+                    );
+                    std::process::exit(78);
+                });
+            }
+        }
+    }
+
     // Connect to peers
     if let Some(peers_str) = &cli.p2p_peers {
         for peer in peers_str.split(',') {
@@ -2733,8 +2898,10 @@ async fn main() -> Result<()> {
     let election_config = election::ElectionConfig {
         our_peer_id: p2p_node.peer_id.to_string(),
         our_priority: cli.priority,
-        heartbeat_interval: Duration::from_secs(5),
-        heartbeat_timeout: Duration::from_secs(15),
+        heartbeat_interval: election::HEARTBEAT_INTERVAL,
+        heartbeat_timeout: election::HEARTBEAT_TIMEOUT,
+        // Priority 0 takes over at 15 s, priority 1 at 20 s, priority 2 at 25 s (liveness only).
+        takeover_stagger: election::TAKEOVER_STAGGER,
     };
     let mut election_state = election::ElectionState::new(
         election_config,

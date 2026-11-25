@@ -129,6 +129,10 @@ pub struct AppState {
     /// Maintenance flag surfaced by `/v1/system/status` so frontends can show a banner
     /// without needing a redeploy. Toggled via `PERP_MAINTENANCE` env at startup.
     pub maintenance_mode: Arc<AtomicBool>,
+    /// The replicated log on this node: mode, position, halt/divergence, recent alarms.
+    pub log_health: Arc<crate::log_node::LogHealth>,
+    /// The enclave-backed subsystems this node is configured to run, and whether each is running.
+    pub subsystems: Arc<crate::subsystems::Subsystems>,
 }
 
 // ── Request/Response types ──────────────────────────────────────
@@ -381,6 +385,10 @@ async fn system_status(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         // The trust root both of the above rest on. `enabled: false` is not "healthy" —
         // it means the enclave's derived validator set is ageing with nothing refreshing
         // it, and a 5-of-6 floor spends its whole margin on ONE stale signing key.
+        // The replicated log. `diverged: true` means this node's state is not the cluster's: its reads
+        // must not be taken as the cluster's.
+        "log": state.log_health.snapshot(),
+        "subsystems": state.subsystems.snapshot(),
         "unl_refresh": {
             "enabled": state.unl_refresh.enabled.load(Ordering::Relaxed),
             "submissions": state.unl_refresh.submissions.load(Ordering::Relaxed),
@@ -399,7 +407,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers(tower_http::cors::Any);
 
-    Router::new()
+    // Everything that reads or changes trading state. On a node whose replicated state is known not to be
+    // the cluster's (diverged from the log, or fenced) these answer 503 instead of that state.
+    let trading = Router::new()
         .route("/v1/orders", post(submit_order))
         .route("/v1/orders", get(get_orders))
         .route("/v1/orders", delete(cancel_all_orders))
@@ -421,6 +431,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/markets/{market}/ticker", get(get_ticker))
         .route("/v1/markets/{market}/trades", get(get_trades))
         .route("/v1/markets/{market}/funding", get(get_funding))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.log_health.clone(),
+            refuse_if_state_is_not_the_clusters,
+        ));
+
+    Router::new()
+        .merge(trading)
         .route("/v1/markets", get(get_markets))
         .route("/v1/openapi.json", get(openapi_spec))
         .route("/v1/attestation/quote", post(attestation_quote))
@@ -433,6 +450,23 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ws", get(ws::ws_handler))
         .layer(cors)
         .with_state(state)
+}
+
+/// 503 on every trading route while this node's replicated state is known not to be the cluster's: a
+/// diverged or fenced node would otherwise serve balances, positions and a book the cluster does not have.
+async fn refuse_if_state_is_not_the_clusters(
+    State(health): State<Arc<crate::log_node::LogHealth>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if health.refuses_trading() {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this node's replicated state is not the cluster's (diverged or fenced); use another node",
+        )
+        .into_response();
+    }
+    next.run(request).await
 }
 
 /// Serve OpenAPI spec
@@ -651,7 +685,7 @@ async fn openapi_spec() -> impl IntoResponse {
                         "200": {"description": "Position closed; realized PnL and freed margin returned"},
                         "401": {"description": "Authentication required"},
                         "404": {"description": "Position not found or not owned by caller"},
-                        "503": {"description": "Mark price unavailable"}
+                        "503": {"description": "Position close temporarily unavailable on this release, or mark price unavailable"}
                     }
                 }
             },
@@ -735,7 +769,7 @@ async fn openapi_spec() -> impl IntoResponse {
                         "size": {"type": "string", "description": "FP8 size in XRP", "example": "100.00000000"},
                         "leverage": {"type": "integer", "default": 1, "minimum": 1, "maximum": 20},
                         "time_in_force": {"type": "string", "enum": ["gtc", "ioc", "fok"], "default": "gtc"},
-                        "reduce_only": {"type": "boolean", "default": false},
+                        "reduce_only": {"type": "boolean", "default": false, "description": "Not supported yet: true is rejected with 400"},
                         "client_order_id": {"type": "string", "description": "Optional user-defined ID"}
                     }
                 }
@@ -915,6 +949,10 @@ async fn submit_order(
     // Validate leverage (1-20)
     if req.leverage < 1 || req.leverage > 20 {
         return err(StatusCode::BAD_REQUEST, "leverage must be 1-20").into_response();
+    }
+
+    if let Some(why) = unsupported_order_flag(&req) {
+        return err(StatusCode::BAD_REQUEST, why).into_response();
     }
 
     // AUDIT Q6 (2026-09-25): an order may not enter the matchable book without a per-order
@@ -1223,6 +1261,25 @@ async fn cancel_all_orders(
     .into_response()
 }
 
+/// Position close is temporarily unavailable on this release (see the notice on the endpoint).
+/// Kept as a constant rather than deleted so the handler below stays compiled and tested.
+const POSITION_CLOSE_ENABLED: bool = false;
+const POSITION_CLOSE_UNAVAILABLE: &str =
+    "position close is temporarily unavailable; it returns in the next release";
+
+fn position_close_gate() -> Option<&'static str> {
+    (!POSITION_CLOSE_ENABLED).then_some(POSITION_CLOSE_UNAVAILABLE)
+}
+
+/// Order flags this release accepts on the wire but does not support. Refused up front
+/// instead of being stored and ignored.
+fn unsupported_order_flag(req: &SubmitOrderRequest) -> Option<&'static str> {
+    if req.reduce_only {
+        return Some("reduce_only is not supported yet; submit the order without it");
+    }
+    None
+}
+
 /// Close a position by routing a reduce_only IOC order through the CLOB.
 /// This ensures price discovery happens on the order book, not at mark price.
 async fn close_position(
@@ -1230,6 +1287,9 @@ async fn close_position(
     Path(position_id): Path<u64>,
     request: axum::extract::Request,
 ) -> impl IntoResponse {
+    if let Some(why) = position_close_gate() {
+        return err(StatusCode::SERVICE_UNAVAILABLE, why).into_response();
+    }
     let caller = match request.extensions().get::<auth::AuthenticatedUser>() {
         Some(u) => u.xrpl_address.clone(),
         None => return err(StatusCode::UNAUTHORIZED, "authentication required").into_response(),
@@ -1753,5 +1813,82 @@ mod attestation_gap_tests {
             epoch: 1,
         };
         assert_eq!(gap(&f).0, None);
+    }
+}
+
+#[cfg(test)]
+mod interim_gate_tests {
+    use super::*;
+
+    fn order(reduce_only: bool) -> SubmitOrderRequest {
+        serde_json::from_value(serde_json::json!({
+            "user_id": "rTest", "side": "buy", "type": "limit", "price": "1.0",
+            "size": "1.0", "leverage": 2, "reduce_only": reduce_only
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn reduce_only_order_is_refused() {
+        assert!(unsupported_order_flag(&order(true)).is_some());
+    }
+
+    #[test]
+    fn plain_order_passes_the_flag_check() {
+        assert!(unsupported_order_flag(&order(false)).is_none());
+    }
+
+    #[test]
+    fn position_close_is_gated_off() {
+        assert!(position_close_gate().is_some());
+    }
+}
+
+#[cfg(test)]
+mod state_gate_tests {
+    use super::*;
+    use crate::log_node::LogHealth;
+
+    async fn serve(health: Arc<LogHealth>) -> String {
+        let app = Router::new()
+            .route("/v1/account/balance", get(|| async { "balance" }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                health,
+                refuse_if_state_is_not_the_clusters,
+            ))
+            .route("/v1/system/status", get(|| async { "status" }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        format!("http://{a}")
+    }
+
+    async fn get_code(url: String) -> u16 {
+        reqwest::get(url).await.unwrap().status().as_u16()
+    }
+
+    #[tokio::test]
+    async fn a_diverged_node_refuses_trading_reads_but_still_reports_status() {
+        let health = Arc::new(LogHealth::new("follow"));
+        let base = serve(health.clone()).await;
+        assert_eq!(get_code(format!("{base}/v1/account/balance")).await, 200);
+        health.update(|s| {
+            s.halted = Some(crate::log_client::rc::DIVERGED);
+            s.diverged = true;
+        });
+        let r = reqwest::get(format!("{base}/v1/account/balance"))
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 503);
+        assert!(r.text().await.unwrap().contains("not the cluster's"));
+        assert_eq!(get_code(format!("{base}/v1/system/status")).await, 200);
+    }
+
+    #[tokio::test]
+    async fn a_fenced_node_refuses_trading_too() {
+        let health = Arc::new(LogHealth::new("follow"));
+        health.update(|s| s.halted = Some(crate::log_client::rc::FENCED));
+        let base = serve(health).await;
+        assert_eq!(get_code(format!("{base}/v1/account/balance")).await, 503);
     }
 }

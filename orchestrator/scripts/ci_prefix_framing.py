@@ -34,6 +34,13 @@ SRC = ORCH / "src"
 SPV = SRC / "spv_proof.rs"
 MAGIC_RE = re.compile(r'(?:b"(X[A-Z]{3})"|&?([A-Z]{4})_MAGIC)')
 
+# Host-only formats whose magic matches MAGIC_RE by name but is not the enclave's shared prefix: they frame
+# files and streams between orchestrators and never reach the enclave (which gets the inner batch and blobs).
+# Exempted by EXACT (file, symbol), not by file, so a real prefix magic emitted in the same file still fails.
+HOST_ONLY_MAGICS = {
+    ("src/log_store.rs", "CERT"),  # log certificate file (PLC1)
+}
+
 failures: list[str] = []
 notes: list[str] = []
 
@@ -63,6 +70,10 @@ for rs in sorted(SRC.rglob("*.rs")):
         if stripped.startswith("//"):
             continue  # a commented-out emission emits nothing
         if "extend_from_slice" in line and MAGIC_RE.search(line):
+            names = {a or b for a, b in MAGIC_RE.findall(line)}
+            rel = str(rs.relative_to(ORCH))
+            if names and all((rel, nm) in HOST_ONLY_MAGICS for nm in names):
+                continue
             fail(
                 f"{rs.relative_to(ORCH)}:{n} emits a prefix magic outside spv_proof.rs — "
                 "the prefix is assembled in one place so that one place can frame the "
