@@ -35,6 +35,12 @@ use crate::tx_shamap::{tx_id, TxShaMap};
 /// a stale entry lingers past any plausible use.
 pub const VALIDATION_BUFFER_LEDGERS: usize = 256;
 
+/// The enclave refuses a bundle of more validations than this (XRPL_SPV_MAX_VALIDATIONS in
+/// the enclave's xrpl_spv.h), so holding more for one ledger is useless. It also bounds what
+/// one ledger can cost in host memory before the first UNL fetch, when there is no
+/// signing-key filter and only the per-key dedup limits a flood of distinct signers.
+pub const MAX_VALIDATIONS_PER_LEDGER: usize = 64;
+
 /// Rolling store of validation blobs, keyed by the ledger hash they attest.
 ///
 /// Keyed by HASH rather than by sequence deliberately: two different ledgers can share a
@@ -69,6 +75,13 @@ impl ValidationBuffer {
         let (pk, lh) = crate::spv_proof::admitted_validation(&data, unl)?;
         let lh = hex::encode_upper(lh);
         if self.signers.get(&lh).is_some_and(|s| s.contains(&pk)) {
+            return None;
+        }
+        if self
+            .by_hash
+            .get(&lh)
+            .is_some_and(|v| v.len() >= MAX_VALIDATIONS_PER_LEDGER)
+        {
             return None;
         }
         self.insert(&lh, data);
@@ -1473,6 +1486,35 @@ mod tests {
         // the same key on another ledger is a separate count
         assert!(open
             .admit(signed_validation(&c, 0x8000_0001, [0x33; 32]), None)
+            .is_some());
+    }
+
+    #[test]
+    fn a_ledger_holds_at_most_the_enclaves_bundle_cap() {
+        // #230 review (LOW): before the first UNL fetch nothing limits distinct signers, so a
+        // hostile stream could grow one ledger without bound. More than the enclave's bundle
+        // cap is useless anyway; the cap applies with or without a known set.
+        use crate::spv_proof::test_validations::{key, signed_validation};
+        let mut buf = ValidationBuffer::new();
+        for i in 0..MAX_VALIDATIONS_PER_LEDGER {
+            assert!(buf
+                .admit(
+                    signed_validation(&key(i as u8 + 1), 0x8000_0001, [0x44; 32]),
+                    None
+                )
+                .is_some());
+        }
+        let lh = hex::encode_upper([0x44; 32]);
+        assert_eq!(buf.get(&lh).unwrap().len(), MAX_VALIDATIONS_PER_LEDGER);
+        assert!(
+            buf.admit(signed_validation(&key(200), 0x8000_0001, [0x44; 32]), None)
+                .is_none(),
+            "a 65th distinct signer for a full ledger is not held"
+        );
+        assert_eq!(buf.get(&lh).unwrap().len(), MAX_VALIDATIONS_PER_LEDGER);
+        // another ledger still takes the same key
+        assert!(buf
+            .admit(signed_validation(&key(200), 0x8000_0001, [0x55; 32]), None)
             .is_some());
     }
 
