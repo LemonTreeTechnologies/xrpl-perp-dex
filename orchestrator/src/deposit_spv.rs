@@ -35,6 +35,12 @@ use crate::tx_shamap::{tx_id, TxShaMap};
 /// a stale entry lingers past any plausible use.
 pub const VALIDATION_BUFFER_LEDGERS: usize = 256;
 
+/// The enclave refuses a bundle of more validations than this (XRPL_SPV_MAX_VALIDATIONS in
+/// the enclave's xrpl_spv.h), so holding more for one ledger is useless. It also bounds what
+/// one ledger can cost in host memory before the first UNL fetch, when there is no
+/// signing-key filter and only the per-key dedup limits a flood of distinct signers.
+pub const MAX_VALIDATIONS_PER_LEDGER: usize = 64;
+
 /// Rolling store of validation blobs, keyed by the ledger hash they attest.
 ///
 /// Keyed by HASH rather than by sequence deliberately: two different ledgers can share a
@@ -44,6 +50,8 @@ pub const VALIDATION_BUFFER_LEDGERS: usize = 256;
 #[derive(Default)]
 pub struct ValidationBuffer {
     by_hash: HashMap<String, Vec<Vec<u8>>>,
+    /// #230: signing keys already held per ledger — one admitted validation per key.
+    signers: HashMap<String, std::collections::HashSet<[u8; 33]>>,
     /// Insertion order, so the oldest can be dropped without scanning the map.
     order: Vec<String>,
 }
@@ -53,10 +61,39 @@ impl ValidationBuffer {
         Self::default()
     }
 
-    /// Record one validation for a ledger hash. Duplicates from the same validator are
-    /// the stream's business, not ours — the enclave counts DISTINCT signers, so a
-    /// repeat cannot inflate the quorum.
-    pub fn insert(&mut self, ledger_hash: &str, data: Vec<u8>) {
+    /// #230: record a validation only if the enclave would count it — full, verifying under its
+    /// own key, in the UNL signing-key set when one is known — and only once per key. Filed under
+    /// the ledger hash its SIGNED body names, upper-case hex, the form rippled's `ledger`
+    /// responses use. Counting raw frames let non-UNL validators and the same validation
+    /// relayed by three sources reach `min` (and the enclave's 64-entry cap) on bundles the
+    /// enclave then refused. Returns the ledger it was filed under, None when not kept.
+    pub fn admit(
+        &mut self,
+        data: Vec<u8>,
+        unl: Option<&std::collections::HashSet<[u8; 33]>>,
+    ) -> Option<String> {
+        let (pk, lh) = crate::spv_proof::admitted_validation(&data, unl)?;
+        let lh = hex::encode_upper(lh);
+        if self.signers.get(&lh).is_some_and(|s| s.contains(&pk)) {
+            return None;
+        }
+        if self
+            .by_hash
+            .get(&lh)
+            .is_some_and(|v| v.len() >= MAX_VALIDATIONS_PER_LEDGER)
+        {
+            return None;
+        }
+        self.insert(&lh, data);
+        if self.by_hash.contains_key(&lh) {
+            self.signers.entry(lh.clone()).or_default().insert(pk);
+        }
+        Some(lh)
+    }
+
+    /// The raw store under `admit` (and the eviction mechanics its tests pin). Not called on
+    /// stream input directly: that goes through `admit`.
+    pub(crate) fn insert(&mut self, ledger_hash: &str, data: Vec<u8>) {
         let e = self
             .by_hash
             .entry(ledger_hash.to_string())
@@ -68,11 +105,15 @@ impl ValidationBuffer {
         while self.order.len() > VALIDATION_BUFFER_LEDGERS {
             let oldest = self.order.remove(0);
             self.by_hash.remove(&oldest);
+            self.signers.remove(&oldest);
         }
     }
 
     pub fn get(&self, ledger_hash: &str) -> Option<&Vec<Vec<u8>>> {
-        self.by_hash.get(ledger_hash)
+        // admit files under upper-case hex; accept a caller's hash in either case
+        self.by_hash
+            .get(ledger_hash)
+            .or_else(|| self.by_hash.get(&ledger_hash.to_ascii_uppercase()))
     }
 
     /// The most recently first-seen ledger holding at least `min` validations — the anchor a
@@ -633,12 +674,13 @@ where
         if j["type"] != "validationReceived" || j["full"] != true {
             continue;
         }
-        let (Some(lh), Some(data_hex)) = (j["ledger_hash"].as_str(), j["data"].as_str()) else {
+        let Some(data_hex) = j["data"].as_str() else {
             continue;
         };
         if let Ok(data) = unhex(data_hex) {
+            let unl = crate::unl_refresh::unl_signing_keys();
             if let Ok(mut b) = buffer.lock() {
-                b.insert(lh, data);
+                b.admit(data, unl.as_deref());
             }
         }
     }
@@ -962,14 +1004,28 @@ mod tests {
     /// One REAL frame off `wss://clio.altnet.rippletest.net:51233`, captured 2026-10-08.
     ///
     /// Every key and value is as the endpoint sent it. Only `data` is shortened — the capture
-    /// script truncated it — and that is safe here because the pump only unhexes it; nothing in
-    /// this file inspects the validation blob. Written out rather than invented because a
+    /// script truncated it; `real_frame()` below swaps in a complete validation, which the
+    /// buffer's admission (#230) now requires. Written out rather than invented because a
     /// fixture built from my idea of the shape passes tautologically: the live frame carries
     /// thirteen keys, including `cookie` and `network_id`, which I would not have guessed.
     const REAL_VALIDATION_FRAME: &str = r#"{"cookie":"6079102537327064379","data":"2280000001260146177129325A06CA3A1234567890ABCDEF","flags":2147483649,"full":true,"ledger_hash":"451C6E1D2A1B5BFA776CB54B3CBC35F1B77F06F6D27C1229384EF279369BFC05","ledger_index":"21370737","master_key":"nHUCAdca6VoWWYVdBH1bwCUQggEX2e5acQSqxM3DwyuhsFknxmh3","network_id":1,"signature":"304402204B2CA83844D82E8EC6199E904D7AA6DFAD3FE131BB1376AF8354D49ABDB1FFF302205507A77ACC2A76FA68D8345135AEA80FA729A0AAD1D62C156A25D4D4CF2548A3","signing_time":844760778,"type":"validationReceived","validated_hash":"E890251C88D063C4DB4D507EB19F5E04D035506C9BFE4CAA0E8DB7A72DFB5D5F","validation_public_key":"n9KWVA64rMeqkAvcQ4DNCa2eDXTzprCtK1HLC8H5PEyUVwSSyL5X"}"#;
 
     const REAL_LEDGER_HASH: &str =
         "451C6E1D2A1B5BFA776CB54B3CBC35F1B77F06F6D27C1229384EF279369BFC05";
+
+    /// #230: the buffer now admits only a validation whose signature verifies, so the captured
+    /// frame's truncated `data` would be (rightly) dropped. This is the same live frame carrying
+    /// a REAL, complete validation (`spv_proof::REAL_VALIDATION_HEX`, its own capture). It is
+    /// filed under the ledger its SIGNED body names, never the frame's `ledger_hash`, which here
+    /// belongs to another capture — so the test also shows the JSON field is not trusted.
+    fn real_frame() -> String {
+        REAL_VALIDATION_FRAME.replace(
+            "2280000001260146177129325A06CA3A1234567890ABCDEF",
+            crate::spv_proof::REAL_VALIDATION_HEX,
+        )
+    }
+    const REAL_SIGNED_LEDGER_HASH: &str =
+        "1124A12059FA1D708D4CB718767B5C2C1971E6D644F7731BD8D60B8666538532";
 
     /// Serve ONE websocket connection on loopback and run `script` against it.
     ///
@@ -1048,7 +1104,7 @@ mod tests {
 
         let url = serve_once(|mut ws| async move {
             ws.send(Message::Ping(vec![])).await.expect("ping");
-            ws.send(Message::text(REAL_VALIDATION_FRAME))
+            ws.send(Message::text(real_frame()))
                 .await
                 .expect("validation");
             ws.send(Message::Close(None)).await.expect("close");
@@ -1071,8 +1127,12 @@ mod tests {
             "the validation sent AFTER the ping was dropped — the reader ended at the keepalive"
         );
         assert!(
-            b.get(REAL_LEDGER_HASH).is_some_and(|v| v.len() == 1),
+            b.get(REAL_SIGNED_LEDGER_HASH).is_some_and(|v| v.len() == 1),
             "the validation landed under the wrong ledger hash"
+        );
+        assert!(
+            b.get(REAL_LEDGER_HASH).is_none(),
+            "#230: filed under the frame's unsigned JSON ledger_hash"
         );
     }
 
@@ -1086,11 +1146,8 @@ mod tests {
         use futures_util::SinkExt;
         use tokio_tungstenite::tungstenite::Message;
 
-        let partial = REAL_VALIDATION_FRAME.replace(r#""full":true"#, r#""full":false"#);
-        assert_ne!(
-            partial, REAL_VALIDATION_FRAME,
-            "the fixture edit did not land"
-        );
+        let partial = real_frame().replace(r#""full":true"#, r#""full":false"#);
+        assert_ne!(partial, real_frame(), "the fixture edit did not land");
 
         let url = serve_once(move |mut ws| async move {
             ws.send(Message::text(partial)).await.expect("partial");
@@ -1381,6 +1438,100 @@ mod tests {
             SubmitOutcome::Transient(_) => {}
             other => panic!("expected Transient, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn admit_counts_each_unl_signer_once_under_the_signed_ledger() {
+        use crate::spv_proof::test_validations::{key, pk33, signed_validation};
+        let (a, b, c) = (key(1), key(2), key(3));
+        let unl: std::collections::HashSet<[u8; 33]> = [pk33(&a), pk33(&b)].into();
+        let mut buf = ValidationBuffer::new();
+        let va = signed_validation(&a, 0x8000_0001, [0xAB; 32]);
+        let lh = buf
+            .admit(va.clone(), Some(&unl))
+            .expect("UNL signer admitted");
+        assert_eq!(lh, hex::encode_upper([0xAB; 32]));
+        // the same validation relayed by two more sources
+        assert!(buf.admit(va.clone(), Some(&unl)).is_none());
+        assert!(buf.admit(va, Some(&unl)).is_none());
+        // a non-UNL validator for the same ledger
+        let vc = signed_validation(&c, 0x8000_0001, [0xAB; 32]);
+        assert!(buf.admit(vc, Some(&unl)).is_none());
+        let vb = signed_validation(&b, 0x8000_0001, [0xAB; 32]);
+        assert!(buf.admit(vb, Some(&unl)).is_some());
+        assert_eq!(
+            buf.get(&lh).unwrap().len(),
+            2,
+            "#230: two UNL signers, not five frames"
+        );
+        assert_ne!(
+            lh,
+            lh.to_lowercase(),
+            "the hash has letters, so case matters"
+        );
+        assert_eq!(
+            buf.get(&lh.to_lowercase()).unwrap().len(),
+            2,
+            "lookup is case-blind"
+        );
+        assert_eq!(buf.newest_with(2).map(|(h, _)| h), Some(lh));
+        // no set known yet: still verified and deduped, just not membership-filtered
+        let mut open = ValidationBuffer::new();
+        assert!(open
+            .admit(signed_validation(&c, 0x8000_0001, [0x22; 32]), None)
+            .is_some());
+        assert!(open
+            .admit(signed_validation(&c, 0x8000_0001, [0x22; 32]), None)
+            .is_none());
+        // the same key on another ledger is a separate count
+        assert!(open
+            .admit(signed_validation(&c, 0x8000_0001, [0x33; 32]), None)
+            .is_some());
+    }
+
+    #[test]
+    fn a_ledger_holds_at_most_the_enclaves_bundle_cap() {
+        // #230 review (LOW): before the first UNL fetch nothing limits distinct signers, so a
+        // hostile stream could grow one ledger without bound. More than the enclave's bundle
+        // cap is useless anyway; the cap applies with or without a known set.
+        use crate::spv_proof::test_validations::{key, signed_validation};
+        let mut buf = ValidationBuffer::new();
+        for i in 0..MAX_VALIDATIONS_PER_LEDGER {
+            assert!(buf
+                .admit(
+                    signed_validation(&key(i as u8 + 1), 0x8000_0001, [0x44; 32]),
+                    None
+                )
+                .is_some());
+        }
+        let lh = hex::encode_upper([0x44; 32]);
+        assert_eq!(buf.get(&lh).unwrap().len(), MAX_VALIDATIONS_PER_LEDGER);
+        assert!(
+            buf.admit(signed_validation(&key(200), 0x8000_0001, [0x44; 32]), None)
+                .is_none(),
+            "a 65th distinct signer for a full ledger is not held"
+        );
+        assert_eq!(buf.get(&lh).unwrap().len(), MAX_VALIDATIONS_PER_LEDGER);
+        // another ledger still takes the same key
+        assert!(buf
+            .admit(signed_validation(&key(200), 0x8000_0001, [0x55; 32]), None)
+            .is_some());
+    }
+
+    #[test]
+    fn eviction_forgets_the_signers_of_an_evicted_ledger() {
+        use crate::spv_proof::test_validations::{key, signed_validation};
+        let first = signed_validation(&key(1), 0x8000_0001, [0x00; 32]);
+        let mut buf = ValidationBuffer::new();
+        buf.admit(first.clone(), None).unwrap();
+        for i in 0..VALIDATION_BUFFER_LEDGERS {
+            buf.insert(&format!("filler{i}"), vec![0]);
+        }
+        assert!(buf.get(&hex::encode_upper([0u8; 32])).is_none(), "evicted");
+        assert!(
+            buf.admit(first, None).is_some(),
+            "an evicted ledger starts fresh"
+        );
     }
 
     #[test]
