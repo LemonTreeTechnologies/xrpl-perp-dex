@@ -413,7 +413,7 @@ fn push_be16(v: &mut Vec<u8>, x: u16) {
 /// Minimal bounds-checked STObject field walker. From `b[pos..]`, returns
 /// (type, field, id_start, value_start, next_pos) for the next field, or None on
 /// truncation / an unhandled type. Only the types an STValidation carries are handled.
-fn st_next(b: &[u8], pos: usize) -> Option<(u16, u16, usize, usize, usize)> {
+pub(crate) fn st_next(b: &[u8], pos: usize) -> Option<(u16, u16, usize, usize, usize)> {
     let id_start = pos;
     let mut i = pos;
     let h = *b.get(i)?;
@@ -525,6 +525,71 @@ pub fn validation_entry(data: &[u8]) -> Result<([u8; 33], Vec<u8>, Vec<u8>)> {
     vbody.extend_from_slice(&data[..sf_start]);
     vbody.extend_from_slice(&data[sf_end..]);
     Ok((pubkey, sig, vbody))
+}
+
+/// #230 — the validation the enclave will COUNT, judged before we count it ourselves.
+///
+/// Returns (signing key, ledger hash) when `data` is a FULL validation whose signature verifies
+/// under its own signing key and, if `unl` is given, whose key is in that set. The ledger hash
+/// is read from the SIGNED body, never from the stream's JSON, so a source cannot file a real
+/// validation under another ledger. These are the enclave's own per-entry checks
+/// (`xrpl_spv_verify_quorum`), run host-side so a collector stops at a quorum the enclave will
+/// accept: counting raw frames let non-UNL validators and multi-source repeats fill the count
+/// and the enclave then refused the bundle (-208). Because the signature is checked, keeping
+/// one entry per key is safe: a forged frame under a UNL key is dropped here, so it cannot
+/// occupy that key's slot ahead of the genuine one.
+///
+/// UNTRUSTED either way: the enclave re-verifies everything against its pinned set.
+pub fn admitted_validation(
+    data: &[u8],
+    unl: Option<&std::collections::HashSet<[u8; 33]>>,
+) -> Option<([u8; 33], [u8; 32])> {
+    use k256::ecdsa::signature::hazmat::PrehashVerifier;
+    use k256::ecdsa::{Signature, VerifyingKey};
+    let (pk, sig, vbody) = validation_entry(data).ok()?;
+    if let Some(set) = unl {
+        if !set.contains(&pk) {
+            return None;
+        }
+    }
+    let mut flags: Option<u32> = None;
+    let mut ledger: Option<[u8; 32]> = None;
+    let mut pos = 0;
+    while pos < vbody.len() {
+        let (tc, fc, _, vs, next) = st_next(&vbody, pos)?;
+        if tc == 2 && fc == 2 {
+            flags = Some(u32::from_be_bytes(vbody[vs..next].try_into().ok()?));
+        } else if tc == 5 && fc == 1 {
+            ledger = Some(vbody[vs..next].try_into().ok()?);
+        }
+        pos = next;
+    }
+    if flags? & 0x0000_0001 == 0 {
+        return None; // vfFullValidation
+    }
+    let ledger = ledger?;
+    let h = sha512half(&[&[0x56, 0x41, 0x4C, 0x00], &vbody]); // 'VAL\0'
+    let vk = VerifyingKey::from_sec1_bytes(&pk).ok()?;
+    let s = Signature::from_der(&sig).ok()?;
+    let s = s.normalize_s().unwrap_or(s);
+    vk.verify_prehash(&h, &s).ok()?;
+    Some((pk, ledger))
+}
+
+/// The secp256k1 signing key a validator manifest binds (sfSigningPubKey), or None for a
+/// revocation / malformed manifest. Not a manifest VERIFICATION — the enclave does that with
+/// ed25519 against its measured masters; this only tells the host which keys to count.
+pub fn manifest_signing_key(m: &[u8]) -> Option<[u8; 33]> {
+    let mut pos = 0;
+    while pos < m.len() {
+        let (tc, fc, _, vs, next) = st_next(m, pos)?;
+        if tc == 7 && fc == 3 {
+            let k: [u8; 33] = m[vs..next].try_into().ok()?;
+            return (k[0] == 0x02 || k[0] == 0x03).then_some(k);
+        }
+        pos = next;
+    }
+    None
 }
 
 /// Build the XSPV validations section (`val_count`, concatenated entries) from the raw
@@ -864,6 +929,45 @@ fn build_xclk_blob_framed(
 #[cfg(test)]
 pub(crate) const REAL_VALIDATION_HEX: &str = "228000000126013949042932300C863A2D270CF98511C639511124A12059FA1D708D4CB718767B5C2C1971E6D644F7731BD8D60B8666538532501700000000000000000000000000000000000000000000000000000000000000005019696E5F5288E3EE08676023DB69CFA2E333692B0F7E97D87553CB0312D9C5C0767321027F285B8BB33F0E8B025BF955C29A7CFA8A0995831EE4AD93A9BD572A7C8EEDCD76463044022018975AFA77A0F6D273D8E36F5FDCB4876491FF3CD2719CE5C30D3A464F6CD33B0220383E44ECCAAB37930DBE272AA2586B1CBD287C872E31FEF587D5218142E44554";
 
+/// #230 test helpers: validations and keys made here, so admission is tested against
+/// signatures that really verify (and really fail) rather than fixtures shaped like output.
+#[cfg(test)]
+pub(crate) mod test_validations {
+    use super::sha512half;
+    use k256::ecdsa::SigningKey;
+
+    /// rippled's shape: sfFlags, sfLedgerHash, sfSigningPubKey, then sfSignature over
+    /// SHA-512Half('VAL\0' || the body without the signature).
+    pub(crate) fn signed_validation(sk: &SigningKey, flags: u32, ledger: [u8; 32]) -> Vec<u8> {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        let mut body = vec![0x22];
+        body.extend_from_slice(&flags.to_be_bytes());
+        body.push(0x51);
+        body.extend_from_slice(&ledger);
+        body.extend_from_slice(&[0x73, 33]);
+        body.extend_from_slice(&pk33(sk));
+        let h = sha512half(&[&[0x56, 0x41, 0x4C, 0x00], &body]);
+        let sig: k256::ecdsa::Signature = sk.sign_prehash(&h).unwrap();
+        let der = sig.to_der();
+        let mut out = body;
+        out.extend_from_slice(&[0x76, der.as_bytes().len() as u8]);
+        out.extend_from_slice(der.as_bytes());
+        out
+    }
+
+    pub(crate) fn key(n: u8) -> SigningKey {
+        SigningKey::from_slice(&[n; 32]).unwrap()
+    }
+
+    pub(crate) fn pk33(sk: &SigningKey) -> [u8; 33] {
+        sk.verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .try_into()
+            .unwrap()
+    }
+}
+
 #[cfg(test)]
 mod xclk_producer_tests {
     use super::*;
@@ -1088,7 +1192,6 @@ mod xspv_producer_tests {
 }
 
 // ── async fetch (ws validations + HTTP header/proof → XSPV blob) ───────────────
-use std::collections::HashMap;
 use std::time::Duration;
 
 /// Config for the leader's one-shot SPV proof fetch.
@@ -1184,7 +1287,10 @@ pub async fn fetch_spv_bundle(cfg: &SpvFetchConfig) -> Result<Vec<u8>> {
     ))
     .await
     .context("ws subscribe")?;
-    let mut by_ledger: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+    // #230: per ledger, one ADMITTED validation per signing key (see admitted_validation).
+    // The same admission the deposit/clock buffer applies — one counting rule, one place.
+    let unl = crate::unl_refresh::unl_signing_keys();
+    let mut by_ledger = crate::deposit_spv::ValidationBuffer::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(cfg.collect_secs);
     let (lh_hex, datas) = loop {
         let msg = tokio::time::timeout_at(deadline, ws.next())
@@ -1198,15 +1304,14 @@ pub async fn fetch_spv_bundle(cfg: &SpvFetchConfig) -> Result<Vec<u8>> {
             Err(_) => continue,
         };
         if j["type"] == "validationReceived" && j["full"] == true {
-            if let Some(d) = j["data"].as_str() {
-                let lh = j["ledger_hash"].as_str().unwrap_or_default().to_string();
-                let entry = by_ledger.entry(lh.clone()).or_default();
-                if let Ok(bytes) = hex::decode(d) {
-                    entry.push(bytes);
-                }
-                if entry.len() >= cfg.quorum {
-                    break (lh, entry.clone());
-                }
+            let Some(bytes) = j["data"].as_str().and_then(|d| hex::decode(d).ok()) else {
+                continue;
+            };
+            let Some(lh) = by_ledger.admit(bytes, unl.as_deref()) else {
+                continue;
+            };
+            if let Some(datas) = by_ledger.get(&lh).filter(|d| d.len() >= cfg.quorum) {
+                break (lh, datas.clone());
             }
         }
     };
@@ -1533,6 +1638,92 @@ mod tests {
                  cannot distinguish the bug from the fix"
             ),
         }
+    }
+
+    #[test]
+    fn a_real_validation_is_admitted_under_its_signed_ledger() {
+        use super::test_validations::{key, pk33};
+        let data = hex::decode(VAL_DATA).unwrap();
+        let (pk, lh) = admitted_validation(&data, None).expect("real validation admitted");
+        assert_eq!(
+            lh.to_vec(),
+            hex::decode(LEDGER_HASH_VAL).unwrap(),
+            "ledger from the signed body"
+        );
+        let set: std::collections::HashSet<[u8; 33]> = [pk].into();
+        assert!(
+            admitted_validation(&data, Some(&set)).is_some(),
+            "UNL member admitted"
+        );
+        let other: std::collections::HashSet<[u8; 33]> = [pk33(&key(9))].into();
+        assert!(
+            admitted_validation(&data, Some(&other)).is_none(),
+            "#230: non-UNL key not counted"
+        );
+    }
+
+    #[test]
+    fn a_tampered_real_validation_is_not_admitted() {
+        let mut data = hex::decode(VAL_DATA).unwrap();
+        let lh = hex::decode(LEDGER_HASH_VAL).unwrap();
+        let at = data.windows(32).position(|w| w == lh.as_slice()).unwrap();
+        data[at] ^= 1;
+        assert!(
+            admitted_validation(&data, None).is_none(),
+            "signature must not verify"
+        );
+    }
+
+    #[test]
+    fn admission_checks_full_flag_and_signature() {
+        use super::test_validations::{key, pk33, signed_validation};
+        let sk = key(7);
+        let good = signed_validation(&sk, 0x8000_0001, [0xAB; 32]);
+        assert_eq!(
+            admitted_validation(&good, None),
+            Some((pk33(&sk), [0xAB; 32]))
+        );
+        let partial = signed_validation(&sk, 0x8000_0000, [0xAB; 32]);
+        assert!(
+            admitted_validation(&partial, None).is_none(),
+            "partial validation not counted"
+        );
+        // a frame that claims sk's key but is signed by another key
+        let mut forged = signed_validation(&key(8), 0x8000_0001, [0xAB; 32]);
+        let k8 = pk33(&key(8));
+        let at = forged.windows(33).position(|w| w == k8).unwrap();
+        forged[at..at + 33].copy_from_slice(&pk33(&sk));
+        assert!(
+            admitted_validation(&forged, None).is_none(),
+            "forged under a UNL key not counted"
+        );
+        assert!(
+            admitted_validation(&[0x22, 0, 0], None).is_none(),
+            "garbage not counted"
+        );
+    }
+
+    #[test]
+    fn manifest_signing_key_reads_the_bound_key_only() {
+        use super::test_validations::{key, pk33};
+        let sk = pk33(&key(3));
+        let mut m = vec![0x24, 0, 0, 0, 5, 0x71, 33];
+        m.extend_from_slice(&[0xED; 33]);
+        m.extend_from_slice(&[0x73, 33]);
+        m.extend_from_slice(&sk);
+        m.extend_from_slice(&[0x70, 0x12, 64]);
+        m.extend_from_slice(&[0x11; 64]);
+        assert_eq!(manifest_signing_key(&m), Some(sk));
+        let mut rev = vec![0x24, 0xFF, 0xFF, 0xFF, 0xFF, 0x71, 33];
+        rev.extend_from_slice(&[0xED; 33]);
+        assert_eq!(
+            manifest_signing_key(&rev),
+            None,
+            "a revocation binds no key"
+        );
+        let mut ed = vec![0x73, 33];
+        ed.extend_from_slice(&[0xED; 33]);
+        assert_eq!(manifest_signing_key(&ed), None, "not a secp256k1 key");
     }
 
     #[test]

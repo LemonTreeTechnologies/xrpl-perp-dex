@@ -24,8 +24,32 @@
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use tracing::{error, info};
+
+/// #230 — the validator SIGNING keys from the last VL this loop fed the enclave. Host-side
+/// collectors count only validations under these keys, so they stop at a quorum the enclave
+/// will accept. Set by the same fetch that submits the manifests, so the host's view rotates
+/// together with the enclave's. None until the first successful fetch (or with the loop off):
+/// collectors then still verify and dedup, they just cannot exclude non-UNL validators.
+static UNL_SIGNING_KEYS: RwLock<Option<Arc<HashSet<[u8; 33]>>>> = RwLock::new(None);
+
+pub fn unl_signing_keys() -> Option<Arc<HashSet<[u8; 33]>>> {
+    UNL_SIGNING_KEYS.read().ok().and_then(|g| g.clone())
+}
+
+/// The signing keys the VL's manifests bind. Empty → None: an empty filter would admit
+/// nothing, turning a bad VL into a stopped SPV path rather than an unfiltered one.
+pub fn signing_keys_from_manifests(manifests_hex: &[String]) -> Option<HashSet<[u8; 33]>> {
+    let keys: HashSet<[u8; 33]> = manifests_hex
+        .iter()
+        .filter_map(|h| hex::decode(h).ok())
+        .filter_map(|m| crate::spv_proof::manifest_signing_key(&m))
+        .collect();
+    (!keys.is_empty()).then_some(keys)
+}
 
 /// Counters for `/v1/system/status`. `enabled` is first because a node that is not
 /// refreshing must not look like one whose validators simply never rotate.
@@ -154,6 +178,11 @@ async fn refresh_once(
         .masters_seen
         .store(pairs.len() as u64, Ordering::Relaxed);
     let manifests: Vec<String> = pairs.into_iter().map(|(_, hexm)| hexm).collect();
+    if let Some(keys) = signing_keys_from_manifests(&manifests) {
+        if let Ok(mut g) = UNL_SIGNING_KEYS.write() {
+            *g = Some(Arc::new(keys));
+        }
+    }
     let resp = perp.submit_validator_manifests(&manifests).await?;
     let changed = resp["changed"].as_u64().unwrap_or(0);
     Ok((manifests.len(), changed))
@@ -216,6 +245,36 @@ mod tests {
     /// fixture we invented could agree with a parser we invented and both be wrong about
     /// what the publisher actually serves.
     const VL: &str = r#"{"public_key":"ED264807102805220DA0F312E71FC2C69E1552C9C5790F6C25E3729DEB573D5860","version":1,"blob":"eyJzZXF1ZW5jZSI6NTksImV4cGlyYXRpb24iOjg3MDk3NTA2NiwidmFsaWRhdG9ycyI6W3sidmFsaWRhdGlvbl9wdWJsaWNfa2V5IjoiRUQwNjFFQ0I1MUI1QkQ2MjY2NUY1RDFBNURCMUE2MkFGODQ0NjRCRUQ3N0U3NzI4MjM1QTdBNTUxRDQ1MzVFNzE3IiwibWFuaWZlc3QiOiJKQUFBQUFKeEllMEdIc3RSdGIxaVpsOWRHbDJ4cGlyNFJHUysxMzUzS0NOYWVsVWRSVFhuRjNNaEFubkJza0psamRlRkZLV21DaUJ2b3d3WW8rNDNCWktnV0tnUHFqNWNSUENYZGtjd1JRSWhBS1JpTFhldko2MXVraFp0aWt2Q3VLZ0dSblY4SDA4ZU0vUEV2Sk5FZGwwNEFpQmkvQms2OFZWZWZSMUd0Z0k0WWV6UlFWc3huRWlOL0xtV1NObVFZS1FSSUhBU1FBdDhoS2Z4a3FQTWVCT1RoMngyaGpya0FhN2xlVGVuQnRmOUR4dWh3bGdzQjlOL3h4VGZwek1Ra2pVWW9ZaXlYa1haeWgxTlZzTkxES1VtT2RXWkxBTT0ifSx7InZhbGlkYXRpb25fcHVibGljX2tleSI6IkVEQURCNkU2RjcyMjlGOTI5MDlFNUE2REJBRjgxQUQxRUM3MjNEMzFCNjc2Q0Q4RjVGM0U5MjZBRDA0M0QxODdDMCIsIm1hbmlmZXN0IjoiSkFBQUFBSnhJZTJ0dHViM0lwK1NrSjVhYmJyNEd0SHNjajB4dG5iTmoxOCtrbXJRUTlHSHdITWhBbjhvVzR1elB3NkxBbHY1VmNLYWZQcUtDWldESHVTdGs2bTlWeXA4anUzTmRrY3dSUUloQU5RbEZiaUROZmEvTEpJcitlYVoyS0tjMDRHbGRaTXJBRzRiRFdGTUx5VVJBaUFsd0FmTkl1dmVJMEhtaE0wSStGdzR5Z0FzSEZXdXdWcmNXS2FiWkxIdGdIQVNRQkJFVFRSRHhDc1FvNHdJSyt6NUNkOU9ta3UweUR4Qk9NVEE3MFJTcUVvcFY5REhCZ1ZWOWc4MmoxbW4wb0pYRHowcE5YcnJDbjNEcU1id0EwdkMrUUE9In1dfQ=="}"#;
+
+    #[test]
+    fn the_real_vl_keys_admit_the_real_validation_and_nothing_else() {
+        // #230 end to end on real bytes: the signing keys the published manifests bind are
+        // the keys a real validation is counted under.
+        let vl: serde_json::Value = serde_json::from_str(VL).unwrap();
+        let manifests: Vec<String> = manifests_from_vl(&vl)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.1)
+            .collect();
+        let keys = signing_keys_from_manifests(&manifests).expect("two keys");
+        assert_eq!(keys.len(), 2, "one signing key per manifest");
+        let val = hex::decode(crate::spv_proof::REAL_VALIDATION_HEX).unwrap();
+        assert!(
+            crate::spv_proof::admitted_validation(&val, Some(&keys)).is_some(),
+            "the real validation's signer is in the real VL"
+        );
+        let one: Vec<String> = manifests[..1].to_vec();
+        let k1 = signing_keys_from_manifests(&one).unwrap();
+        assert!(
+            crate::spv_proof::admitted_validation(&val, Some(&k1)).is_none(),
+            "and not counted against a list without its validator"
+        );
+        assert!(
+            signing_keys_from_manifests(&[]).is_none(),
+            "no keys → no filter, not an empty one"
+        );
+        assert!(signing_keys_from_manifests(&["zz".into()]).is_none());
+    }
 
     #[test]
     fn the_real_validator_list_yields_master_and_manifest_pairs() {
